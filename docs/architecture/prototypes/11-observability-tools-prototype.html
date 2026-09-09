@@ -1,0 +1,750 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ticket 11 · 记忆修正闭环原型</title>
+<style>
+:root{color-scheme:light;--paper:#f2efe7;--surface:#fffefa;--ink:#18211c;--muted:#5d6861;--line:#ccd5cf;--forest:#164f3b;--forest-soft:#e5f1eb;--red:#8c2d2d;--red-soft:#fff0ed;--info:#2d6670;--info-soft:#e8f2f3;--warning:#8a5a16;--warning-soft:#fff5df;--shadow:0 18px 45px rgba(24,45,35,.11)}*{box-sizing:border-box}::selection{background:#b9dccb;color:#0d3326}html{scrollbar-color:#789486 #e7e2d7}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,textarea{font:inherit}button{touch-action:manipulation}main{width:min(980px,calc(100% - 32px));margin:auto;padding:38px 0 58px}.intro{max-width:780px;margin-bottom:28px}.intro h1{max-width:700px;margin:0 0 12px;font:700 clamp(36px,6vw,62px)/1.02 Georgia,"Times New Roman",serif;letter-spacing:-.03em;text-wrap:balance}.intro>p{max-width:68ch;margin:0;color:var(--muted);font-size:17px}.thesis{display:grid;grid-template-columns:repeat(3,1fr);gap:0;margin:24px 0 0;padding:0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);list-style:none}.thesis li{padding:14px 18px;border-left:1px solid var(--line)}.thesis li:first-child{padding-left:0;border-left:0}.thesis strong{display:block;color:var(--forest);font:700 21px Georgia,"Times New Roman",serif}.thesis span{color:var(--muted);font-size:13px}.question{margin:18px 0 0;padding:10px 12px;border-radius:10px;background:var(--forest-soft);color:#123e2f;font-size:13px}.conversation{overflow:hidden;border-radius:15px;background:var(--surface);box-shadow:var(--shadow)}.conversation-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line)}.conversation-head h2,.workspace h2{margin:0;font-size:16px}.prototype-label{color:var(--muted);font-size:12px}.timeline{height:min(540px,65vh);min-height:420px;overflow:auto;padding:18px;scrollbar-color:#789486 #eef1ed}.entry{display:flex;margin-bottom:14px}.entry.user{justify-content:flex-end}.bubble{max-width:78%;padding:10px 13px;border-radius:13px;background:#edf0ed}.entry.user .bubble{border-radius:13px 13px 3px 13px;background:var(--forest);color:#fff}.entry.agent .bubble{border-radius:13px 13px 13px 3px}.tag{display:inline-flex;align-items:center;margin-bottom:4px;border-radius:999px;padding:2px 7px;background:#e8ece9;color:#46534b;font-size:11px;font-weight:700}.tag.host{background:var(--forest-soft);color:var(--forest)}.request{width:100%;padding:8px 10px;border:1px dashed #9caf9f;border-radius:10px;background:#f7faf8;color:#405148;font-size:13px}.host-card{width:100%;overflow:hidden;border:1px solid #86aa98;border-radius:13px;background:#fbfffd}.host-card.danger{border-color:#c47a74;background:#fffafa}.host-card.info{border-color:#8db2b8;background:#fbffff}.host-card.info .host-head{border-color:#c9dfe2;background:var(--info-soft)}.host-card.warning{border-color:#c69a52;background:#fffdf7}.host-card.warning .host-head{border-color:#ead5aa;background:var(--warning-soft)}.host-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-bottom:1px solid #cadbd2;background:var(--forest-soft)}.host-card.danger .host-head{border-color:#e8c2be;background:var(--red-soft)}.host-head strong{font-size:13px}.status{border-radius:999px;padding:2px 7px;background:#fff;color:var(--forest);font-size:11px;font-weight:750}.status.danger{color:var(--red)}.status.info{color:var(--info)}.status.warning{color:var(--warning)}.host-body{padding:12px}.host-body>p{margin:7px 0}.memory-text{margin:8px 0;padding:10px;border-radius:9px;background:#eef3f0;color:#1b2d24;white-space:pre-wrap}.host-card.danger .memory-text{background:#fff4f2}.meta{display:flex;gap:7px 14px;flex-wrap:wrap;color:var(--muted);font-size:12px}.used-list,.state-list{display:grid}.update-list{display:grid;gap:14px}.update-item{padding-top:12px;border-top:1px solid #dfe5e1}.update-item:first-child{padding-top:0;border-top:0}.update-title{display:flex;align-items:center;justify-content:space-between;gap:10px}.update-title strong{font-size:13px}.used-row,.state-row{display:grid;grid-template-columns:90px 1fr;gap:12px;padding:10px 0;border-top:1px solid #e0e6e2}.used-row:first-child,.state-row:first-child{border-top:0}.ref{font:700 12px ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--forest)}.used-row small,.state-row small{display:block;color:var(--muted)}details{margin-top:10px;padding-top:9px;border-top:1px solid #dfe5e1;color:var(--muted);font-size:12px}summary{display:flex;min-height:44px;align-items:center;cursor:pointer;color:var(--forest);font-weight:700}.comparison{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}.source-block{margin-top:12px;padding-top:12px;border-top:1px solid #dfe5e1}.source-block h3{margin:0 0 6px;color:var(--muted);font-size:12px}.comparison section{min-width:0}.comparison h3{margin:0 0 5px;color:var(--muted);font-size:12px}.comparison .memory-text{height:calc(100% - 24px);margin:0}.correction{width:100%;min-height:88px;resize:vertical;border:1px solid #98a79f;border-radius:9px;background:#fff;padding:9px 10px;color:var(--ink);caret-color:var(--forest)}.correction:focus,input:focus{outline:3px solid #77b39455;border-color:var(--forest)}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.button{min-height:44px;border:1px solid #98a79f;border-radius:9px;background:#fff;color:var(--ink);padding:8px 11px;cursor:pointer}.button:hover{border-color:var(--forest);background:#f3f8f5}.button:focus-visible,summary:focus-visible{outline:3px solid #77b39466;outline-offset:2px}.button.primary{border-color:var(--forest);background:var(--forest);color:#fff}
+.button.select.on{border-color:var(--forest);background:#e8f0ea;color:var(--forest);font-weight:600}.button.danger{border-color:var(--red);background:var(--red);color:#fff}.button:disabled{cursor:not-allowed;opacity:.48}.composer{padding:14px 18px 17px;border-top:1px solid var(--line);background:#f8f7f2}.composer label{display:block;margin-bottom:6px;font-weight:700}.input-row{display:flex;gap:8px}.input-row input{min-width:0;min-height:44px;flex:1;border:1px solid #98a79f;border-radius:9px;background:#fff;padding:10px 11px;color:var(--ink);caret-color:var(--forest)}input::placeholder,textarea::placeholder{color:#657269}.workspace{display:grid;grid-template-columns:1.15fr .85fr;gap:28px;margin-top:30px}.workspace section{min-width:0}.section-copy{margin:5px 0 14px;color:var(--muted);font-size:13px}.tabs,.steps,.free-play{display:flex;gap:7px;flex-wrap:wrap}.tabs{margin-bottom:12px}.tabs .button,.steps .button,.free-play .button{font-size:12px}.steps{margin-top:12px}.step.current{border-color:var(--forest);background:var(--forest-soft)}.free-play{margin-top:12px}.state-row{grid-template-columns:88px 1fr}.state-row .state{display:inline-block;margin-top:5px;border-radius:999px;padding:1px 7px;background:var(--forest-soft);color:var(--forest);font-size:11px;font-weight:700}.state-row .state.off{background:#ececea;color:#5e625f}.state-row .state.purged{background:var(--red-soft);color:var(--red)}.receipt{display:grid;grid-template-columns:82px 1fr;gap:4px 12px;margin:0}.receipt dt{color:var(--muted)}.receipt dd{margin:0;overflow-wrap:anywhere}.closure{margin:7px 0;padding-left:20px}.small{color:var(--muted);font-size:12px}@media(max-width:720px){main{width:min(100% - 20px,980px);padding-top:24px}.intro h1{font-size:40px}.thesis{grid-template-columns:1fr}.thesis li,.thesis li:first-child{padding:10px 0;border-left:0;border-top:1px solid var(--line)}.thesis li:first-child{border-top:0}.timeline{height:58vh;min-height:430px;padding:12px}.bubble{max-width:90%}.comparison,.workspace{grid-template-columns:1fr}.workspace{gap:24px}.input-row{align-items:stretch;flex-direction:column}.used-row,.state-row{grid-template-columns:76px 1fr}}
+</style>
+</head>
+<body>
+<main>
+<header class="intro"><h1>记忆出错后，只做三件事</h1><p>后台自动处理不打断；有已启用变更时，Host 汇总告知。你质疑时再展开依据、修改或撤销。</p><ol class="thesis"><li><strong>看</strong><span>看清本轮用了什么和原始来源。</span></li><li><strong>改</strong><span>先看当前内容，再纠正、忘记或清除。</span></li><li><strong>退</strong><span>批量撤销自动记忆更新：选中、一次确认。</span></li></ol><p class="question"><strong>本原型只验证宿主无关语义：</strong>这三步是否足够直观、安全，并且不把后台机制变成你的操作负担。卡片与点击仅供演示，不代表 Pi 或自研 TUI 的实际渲染；自由文本输入只覆盖固定演示语句，不代表生产意图分类器。</p></header>
+<section class="conversation" aria-label="Agent 对话原型"><div class="conversation-head"><h2>与 Agent 对话</h2><span class="prototype-label">纯内存 fixture · 非生产功能</span></div><div class="timeline" id="timeline" aria-live="polite"></div><form class="composer" id="composer"><label for="message">直接说出你的意图</label><div class="input-row"><input id="message" maxlength="260" autocomplete="off" placeholder="例如：纠正 mem-N 这条记忆"><button class="button primary" type="submit">发送</button></div></form></section>
+<div class="workspace"><section><h2>引导场景</h2><p class="section-copy" id="scenarioDescription"></p><div class="tabs" id="scenarioTabs"></div><div class="steps" id="scenarioSteps"></div><h2 style="margin-top:24px">自由体验</h2><p class="section-copy">任意顺序触发，观察 Host 如何汇总更新，并在变更前展示内容。</p><div class="free-play" id="freePlay"></div></section><section><h2>当前记忆状态</h2><p class="section-copy">每次操作后更新；原型关闭即重置。</p><div class="state-list" id="statePanel"></div></section></div>
+</main>
+<script>
+const Domain=(()=>{
+const rotate=(value,bits)=>(value>>>bits)|(value<<(32-bits));
+const sha256=text=>{
+  const bytes=new TextEncoder().encode(text),bitLength=bytes.length*8,size=Math.ceil((bytes.length+9)/64)*64,data=new Uint8Array(size),view=new DataView(data.buffer);
+  const constants=new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]),hash=new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]),words=new Uint32Array(64);
+  data.set(bytes);data[bytes.length]=0x80;view.setUint32(size-8,Math.floor(bitLength/0x100000000));view.setUint32(size-4,bitLength>>>0);
+  for(let offset=0;offset<size;offset+=64){
+    for(let index=0;index<16;index+=1)words[index]=view.getUint32(offset+index*4);
+    for(let index=16;index<64;index+=1){const a=words[index-15],b=words[index-2],s0=rotate(a,7)^rotate(a,18)^(a>>>3),s1=rotate(b,17)^rotate(b,19)^(b>>>10);words[index]=(words[index-16]+s0+words[index-7]+s1)>>>0;}
+    let [a,b,c,d,e,f,g,h]=hash;
+    for(let index=0;index<64;index+=1){const s1=rotate(e,6)^rotate(e,11)^rotate(e,25),choice=(e&f)^(~e&g),t1=(h+s1+choice+constants[index]+words[index])>>>0,s0=rotate(a,2)^rotate(a,13)^rotate(a,22),majority=(a&b)^(a&c)^(b&c),t2=(s0+majority)>>>0;h=g;g=f;f=e;e=(d+t1)>>>0;d=c;c=b;b=a;a=(t1+t2)>>>0;}
+    hash[0]=(hash[0]+a)>>>0;hash[1]=(hash[1]+b)>>>0;hash[2]=(hash[2]+c)>>>0;hash[3]=(hash[3]+d)>>>0;hash[4]=(hash[4]+e)>>>0;hash[5]=(hash[5]+f)>>>0;hash[6]=(hash[6]+g)>>>0;hash[7]=(hash[7]+h)>>>0;
+  }
+  return [...hash].map(value=>value.toString(16).padStart(8,"0")).join("");
+};
+const withHash=record=>({...record,hash:`sha256:${sha256(record.content)}`});
+const source=withHash({id:"src-plan-10",scope:"project: ai-agent-cli",locator:"issue/10#physical-ownership",content:"每台宿主、每个 OS 用户、每个最终 app-id 使用一份 store.sqlite3；数据根使用宿主标准 app-data 目录，最终 app-id 由 Ticket 13 冻结。"});
+const assemblySources=[
+  source,
+  withHash({id:"src-ledger-09",target:"mem-42",scope:"project: ai-agent-cli",locator:"issue/09#canonical-ledger",content:"canonical ledger 同时记录上下文装配与每次模型 attempt。"}),
+  withHash({id:"src-owner-19",target:"mem-19",scope:"personal",locator:"owner-decision:memory-display",content:"默认对话不展示记忆与 ledger 细节。"})
+];
+const updateBatch=[
+  {id:"update-mem-42-r4",batchId:"batch-1",target:"mem-42",kind:"自动修订",automatic:true,scope:"project: ai-agent-cli",reason:"source-change",verification:"verifier-02 · 通过",status:"active",before:{content:"canonical ledger 记录上下文装配 receipt。",revision:"r3",verification:"verified",lifecycle:"active",scope:"project: ai-agent-cli",source:"issue/09#canonical-ledger"},after:{content:"canonical ledger 同时记录上下文装配与每次模型 attempt。",revision:"r4",verification:"verified",lifecycle:"active",scope:"project: ai-agent-cli",source:"issue/09#canonical-ledger"}},
+  {id:"update-mem-19-r2",batchId:"batch-1",target:"mem-19",kind:"自动晋升",automatic:true,scope:"personal",reason:"owner-preference-sync",verification:"owner-signal · 通过",status:"active",before:{content:"默认对话可以展示记忆与 ledger 细节。",revision:"r1",verification:"verified",lifecycle:"active",scope:"personal",source:"owner decision"},after:{content:"默认对话不展示记忆与 ledger 细节。",revision:"r2",verification:"verified",lifecycle:"active",scope:"personal",source:"owner decision"}}
+];
+const initial=()=>{
+  const state={
+    memories:{
+      "mem-13":{id:"mem-13",subjectRef:"subject-a1",content:"store.sqlite3 固定放在 .pi/agent 下",scope:"project: ai-agent-cli",source:"issue/10#physical-ownership",revision:"r1",revisionSeq:1,lifecycle:"active",verification:"stale"},
+      "mem-42":{id:"mem-42",subjectRef:"subject-a2",content:"canonical ledger 同时记录上下文装配与每次模型 attempt。",scope:"project: ai-agent-cli",source:"issue/09#canonical-ledger",revision:"r4",revisionSeq:4,lifecycle:"active",verification:"verified",automatic:true,previous:{content:"canonical ledger 记录上下文装配 receipt。",revision:"r3",verification:"verified",lifecycle:"active",scope:"project: ai-agent-cli",source:"issue/09#canonical-ledger"}},
+      "mem-19":{id:"mem-19",subjectRef:"subject-a3",content:"默认对话不展示记忆与 ledger 细节。",scope:"personal",source:"owner decision",revision:"r2",revisionSeq:2,lifecycle:"active",verification:"verified",automatic:true,previous:{content:"默认对话可以展示记忆与 ledger 细节。",revision:"r1",verification:"verified",lifecycle:"active",scope:"personal",source:"owner decision"}}
+    },
+    assembly:{id:"asm-fixture-01",attempt:"finished",tokens:"45,430 / 128,000",used:[
+      {id:"mem-42",kind:"memory",content:"canonical ledger 同时记录上下文装配与每次模型 attempt。",scope:"project: ai-agent-cli",source:"issue/09#canonical-ledger",sourceRef:"src-ledger-09",revision:"r4",reason:"当前任务涉及 execution ledger"},
+      {id:"mem-19",kind:"memory",content:"默认对话不展示记忆与 ledger 细节。",scope:"personal",source:"owner decision",sourceRef:"src-owner-19",revision:"r2",reason:"个人偏好适用于本轮"},
+      {...source,kind:"source",sourceRef:"src-plan-10",reason:"当前问题需要 Ticket 10 原文"}
+    ],sources:structuredClone(assemblySources),rejected:["mem-88 · project 不匹配","mem-71 · claim 重复"]},
+    pending:null,purged:[],revokedUpdateIds:[],nextOperation:1,nextReceipt:1,nextNotice:2,nextCard:1,updates:structuredClone(updateBatch),batches:[batchRecord("batch-1",updateBatch.map(update=>update.id))],timeline:[{kind:"user",text:"继续当前任务"},{kind:"agent",text:"已完成。"}]
+  };
+  const eventIds=state.batches[0].eventIds;
+  state.timeline.push(host("updateNotice",{level:"info",read:false,expanded:false,entryId:"notice-1",batchId:"batch-1",eventIds:[...eventIds],eligibleEventIds:[...eventIds],updates:updateDetails(state,"batch-1"),selected:[]}));
+  return state;
+};
+const newCardId=(state,prefix)=>`${prefix}-${state.nextCard++}`;
+const uniqueEntryIndex=(state,view,id)=>{if(!id)return -1;const matches=[];state.timeline.forEach((entry,index)=>{if(entry.kind==="host"&&entry.view===view&&entry.data?.entryId===id)matches.push(index);});return matches.length===1?matches[0]:-1;};
+const sourceComplete=source=>Boolean(source&&["id","scope","locator","hash","content"].every(key=>typeof source[key]==="string"&&source[key].trim())&&/^sha256:[0-9a-f]{64}$/.test(source.hash)&&source.hash===`sha256:${sha256(source.content)}`);
+const add=(state,...entries)=>state.timeline.push(...entries);
+const request=(label)=>({kind:"request",text:label});
+const host=(view,data)=>({kind:"host",view,data});
+const intent=(action,text,label)=>action.origin==="card"?[]:[{kind:"user",text:action.message||text},request(label)];
+const snapshot=(memory)=>memory?{id:memory.id,subjectRef:memory.subjectRef,content:memory.content,scope:memory.scope,source:memory.source,revision:memory.revision,lifecycle:memory.lifecycle,verification:memory.verification}:null;
+const effectiveUpdateStatus=(update,memory,eventStatus=update.status)=>{
+  if(eventStatus==="redacted")return "redacted";
+  if(!memory)return eventStatus==="rolled-back"?"rolled-back":"superseded";
+  if(memory.revision!==update.after?.revision){
+    if(eventStatus==="rolled-back"&&update.before?.revision===memory.revision)return memory.lifecycle==="active"?"rolled-back":memory.lifecycle;
+    return "superseded";
+  }
+  if(memory.lifecycle!=="active")return memory.lifecycle;
+  return eventStatus==="rolled-back"?"rolled-back":"active";
+};
+const revisionFields=["content","revision","verification","lifecycle","scope","source"];
+const revisionSnapshot=value=>value===null?null:Object.fromEntries(revisionFields.map(key=>[key,value[key]]));
+const completeRevision=value=>Boolean(value&&revisionFields.every(key=>typeof value[key]==="string"&&value[key]));
+const eventWellFormed=update=>Boolean(update&&["id","batchId","target","kind","status"].every(key=>typeof update[key]==="string"&&update[key])&&update.automatic===true&&completeRevision(update.after)&&(!update.after.id||update.after.id===update.target)&&(update.before===null?update.kind==="activation":update.kind!=="activation"&&completeRevision(update.before)));
+const canonicalJson=value=>value===null||typeof value!=="object"?JSON.stringify(value):Array.isArray(value)?`[${value.map(canonicalJson).join(",")}]`:`{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+const eventDigest=update=>eventWellFormed(update)?sha256(canonicalJson(update)):null;
+const batchRecord=(id,eventIds,redacted=false)=>{const batch={id,eventIds:[...eventIds],redacted};return {...batch,manifestDigest:sha256(canonicalJson(batch))};};
+const sameIdentitySet=(left,right)=>Array.isArray(left)&&Array.isArray(right)&&left.length===right.length&&new Set(left).size===left.length&&left.every(id=>right.includes(id));
+const sameIdentitySequence=(left,right)=>Array.isArray(left)&&Array.isArray(right)&&left.length===right.length&&new Set(left).size===left.length&&left.every((id,index)=>id===right[index]);
+const validateBatch=(state,batchId)=>{
+  const records=(state.batches||[]).filter(batch=>batch.id===batchId);if(records.length!==1)return null;const record=records[0],eventIds=record.eventIds;
+  if(record.manifestDigest!==batchRecord(record.id,eventIds,Boolean(record.redacted)).manifestDigest||!Array.isArray(eventIds)||new Set(eventIds).size!==eventIds.length||eventIds.some(id=>typeof id!=="string"||!id))return null;
+  if(!eventIds.length)return record.redacted?{id:batchId,eventIds:[],events:[],redacted:true}:null;
+  const events=[];for(const eventId of eventIds){const matches=state.updates.filter(update=>update.id===eventId);if(matches.length!==1||matches[0].batchId!==batchId||!eventWellFormed(matches[0]))return null;events.push(matches[0]);}
+  const members=state.updates.filter(update=>update.batchId===batchId&&update.status!=="redacted");
+  if(!sameIdentitySet(eventIds,members.map(update=>update.id))||new Set(events.map(update=>update.target)).size!==events.length)return null;
+  return {id:batchId,eventIds:[...eventIds],events};
+};
+const updateDetails=(state,batchId)=>state.updates.filter(update=>!batchId||update.batchId===batchId).map(update=>{const memory=state.memories[update.target],eventStatus=state.revokedUpdateIds.includes(update.id)?"rolled-back":update.status;return {...structuredClone(update),eventStatus,status:effectiveUpdateStatus(update,memory,eventStatus),current:memory?snapshot(memory):null};});
+const latestBatchId=state=>(state.batches||[]).at(-1)?.id;
+const inspection=(state)=>structuredClone(state.assembly.used);
+const sourceFor=(state,target)=>{
+  const used=state.assembly.used.filter(item=>target?item.kind==="memory"&&item.id===target:item.kind==="source");
+  if(used.length!==1||!used[0].sourceRef)return undefined;
+  const sources=state.assembly.sources.filter(item=>item.id===used[0].sourceRef);
+  return sources.length===1&&sourceComplete(sources[0])?structuredClone(sources[0]):undefined;
+};
+const lastIndex=(state,view)=>{for(let index=state.timeline.length-1;index>=0;index-=1){const entry=state.timeline[index];if(entry.kind==="host"&&entry.view===view)return index;}return -1;};
+const uniqueNoticeIndex=(state,id)=>id?uniqueEntryIndex(state,"updateNotice",id):(()=>{const matches=[];state.timeline.forEach((entry,index)=>{if(entry.kind==="host"&&entry.view==="updateNotice")matches.push(index);});return matches.length===1?matches[0]:-1;})();
+const operationIndex=(state,operationId)=>{for(let index=state.timeline.length-1;index>=0;index-=1){const entry=state.timeline[index];if(entry.kind==="host"&&entry.data?.operationId===operationId)return index;}return -1;};
+const markOperation=(state,pending,field,extra={})=>{const index=operationIndex(state,pending.operationId);if(index>=0)state.timeline[index].data={...state.timeline[index].data,[field]:true,...extra};};
+const eventMatchesHead=(memory,after)=>Boolean(memory&&completeRevision(after)&&revisionFields.every(key=>memory[key]===after[key]));
+const rollbackEligible=(state,updateId)=>{const matches=state.updates.filter(item=>item.id===updateId);if(matches.length!==1||!eventWellFormed(matches[0]))return false;const update=matches[0],memory=state.memories[update.target];return Boolean(memory?.lifecycle==="active"&&update.status==="active"&&!state.revokedUpdateIds.includes(update.id)&&eventMatchesHead(memory,update.after));};
+const eligibleUpdates=(state,batchId)=>state.updates.filter(update=>(!batchId||update.batchId===batchId)&&rollbackEligible(state,update.id));
+const noticeBatch=(state,entry)=>{const batch=validateBatch(state,entry.data.batchId);return batch&&sameIdentitySequence(entry.data.eventIds,batch.eventIds)?batch:null;};
+// 失效只针对“因其他操作”失去资格：本次撤销被接受后，被撤销的 event 当然不再 eligible，
+// 那是这次操作成功的后置条件，不能反过来向用户宣称他的选择整体作废。
+// 豁免只属于发起本次撤销的那张卡，且只覆盖本次实际处理的 event：其他卡上同一 event 的选择
+// 属于“因其他操作失去资格”，必须整次 fail closed，不能静默丢弃 selection 后回退成整批。
+const refreshNotices=(state,exempt=null)=>{const eligible=new Set(eligibleUpdates(state).map(update=>update.id));state.timeline=state.timeline.map((entry,index)=>{if(!(entry.kind==="host"&&entry.view==="updateNotice"))return entry;const settled=exempt&&exempt.at===index?new Set(exempt.ids||[]):new Set();const selected=entry.data.selected||[];const lost=selected.some(id=>!eligible.has(id)&&!settled.has(id));return {...entry,data:{...entry.data,updates:updateDetails(state,entry.data.batchId),eligibleEventIds:(entry.data.eventIds||[]).filter(id=>eligible.has(id)),selected:lost?[]:selected.filter(id=>!settled.has(id)),selectionInvalidated:lost||Boolean(entry.data.selectionInvalidated)}};});};
+const expectedHead=memory=>({id:memory.id,revision:memory.revision,lifecycle:memory.lifecycle,headDigest:sha256(canonicalJson(snapshot(memory)))});
+const headMatches=(memory,expected)=>Boolean(memory&&memory.id===expected.id&&memory.revision===expected.revision&&memory.lifecycle===expected.lifecycle&&sha256(canonicalJson(snapshot(memory)))===expected.headDigest);
+const newOperation=(state,kind,expected,extra={})=>({kind,operationId:`op-${state.nextOperation++}`,expected,...extra});
+const matchingPending=(state,action,kind)=>{const pending=state.pending?.kind===kind&&action.operationId===state.pending.operationId?state.pending:null;if(!pending&&action.origin==="card")add(state,host("error",{text:"该卡片没有匹配的 operation identity，未执行任何变更。"}));return pending;};
+const rejectWhilePending=(state,action)=>{if(!state.pending)return false;add(state,...intent(action,"先处理当前预览","Agent 请求 Host 打开另一项变更"),host("error",{text:"已有一项变更等待确认或放弃。",detail:"先结束当前预览；后来的请求没有覆盖它。"}));return true;};
+const issueReceipt=(state,data,prefix="rcpt")=>{const receipt=`${prefix}-${String(state.nextReceipt++).padStart(2,"0")}`;add(state,host("receipt",{...data,receipt}));return receipt;};
+const openPreview=(state,action,text,label,view,data,triggerView)=>{
+  let at=-1;
+  if(action.origin==="card"&&triggerView){at=uniqueNoticeIndex(state,action.entryId);if(at<0)return {error:true};}
+  if(at>=0){const restore=state.timeline[at];state.timeline[at]=host(view,data);return {at,restore};}
+  add(state,...intent(action,text,label),host(view,data));return null;
+};
+const restorePlace=(state,pending=state.pending)=>{const replaced=pending?.replaced;if(replaced)state.timeline[replaced.at]=replaced.restore;return Boolean(replaced);};
+const invalidatePending=(state,pending,detail)=>{if(!restorePlace(state,pending))markOperation(state,pending,"invalidated");state.pending=null;refreshNotices(state);add(state,host("error",{title:"预览已失效",text:"目标在确认前已经变化，未执行任何变更。",detail}));};
+const sourceRecord=value=>Boolean(value&&typeof value==="object"&&typeof value.id==="string"&&typeof value.locator==="string"&&typeof value.hash==="string"&&typeof value.content==="string");
+const purgeManifest=(state,id)=>{
+  const manifest={id,contents:new Set(),locators:new Set(),hashes:new Set(),sourceRefs:new Set(),updateIds:new Set(),subjects:new Set()};
+  const signature=()=>[manifest.contents,manifest.locators,manifest.hashes,manifest.sourceRefs,manifest.updateIds,manifest.subjects].map(set=>set.size).join(":");
+  const walk=(value,inherited=false,seen=new Set())=>{
+    if(Array.isArray(value)){if(seen.has(value))return;seen.add(value);value.forEach(item=>walk(item,inherited,seen));return;}
+    if(!value||typeof value!=="object")return;
+    if(seen.has(value))return;
+    seen.add(value);
+    const linkedSource=manifest.sourceRefs.has(value.id)||manifest.locators.has(value.locator)||manifest.hashes.has(value.hash);
+    const owned=inherited||value.id===id||value.target===id||value.current?.id===id||manifest.updateIds.has(value.id)||manifest.sourceRefs.has(value.id)||manifest.sourceRefs.has(value.sourceRef)||manifest.subjects.has(value.subjectRef)||linkedSource;
+    if(owned){
+      if(value.target===id&&typeof value.id==="string"&&("before" in value||"after" in value))manifest.updateIds.add(value.id);
+      if(sourceRecord(value)||typeof value.id==="string"&&("locator" in value||"hash" in value))manifest.sourceRefs.add(value.id);
+      Object.entries(value).forEach(([key,item])=>{if(typeof item!=="string"||!item)return;if(["content","draft"].includes(key))manifest.contents.add(item);if(["source","locator"].includes(key))manifest.locators.add(item);if(key==="sourceRef")manifest.sourceRefs.add(item);if(key==="hash")manifest.hashes.add(item);if(key==="subjectRef")manifest.subjects.add(item);});
+    }
+    Object.values(value).forEach(item=>walk(item,owned,seen));
+  };
+  let before;do{before=signature();walk(state);}while(signature()!==before);
+  manifest.identities=new Set([id,...manifest.sourceRefs,...manifest.updateIds,...manifest.subjects]);manifest.texts=new Set([...manifest.contents,...manifest.locators,...manifest.hashes]);return manifest;
+};
+const regexEscape=value=>value.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
+const containsIdentity=(text,identity)=>new RegExp(`(^|[^A-Za-z0-9_-])${regexEscape(identity)}(?=$|[^A-Za-z0-9_-])`).test(text);
+const redactText=(text,manifest)=>{
+  let redacted=text;
+  for(const token of [...manifest.texts].filter(Boolean).sort((a,b)=>b.length-a.length))redacted=redacted.split(token).join("[purged]");
+  for(const identity of [...manifest.identities].filter(Boolean).sort((a,b)=>b.length-a.length))redacted=redacted.replace(new RegExp(`(^|[^A-Za-z0-9_-])${regexEscape(identity)}(?=$|[^A-Za-z0-9_-])`,"g"),"$1[purged]");
+  return redacted;
+};
+const ownedByManifest=(value,manifest)=>Boolean(value&&typeof value==="object"&&(value.id===manifest.id||value.target===manifest.id||value.current?.id===manifest.id||manifest.updateIds.has(value.id)||manifest.sourceRefs.has(value.id)||manifest.sourceRefs.has(value.sourceRef)||manifest.subjects.has(value.subjectRef)||manifest.locators.has(value.locator)||manifest.hashes.has(value.hash)));
+const referencesManifest=(value,manifest,seen=new Set())=>{if(!value||typeof value!=="object")return false;if(seen.has(value))return false;seen.add(value);if(Array.isArray(value))return value.some(item=>referencesManifest(item,manifest,seen));return ownedByManifest(value,manifest)||Object.values(value).some(item=>referencesManifest(item,manifest,seen));};
+const controlledString=(value,manifest)=>{
+  if(manifest.identities.has(value)||manifest.texts.has(value))return true;
+  if([...manifest.texts].some(token=>token&&value.includes(token)))return true;
+  return [...manifest.identities].some(identity=>identity&&containsIdentity(value,identity));
+};
+const redactValue=(value,manifest,key="",seen=new Set())=>{
+  if(typeof value==="string")return controlledString(value,manifest)?(manifest.identities.has(value)||manifest.texts.has(value)?"[purged]":redactText(value,manifest)):value;
+  if(!value||typeof value!=="object")return value;
+  if(seen.has(value))return "[purged-cycle]";
+  seen.add(value);
+  if(Array.isArray(value))return value.map(item=>redactValue(item,manifest,key,seen));
+  if(ownedByManifest(value,manifest)){
+    if(sourceRecord(value)||manifest.sourceRefs.has(value.id)||manifest.sourceRefs.has(value.sourceRef))return {id:"[purged-source]",kind:"redacted",content:"内容与来源已按授权清除",reason:"source snapshot 已 redacted"};
+    if(manifest.updateIds.has(value.id)||value.target===manifest.id&&("before" in value||"after" in value))return {id:"[redacted-update]",batchId:value.batchId,target:"[purged]",kind:"已清除",scope:"[redacted]",reason:"[redacted]",verification:"[redacted]",eventStatus:"redacted",status:"redacted",before:null,after:null,current:null};
+    return {id:"[purged]",kind:"redacted",content:"内容已按授权清除",reason:"manifest 已 redacted"};
+  }
+  return Object.fromEntries(Object.entries(value).filter(([childKey])=>!controlledString(childKey,manifest)).map(([childKey,item])=>[childKey,redactValue(item,manifest,childKey,seen)]));
+};
+const hasControlledData=(value,manifest,key="",seen=new Set())=>{
+  if(typeof value==="string")return controlledString(value,manifest);
+  if(!value||typeof value!=="object")return false;
+  if(seen.has(value))return false;
+  seen.add(value);
+  if(Array.isArray(value))return value.some(item=>hasControlledData(item,manifest,key,seen));
+  return ownedByManifest(value,manifest)||Object.entries(value).some(([childKey,item])=>controlledString(childKey,manifest)||hasControlledData(item,manifest,childKey,seen));
+};
+const scrubControlled=(state,manifest)=>{
+  state.timeline=state.timeline.map(entry=>{
+    if(entry.kind==="host"&&entry.view==="receipt")return entry;
+    if(entry.kind==="host"&&["correct","forget","restore","purge","rollback"].includes(entry.view)&&referencesManifest(entry.data,manifest))return {...entry,data:{kind:"redacted",redacted:true}};
+    const cleaned=redactValue(entry,manifest);
+    if(cleaned.kind==="host"&&cleaned.view==="updateNotice"){cleaned.data.eventIds=(entry.data.eventIds||[]).filter(id=>!manifest.updateIds.has(id));const keptSelected=(entry.data.selected||[]).filter(id=>!manifest.updateIds.has(id)),droppedSelected=keptSelected.length!==(entry.data.selected||[]).length;if(droppedSelected)cleaned.data.selectionInvalidated=true;cleaned.data.selected=droppedSelected?[]:keptSelected;}
+    return cleaned;
+  });
+  state.updates=state.updates.map(update=>redactValue(update,manifest));state.assembly=redactValue(state.assembly,manifest);state.revokedUpdateIds=state.revokedUpdateIds.filter(id=>!manifest.updateIds.has(id));
+  state.batches=(state.batches||[]).map(batch=>{const kept=batch.eventIds.filter(id=>!manifest.updateIds.has(id));return batchRecord(batch.id,kept,kept.length!==batch.eventIds.length||Boolean(batch.redacted));});
+  const handled=new Set(["timeline","updates","assembly","batches","selected","revokedUpdateIds"]);for(const [key,value] of Object.entries(state))if(!handled.has(key))state[key]=redactValue(value,manifest,key);
+  delete state.memories[manifest.id];state.pending=null;
+};
+const reduce=(state,action)=>{
+  let next=structuredClone(state);
+  switch(action.type){
+    case "VIEW_UPDATES":{
+      const viewedBatchId=latestBatchId(next);
+      next.timeline=next.timeline.map(entry=>entry.kind==="host"&&entry.view==="updateNotice"&&entry.data.batchId===viewedBatchId?{...entry,data:{...entry.data,read:true}}:entry);
+      if(next.pending?.replaced?.restore?.view==="updateNotice"&&next.pending.replaced.restore.data.batchId===viewedBatchId)next.pending.replaced.restore.data.read=true;
+      const entryId=`notice-${next.nextNotice++}`,batchId=viewedBatchId,batch=validateBatch(next,batchId);if(!batch){add(next,...intent(action,"最近自动更新了什么？","Agent 请求 Host 查看最近自动更新"),host("error",{text:"更新批次身份或 event manifest 不完整，未展示可操作详情。"}));break;}
+      if(batch.redacted&&!batch.eventIds.length){add(next,...intent(action,"最近自动更新了什么？","Agent 请求 Host 查看最近自动更新"),host("updateNotice",{level:"info",read:true,expanded:true,entryId,batchId,eventIds:[],eligibleEventIds:[],updates:[],selected:[],purgedEmpty:true}));break;}
+      const eventIds=batch.eventIds,eligibleEventIds=batch.events.filter(update=>rollbackEligible(next,update.id)).map(update=>update.id);
+      add(next,...intent(action,"最近自动更新了什么？","Agent 请求 Host 查看最近自动更新"),host("updateNotice",{level:"info",read:true,expanded:true,entryId,batchId,eventIds:[...eventIds],eligibleEventIds,updates:updateDetails(next,batchId),selected:[]}));break;
+    }
+    case "TOGGLE_UPDATES":{
+      const identity=action.entryId;
+      if(action.origin!=="card"||!identity){add(next,host("error",{text:"更新汇总控件缺少卡片身份，请重新查看更新。"}));break;}
+      const at=uniqueNoticeIndex(next,identity);
+      if(at<0){add(next,host("error",{text:"更新汇总卡片已经失效，请重新查看更新。"}));break;}
+      const entry=next.timeline[at],batch=noticeBatch(next,entry);if(!batch){add(next,host("error",{text:"更新批次身份已经变化，请重新查看更新。"}));break;}
+      if(batch.redacted&&!batch.eventIds.length){next.timeline[at]={...entry,data:{...entry.data,read:true,expanded:!entry.data.expanded,eventIds:[],eligibleEventIds:[],updates:[],selected:[],purgedEmpty:true}};break;}
+      next.timeline[at]={...entry,data:{...entry.data,read:true,expanded:!entry.data.expanded,updates:updateDetails(next,entry.data.batchId),eligibleEventIds:batch.events.filter(update=>rollbackEligible(next,update.id)).map(update=>update.id),selected:(entry.data.selected||[]).filter(id=>rollbackEligible(next,id))}};break;
+    }
+    case "TOGGLE_SELECT":{
+      if(action.origin!=="card"||!action.entryId){add(next,host("error",{text:"选择控件缺少更新卡片身份，请重新展开详情。"}));break;}
+      const at=uniqueNoticeIndex(next,action.entryId);
+      if(at<0){add(next,host("error",{text:"选择控件对应的更新卡片已经失效。"}));break;}
+      const entry=next.timeline[at],batch=noticeBatch(next,entry);
+      if(!batch||!entry.data.eventIds.includes(action.id)||!batch.eventIds.includes(action.id)||!rollbackEligible(next,action.id)){add(next,host("error",{text:"该更新事件不属于此卡片、批次身份已变化或已不可撤销。"}));break;}
+      const selected=entry.data.selected||[],toggled=selected.includes(action.id)?selected.filter(id=>id!==action.id):[...selected,action.id];
+      // 用户重新做出选择即解除失效状态；在此之前批量决策必须保持 fail closed。
+      next.timeline[at]={...entry,data:{...entry.data,selected:toggled,selectionInvalidated:false}};break;
+    }
+    case "CANCEL_PENDING":{
+      const pending=next.pending;
+      if(!pending||action.operationId!==pending.operationId){if(action.origin==="card")add(next,host("error",{text:"该取消控件没有匹配的 operation identity，未执行任何变更。"}));else add(next,...intent(action,"取消当前操作","Agent 请求 Host 取消待确认操作"),host("error",{text:"当前没有可取消的待确认操作。"}));break;}
+      const userInitiated=action.origin!=="card";
+      if(!restorePlace(next,pending))markOperation(next,pending,"cancelled");next.pending=null;refreshNotices(next);
+      if(userInitiated)add(next,...intent(action,"取消当前操作","Agent 请求 Host 取消待确认操作"),host("cancelled",{operationId:pending.operationId}));break;
+    }
+    case "SHOW_WARNING":add(next,...intent(action,"查看待复核提示","Agent 请求 Host 展示待复核状态"),host("warning",{text:"有 1 条项目事实证据不足，尚未启用。",detail:"当前版本继续生效；补齐来源或明确确认后再处理。"}));break;
+    case "SHOW_ERROR":add(next,...intent(action,"查看更新失败提示","Agent 请求 Host 展示更新错误"),host("error",{text:"自动 revision 写入失败，current 未改变。",detail:"旧版本仍生效；receipt 未完成，不会自动重试。"}));break;
+    case "SAFE_NOOP":add(next,...intent(action,action.message||"未执行记忆变更","Agent 请求 Host 确认未执行变更"),host("safeNoop",{text:"检测到否定表达，未执行记忆变更。",detail:"如需操作，请明确说出一个具体动作和 mem-N ID。"}));break;
+    case "AMBIGUOUS_DESTRUCTIVE":add(next,...intent(action,action.message||"未执行方向冲突的记忆操作","Agent 请求 Host 拒绝方向冲突的记忆操作"),host("error",{text:"同一句同时包含不可逆删除与恢复方向，未执行任何变更。",detail:"请只保留一个方向并重新表述：恢复该记忆，或不可恢复地删除该记忆。"}));break;
+    case "INVALID_TARGET":add(next,...intent(action,action.message||"处理这条记忆","Agent 请求 Host 解析目标"),host("error",{text:"无法唯一确定目标记忆。",detail:"请明确给出一个 mem-N ID；破坏性操作不会使用默认目标。"}));break;
+    case "ASK_USED":{
+      const source=sourceFor(next),entryId=newCardId(next,"inspect");
+      add(next,...intent(action,"刚才用了哪些记忆？","Agent 请求 Host 查看本轮依据"),host("inspect",{entryId,used:inspection(next),technical:structuredClone(next.assembly),source,expanded:false}));break;
+    }
+    case "EXPAND_SOURCE":{
+      let at=-1;
+      if(action.origin==="card"){
+        at=uniqueEntryIndex(next,"inspect",action.entryId);
+        if(at<0){add(next,host("error",{text:"来源展开控件已经失效，请重新查看本轮依据。"}));break;}
+      }
+      const selectedSource=action.origin==="card"?structuredClone(next.timeline[at].data.source):sourceFor(next,action.id);
+      if(!sourceComplete(selectedSource)){add(next,...intent(action,"展开指定记忆的原始来源","Agent 请求 Host 展开来源"),host("error",{text:"assembly snapshot 中没有完整且唯一绑定的来源。",detail:"locator、hash 或 sourceRef 缺失时不展示来源，也不回退到其他 source。"}));break;}
+      if(action.origin==="card"){next.timeline[at]={...next.timeline[at],data:{...next.timeline[at].data,source:selectedSource,expanded:!next.timeline[at].data.expanded}};break;}
+      const entryId=newCardId(next,"inspect");add(next,...intent(action,action.id?`展开 ${action.id} 的原始来源`:`展开 ${selectedSource.id} 的原文`,"Agent 请求 Host 展开来源"),host("inspect",{entryId,used:inspection(next),technical:structuredClone(next.assembly),source:selectedSource,expanded:true}));break;
+    }
+    case "PREPARE_CORRECTION":{
+      if(rejectWhilePending(next,action))break;const target=next.memories[action.id],draft=action.draft??"";
+      if(!target){add(next,...intent(action,"纠正这条记忆","Agent 请求 Host 准备纠正"),host("error",{text:"目标记忆不存在。"}));break;}
+      if(target.lifecycle!=="active"){add(next,...intent(action,`纠正 ${target.id}`,"Agent 请求 Host 准备纠正"),host("error",{text:"该记忆当前不是 active。",detail:"先通过独立恢复流程结束 tombstoned 状态。"}));break;}
+      const pending=newOperation(next,"correct",expectedHead(target),{id:target.id,draft});next.pending=pending;
+      add(next,...intent(action,`纠正 ${target.id}`,"Agent 请求 Host 准备纠正"),host("correct",{current:snapshot(target),draft,confirmed:false,operationId:pending.operationId}));break;
+    }
+    case "CONFIRM_CORRECTION":{
+      const pending=matchingPending(next,action,"correct");if(!pending)break;const target=next.memories[pending.id];
+      if(!headMatches(target,pending.expected)){invalidatePending(next,pending,"revision 或 lifecycle 已变化，请重新打开预览。");break;}
+      if(typeof action.draft!=="string"){invalidatePending(next,pending,"确认缺少用户提交的新正文，已中止本次纠正。");break;}
+      const draft=action.draft.trim();
+      if(!draft||draft===target.content.trim()){
+        if(!restorePlace(next,pending)){const at=operationIndex(next,pending.operationId);if(at>=0)next.timeline[at].data={...next.timeline[at].data,noChange:true,noChangeReason:draft?"修改内容与 current 相同。":"修改内容为空。"};}
+        next.pending=null;refreshNotices(next);break;
+      }
+      const old=snapshot(target),newRevision=`r${target.revisionSeq+1}`;target.content=draft;target.revision=newRevision;target.revisionSeq+=1;target.verification="pending-reverification";target.previous=old;markOperation(next,pending,"confirmed",{draft,committed:draft});next.pending=null;refreshNotices(next);
+      issueReceipt(next,{status:"纠正完成",owner:"memory",effect:`${newRevision} 已成为 current；${old.revision} 保留为 superseded。`,verification:"已排入后台复验，结果另行返回",target:target.subjectRef},"rcpt-memory");break;
+    }
+
+    case "PREPARE_FORGET":{
+      if(rejectWhilePending(next,action))break;const target=next.memories[action.id];
+      if(!target){add(next,...intent(action,"忘记这条记忆","Agent 请求 Host 准备忘记"),host("error",{text:"目标记忆不存在。"}));break;}
+      if(target.lifecycle!=="active"){add(next,...intent(action,`忘记 ${target.id}`,"Agent 请求 Host 准备忘记"),host("error",{text:"该记忆已经不是 active，没有执行重复 forget。"}));break;}
+      const pending=newOperation(next,"forget",expectedHead(target),{id:target.id});next.pending=pending;
+      add(next,...intent(action,`忘掉 ${target.id}`,"Agent 请求 Host 准备忘记"),host("forget",{current:snapshot(target),confirmed:false,operationId:pending.operationId}));break;
+    }
+    case "CONFIRM_FORGET":{
+      const pending=matchingPending(next,action,"forget");if(!pending)break;const target=next.memories[pending.id];
+      if(!headMatches(target,pending.expected)){invalidatePending(next,pending,"revision 或 lifecycle 已变化，请重新打开预览。");break;}
+      target.lifecycle="tombstoned";markOperation(next,pending,"confirmed");next.pending=null;refreshNotices(next);
+      issueReceipt(next,{status:"已忘记",owner:"memory",effect:`确认时 ${target.revision} 从 active 标记为 tombstoned；未来检索与注入停止，canonical 历史保留。`,followUp:"恢复必须针对届时的 current 另行发起并确认；本 receipt 只记录此次 forget 事件。",target:target.subjectRef},"rcpt-forget");break;
+    }
+    case "PREPARE_RESTORE":{
+      if(rejectWhilePending(next,action))break;const target=next.memories[action.id];
+      if(!target||target.lifecycle!=="tombstoned"){add(next,...intent(action,"恢复这条记忆","Agent 请求 Host 准备恢复"),host("error",{text:"目标不是可恢复的 tombstone。"}));break;}
+      const pending=newOperation(next,"restore",expectedHead(target),{id:target.id});next.pending=pending;
+      add(next,...intent(action,`恢复 ${target.id}`,"Agent 请求 Host 准备恢复"),host("restore",{current:snapshot(target),confirmed:false,operationId:pending.operationId}));break;
+    }
+    case "CONFIRM_RESTORE":{
+      const pending=matchingPending(next,action,"restore");if(!pending)break;const target=next.memories[pending.id];
+      if(!headMatches(target,pending.expected)){invalidatePending(next,pending,"revision 或 lifecycle 已变化，请重新打开预览。");break;}
+      target.lifecycle="active";markOperation(next,pending,"confirmed");next.pending=null;refreshNotices(next);
+      issueReceipt(next,{status:"已恢复",owner:"memory",effect:`确认时 ${target.revision} 从 tombstoned 恢复为 active，下一轮重新具备注入资格。`,target:target.subjectRef},"rcpt-restore");break;
+    }
+    case "PREPARE_PURGE":{
+      if(rejectWhilePending(next,action))break;const target=next.memories[action.id];
+      if(!target){add(next,...intent(action,"彻底清除这条记忆","Agent 请求 Host 准备隐私清除"),host("error",{text:"目标已经不存在或未明确。"}));break;}
+      const pending=newOperation(next,"purge",expectedHead(target),{id:target.id});next.pending=pending;
+      add(next,...intent(action,`彻底清除 ${target.id}`,"Agent 请求 Host 准备隐私清除"),host("purge",{current:snapshot(target),closure:["memory revision、candidate 与验证证据","provenance、feedback、索引、cache 与文件投影","ledger manifest/reverse refs 与受控本地备份","拥有该内容的 session/source archive"],residual:"外部 Git remote 或不受控备份只能报告，不能宣称删除",confirmed:false,operationId:pending.operationId}));break;
+    }
+    case "CONFIRM_PURGE":{
+      const pending=matchingPending(next,action,"purge");if(!pending)break;const id=pending.id,target=next.memories[id];
+      if(!headMatches(target,pending.expected)){invalidatePending(next,pending,"revision 或 lifecycle 已变化，请重新打开预览。");break;}
+      const subjectRef=target.subjectRef,manifest=purgeManifest(next,id),receiptsBefore=next.timeline.filter(entry=>entry.view==="receipt").map(entry=>JSON.stringify(entry)),candidate=structuredClone(next);
+      const previewAt=operationIndex(candidate,pending.operationId);if(previewAt>=0)candidate.timeline[previewAt]=host("purgeClosed",{confirmed:true});
+      scrubControlled(candidate,manifest);refreshNotices(candidate);
+      const receiptsAfter=candidate.timeline.filter(entry=>entry.view==="receipt").map(entry=>JSON.stringify(entry)),controlledProjection={...candidate,timeline:candidate.timeline.filter(entry=>entry.view!=="receipt"),purged:[]};
+      if(hasControlledData(controlledProjection,manifest)||JSON.stringify(receiptsBefore)!==JSON.stringify(receiptsAfter)){
+        markOperation(next,pending,"invalidated");next.pending=null;add(next,host("error",{title:"彻底清除未完成",text:"Host 未能证明受控删除闭包已经清空；未签发 receipt。",detail:"canonical 保持原状，请检查未解析的 revision/sourceRef 后重试。"}));break;
+      }
+      next=candidate;const receipt=issueReceipt(next,{status:"已彻底清除",owner:"privacy",effect:"受控本地闭包已清除；相关 manifest 已 redacted 且不可完整复算。",verification:"残留仅报告外部 Git remote 或不受控备份",target:subjectRef},"purge-receipt");
+      next.purged.push({receipt,status:"controlled-complete"});break;
+    }
+    case "PREPARE_ROLLBACK":{
+      if(rejectWhilePending(next,action))break;
+      const identity=action.origin==="card"?action.entryId:undefined;
+      if(action.origin==="card"&&!identity){add(next,host("error",{text:"撤销控件缺少更新卡片身份，请从对应的 Info 详情重新打开。"}));break;}
+      const noticeAt=action.origin==="card"?uniqueNoticeIndex(next,identity):-1;
+      if(action.origin==="card"&&noticeAt<0){add(next,host("error",{text:"撤销控件已经失效，请从对应的 Info 详情重新打开。"}));break;}
+      const explicit=action.ids?.length?[...new Set(action.ids)]:action.id?[action.id]:null;let batch=null,requestedIds=[];
+      if(noticeAt>=0&&next.timeline[noticeAt].data.selectionInvalidated){add(next,host("error",{text:"已选中的自动更新事件在此期间失去撤销资格，本次选择整体作废，请重新选择后再撤销。"}));break;}
+      if(noticeAt>=0){
+        const entry=next.timeline[noticeAt];batch=noticeBatch(next,entry);
+        if(batch){const selected=entry.data.selected||[];requestedIds=selected.length?[...selected]:batch.events.filter(update=>rollbackEligible(next,update.id)).map(update=>update.id);}
+      }else if(explicit){
+        const resolved=[];
+        for(const targetId of explicit){const memory=next.memories[targetId],matches=next.updates.filter(update=>update.target===targetId&&rollbackEligible(next,update.id));if(matches.length!==1){resolved.length=0;break;}const candidateBatch=validateBatch(next,matches[0].batchId);if(!candidateBatch||!candidateBatch.eventIds.includes(matches[0].id)){resolved.length=0;break;}resolved.push(matches[0]);}
+        if(resolved.length===explicit.length&&new Set(resolved.map(update=>update.batchId)).size===1){batch=validateBatch(next,resolved[0].batchId);requestedIds=resolved.map(update=>update.id);}
+      }else{
+        batch=validateBatch(next,latestBatchId(next));if(batch)requestedIds=batch.events.filter(update=>rollbackEligible(next,update.id)).map(update=>update.id);
+      }
+      const uniqueIds=new Set(requestedIds),updates=batch&&requestedIds.length&&uniqueIds.size===requestedIds.length?requestedIds.map(id=>batch.events.find(update=>update.id===id)):[];
+      const valid=Boolean(batch&&updates.length&&updates.length===requestedIds.length&&updates.every(update=>update&&rollbackEligible(next,update.id))&&new Set(updates.map(update=>update.target)).size===updates.length);
+      if(!valid){add(next,...intent(action,"撤销自动记忆更新","Agent 请求 Host 准备撤销自动更新"),host("error",{text:"批次身份、事件集合、目标或 current head 已变化；整批未打开预览。"}));break;}
+      const operationId=`op-${next.nextOperation++}`,targets=updates.map(update=>{const memory=next.memories[update.target],previous=revisionSnapshot(update.before);return {id:memory.id,updateId:update.id,batchId:update.batchId,current:snapshot(memory),previous,reason:`${update.after.revision} 由后台 ${update.reason} ${update.kind}`};});
+      const replaced=openPreview(next,action,"撤销刚才的自动记忆更新","Agent 请求 Host 准备撤销自动更新","rollback",{targets,confirmed:false,operationId,entryId:identity||undefined,batchId:batch.id},"updateNotice");
+      if(replaced?.error){add(next,host("error",{text:"撤销控件已经失效，请从对应的 Info 详情重新打开。"}));break;}
+      next.pending={kind:"rollback",operationId,batchId:batch.id,batchEventIds:[...batch.eventIds],updateIds:[...requestedIds],ids:targets.map(item=>item.id),expected:updates.map(update=>{const memory=next.memories[update.target];return {...expectedHead(memory),updateId:update.id,batchId:update.batchId,eventDigest:eventDigest(update),event:structuredClone(update)};}),replaced};break;
+    }
+    case "CONFIRM_ROLLBACK":{
+      const pending=matchingPending(next,action,"rollback");if(!pending)break;const batch=validateBatch(next,pending.batchId),stableBatch=Boolean(batch&&sameIdentitySequence(batch.eventIds,pending.batchEventIds));
+      const stale=!stableBatch||pending.expected.some(expected=>{const memory=next.memories[expected.id],update=batch.events.find(item=>item.id===expected.updateId);return !update||!headMatches(memory,expected)||update.target!==expected.id||update.batchId!==expected.batchId||!rollbackEligible(next,update.id)||eventDigest(update)!==expected.eventDigest||eventDigest(expected.event)!==expected.eventDigest;});
+      if(stale){invalidatePending(next,pending,"批次 membership、event payload、revision 或 lifecycle 已变化；整批未执行。");break;}
+      const moved=[];
+      for(const expected of pending.expected){
+        const update=batch.events.find(item=>item.id===expected.updateId),target=next.memories[expected.id],old=snapshot(target),previous=revisionSnapshot(expected.event.before);
+        if(previous){target.previous=null;for(const key of revisionFields)target[key]=previous[key];target.automatic=false;}
+        else {target.previous=null;target.lifecycle="inactive";target.verification=old.verification;target.automatic=false;}
+        next.revokedUpdateIds.push(update.id);moved.push({subject:target.subjectRef,from:old.revision,to:previous?.revision||"无 active head",inactive:previous===null});
+      }
+      const settledHere=pending.replaced?{at:pending.replaced.at,ids:[...(pending.updateIds||[])]}:null;
+      if(!restorePlace(next,pending))markOperation(next,pending,"confirmed");next.pending=null;refreshNotices(next,settledHere);
+      const superseded=moved.filter(item=>!item.inactive).length,inactive=moved.filter(item=>item.inactive).length,audit=[superseded?`${superseded} 条被撤销 revision 保留为 superseded 审计记录`:"",inactive?`${inactive} 条首次 activation 仅保留为 inactive 审计记录`:""].filter(Boolean).join("；");
+      issueReceipt(next,{status:`已撤销 ${moved.length} 条自动更新`,owner:"memory",effect:`一份 receipt 覆盖本次决策：${moved.map(item=>`${item.from} → ${item.to}`).join("；")}；${audit}。`,target:moved.map(item=>item.subject).join("、")},"rcpt-rollback");break;
+    }
+    case "CARD_CONTROL_MISSING":add(next,host("error",{text:"引导步骤对应的卡片控件已不存在，未执行任何操作。",detail:"卡内操作只能由卡片自己的控件发起，Host 不会替它补身份。"}));break;
+    default:add(next,{kind:"user",text:action.message||"继续"},{kind:"agent",text:"这句话没有匹配到记忆工具，交回 Host 说明。"},host("error",{text:"没有匹配到可执行的记忆操作，未做任何改动。",detail:"没有创建 revision、没有 lifecycle 变化、没有 receipt。可以换一种说法，或点卡片上的控件。"}));
+  }
+  return next;
+};
+return {initial,reduce,sourceComplete,sha256,batchRecord};
+})();
+const scenarios={
+  inspect:{label:"查看依据",description:"用户只问一句，Host 展示本轮真正用到的记忆；展开来源是卡片内操作，不再占一轮对话。",steps:[{label:"询问本轮依据（用户发言）",type:"ASK_USED"},{label:"展开原始来源（卡内）",type:"EXPAND_SOURCE",origin:"card",entryId:"inspect-1"}]},
+  correct:{label:"纠正",description:"先展示当前 canonical 内容与 revision，再确认修改；确认时原子校验同一 head，项目事实在后台自动复验。",steps:[{label:"提出纠正（用户发言）",type:"PREPARE_CORRECTION",id:"mem-13"},{label:"确认纠正（卡内）",type:"CONFIRM_CORRECTION",origin:"card"}]},
+  forget:{label:"忘记 / 恢复",description:"先看内容与影响，再停止检索和注入。恢复是一次独立决策；receipt 只记录当时发生的事件。",steps:[{label:"请求忘记（用户发言）",type:"PREPARE_FORGET",id:"mem-42"},{label:"确认忘记（卡内）",type:"CONFIRM_FORGET",origin:"card"},{label:"请求恢复（用户发言）",type:"PREPARE_RESTORE",id:"mem-42"},{label:"确认恢复（卡内）",type:"CONFIRM_RESTORE",origin:"card"}]},
+  purge:{label:"彻底清除",description:"先展示原内容、删除闭包和残留；只有 Host 的明确确认能执行。",steps:[{label:"请求彻底清除（用户发言）",type:"PREPARE_PURGE",id:"mem-19"},{label:"确认永久清除（卡内）",type:"CONFIRM_PURGE",origin:"card",danger:true}]},
+  rollback:{label:"批量撤销自动更新",description:"从首屏 Info 就地展开整批变更，选中要撤销的事件，一次确认全部生效。不逐条审批，一份 receipt 覆盖本次决策；不混入通用 Policy、Skill 或代码演化。",steps:[{label:"展开自动更新汇总（卡内）",type:"TOGGLE_UPDATES",origin:"card",entryId:"notice-1"},{label:"选中 mem-42（卡内）",type:"TOGGLE_SELECT",origin:"card",id:"update-mem-42-r4",entryId:"notice-1"},{label:"选中 mem-19（卡内）",type:"TOGGLE_SELECT",origin:"card",id:"update-mem-19-r2",entryId:"notice-1"},{label:"查看批量差异（卡内）",type:"PREPARE_ROLLBACK",origin:"card",entryId:"notice-1"},{label:"一次确认全部撤销（卡内）",type:"CONFIRM_ROLLBACK",origin:"card"}]}
+};
+const freeActions=[{label:"查看最近自动更新",type:"VIEW_UPDATES"},{label:"刚才用了哪些记忆？",type:"ASK_USED"},{label:"纠正 mem-13",type:"PREPARE_CORRECTION",id:"mem-13"},{label:"忘掉 mem-42",type:"PREPARE_FORGET",id:"mem-42"},{label:"恢复 mem-42",type:"PREPARE_RESTORE",id:"mem-42"},{label:"彻底清除 mem-19",type:"PREPARE_PURGE",id:"mem-19"},{label:"批量撤销自动更新",type:"PREPARE_ROLLBACK"},{label:"只撤销 mem-42",type:"PREPARE_ROLLBACK",id:"mem-42"},{label:"模拟待复核 Warning",type:"SHOW_WARNING"},{label:"模拟更新失败 Error",type:"SHOW_ERROR"}];
+let state=Domain.initial(),activeScenario="inspect",scenarioStep=0;
+function actionForText(text){
+  const clean=text.trim();
+  const negation="(?:不要|别|勿|不必|无需|不需要|不想|不用|没有|没|未曾|尚未|无法|不能|禁止|先不|停止|不(?=删除|忘|清除|纠正|更正|修正|修改|恢复|还原|撤销|回滚|回退|purge|forget)|don't|do not|never|no longer)";
+  // 整句否定只在否定词位于操作动词之前时成立：理由从句里的「没有/没」属正文，不构成整句否定。
+  const operativeVerb=/删除|删掉|清除|清掉|去掉|移除|抹掉|抹除|忘掉|忘记|忘了|恢复|还原|复原|撤销|撤回|回滚|回退|不对|纠正|更正|修正|改成|改为|更改为|修改为|purge|forget/i;
+  // 不可逆标记（不可恢复/不能恢复/无法恢复…）自身含否定词，但它是破坏性等级标记、不是整句否定：
+  // 判定否定前先扣掉标记覆盖的字符区间，否则「无法恢复地删除 mem-N」会被整句否掉而不是升级为 purge。
+  const irreversibleSpans=[...clean.matchAll(/不可恢复|不可撤销|不可撤回|不可复原|不可逆|不能恢复|无法恢复|不能撤销|无法撤销/gi)].map(m=>[m.index,m.index+m[0].length]);
+  const insideMark=at=>irreversibleSpans.some(([from,to])=>at>=from&&at<to);
+  const verbAt=clean.search(operativeVerb);
+  const negHit=[...clean.matchAll(new RegExp(negation,"gi"))].find(m=>!insideMark(m.index))||null;
+  // 否定词只在与操作动词同一小句内才构成整句否定：前置理由从句里的“没用了/没问题/没必要”属正文，
+  // 位置先后不足以区分（`这条彻底没用了，删除 mem-N` 是删除请求，不是 no-op）。
+  const clauseIndexAt=at=>(clean.slice(0,at).match(/[,，、]/g)||[]).length;
+  const negated=!!negHit&&(verbAt<0||negHit.index<=verbAt&&clauseIndexAt(negHit.index)===clauseIndexAt(verbAt)),negatedPrefix=new RegExp(`^(?:(?:请|我|我想|麻烦)\\s*)?${negation}`,"i").test(clean);
+  const cancelCurrent=/^(?:请|麻烦|我想|我要|帮我)?[\s]*(?:取消|放弃|停止|算了)(?:[\s]*(?:当前|这次|这个|这项))?(?:[\s]*(?:操作|预览))?[\s]*[。！.!]*[\s]*$/i.test(clean)||/不改了|先不处理|停止当前(?:操作|预览)?/i.test(clean),cancelDestructive=/^(?:请|麻烦|我想|我要|帮我)?[\s]*(?:取消|放弃)(?:删除|清除|忘记|纠正|修改|恢复|撤销)/i.test(clean);
+  if(cancelCurrent||state.pending&&cancelDestructive)return {type:"CANCEL_PENDING",message:clean};
+  if(cancelDestructive)return {type:"SAFE_NOOP",message:clean};
+  const correction=clean.match(/^(?:(?:请|麻烦|我想|我要|帮我)\s*)?(?:(?:把|将)\s*)?(mem-\d+)(?:\s*这条(?:记忆)?)?\s*(?:改成|改为|更改为|修改为|更正为|纠正为|修正为)\s*([\s\S]*)$/i)||clean.match(/^(?:(?:请|麻烦|我想|我要|帮我)\s*)?(?:纠正|更正|修正|修改)\s*(mem-\d+)\s*(?:为|成|：|:)\s*([\s\S]*)$/i);
+  if(correction&&!negatedPrefix)return {type:"PREPARE_CORRECTION",id:correction[1].toLowerCase(),draft:correction[2].trim(),message:clean};
+  const targets=[...new Set([...clean.matchAll(/\bmem-\d+\b/gi)].map(match=>match[0].toLowerCase()))],target=targets.length===1?targets[0]:null,targeted=(type,extra={})=>target?{type,id:target,message:clean,...extra}:{type:"INVALID_TARGET",message:clean};
+  const route=()=>{
+    // 破坏性等级只由动词短语决定：不可逆标记必须与删除动词同句才升级为 purge；标记落在正文或疑问句里时不得成为路由依据。
+    // 不可逆标记必须先于一切 restore/撤销 裸词求值：标记内部含「恢复」「撤销」子串，若让 restore 分支先匹配，
+    // 不可逆销毁意图会被解析成语义相反的恢复（对 tombstoned 目标等于把用户要销毁的内容放回注入池）。
+    const correcting=/不对|纠正|更正|修正|改成|改为|更改为|修改为/.test(clean);
+    const deleteVerb=/删除|删掉|清除|清掉|移除|抹掉|抹除|去掉|purge/i;
+    const markAlt="彻底|永久性|永久|完全|不可恢复|不可撤销|不可撤回|不可逆|不能恢复|无法恢复|不可复原";
+    const irreversibleMark=new RegExp(markAlt,"i");
+    // 以下附着启发式只服务固定演示语句；生产解析与 held-out 验收归 Ticket 10 §28c，不再扩张 Ticket 11 的验收面。
+    // 配对要求标记“附着”于删除动词，而不是与它同时出现在输入里：
+    //   附着——彻底清除 mem-N / 不可恢复地删除 mem-N / 删除 mem-N，不可恢复（中间只有目标与助词）
+    //   不附着——我完全同意，删除 mem-N（标记归属“同意”）/ 原文永久保存在哪里？顺便去掉 mem-N（标记归属“保存”）
+    // 判定方式：同一句内、标记与删除动词之间只允许目标 id、助词与连接符；配不上就按“就低不就高”留在 forget。
+    const sentences=clean.split(/[。！？!?；;\n]+/).filter(part=>part.trim());
+    // 允许的填充只有目标 id、空白/标点、助词与连接词。不能放过任意拉丁 token：
+    // `完全 OK，删除 mem-N` 的标记归属 OK，与规格点名的 `我完全同意，删除 mem-N` 同构，不得升级。
+    const fillerAlt="mem-\\d+|[\\s,，、]|地|的|得|了|过|把|将|就|要|请|务必|需要|一定|这条|那条|该|它|其|记忆|内容|条目|条|是|和|且|并|而|以及|全部|整条";
+    const attachFiller=new RegExp(`^(?:${fillerAlt})*$`);
+    // 只含标记与助词的小句是对前面那次删除的追加限定，与它在句中的位置无关。
+    const markOnlyClause=new RegExp(`^(?:${markAlt}|${fillerAlt}|[。．…!！?？)）])+$`,'i');
+    const clauseFinal=/^[\s,，、。．…!！?？"'’”)）]*(?:了|的|吧|啊|呀|哦|呢)?[\s,，、。．…!！?？]*$/;
+    const markPattern=new RegExp(markAlt,"gi");
+    // 标记被否定词修饰时不构成不可逆标记，否定与标记之间允许程度副词（`删得不太彻底`/`不够彻底`）。
+    const negatedMark=(part,mark)=>/^[不非没无未别莫勿]/.test(mark[0])?false:/[不非没无未](?:太|够|算|很|怎么|那么|特别|十分)?$/.test(part.slice(0,mark.index));
+    // fixture 不再尝试在相反方向之间猜用户最终意图：删除 + 未被否定的不可逆标记 + 独立恢复/撤销词同时出现时，
+    // 一律要求重述。标记内部的“恢复/撤销”不是独立方向，因此 `不可恢复地删除 mem-N` 仍可进入 purge。
+    const activeMarks=[...clean.matchAll(markPattern)].filter(mark=>!negatedMark(clean,mark));
+    const restoreDirection=[...clean.matchAll(/恢复|还原|复原|撤销|撤回|回滚|回退/gi)].some(match=>!insideMark(match.index));
+    const directionConflict=deleteVerb.test(clean)&&(activeMarks.length>0||/\bpurge\b/i.test(clean))&&restoreDirection;
+    if(directionConflict)return {type:"AMBIGUOUS_DESTRUCTIVE",message:clean};
+    const restoreVerbs=[...clean.matchAll(/恢复|还原|复原/gi)].filter(match=>!insideMark(match.index));
+    const undoOfDelete=/(?:撤销|撤回)[^。]*(?:忘|删|forget)/i.test(clean)&&[...clean.matchAll(/撤销|撤回/gi)].some(match=>!insideMark(match.index));
+    const restoreOperative=restoreVerbs.length>0||undoOfDelete;
+    const attachedMark=part=>{
+      const bounds=[];let cursor=0;
+      for(const segment of part.split(/[,，、]/)){bounds.push([cursor,cursor+segment.length,segment]);cursor+=segment.length+1;}
+      const clauseAt=at=>bounds.find(([from,to])=>at>=from&&at<=to)||bounds[0];
+      const marks=[...part.matchAll(markPattern)].filter(mark=>!negatedMark(part,mark)),verbs=[...part.matchAll(/删除|删掉|清除|清掉|移除|抹掉|抹除|去掉|purge/gi)];
+      return marks.some(mark=>verbs.some(verb=>{
+        // 前置：标记与动词之间只允许目标 id、助词与连接符，否则标记归属中间那个谓语（`我完全同意，删除 mem-N`）。
+        if(mark.index<verb.index)return attachFiller.test(part.slice(mark.index+mark[0].length,verb.index));
+        if(mark.index<verb.index+verb[0].length)return false;
+        // 后置：动词与标记之间是该动词的宾语短语，属开放集，不能用白名单裁决——只要标记收在小句末尾，
+        // 它就是对这次删除的限定（`删除 mem-N 的自动更新，不可恢复`）；标记后面还接着名词短语或另一个谓语时
+        // （`去掉 mem-N 的永久链接`/`删除 mem-N 的完全重复内容`/`去掉 mem-N，完全是我记错了`）标记归属那个短语。
+        const markClause=clauseAt(mark.index),verbClause=clauseAt(verb.index);
+        // 同一小句内：标记必须收在该小句末尾，后面还接着名词短语或另一个谓语时归属那个短语
+        // （`去掉 mem-N 的永久链接`/`删除 mem-N 的完全重复内容`）。
+        if(markClause[0]===verbClause[0])return clauseFinal.test(part.slice(mark.index+mark[0].length,markClause[1]));
+        // 跨小句：标记所在小句只有标记与助词时是对这次删除的追加限定，且与语序无关——
+        // `删除 mem-N，谢谢，不可恢复` 与 `删除 mem-N，不可恢复，谢谢` 必须同判。
+        return markOnlyClause.test(markClause[2]);
+      }));
+    };
+    // 本次请求的操作谓语是恢复时，句中的删除动词只是被陈述的过去那次删除，不得据此升级为不可逆销毁。
+    const irreversible=!restoreOperative&&(sentences.some(attachedMark)||/\bpurge\b/i.test(clean));
+    if(irreversible)return targeted("PREPARE_PURGE");
+    // 不可逆销毁意图优先于任何 restore/撤销/回退/回滚分支：`彻底清除 mem-N 的自动更新` 若先命中 rollback，确认后 head 会退回旧 revision、旧正文重回 active 注入池，与 owner 的销毁请求语义相反。
+    if(/(?:撤销|撤回|取消|回滚|回退|删除|清除|去掉)[^。]*自动(?:更新|修订|晋升)|回滚.*记忆|回退.*记忆/i.test(clean))return {type:"PREPARE_ROLLBACK",ids:targets.length>1?targets:undefined,id:target||undefined,message:clean};
+    // restore 只在它确实是操作谓语时成立：`不可撤销，删除 mem-N` 里的“撤销”落在不可逆标记内部，
+    // 不构成恢复请求，不会被裸词接走；`彻底恢复 mem-N` 则是带强调副词的正常恢复请求。
+    if(!correcting&&restoreOperative)return targeted("PREPARE_RESTORE");
+    if(!correcting&&/忘掉|忘记|忘了|不再记得|别再记|forget|删除|删掉|清除|清掉|移除|抹掉|抹除|去掉/i.test(clean))return targeted("PREPARE_FORGET");
+    if(correcting)return targeted("PREPARE_CORRECTION",{draft:""});
+    if(/展开|原文|来源/.test(clean))return targets.length>1?{type:"INVALID_TARGET",message:clean}:{type:"EXPAND_SOURCE",id:target||undefined,message:clean};
+    if(/最近.*自动更新|自动更新.*(什么|哪些)|更新历史/.test(clean))return {type:"VIEW_UPDATES",message:clean};
+    if(/用了哪些|本轮.*(记忆|依据)|为什么.*记得/.test(clean))return {type:"ASK_USED",message:clean};
+    return {type:"NORMAL",message:clean};
+  };
+  const routed=route();
+  if(negated&&["PREPARE_PURGE","PREPARE_FORGET","PREPARE_RESTORE","PREPARE_ROLLBACK","PREPARE_CORRECTION","AMBIGUOUS_DESTRUCTIVE","INVALID_TARGET"].includes(routed.type))return {type:"SAFE_NOOP",message:clean};
+  return routed;
+}
+const esc=value=>String(value).replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
+const memoryBlock=m=>`<div class="meta"><span>${esc(m.scope)}</span><span>revision ${esc(m.revision)}</span><span>${esc(m.lifecycle)} / ${esc(m.verification)}</span><span>source ${esc(m.source)}</span></div><div class="memory-text">${esc(m.content)}</div>`;
+const previewActions=(d,label,type,kind="primary")=>`<div class="actions">${d.cancelled?'<button class="button" type="button" disabled>已取消</button>':d.confirmed?`<button class="button" type="button" disabled>已${esc(label)}</button>`:`<button class="button ${kind}" type="button" data-action="${type}" data-origin="card" data-operation="${esc(d.operationId)}">${esc(label)}</button><button class="button" type="button" data-action="CANCEL_PENDING" data-origin="card" data-operation="${esc(d.operationId)}">取消</button>`}</div>`;
+const card=(title,status,body,kind="")=>`<section class="host-card ${kind}"><div class="host-head"><strong><span class="tag host">Host</span> ${esc(title)}</strong><span class="status ${kind}">${esc(status)}</span></div><div class="host-body">${body}</div></section>`;
+function renderHost(entry){
+  const d=entry.data;
+  if(d.redacted)return card("历史操作已清除","目标内容已移除",'<p class="small">该预览关联的正文、目标 ID、revision 与来源已按授权清除；不可再次确认。</p>');
+  if(d.cancelled)return card("已放弃的操作","未发生变更",`<p class="small">${esc(d.current?.id||(d.targets||[]).map(item=>item.id).join("、")||"目标")} 保持原状，没有创建 revision、没有 receipt。</p>`);
+  if(d.noChange)return card("操作已结束","未发生变更",`<p class="small">${esc(d.noChangeReason)}没有创建 revision、没有 receipt。</p>`);
+  if(d.invalidated)return card("预览已失效","未发生变更",'<p class="small">目标在确认前发生变化；旧预览不再具有确认能力，请重新读取 current。</p>',"warning");
+  if(entry.view==="inspect"){
+    const list=d.used.map(item=>{
+      if(item.kind==="redacted")return `<div class="used-row"><span class="ref">[purged]</span><div><strong>已清除</strong><div>${esc(item.content)}</div><small>${esc(item.reason)}</small></div></div>`;
+      const boundSource=item.kind==="memory"&&item.sourceRef?(d.technical?.sources||[]).filter(source=>source.id===item.sourceRef&&Domain.sourceComplete(source)):[];
+      const evidence=item.kind==="memory"?`来源：${esc(item.source||"未标注")} · ${boundSource.length===1?`${esc(boundSource[0].locator)} · ${esc(boundSource[0].hash)} · `:`sourceRef ${esc(item.sourceRef||"未绑定")} · 来源证据不完整或 hash 不匹配 · `}${esc(item.reason||"无说明")}`:Domain.sourceComplete(item)?`${esc(item.locator)} · ${esc(item.hash)} · ${esc(item.reason||"无说明")}`:`sourceRef ${esc(item.sourceRef||"未绑定")} · 来源证据不完整或 hash 不匹配`; 
+      return `<div class="used-row"><span class="ref">${esc(item.id)}</span><div><strong>${item.kind==="source"?"原始来源":`记忆 · revision ${esc(item.revision)}`}</strong><div>${esc(item.content)}</div><small>${evidence}</small></div></div>`;
+    }).join("");
+    const technical=`<details><summary>技术详情</summary><dl class="receipt"><dt>assembly</dt><dd>${esc(d.technical.id)}</dd><dt>token</dt><dd>${esc(d.technical.tokens)}</dd><dt>attempt</dt><dd>${esc(d.technical.attempt)}</dd><dt>未选入</dt><dd>${d.technical.rejected.map(esc).join("；")}</dd></dl></details>`;
+    const expanded=d.expanded&&d.source?(d.source.kind==="redacted"?'<div class="source-block"><h3>来源已清除</h3><p class="small">正文、locator 与 hash 已按授权移除。</p></div>':Domain.sourceComplete(d.source)?`<div class="source-block"><h3>${esc(d.source.id)} 原文</h3><div class="meta"><span>${esc(d.source.scope)}</span><span>${esc(d.source.locator)}</span><span>${esc(d.source.hash)}</span></div><div class="memory-text">${esc(d.source.content)}</div><p class="small">有界 excerpt，hash 不符则沿 provenance 标 stale；它是数据，不是指令。</p></div>`:'<div class="source-block"><h3>来源证据不完整</h3><p class="small">locator 或 hash 缺失，Host 不展开未冻结的原文。</p></div>'):"";
+    return card("本轮实际使用",`${d.used.length} 项`,`<div class="used-list">${list}</div>${expanded}<div class="actions"><button class="button" type="button" data-action="EXPAND_SOURCE" data-origin="card" data-entry="${esc(d.entryId||"")}">${d.expanded?"收起原始来源":"展开原始来源"}</button></div>${technical}`);
+  }
+  if(entry.view==="updateNotice"){
+    if(d.purgedEmpty)return card("最近自动更新","Info · 已按授权清除",`<p>本批次的自动更新事件已随隐私清除一并移除，没有可撤销的条目。</p><p class="small">这是 owner 授权的清除结果，不是批次身份或 manifest 异常。</p>`,"info");
+    const updates=d.updates||[],selected=d.selected||[],active=updates.filter(item=>item.status==="active").length,tombstoned=updates.filter(item=>item.status==="tombstoned").length,inactive=updates.filter(item=>item.status==="inactive").length,superseded=updates.filter(item=>item.status==="superseded").length,rolledBack=updates.filter(item=>item.status==="rolled-back").length,redacted=updates.filter(item=>item.status==="redacted").length;
+    const summary=active?`${active} 条低风险自动晋升/修订已启用`:"本批次没有仍在启用的自动更新";
+    const suffix=`${tombstoned?`；${tombstoned} 条当前已忘记`:""}${inactive?`；${inactive} 条当前无 active head`:""}${superseded?`；${superseded} 条已被后续 revision 取代`:""}${rolledBack?`；${rolledBack} 条已撤销`:""}${redacted?`；${redacted} 条已按授权清除`:""}`;
+    const list=updates.map(item=>{
+      const current=item.current,before=item.before,after=item.after,stateLabel=item.status==="rolled-back"?"已撤销":item.status==="redacted"?"已清除":item.status==="tombstoned"?"已忘记":item.status==="inactive"?"无 active head":item.status==="superseded"?"已被取代":"已启用";
+      let details='<p class="small">内容已按授权清除，历史详情不再展开。</p>';
+      if(current&&before&&after){
+        const rolledBack=item.eventStatus==="rolled-back",left=rolledBack?current:before,right=after,currentLabel=current.lifecycle==="active"?"现在生效":current.lifecycle==="tombstoned"?"当前已忘记":"当前不在 active set";
+        details=`<div class="meta"><span>${esc(before.revision)} -&gt; ${esc(after.revision)}</span><span>${esc(item.scope||current.scope)}</span><span>canonical current ${esc(current.revision)} · ${esc(current.lifecycle)}</span></div><div class="comparison"><section><h3>${rolledBack?currentLabel:"更新前"} ${esc(left.revision)}</h3><div class="memory-text">${esc(left.content)}</div></section><section><h3>${rolledBack?"已撤销":"该次更新后"} ${esc(right.revision)}</h3><div class="memory-text">${esc(right.content)}</div></section></div>`;
+      }else if(current&&after&&!before){
+        const rolledBack=item.eventStatus==="rolled-back";
+        details=`<div class="meta"><span>首次 activation -&gt; ${esc(after.revision)}</span><span>${esc(item.scope||current.scope)}</span><span>${current.lifecycle==="active"?`canonical current ${esc(current.revision)} · active`:"canonical 无 active head"}</span></div><div class="comparison"><section><h3>激活前</h3><div class="memory-text">无 active head</div></section><section><h3>${rolledBack?"已撤销":"该次激活后"} ${esc(after.revision)}</h3><div class="memory-text">${esc(after.content)}</div></section></div>`;
+      }
+      const pick=current&&after&&item.status==="active"&&current.lifecycle==="active"?`<button class="button select${selected.includes(item.id)?" on":""}" type="button" data-action="TOGGLE_SELECT" data-id="${esc(item.id)}" data-origin="card" data-entry="${esc(d.entryId||"")}">${selected.includes(item.id)?"✓ 已选中要撤销":"选中要撤销"}</button>`:"";
+      return `<article class="update-item"><div class="update-title"><strong>${esc(item.target)} · ${esc(item.kind)}</strong><span class="status">${esc(stateLabel)}</span></div>${details}<p class="small">事件：${esc(item.id)} · 批次：${esc(item.batchId)}；原因：${esc(item.reason)}；${esc(item.verification)}</p><div class="actions">${pick}</div></article>`;
+    }).join("");
+    const chosen=selected.filter(id=>updates.some(item=>item.id===id&&item.status==="active"));
+    const invalidated=Boolean(d.selectionInvalidated);
+    const batch=active&&!invalidated?`<button class="button primary" type="button" data-action="PREPARE_ROLLBACK" data-origin="card" data-entry="${esc(d.entryId||"")}">${chosen.length?`撤销选中的 ${chosen.length} 条`:`撤销整批 ${active} 条`}</button>`:"";
+    const invalidNote=invalidated?'<p class="small">此前选中的事件已在期间失去撤销资格，本次选择整体作废，请重新选择后再撤销。</p>':"";
+    const detail=d.expanded?`<div class="update-list">${list}</div>${invalidNote}<p class="small">一次决策处理整批：先选中要撤销的事件，再一次确认；一条也不选则视为整批，不逐条审批。</p>`:'<p class="small">只汇总已启用变更；candidate、被拒绝项不会打断对话。</p>';
+    const toggle=`<button class="button" type="button" data-action="TOGGLE_UPDATES" data-id="${esc(d.entryId||"")}" data-entry="${esc(d.entryId||"")}" data-origin="card">${d.expanded?"收起详情":"查看变更"}</button>`;
+    return card("记忆自动更新",d.read?`Info · ${updates.length} 条`:"Info · 未读",`<p>${esc(summary+suffix)}。</p>${d.expanded?"":invalidNote}${detail}<div class="actions">${toggle}${d.expanded?batch:""}</div>`,"info");
+  }
+  if(entry.view==="warning")return card("记忆更新待复核","Warning",`<p>${esc(d.text)}</p><p class="small">${esc(d.detail)}</p>`,"warning");
+  if(entry.view==="correct"){
+    const body=`<p><strong>${d.confirmed?`预览时 canonical 内容（revision ${esc(d.current.revision)}，已被本次纠正取代）`:"当前 canonical 内容"}</strong></p>${memoryBlock(d.current)}<div class="comparison"><section><h3>原内容</h3><div class="memory-text">${esc(d.current.content)}</div></section><section><h3>${d.confirmed?"已提交内容":"修改为"}</h3>${d.confirmed?`<div class="memory-text">${esc(d.committed??d.draft)}</div>`:`<label><span class="small">确认前可编辑</span><textarea class="correction" data-correction-input data-operation="${esc(d.operationId)}">${esc(d.draft)}</textarea></label>`}</section></div><p class="small">确认时原子校验 revision 与 lifecycle；匹配后才创建新 revision 并自动复验。</p>${previewActions(d,"确认纠正","CONFIRM_CORRECTION")}`;
+    return card("确认要纠正的内容",d.confirmed?"已提交":"等待确认",body);
+  }
+  if(entry.view==="forget"){
+    const body=`<p><strong>${d.confirmed?`预览时 canonical 内容（revision ${esc(d.current.revision)}，现已 tombstoned）`:"即将忘记的内容"}</strong></p>${memoryBlock(d.current)}<p><strong>影响：</strong>停止未来检索与注入；canonical revision/event 仍保留，因此可另行发起恢复。</p>${previewActions(d,"确认忘记","CONFIRM_FORGET")}`;
+    return card("确认要忘记的内容",d.confirmed?"已执行":"可恢复",body);
+  }
+  if(entry.view==="restore"){
+    const body=`<p><strong>${d.confirmed?`预览时 canonical 内容（revision ${esc(d.current.revision)}，现已恢复为 active）`:"即将恢复的内容"}</strong></p>${memoryBlock(d.current)}<p><strong>影响：</strong>恢复为 active，下一轮重新具备检索与注入资格。</p>${previewActions(d,"确认恢复","CONFIRM_RESTORE")}`;
+    return card("确认要恢复的内容",d.confirmed?"已恢复":"等待确认",body);
+  }
+
+  if(entry.view==="purge"){
+    const body=`<p><strong>即将永久清除的内容</strong></p>${memoryBlock(d.current)}<p><strong>确认后清除：</strong></p><ul class="closure">${d.closure.map(item=>`<li>${esc(item)}</li>`).join("")}</ul><p><strong>外部残留：</strong>${esc(d.residual)}</p>${previewActions(d,"确认永久清除","CONFIRM_PURGE","danger")}`;
+    return card("确认要彻底清除的内容","不可恢复",body,"danger");
+  }
+  if(entry.view==="purgeClosed")return card("隐私清除已执行","内容已移除",`<p>原内容、目标 ID 与关联 locator/hash 已从当前状态、通知投影与旧预览中移除。</p><button class="button" type="button" disabled>无法撤销</button>`,"danger");
+  if(entry.view==="cancelled")return card("操作已取消","未发生变更",'<p class="small">当前待确认操作已放弃；canonical current、revision 与 lifecycle 均未改变。</p>');
+  if(entry.view==="safeNoop")return card("未执行记忆变更","Info",`<p>${esc(d.text)}</p><p class="small">${esc(d.detail)}</p>`,"info");
+  if(entry.view==="rollback"){
+    const targets=d.targets||[];
+    const blocks=targets.map(item=>{
+      if(item.kind==="redacted")return `<article class="update-item"><div class="update-title"><strong>[purged]</strong><span class="status">已清除</span></div><p class="small">内容、目标 ID 与旧 revision 引用已按授权清除。</p></article>`;
+      const destination=item.previous?item.previous.revision:"无 active head",destinationContent=item.previous?item.previous.content:"撤销首次自动 activation 后，该 revision 仅保留为 inactive 审计记录。";
+      return `<article class="update-item"><div class="update-title"><strong>${esc(item.id)}</strong><span class="status">${esc(item.current.revision)} → ${esc(destination)}</span></div><p class="small">${esc(item.reason)}</p><div class="comparison"><section><h3>预览时 head ${esc(item.current.revision)}</h3><div class="memory-text">${esc(item.current.content)}</div></section><section><h3>本次恢复目标 ${esc(destination)}</h3><div class="memory-text">${esc(destinationContent)}</div></section></div></article>`;
+    }).join("");
+    const body=`<p>本次决策覆盖 ${targets.length} 条自动更新，确认一次全部生效，只返回一份 receipt。</p><div class="update-list">${blocks}</div><p class="small">只移动 memory current pointer；不会触碰 Policy、Skill 或代码。</p>${previewActions(d,`确认撤销这 ${targets.length} 条`,"CONFIRM_ROLLBACK")}`;
+    return card("撤销自动记忆更新",d.confirmed?"已执行":`等待确认 · ${targets.length} 条`,body);
+  }
+  if(entry.view==="receipt"){
+    const body=`<dl class="receipt"><dt>receipt</dt><dd>${esc(d.receipt)}</dd><dt>owner</dt><dd>${esc(d.owner)}</dd><dt>target</dt><dd>${esc(d.target)}</dd><dt>结果</dt><dd>${esc(d.effect)}</dd>${d.verification?`<dt>自动复验</dt><dd>${esc(d.verification)}</dd>`:""}</dl>${d.followUp?`<p class="small">${esc(d.followUp)}</p>`:""}`;
+    return card("Owner receipt",d.status,body);
+  }
+  if(entry.view==="error")return card(d.title||"记忆更新失败","Error",`<p>${esc(d.text)}</p>${d.detail?`<p class="small">${esc(d.detail)}</p>`:""}`,"danger");
+  return "";
+}
+function renderEntry(entry){
+  if(entry.kind==="user")return `<div class="entry user"><div class="bubble">${esc(entry.text)}</div></div>`;
+  if(entry.kind==="agent")return `<div class="entry agent"><div class="bubble"><span class="tag">Agent</span><div>${esc(entry.text)}</div></div></div>`;
+  if(entry.kind==="request")return `<div class="entry"><div class="request"><span class="tag">Agent 请求</span> ${esc(entry.text.replace(/^Agent 请求 Host /,""))}</div></div>`;
+  return `<div class="entry">${renderHost(entry)}</div>`;
+}
+function renderState(){
+  const rows=Object.values(state.memories).map(memory=>{const off=memory.lifecycle!=="active"||memory.verification==="stale",label=memory.lifecycle==="tombstoned"?"tombstoned":memory.lifecycle==="inactive"?"inactive":`${memory.revision} · ${memory.verification}`;return `<div class="state-row"><span class="ref">${esc(memory.id)}</span><div>${esc(memory.content)}<small>${esc(memory.scope)} · ${esc(memory.source)}</small><span class="state ${off?"off":""}">${esc(label)}</span></div></div>`;});
+  rows.push(...state.purged.map(item=>`<div class="state-row"><span class="ref">[opaque]</span><div>内容已彻底清除<small>${esc(item.receipt)}</small><span class="state purged">${esc(item.status)}</span></div></div>`));document.querySelector("#statePanel").innerHTML=rows.join("");
+}
+function perform(action){
+  const current=scenarios[activeScenario].steps[scenarioStep];
+  if(action.type==="CANCEL_PENDING"&&action.origin!=="card"&&!action.operationId&&state.pending)action={...action,operationId:state.pending.operationId};
+  if(action.type==="CONFIRM_CORRECTION"){const input=action.operationId?document.querySelector(`[data-correction-input][data-operation="${action.operationId}"]`):null;action={...action,draft:input?.value};}
+  const before=state,pendingBefore=state.pending?.operationId;state=Domain.reduce(state,action);const changed=JSON.stringify(state)!==JSON.stringify(before),completed=/^(?:CONFIRM_|CANCEL_PENDING)/.test(action.type)?Boolean(pendingBefore&&!state.pending):changed;if(current?.type===action.type&&completed)scenarioStep+=1;if(action.type==="CANCEL_PENDING"&&completed&&scenarioStep>0)scenarioStep-=1;render();
+} 
+function render(){
+  const liveDrafts=new Map([...document.querySelectorAll("[data-correction-input][data-operation]")].map(input=>[input.dataset.operation,input.value]));
+  const timeline=document.querySelector("#timeline");timeline.innerHTML=state.timeline.map(renderEntry).join("");
+  document.querySelectorAll("[data-correction-input][data-operation]").forEach(input=>{if(liveDrafts.has(input.dataset.operation))input.value=liveDrafts.get(input.dataset.operation);});timeline.scrollTop=timeline.scrollHeight;
+  document.querySelector("#scenarioTabs").innerHTML=Object.entries(scenarios).map(([id,item])=>`<button class="button ${id===activeScenario?"primary":""}" type="button" data-scenario="${id}" aria-pressed="${id===activeScenario}">${esc(item.label)}</button>`).join("");
+  document.querySelector("#scenarioDescription").textContent=scenarios[activeScenario].description;
+  document.querySelector("#scenarioSteps").innerHTML=scenarios[activeScenario].steps.map((step,index)=>`<button class="button step ${step.danger?"danger":""} ${index===scenarioStep?"current":""}" type="button" data-action="${step.type}" ${step.origin?`data-origin="${step.origin}"`:""} ${step.id?`data-id="${step.id}"`:""} ${step.entryId?`data-entry="${step.entryId}"`:""} ${index!==scenarioStep?"disabled":""}>${index<scenarioStep?"完成 · ":""}${esc(step.label)}</button>`).join("");
+  document.querySelector("#freePlay").innerHTML=freeActions.filter(action=>!action.id||state.memories[action.id]).map(action=>`<button class="button" type="button" data-action="${action.type}" ${action.id?`data-id="${esc(action.id)}"`:""}>${esc(action.label)}</button>`).join("");renderState();
+  document.querySelectorAll("[data-scenario]").forEach(button=>button.addEventListener("click",()=>{activeScenario=button.dataset.scenario;scenarioStep=0;state=Domain.initial();render();}));
+  document.querySelectorAll("[data-action]").forEach(button=>button.addEventListener("click",()=>{
+    if(button.classList.contains("step")&&button.dataset.origin==="card"){
+      const selector=`[data-action="${button.dataset.action}"][data-origin="card"]`+(button.dataset.entry?`[data-entry="${button.dataset.entry}"]`:"")+(button.dataset.id?`[data-id="${button.dataset.id}"]`:"");
+      const control=document.querySelector(`#timeline ${selector}`);
+      if(!control){perform({type:"CARD_CONTROL_MISSING",label:button.textContent});return;}
+      control.click();return;
+    }
+    perform({type:button.dataset.action,id:button.dataset.id,origin:button.dataset.origin,operationId:button.dataset.operation,entryId:button.dataset.entry});
+  }));
+}
+document.querySelector("#composer").addEventListener("submit",event=>{event.preventDefault();const input=document.querySelector("#message"),text=input.value.trim();if(!text)return;perform(actionForText(text));input.value="";input.focus();});
+(function selfCheck(){
+  const assert=(condition,message)=>{if(!condition)throw new Error(`Prototype self-check failed: ${message}`);};
+  const confirm=(state,type,draft)=>Domain.reduce(state,{type,origin:"card",operationId:state.pending?.operationId,...(type==="CONFIRM_CORRECTION"?{draft:draft??state.pending?.draft??""}:{})});
+  const cancel=state=>Domain.reduce(state,{type:"CANCEL_PENDING",origin:"card",operationId:state.pending?.operationId});
+  let test=Domain.initial(),notice=test.timeline.find(entry=>entry.view==="updateNotice");
+  assert(notice?.data?.level==="info"&&notice.data.updates.length===2&&!notice.data.read,"automatic updates emit one unread Info batch");
+  const before=JSON.stringify(test.memories);test=Domain.reduce(test,{type:"TOGGLE_UPDATES",entryId:"notice-1",origin:"card"});
+  notice=test.timeline.find(entry=>entry.view==="updateNotice");assert(notice.data.expanded&&notice.data.read&&JSON.stringify(test.memories)===before,"Info expands in place without mutating memory");
+  test=Domain.reduce(Domain.initial(),{type:"SHOW_WARNING"});assert(JSON.stringify(test.memories)===JSON.stringify(Domain.initial().memories),"Warning leaves current unchanged");
+  test=Domain.reduce(Domain.initial(),{type:"SHOW_ERROR"});assert(JSON.stringify(test.memories)===JSON.stringify(Domain.initial().memories),"Error leaves current unchanged");
+
+  test=Domain.reduce(Domain.initial(),{type:"ASK_USED"});const cards=test.timeline.filter(entry=>entry.kind==="host").length,inspectEntry=test.timeline.findLast(entry=>entry.view==="inspect"),inspectHtml=renderHost(inspectEntry);
+  const frozenHashes=inspectEntry.data.technical.sources.map(item=>item.hash);assert(inspectHtml.includes("revision r4")&&inspectHtml.includes("issue/09#canonical-ledger")&&frozenHashes.every(hash=>inspectHtml.includes(hash))&&Domain.sha256("abc")==="ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","actual-use rows expose full verified hashes and SHA-256 matches a known vector");
+  test=Domain.reduce(test,{type:"EXPAND_SOURCE",origin:"card",entryId:"inspect-1"});assert(test.timeline.filter(entry=>entry.kind==="host").length===cards&&test.timeline.find(entry=>entry.view==="inspect").data.expanded,"card-origin source expansion is in place");
+  test=Domain.reduce(test,{type:"EXPAND_SOURCE",id:"mem-42",message:"展开 mem-42 的来源"});assert(test.timeline.at(-1).view==="inspect"&&test.timeline.at(-2).kind==="request"&&test.timeline.at(-1).data.source.locator==="issue/09#canonical-ledger","user-origin source expansion resolves the requested assembly snapshot");
+  let sourceBinding=Domain.initial();sourceBinding.assembly.sources.unshift({id:"src-wrong",target:"mem-42",locator:"wrong",hash:"wrong",content:"wrong"});sourceBinding=Domain.reduce(sourceBinding,{type:"EXPAND_SOURCE",id:"mem-42",message:"展开 mem-42 的来源"});
+  assert(sourceBinding.timeline.at(-1).data.source.id==="src-ledger-09","same-target sources cannot override the used item's sourceRef");
+  sourceBinding=Domain.initial();sourceBinding.assembly.sources.push({id:"src-ledger-09",target:"mem-42",scope:"project: ai-agent-cli",locator:"duplicate",hash:"duplicate",content:"duplicate"});sourceBinding=Domain.reduce(sourceBinding,{type:"EXPAND_SOURCE",id:"mem-42"});assert(sourceBinding.timeline.at(-1).view==="error","duplicate sourceRef matches fail closed");
+  sourceBinding=Domain.initial();sourceBinding.assembly.sources.find(item=>item.id==="src-ledger-09").hash="";sourceBinding=Domain.reduce(sourceBinding,{type:"EXPAND_SOURCE",id:"mem-42",message:"展开 mem-42 的来源"});assert(sourceBinding.timeline.at(-1).view==="error"&&!renderHost(sourceBinding.timeline.at(-1)).includes("undefined"),"incomplete source locator/hash fails closed without undefined output");
+  sourceBinding=Domain.initial();sourceBinding.assembly.sources.find(item=>item.id==="src-ledger-09").content="tampered source";sourceBinding=Domain.reduce(sourceBinding,{type:"EXPAND_SOURCE",id:"mem-42"});assert(sourceBinding.timeline.at(-1).view==="error"&&!Domain.sourceComplete({id:"x",scope:"x",locator:"x",hash:"not-a-hash",content:"x"}),"tampered content or malformed digest fails closed");
+  let inspectCards=Domain.reduce(Domain.initial(),{type:"ASK_USED"});inspectCards=Domain.reduce(inspectCards,{type:"ASK_USED"});inspectCards=Domain.reduce(inspectCards,{type:"EXPAND_SOURCE",origin:"card",entryId:"inspect-1"});assert(inspectCards.timeline.find(entry=>entry.data?.entryId==="inspect-1").data.expanded&&!inspectCards.timeline.find(entry=>entry.data?.entryId==="inspect-2").data.expanded,"source expansion is bound to the originating inspect card");
+  let noticeCards=Domain.reduce(Domain.initial(),{type:"VIEW_UPDATES"});noticeCards=Domain.reduce(noticeCards,{type:"PREPARE_ROLLBACK",origin:"card",entryId:"notice-1"});assert(noticeCards.timeline.find(entry=>entry.data?.entryId==="notice-1").view==="rollback"&&noticeCards.timeline.find(entry=>entry.data?.entryId==="notice-2").view==="updateNotice","rollback preview replaces the addressed notice only");noticeCards=cancel(noticeCards);
+  let missingCardIdentity=Domain.reduce(Domain.initial(),{type:"TOGGLE_SELECT",origin:"card",id:"update-mem-42-r4"});assert(missingCardIdentity.timeline.at(-1).view==="error"&&missingCardIdentity.timeline.every(entry=>!(entry.data?.selected||[]).length),"card actions without an immutable entry identity fail closed");
+  let userCancel=Domain.reduce(Domain.initial(),{type:"PREPARE_CORRECTION",id:"mem-13"}),userCancelOp=userCancel.pending.operationId,userCancelMemory=JSON.stringify(userCancel.memories);userCancel=Domain.reduce(userCancel,{type:"CANCEL_PENDING",origin:"user",operationId:userCancelOp,message:"取消当前操作"});assert(!userCancel.pending&&JSON.stringify(userCancel.memories)===userCancelMemory&&userCancel.timeline.at(-1).view==="cancelled"&&userCancel.timeline.filter(entry=>entry.kind==="user").at(-1).text==="取消当前操作","independent user cancel closes the operation with an observable no-change Host result");
+
+  test=Domain.reduce(Domain.initial(),{type:"PREPARE_CORRECTION",id:"mem-13",draft:"first correction"});assert(test.pending?.expected.revision==="r1","correction records its expected head");
+  test=confirm(test,"CONFIRM_CORRECTION");assert(test.memories["mem-13"].revision==="r2"&&test.memories["mem-13"].verification==="pending-reverification","correction creates r2 and leaves re-verification pending");
+  assert(test.timeline.findLast(entry=>entry.view==="receipt").data.verification==="已排入后台复验，结果另行返回","correction receipt states queued re-verification instead of claiming a verifier pass");
+  test=Domain.reduce(test,{type:"PREPARE_CORRECTION",id:"mem-13",draft:"second correction"});test=confirm(test,"CONFIRM_CORRECTION");
+  assert(test.memories["mem-13"].revision==="r3"&&test.memories["mem-13"].previous.revision==="r2","repeated correction allocates a new immutable revision");
+  let noChange=Domain.reduce(Domain.initial(),{type:"PREPARE_CORRECTION",id:"mem-13",draft:"store.sqlite3 固定放在 .pi/agent 下"});noChange=confirm(noChange,"CONFIRM_CORRECTION");
+  assert(noChange.memories["mem-13"].revision==="r1"&&!noChange.timeline.some(entry=>entry.view==="receipt")&&noChange.timeline.some(entry=>entry.view==="correct"&&entry.data.noChange),"same-content correction ends without revision or receipt");
+  noChange=Domain.reduce(Domain.initial(),{type:"PREPARE_CORRECTION",id:"mem-13",draft:"preview draft"});noChange=Domain.reduce(noChange,{type:"CONFIRM_CORRECTION",operationId:noChange.pending.operationId,draft:""});
+  assert(noChange.memories["mem-13"].revision==="r1"&&!noChange.timeline.some(entry=>entry.view==="receipt"),"an explicitly empty confirm never falls back to stale preview text");
+  noChange=Domain.reduce(Domain.initial(),{type:"PREPARE_CORRECTION",id:"mem-13",draft:""});assert(noChange.pending?.draft==="","an explicitly empty prepare remains empty");noChange=confirm(noChange,"CONFIRM_CORRECTION");
+  assert(noChange.memories["mem-13"].revision==="r1"&&!noChange.timeline.some(entry=>entry.view==="receipt"),"an empty prepared draft is a no-op");
+  test=Domain.reduce(Domain.initial(),{type:"PREPARE_CORRECTION",id:"mem-13"});const staleOp=test.pending.operationId;test.memories["mem-13"].revision="r9";test.memories["mem-13"].revisionSeq=9;test.memories["mem-13"].content="concurrent head";
+  test=Domain.reduce(test,{type:"CONFIRM_CORRECTION",operationId:staleOp});assert(test.memories["mem-13"].revision==="r9"&&!test.pending&&test.timeline.some(entry=>entry.view==="correct"&&entry.data.invalidated),"stale correction fails closed");
+
+  test=Domain.reduce(Domain.initial(),{type:"PREPARE_CORRECTION",id:"mem-13"});const activeOp=test.pending.operationId;
+  test=Domain.reduce(test,{type:"PREPARE_FORGET",id:"mem-42"});assert(test.pending.operationId===activeOp&&test.timeline.at(-1).view==="error","a second prepare cannot replace the active operation");
+  test=Domain.reduce(test,{type:"CANCEL_PENDING",operationId:"stale-op"});assert(test.pending.operationId===activeOp,"a stale control cannot cancel the active operation");
+  test=Domain.reduce(test,{type:"CANCEL_PENDING",operationId:activeOp});assert(!test.pending&&!renderHost(test.timeline.find(entry=>entry.view==="correct")).includes("CONFIRM_CORRECTION"),"the matching control closes its operation");
+
+  test=Domain.reduce(Domain.initial(),{type:"PREPARE_FORGET",id:"mem-42"});test=confirm(test,"CONFIRM_FORGET");const forgetReceipt=JSON.stringify(test.timeline.find(entry=>entry.view==="receipt"));
+  assert(test.memories["mem-42"].lifecycle==="tombstoned","forget produces a tombstone");
+  const receiptCount=test.timeline.filter(entry=>entry.view==="receipt").length;test=Domain.reduce(test,{type:"PREPARE_FORGET",id:"mem-42"});
+  assert(!test.pending&&test.timeline.filter(entry=>entry.view==="receipt").length===receiptCount,"repeated forget is rejected without a receipt");
+  test=Domain.reduce(test,{type:"PREPARE_CORRECTION",id:"mem-42"});assert(test.memories["mem-42"].lifecycle==="tombstoned"&&!test.pending,"correction cannot bypass restore");
+  test=Domain.reduce(test,{type:"PREPARE_RESTORE",id:"mem-42"});let abandoned=cancel(test);assert(abandoned.memories["mem-42"].lifecycle==="tombstoned"&&!abandoned.pending,"restore can be abandoned");
+  test=Domain.reduce(test,{type:"PREPARE_RESTORE",id:"mem-42"});test=confirm(test,"CONFIRM_RESTORE");
+  assert(test.memories["mem-42"].lifecycle==="active"&&JSON.stringify(test.timeline.find(entry=>entry.view==="receipt"))===forgetReceipt,"restore is independent and leaves the forget receipt immutable");
+  assert(!renderHost(test.timeline.find(entry=>entry.view==="receipt")).includes("仍是可恢复的 tombstone"),"receipt copy is event-scoped, not a mutable-current claim");
+  let projected=Domain.reduce(Domain.initial(),{type:"PREPARE_FORGET",id:"mem-42"});projected=confirm(projected,"CONFIRM_FORGET");
+  assert(projected.timeline.find(entry=>entry.view==="updateNotice").data.updates.find(item=>item.target==="mem-42").status==="tombstoned","Info projection follows lifecycle changes");
+  projected=Domain.reduce(projected,{type:"PREPARE_RESTORE",id:"mem-42"});projected=confirm(projected,"CONFIRM_RESTORE");
+  assert(projected.timeline.find(entry=>entry.view==="updateNotice").data.updates.find(item=>item.target==="mem-42").status==="active","Info projection becomes active again after restore");
+  let rolledThenForgot=Domain.reduce(Domain.initial(),{type:"PREPARE_ROLLBACK",id:"mem-42"});rolledThenForgot=confirm(rolledThenForgot,"CONFIRM_ROLLBACK");rolledThenForgot=Domain.reduce(rolledThenForgot,{type:"PREPARE_FORGET",id:"mem-42"});rolledThenForgot=confirm(rolledThenForgot,"CONFIRM_FORGET");
+  let lifecycleNotice=rolledThenForgot.timeline.find(entry=>entry.view==="updateNotice");assert(lifecycleNotice.data.updates.find(item=>item.target==="mem-42").status==="tombstoned","canonical lifecycle overrides the older rollback event outcome");rolledThenForgot=Domain.reduce(rolledThenForgot,{type:"TOGGLE_UPDATES",entryId:"notice-1",origin:"card"});lifecycleNotice=rolledThenForgot.timeline.find(entry=>entry.view==="updateNotice");
+  assert(renderHost(lifecycleNotice).includes("当前已忘记 r3")&&!renderHost(lifecycleNotice).includes("现在生效 r3"),"a tombstoned rollback destination is never called active");
+  let superseded=Domain.reduce(Domain.initial(),{type:"PREPARE_CORRECTION",id:"mem-42",draft:"new owner correction"});superseded=confirm(superseded,"CONFIRM_CORRECTION");
+  assert(superseded.timeline.find(entry=>entry.view==="updateNotice").data.updates.find(item=>item.target==="mem-42").status==="superseded","a later revision supersedes the old automatic update projection");
+  superseded=Domain.reduce(superseded,{type:"PREPARE_ROLLBACK",id:"mem-42"});assert(!superseded.pending&&superseded.timeline.at(-1).view==="error","a superseded update cannot be rolled back as current");
+  let laterUpdate=Domain.initial(),r4Head=structuredClone(laterUpdate.memories["mem-42"]);Object.assign(laterUpdate.memories["mem-42"],{content:"new automatic r5",revision:"r5",revisionSeq:5,previous:r4Head,automatic:true});laterUpdate.updates.push({id:"update-mem-42-r5",batchId:"batch-2",target:"mem-42",kind:"自动修订",automatic:true,scope:r4Head.scope,reason:"source-change-2",verification:"verifier-03 · 通过",status:"active",before:{content:r4Head.content,revision:r4Head.revision,verification:r4Head.verification,lifecycle:r4Head.lifecycle,scope:r4Head.scope,source:r4Head.source},after:{content:"new automatic r5",revision:"r5",verification:"verified",lifecycle:"active",scope:r4Head.scope,source:r4Head.source}});laterUpdate.batches.push(Domain.batchRecord("batch-2",["update-mem-42-r5"]));
+  const frozenR5Event=JSON.stringify(laterUpdate.updates.find(item=>item.id==="update-mem-42-r5"));let latestDecision=Domain.reduce(laterUpdate,{type:"PREPARE_ROLLBACK",id:"mem-42"});assert(latestDecision.pending?.updateIds[0]==="update-mem-42-r5","rollback resolves a target to its unique eligible immutable update event");latestDecision=confirm(latestDecision,"CONFIRM_ROLLBACK");assert(latestDecision.memories["mem-42"].revision==="r4"&&latestDecision.revokedUpdateIds.includes("update-mem-42-r5")&&JSON.stringify(latestDecision.updates.find(item=>item.id==="update-mem-42-r5"))===frozenR5Event,"confirm applies the exact event captured by the preview without rewriting that event");
+  const latestBatch=Domain.reduce(laterUpdate,{type:"PREPARE_ROLLBACK"});assert(latestBatch.pending?.updateIds.length===1&&latestBatch.pending.updateIds[0]==="update-mem-42-r5","an unqualified batch rollback stays within the latest batch");const crossBatch=Domain.reduce(laterUpdate,{type:"PREPARE_ROLLBACK",ids:["mem-42","mem-19"]});assert(!crossBatch.pending&&crossBatch.timeline.at(-1).view==="error","one rollback decision cannot silently combine update batches");let duplicateEvent=structuredClone(laterUpdate);duplicateEvent.updates.push({...structuredClone(duplicateEvent.updates.at(-1)),id:"duplicate-r5-event"});duplicateEvent.batches[duplicateEvent.batches.length-1]=Domain.batchRecord("batch-2",[...duplicateEvent.batches.at(-1).eventIds,"duplicate-r5-event"]);duplicateEvent=Domain.reduce(duplicateEvent,{type:"PREPARE_ROLLBACK",id:"mem-42"});assert(!duplicateEvent.pending&&duplicateEvent.timeline.at(-1).view==="error","a batch manifest with duplicate targets fails closed");let missingEventIdentity=Domain.initial();delete missingEventIdentity.updates[0].batchId;missingEventIdentity=Domain.reduce(missingEventIdentity,{type:"PREPARE_ROLLBACK",id:"mem-42"});assert(!missingEventIdentity.pending&&missingEventIdentity.timeline.at(-1).view==="error","updates without a complete immutable event/batch identity fail closed");
+  let shrunkBatch=Domain.initial();shrunkBatch.updates=shrunkBatch.updates.filter(update=>update.target!=="mem-19");shrunkBatch=Domain.reduce(shrunkBatch,{type:"PREPARE_ROLLBACK"});assert(!shrunkBatch.pending&&shrunkBatch.timeline.at(-1).view==="error","a missing manifest member invalidates the whole batch instead of shrinking it");
+  let staleSelection=Domain.reduce(Domain.initial(),{type:"TOGGLE_SELECT",id:"update-mem-42-r4",origin:"card",entryId:"notice-1"});staleSelection.updates=staleSelection.updates.filter(update=>update.id!=="update-mem-42-r4");staleSelection=Domain.reduce(staleSelection,{type:"PREPARE_ROLLBACK",origin:"card",entryId:"notice-1"});assert(!staleSelection.pending&&staleSelection.timeline.at(-1).view==="error","a vanished selected event cannot fall back to another batch member");
+  let tamperedEvent=Domain.reduce(Domain.initial(),{type:"PREPARE_ROLLBACK",id:"mem-42"}),tamperedOp=tamperedEvent.pending.operationId;tamperedEvent.updates.find(update=>update.id==="update-mem-42-r4").before.content="tampered previous";tamperedEvent=Domain.reduce(tamperedEvent,{type:"CONFIRM_ROLLBACK",operationId:tamperedOp});assert(tamperedEvent.memories["mem-42"].revision==="r4"&&!tamperedEvent.timeline.some(entry=>entry.view==="receipt"),"the complete immutable update payload is revalidated before rollback");
+  let changedManifest=Domain.initial();changedManifest.batches[0].eventIds.reverse();changedManifest=Domain.reduce(changedManifest,{type:"PREPARE_ROLLBACK"});assert(!changedManifest.pending&&changedManifest.timeline.at(-1).view==="error","a batch membership/order change without its frozen manifest digest fails closed");
+  let mismatchedHead=Domain.initial();mismatchedHead.memories["mem-42"].content="same revision, different content";mismatchedHead=Domain.reduce(mismatchedHead,{type:"PREPARE_ROLLBACK",id:"mem-42"});assert(!mismatchedHead.pending&&mismatchedHead.timeline.at(-1).view==="error","event after must match the complete canonical head, not only its revision label");
+  let fullBefore=Domain.initial(),fullEvent=fullBefore.updates.find(update=>update.id==="update-mem-42-r4");Object.assign(fullEvent.before,{scope:"project: old-scope",source:"old-source"});Object.assign(fullEvent.after,{scope:fullBefore.memories["mem-42"].scope,source:fullBefore.memories["mem-42"].source});fullBefore=Domain.reduce(fullBefore,{type:"PREPARE_ROLLBACK",id:"mem-42"});fullBefore=confirm(fullBefore,"CONFIRM_ROLLBACK");assert(fullBefore.memories["mem-42"].scope==="project: old-scope"&&fullBefore.memories["mem-42"].source==="old-source","rollback restores optional scope/source from the frozen before snapshot");
+
+  test=Domain.reduce(Domain.initial(),{type:"PREPARE_ROLLBACK"});test=cancel(test);const removed=test.memories["mem-19"].content;
+  test=Domain.reduce(test,{type:"PREPARE_PURGE",id:"mem-19"});test=confirm(test,"CONFIRM_PURGE");
+  assert(!JSON.stringify(test).includes(removed)&&!JSON.stringify(test).includes("mem-19")&&!test.memories["mem-19"],"purge scrubs cancelled previews, projections, IDs and content");
+  let withReceipt=Domain.reduce(Domain.initial(),{type:"PREPARE_FORGET",id:"mem-19"});withReceipt=confirm(withReceipt,"CONFIRM_FORGET");const issued=JSON.stringify(withReceipt.timeline.find(entry=>entry.view==="receipt"));
+  withReceipt=Domain.reduce(withReceipt,{type:"PREPARE_PURGE",id:"mem-19"});withReceipt=confirm(withReceipt,"CONFIRM_PURGE");assert(JSON.stringify(withReceipt.timeline.find(entry=>entry.view==="receipt"))===issued,"purge does not rewrite an issued receipt");
+  let settled=Domain.reduce(Domain.initial(),{type:"PREPARE_ROLLBACK"});settled=confirm(settled,"CONFIRM_ROLLBACK");
+  assert(!renderHost(settled.timeline.find(entry=>entry.view==="rollback")).includes("<h3>当前 "),"settled rollback preview never keeps claiming its old head is current");
+  ["correct","forget","restore"].forEach(view=>{
+    const prepare={correct:{type:"PREPARE_CORRECTION",id:"mem-13",draft:"改写后的内容"},forget:{type:"PREPARE_FORGET",id:"mem-42"},restore:{type:"PREPARE_RESTORE",id:"mem-42"}}[view];
+    let flow=view==="restore"?confirm(Domain.reduce(Domain.initial(),{type:"PREPARE_FORGET",id:"mem-42"}),"CONFIRM_FORGET"):Domain.initial();
+    flow=confirm(Domain.reduce(flow,prepare),{correct:"CONFIRM_CORRECTION",forget:"CONFIRM_FORGET",restore:"CONFIRM_RESTORE"}[view]);
+    assert(!renderHost(flow.timeline.findLast(entry=>entry.view===view)).includes("<strong>当前 canonical 内容</strong>"),`settled ${view} card never keeps calling its preview snapshot the current canonical content`);
+  });
+  let emptyBatch=confirm(Domain.reduce(Domain.initial(),{type:"PREPARE_ROLLBACK"}),"CONFIRM_ROLLBACK");const receiptsAfterBatch=emptyBatch.timeline.filter(entry=>entry.view==="receipt").length;
+  emptyBatch=Domain.reduce(emptyBatch,{type:"PREPARE_ROLLBACK"});
+  assert(!emptyBatch.pending&&emptyBatch.timeline.filter(entry=>entry.view==="receipt").length===receiptsAfterBatch,"an empty eligible batch never opens a preview or signs a receipt");
+  let manualEdit=Domain.reduce(Domain.initial(),{type:"PREPARE_CORRECTION",id:"mem-13",draft:"owner 手动改写"});manualEdit=confirm(manualEdit,"CONFIRM_CORRECTION");
+  assert(!Domain.reduce(manualEdit,{type:"PREPARE_ROLLBACK",id:"mem-13"}).pending,"rollback stays limited to automatic promotion or revision events");
+  settled=Domain.reduce(settled,{type:"PREPARE_PURGE",id:"mem-19"});settled=confirm(settled,"CONFIRM_PURGE");
+  assert(!JSON.stringify(settled).includes("mem-19")&&settled.timeline.filter(entry=>entry.kind==="host").every(entry=>{renderHost(entry);return true;}),"purge scrubs and can still render every settled Host entry");
+  const purgeAfter=(beforePurge,id)=>{let state=Domain.reduce(beforePurge,{type:"PREPARE_PURGE",id}),closed=confirm(state,"CONFIRM_PURGE"),html=closed.timeline.filter(entry=>entry.kind==="host").map(renderHost).join("");assert(!html.includes("undefined")&&!JSON.stringify(closed).includes(id),`purge closes every historical renderer for ${id}`);return closed;};
+  let historical=Domain.reduce(Domain.initial(),{type:"PREPARE_CORRECTION",id:"mem-19",draft:"temporary corrected content"});historical=confirm(historical,"CONFIRM_CORRECTION");purgeAfter(historical,"mem-19");
+  historical=Domain.reduce(Domain.initial(),{type:"PREPARE_FORGET",id:"mem-19"});historical=confirm(historical,"CONFIRM_FORGET");historical=Domain.reduce(historical,{type:"PREPARE_RESTORE",id:"mem-19"});historical=confirm(historical,"CONFIRM_RESTORE");purgeAfter(historical,"mem-19");
+  historical=Domain.reduce(Domain.initial(),{type:"ASK_USED"});historical=Domain.reduce(historical,{type:"EXPAND_SOURCE",id:"mem-19",message:"展开 mem-19 的来源"});purgeAfter(historical,"mem-19");
+  let deepPurge=Domain.reduce(Domain.initial(),{type:"PREPARE_CORRECTION",id:"mem-13",draft:"SECRET-ONE",message:"把 mem-13 改为 SECRET-ONE"});deepPurge=confirm(deepPurge,"CONFIRM_CORRECTION");deepPurge=Domain.reduce(deepPurge,{type:"PREPARE_CORRECTION",id:"mem-13",draft:"SECRET-TWO",message:"把 mem-13 改为 SECRET-TWO"});deepPurge=confirm(deepPurge,"CONFIRM_CORRECTION");
+  const linkedSource=deepPurge.assembly.sources.find(item=>item.id==="src-plan-10"),controlled=["SECRET-ONE","SECRET-TWO",linkedSource.id,linkedSource.locator,linkedSource.hash,linkedSource.content];deepPurge=Domain.reduce(deepPurge,{type:"PREPARE_PURGE",id:"mem-13"});deepPurge=confirm(deepPurge,"CONFIRM_PURGE");assert(controlled.every(token=>!JSON.stringify(deepPurge).includes(token)),"purge removes every historical revision and linked source locator/hash before signing controlled-complete");
+  let closurePurge=Domain.initial(),archiveSource={id:"src-previous-only",target:"history",kind:"archive",locator:"archive://previous-only",hash:"sha256:previous-only",content:"PREVIOUS-ONLY-SOURCE"};closurePurge.assembly.sources.push(archiveSource);closurePurge.memories["mem-13"].previous={...closurePurge.memories["mem-13"].previous,source:archiveSource.locator};closurePurge=Domain.reduce(closurePurge,{type:"PREPARE_PURGE",id:"mem-13"});closurePurge=confirm(closurePurge,"CONFIRM_PURGE");assert([archiveSource.id,archiveSource.locator,archiveSource.hash,archiveSource.content].every(token=>!JSON.stringify(closurePurge).includes(token)),"purge computes a fixpoint over historical provenance and reverse-linked source objects");
+  let shortId=Domain.initial();shortId.memories["mem-1"]={id:"mem-1",subjectRef:"subject-short",content:"short target only",scope:"project: ai-agent-cli",source:"short://source",revision:"r1",revisionSeq:1,verification:"verified",lifecycle:"active",automatic:false,previous:null};shortId=Domain.reduce(shortId,{type:"PREPARE_PURGE",id:"mem-1"});shortId=confirm(shortId,"CONFIRM_PURGE");assert(!shortId.memories["mem-1"]&&shortId.memories["mem-13"]&&shortId.memories["mem-19"]&&!shortId.timeline.some(entry=>entry.view==="error"),"structured purge identity does not confuse mem-1 with mem-13 or mem-19");
+
+  let batch=Domain.reduce(Domain.initial(),{type:"PREPARE_ROLLBACK"});assert(batch.pending.ids.length===2,"no selection means one whole-batch decision");batch=confirm(batch,"CONFIRM_ROLLBACK");
+  assert(batch.memories["mem-42"].revision==="r3"&&batch.memories["mem-19"].revision==="r1"&&batch.timeline.filter(entry=>entry.view==="receipt").length===1,"one confirmation rolls back the batch with one receipt");
+  let activation=Domain.initial(),activated={id:"mem-77",subjectRef:"subject-77",content:"首次自动激活",scope:"project: ai-agent-cli",source:"source-77",revision:"r1",revisionSeq:1,verification:"verified",lifecycle:"active",automatic:true,previous:null};
+  activation.memories[activated.id]=activated;activation.updates.push({id:"update-mem-77-r1",batchId:"batch-2",target:activated.id,kind:"activation",automatic:true,before:null,after:structuredClone(activated),reason:"verified promotion",scope:activated.scope,verification:"verifier-03 通过",status:"active"});activation.batches.push(Domain.batchRecord("batch-2",["update-mem-77-r1"]));activation=Domain.reduce(activation,{type:"PREPARE_ROLLBACK",id:"mem-77"});
+  assert(activation.pending?.ids[0]==="mem-77"&&renderHost(activation.timeline.find(entry=>entry.view==="rollback")).includes("无 active head"),"a first activation has an explicit rollback destination");activation=confirm(activation,"CONFIRM_ROLLBACK");
+  activation=Domain.reduce(activation,{type:"VIEW_UPDATES"});
+  const activationEffect=activation.timeline.findLast(entry=>entry.view==="receipt").data.effect;assert(activation.memories["mem-77"].lifecycle==="inactive"&&activation.memories["mem-77"].verification==="verified"&&activationEffect.includes("无 active head")&&activationEffect.includes("inactive")&&!activationEffect.includes("superseded")&&renderHost(activation.timeline.findLast(entry=>entry.view==="updateNotice")).includes("canonical 无 active head"),"first-activation rollback receipt reports inactive without claiming a superseded prior revision");
+  const savedState=state;state=activation;renderState();const activationSidebar=document.querySelector("#statePanel").innerHTML;state=savedState;assert(activationSidebar.includes(">inactive<")&&activationSidebar.includes("state off"),"inactive lifecycle is explicit in the state projection");
+  batch=Domain.reduce(batch,{type:"TOGGLE_UPDATES",entryId:"notice-1",origin:"card"});const renderedNotice=renderHost(batch.timeline.find(entry=>entry.view==="updateNotice"));
+  assert(renderedNotice.includes("现在生效</h3>")===false&&renderedNotice.includes("现在生效 r3")&&renderedNotice.includes("已撤销 r4"),"refreshed rollback detail labels canonical and revoked revisions correctly");
+  let staleBatch=Domain.reduce(Domain.initial(),{type:"PREPARE_ROLLBACK"});const batchOp=staleBatch.pending.operationId;staleBatch.memories["mem-19"].revision="r9";
+  staleBatch=Domain.reduce(staleBatch,{type:"CONFIRM_ROLLBACK",operationId:batchOp});assert(staleBatch.memories["mem-42"].revision==="r4"&&staleBatch.memories["mem-19"].revision==="r9"&&!staleBatch.timeline.some(entry=>entry.view==="receipt"),"batch CAS is all-or-nothing");let duplicateAtConfirm=Domain.reduce(Domain.initial(),{type:"PREPARE_ROLLBACK",id:"mem-42"}),duplicateOp=duplicateAtConfirm.pending.operationId;duplicateAtConfirm.updates.push(structuredClone(duplicateAtConfirm.updates.find(item=>item.id==="update-mem-42-r4")));duplicateAtConfirm=Domain.reduce(duplicateAtConfirm,{type:"CONFIRM_ROLLBACK",operationId:duplicateOp});assert(duplicateAtConfirm.memories["mem-42"].revision==="r4"&&!duplicateAtConfirm.timeline.some(entry=>entry.view==="receipt"),"event identity becoming ambiguous after preview invalidates the whole decision");
+  let selected=Domain.reduce(Domain.initial(),{type:"TOGGLE_SELECT",id:"update-mem-19-r2",origin:"card",entryId:"notice-1"});selected=Domain.reduce(selected,{type:"PREPARE_PURGE",id:"mem-19"});selected=confirm(selected,"CONFIRM_PURGE");selected=Domain.reduce(selected,{type:"PREPARE_ROLLBACK"});
+  assert(selected.pending?.ids.length===1&&selected.pending.ids[0]==="mem-42","purge clears stale selection so remaining targets stay reachable");
+  selected=Domain.reduce(Domain.initial(),{type:"TOGGLE_SELECT",id:"update-mem-42-r4",origin:"card",entryId:"notice-1"});selected=Domain.reduce(selected,{type:"PREPARE_FORGET",id:"mem-42"});selected=confirm(selected,"CONFIRM_FORGET");selected=Domain.reduce(selected,{type:"PREPARE_ROLLBACK"});
+  assert(selected.pending?.ids.length===1&&selected.pending.ids[0]==="mem-19","lifecycle changes also prune stale selection");
+
+  assert(actionForText("忘记 mem-19").id==="mem-19"&&actionForText("恢复 mem-19").id==="mem-19"&&actionForText("彻底清除 mem-13").id==="mem-13"&&actionForText("mem-42 这条不对").id==="mem-42","parser preserves the explicit target");
+  assert(actionForText("彻底清除这条").type==="INVALID_TARGET"&&actionForText("忘记 mem-19 和 mem-42").type==="INVALID_TARGET","missing or ambiguous destructive targets fail closed");
+  const multi=actionForText("撤销 mem-42 和 mem-19 的自动更新");assert(multi.type==="PREPARE_ROLLBACK"&&multi.ids.length===2&&Domain.reduce(Domain.initial(),multi).pending.ids.length===2,"natural language can express one explicit multi-target rollback decision");
+  assert(actionForText("展开 mem-42 的来源").id==="mem-42","source routing preserves its requested assembly target");
+  assert(actionForText("回滚 mem-42 的自动更新").type==="PREPARE_ROLLBACK"&&actionForText("把 mem-13 纠正为 正确内容").draft==="正确内容"&&actionForText("把 mem-13 改为 正确内容").draft==="正确内容"&&actionForText("mem-42 这条不对").draft===""&&actionForText("忘了 mem-19").type==="PREPARE_FORGET"&&actionForText("撤销最近的自动更新 mem-42").type==="PREPARE_ROLLBACK","common natural-language aliases preserve operation, target and empty-draft safety");
+  assert(["删除 mem-13","清除 mem-13","去掉 mem-13"].every(text=>actionForText(text).type==="PREPARE_FORGET")&&["彻底清除 mem-13","永久删除 mem-13","purge mem-13"].every(text=>actionForText(text).type==="PREPARE_PURGE"),"ambiguous deletion routes to the reversible operation; irreversible purge needs an explicit irreversibility marker");
+  const directionConflicts=["恢复被彻底删除的 mem-42","撤销彻底删除 mem-42","把彻底删掉的 mem-42 恢复回来","回滚永久删除 mem-42"];
+  assert(directionConflicts.every(text=>actionForText(text).type==="AMBIGUOUS_DESTRUCTIVE")&&["不可恢复地删除 mem-13","不可撤销地删除 mem-42"].every(text=>actionForText(text).type==="PREPARE_PURGE"),"opposite destructive directions fail closed while restore/undo substrings inside an irreversible marker do not create a false conflict");
+  const conflictState=Domain.reduce(Domain.initial(),actionForText(directionConflicts[0]));assert(!conflictState.pending&&!conflictState.timeline.some(entry=>entry.view==="receipt")&&conflictState.timeline.at(-1).view==="error","a direction conflict creates no preview, mutation or receipt and asks the owner to restate");
+  assert(["撤销删除 mem-42","撤回忘记 mem-42","恢复被删除的 mem-42"].every(text=>actionForText(text).type==="PREPARE_RESTORE")&&["删除 mem-42 的自动更新","去掉 mem-42 的自动修订","取消 mem-42 的自动晋升"].every(text=>actionForText(text).type==="PREPARE_ROLLBACK"),"undo phrasing and an explicit automatic-update object outrank the deletion verb");
+  assert(["取消 当前操作","放弃 这次操作","取消　操作"].every(text=>actionForText(text).type==="CANCEL_PENDING"),"spaced cancel phrasing still reaches the cancel envelope");
+  const payloadCorrection=actionForText("我想把 mem-13 改为 删除 mem-42、忘记 mem-19 并恢复 mem-77"),negativePayload=actionForText("把 mem-13 改为 不要删除 mem-42");assert(payloadCorrection.type==="PREPARE_CORRECTION"&&payloadCorrection.id==="mem-13"&&payloadCorrection.draft==="删除 mem-42、忘记 mem-19 并恢复 mem-77"&&negativePayload.type==="PREPARE_CORRECTION"&&negativePayload.draft==="不要删除 mem-42","the correction envelope owns its payload; payload verbs, negation and IDs are not rerouted");
+  assert(actionForText("不要把 mem-19 改为 新内容").type==="SAFE_NOOP"&&actionForText("取消当前操作").type==="CANCEL_PENDING"&&actionForText("取消这项操作").type==="CANCEL_PENDING"&&["不要把 mem-19 忘记","别永久删除 mem-13","不用删除 mem-13"].every(text=>actionForText(text).type==="SAFE_NOOP"),"cancel aliases and sentence-wide negative expressions fail closed without destructive routing");
+  const parserState=state;state=Domain.reduce(Domain.initial(),{type:"PREPARE_FORGET",id:"mem-42"});const cancelDelete=actionForText("取消删除 mem-13");state=parserState;assert(cancelDelete.type==="CANCEL_PENDING","cancel-plus-destructive language cancels the active operation instead of opening another one");
+  let cardIdentity=Domain.reduce(Domain.initial(),{type:"PREPARE_FORGET",id:"mem-42"}),cardOperation=cardIdentity.pending.operationId;cardIdentity=Domain.reduce(cardIdentity,{type:"CONFIRM_FORGET",origin:"card"});assert(cardIdentity.pending?.operationId===cardOperation&&cardIdentity.memories["mem-42"].lifecycle==="active"&&cardIdentity.timeline.at(-1).view==="error","a card action without its operation identity fails closed");cardIdentity=Domain.reduce(cardIdentity,{type:"CONFIRM_FORGET",origin:"card",operationId:cardOperation});assert(cardIdentity.memories["mem-42"].lifecycle==="tombstoned","the matching immutable card identity can confirm its own operation");
+  const adapterState=state,adapterScenario=activeScenario,adapterStep=scenarioStep;state=Domain.reduce(Domain.initial(),{type:"PREPARE_FORGET",id:"mem-42"});perform({type:"CONFIRM_FORGET",origin:"card"});const adapterFailedClosed=state.pending&&state.memories["mem-42"].lifecycle==="active";state=adapterState;activeScenario=adapterScenario;scenarioStep=adapterStep;assert(adapterFailedClosed,"the UI adapter never reconstructs a missing card operation identity");
+  let queried=Domain.reduce(Domain.initial(),{type:"VIEW_UPDATES"});const notices=queried.timeline.filter(entry=>entry.view==="updateNotice");
+  assert(notices[0].data.read&&new Set(notices.map(entry=>entry.data.entryId)).size===notices.length&&new Set(notices.map(entry=>entry.data.batchId)).size===1,"querying one batch keeps its batch identity stable while card identities stay unique");
+  queried=Domain.reduce(Domain.initial(),{type:"PREPARE_ROLLBACK",origin:"card",entryId:"notice-1"});queried=Domain.reduce(queried,{type:"VIEW_UPDATES"});queried=cancel(queried);const restoredNotices=queried.timeline.filter(entry=>entry.view==="updateNotice");
+  assert(restoredNotices.every(entry=>entry.data.read)&&new Set(restoredNotices.map(entry=>entry.data.entryId)).size===restoredNotices.length&&new Set(restoredNotices.map(entry=>entry.data.batchId)).size===1,"restoring an inline notice cannot revive unread state or change its batch identity");
+  let inline=Domain.reduce(Domain.initial(),{type:"PREPARE_ROLLBACK",origin:"card",entryId:"notice-1"}),inlineLength=inline.timeline.length;inline=cancel(inline);
+  assert(inline.timeline.length===inlineLength&&inline.timeline.some(entry=>entry.view==="updateNotice")&&!inline.timeline.some(entry=>entry.view==="rollback"),"host-local cancel restores Info without creating a durable conversation event");
+  assert(!renderHost(Domain.reduce(Domain.reduce(Domain.initial(),{type:"PREPARE_FORGET",id:"mem-42"}),{type:"CANCEL_PENDING",operationId:"wrong"}).timeline.find(entry=>entry.view==="forget")).includes("因此可以撤销"),"forget copy uses restore rather than rollback semantics");
+  test=Domain.reduce(Domain.reduce(Domain.initial(),{type:"PREPARE_ROLLBACK",id:"mem-42"}),{type:"CONFIRM_ROLLBACK",operationId:"wrong"});assert(test.memories["mem-42"].revision==="r4","wrong operation ID cannot confirm rollback");
+  test=Domain.reduce(Domain.initial(),{type:"PREPARE_ROLLBACK",id:"mem-42"});test=confirm(test,"CONFIRM_ROLLBACK");test=Domain.reduce(test,{type:"ASK_USED"});
+  assert(test.timeline.findLast(entry=>entry.view==="inspect").data.used.find(item=>item.id==="mem-42").revision==="r4","inspection uses the assembly-time snapshot after current changes");
+  window.__prototypeChecks="passed";
+})();
+render();
+</script>
+</body>
+</html>

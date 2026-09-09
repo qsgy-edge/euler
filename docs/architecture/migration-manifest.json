@@ -1,0 +1,225 @@
+{
+  "schema_version": 1,
+  "status": "source-docs-migrated; implementation-and-runtime-unverified",
+  "source_repository": "ai-agent-cli",
+  "source_commit": "750a61065fb6f1a874a684ed09b6b2e9d75378e7",
+  "source_root": ".scratch/agent-memory-context-architecture",
+  "target_repository": "qsgy-edge/euler",
+  "target_root": "D:/GithubRepositories/Agent/euler",
+  "files": [
+    {
+      "source_path": "issues/15-euler-v1-spec.md",
+      "source_git_blob": "c678619b668d3eef3c6fe4c5385df6781bd93700",
+      "source_sha256": "2426f45710898cd0429fe54110be617f9ae6bf373a7c4ebb5bba26e9641da956",
+      "source_bytes": 79045,
+      "target_path": "docs/architecture/issues/15-euler-v1-spec.md",
+      "target_sha256": "8b3b1bac9c67a3c5040c99b0473a05fa73b966c963a3c21c8ff73d8d12eb93af",
+      "target_bytes": 79127,
+      "role": "unified implementation specification"
+    },
+    {
+      "source_path": "issues/04-define-domain-boundaries.md",
+      "source_git_blob": "5d8c792e3b3156be1ac1aa006b2e5c8ae815b10c",
+      "source_sha256": "53bf4c3be0aad54155c6eab52fb690b35ab3c4eba75a2d1d856e8eaccf2b0ba0",
+      "source_bytes": 3540,
+      "target_path": "docs/architecture/issues/04-define-domain-boundaries.md",
+      "target_sha256": "53bf4c3be0aad54155c6eab52fb690b35ab3c4eba75a2d1d856e8eaccf2b0ba0",
+      "target_bytes": 3540,
+      "role": "domain contract"
+    },
+    {
+      "source_path": "issues/05-set-authority-boundaries.md",
+      "source_git_blob": "92ea40be206dc01f792fd8171f4d6c7aa6b8c257",
+      "source_sha256": "85ae82cfba39972f34a6c87b83ea09b35884d3f8c1bfb28919e952e096254607",
+      "source_bytes": 5417,
+      "target_path": "docs/architecture/issues/05-set-authority-boundaries.md",
+      "target_sha256": "85ae82cfba39972f34a6c87b83ea09b35884d3f8c1bfb28919e952e096254607",
+      "target_bytes": 5417,
+      "role": "authority contract"
+    },
+    {
+      "source_path": "issues/06-design-memory-hierarchy.md",
+      "source_git_blob": "78015238745e4af52c66f2375e271d56273c1b7b",
+      "source_sha256": "1a81d682fbc26f717275f5ca1e034433a78c24210b76b7341935699570db6f7b",
+      "source_bytes": 5234,
+      "target_path": "docs/architecture/issues/06-design-memory-hierarchy.md",
+      "target_sha256": "1a81d682fbc26f717275f5ca1e034433a78c24210b76b7341935699570db6f7b",
+      "target_bytes": 5234,
+      "role": "memory model"
+    },
+    {
+      "source_path": "issues/07-coordinate-memory-context.md",
+      "source_git_blob": "c0d6c9ea741a907522316be9997568a37f6b3705",
+      "source_sha256": "fecc64f3b6ed9a46e76af1e70366861a6ee01aac8bf5765365c0934373a6ffab",
+      "source_bytes": 13088,
+      "target_path": "docs/architecture/issues/07-coordinate-memory-context.md",
+      "target_sha256": "fecc64f3b6ed9a46e76af1e70366861a6ee01aac8bf5765365c0934373a6ffab",
+      "target_bytes": 13088,
+      "role": "coordination contract"
+    },
+    {
+      "source_path": "issues/08-automate-memory-evolution.md",
+      "source_git_blob": "658295a2aaae7480b6cef8e5fe96ed4a4be9777d",
+      "source_sha256": "489ff84f05dbdfea9f8e0d5686aa854c576522411ebf568ff365d72a051ef5e8",
+      "source_bytes": 27391,
+      "target_path": "docs/architecture/issues/08-automate-memory-evolution.md",
+      "target_sha256": "489ff84f05dbdfea9f8e0d5686aa854c576522411ebf568ff365d72a051ef5e8",
+      "target_bytes": 27391,
+      "role": "lifecycle and verification contract"
+    },
+    {
+      "source_path": "issues/09-assemble-context-safely.md",
+      "source_git_blob": "078821e28779a49adf8b58a3167cd8ee282005cb",
+      "source_sha256": "5b03939f30a0001fc17c2f3896986a976b5fddf941cb63c86acea18570ccbca3",
+      "source_bytes": 12303,
+      "target_path": "docs/architecture/issues/09-assemble-context-safely.md",
+      "target_sha256": "5b03939f30a0001fc17c2f3896986a976b5fddf941cb63c86acea18570ccbca3",
+      "target_bytes": 12303,
+      "role": "safe assembly and ledger contract"
+    },
+    {
+      "source_path": "issues/10-choose-storage-projections.md",
+      "source_git_blob": "e6a7aac0235d7c6d2ddecfd55f8b21ad6efa4ef0",
+      "source_sha256": "c1925c854ae93760c53fe46a3da9b4f1d6e419beb3b20604bc00629867957ef6",
+      "source_bytes": 48429,
+      "target_path": "docs/architecture/issues/10-choose-storage-projections.md",
+      "target_sha256": "c1925c854ae93760c53fe46a3da9b4f1d6e419beb3b20604bc00629867957ef6",
+      "target_bytes": 48429,
+      "role": "storage privacy recovery contract"
+    },
+    {
+      "source_path": "issues/11-prototype-observability.md",
+      "source_git_blob": "8b15b98b44d1bd6d1a886d26428c49c417cd94fe",
+      "source_sha256": "a9bd6f3ab725a68c7fb4dda720fb3dc79822b565d75b740d805c5bbfe946a661",
+      "source_bytes": 18522,
+      "target_path": "docs/architecture/issues/11-prototype-observability.md",
+      "target_sha256": "a9bd6f3ab725a68c7fb4dda720fb3dc79822b565d75b740d805c5bbfe946a661",
+      "target_bytes": 18522,
+      "role": "view change rollback semantics"
+    },
+    {
+      "source_path": "issues/12-build-evidence-experiment-matrix.md",
+      "source_git_blob": "795a402d683dfed77ea4bccd70555e03f67883b5",
+      "source_sha256": "86f7600c62f5fba944319b7c908ee6c43cad2df21295e7d49a81dc579d4f963e",
+      "source_bytes": 87940,
+      "target_path": "docs/architecture/issues/12-build-evidence-experiment-matrix.md",
+      "target_sha256": "86f7600c62f5fba944319b7c908ee6c43cad2df21295e7d49a81dc579d4f963e",
+      "target_bytes": 87940,
+      "role": "acceptance matrix; evidence unverified"
+    },
+    {
+      "source_path": "issues/13-select-target-v1-migration.md",
+      "source_git_blob": "9313a5110f5fe4f1441b532aa5b5b2c3de6f80cf",
+      "source_sha256": "95e904aa6f9ea0efb1170ea79bf3e7fbb7ed0e3b3a73b775bb3acfa45336fb17",
+      "source_bytes": 96539,
+      "target_path": "docs/architecture/issues/13-select-target-v1-migration.md",
+      "target_sha256": "95e904aa6f9ea0efb1170ea79bf3e7fbb7ed0e3b3a73b775bb3acfa45336fb17",
+      "target_bytes": 96539,
+      "role": "architecture phases and MC cutover contract"
+    },
+    {
+      "source_path": "issues/14-define-host-presentation.md",
+      "source_git_blob": "6e0b5c83ff7e7e9ef7668b439700a6f498ae7b2a",
+      "source_sha256": "5250d315bd6b902ae4197d40c0100f0506309b8c61faf7f54bcc4d5cc0636e10",
+      "source_bytes": 38910,
+      "target_path": "docs/architecture/issues/14-define-host-presentation.md",
+      "target_sha256": "5250d315bd6b902ae4197d40c0100f0506309b8c61faf7f54bcc4d5cc0636e10",
+      "target_bytes": 38910,
+      "role": "Host authority contract"
+    },
+    {
+      "source_path": "prototypes/11-observability-tools-prototype.html",
+      "source_git_blob": "7d327cb3448c1d174c5c31b8d9a8d55748bd00f6",
+      "source_sha256": "7357f7995e3ea76ffc9dddedfeafa3f76ed11ac3f0eb6ee24a080d54c1bcb494",
+      "source_bytes": 127801,
+      "target_path": "docs/architecture/prototypes/11-observability-tools-prototype.html",
+      "target_sha256": "7357f7995e3ea76ffc9dddedfeafa3f76ed11ac3f0eb6ee24a080d54c1bcb494",
+      "target_bytes": 127801,
+      "role": "historical synthetic semantic reference"
+    },
+    {
+      "source_path": "research/2026-08-29-pi-vs-dsh-q6.md",
+      "source_git_blob": "6ffdb6f3c61c86ef1b5bc0ec0987945931593024",
+      "source_sha256": "2fe3553990f1f266339a53f3f15790233add4a9a81ac202253225e9ec7f31737",
+      "source_bytes": 10797,
+      "target_path": "docs/architecture/research/2026-08-29-pi-vs-dsh-q6.md",
+      "target_sha256": "2fe3553990f1f266339a53f3f15790233add4a9a81ac202253225e9ec7f31737",
+      "target_bytes": 10797,
+      "role": "bounded Q6 reference"
+    },
+    {
+      "source_path": "research/2026-08-28-dsh-plugin-trajectory-architecture.md",
+      "source_git_blob": "76baa075b1fc485b72b908aa912a9478b8d2f463",
+      "source_sha256": "e75c9adb4beb75d2a99a71d6185f0f0a20db1b509db4ba5c88efecf059ef0763",
+      "source_bytes": 20349,
+      "target_path": "docs/architecture/research/2026-08-28-dsh-plugin-trajectory-architecture.md",
+      "target_sha256": "e75c9adb4beb75d2a99a71d6185f0f0a20db1b509db4ba5c88efecf059ef0763",
+      "target_bytes": 20349,
+      "role": "historical mechanism evidence"
+    }
+  ],
+  "external_references": [
+    {
+      "source_path": "map.md",
+      "source_git_blob": "e3c109cfc39bd22567dd8a7d84b1cb138110604d",
+      "source_sha256": "d947fc610a94d8d142f8c131ba2b1c0fcd0b38310f4db2f3a39278288645e78a",
+      "source_bytes": 21818,
+      "role": "course external reference; not copied into product"
+    },
+    {
+      "source_path": "issues/01-audit-course-evidence.md",
+      "source_git_blob": "42f9bd9fa09625a17e4db506102532870d148f9c",
+      "source_sha256": "feffc86507e0d9277ba6083bc08eac9f4a56722602b13d344141b203fe1cb4dc",
+      "source_bytes": 3032,
+      "role": "course external reference; not copied into product"
+    },
+    {
+      "source_path": "issues/02-verify-magic-context.md",
+      "source_git_blob": "34087255250003c6112c92f3288d31bbe9b198d8",
+      "source_sha256": "f129cb8f7b0958d5bf28b081c2e2429655feb2f2dac494d0acddd526469b098a",
+      "source_bytes": 1581,
+      "role": "course external reference; not copied into product"
+    },
+    {
+      "source_path": "issues/03-recheck-external-evidence.md",
+      "source_git_blob": "543da13c238b7dc8656fd8b23f9ecc07990b53f8",
+      "source_sha256": "01999cb457ac7482da6139886aab5fcaec1cff6a9bdf5f62be5ff90ae80b3768",
+      "source_bytes": 1692,
+      "role": "course external reference; not copied into product"
+    }
+  ],
+  "rewrites": [
+    {
+      "file": "issues/15-euler-v1-spec.md",
+      "old": "Source map: ../map.md",
+      "new": "Source map: course-source:map; see ../migration-manifest.json",
+      "count": 1
+    },
+    {
+      "file": "issues/15-euler-v1-spec.md",
+      "old": "[01](01-audit-course-evidence.md)",
+      "new": "[01 课程检查点](../migration-manifest.json)",
+      "count": 1
+    },
+    {
+      "file": "issues/15-euler-v1-spec.md",
+      "old": "[02](02-verify-magic-context.md)",
+      "new": "[02 课程检查点](../migration-manifest.json)",
+      "count": 1
+    },
+    {
+      "file": "issues/15-euler-v1-spec.md",
+      "old": "[03](03-recheck-external-evidence.md)",
+      "new": "[03 课程检查点](../migration-manifest.json)",
+      "count": 1
+    }
+  ],
+  "generated_files": [
+    {
+      "path": "README.md",
+      "sha256": "c5bba3aa37f3f6e6873352d6714c6d752d07b3b72990c99c660c37f33ba80e0f",
+      "bytes": 958,
+      "role": "migration status and entrypoint"
+    }
+  ]
+}
