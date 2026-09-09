@@ -10,6 +10,8 @@ Blocked by: 05, 06, 07, 08, 09, 10, 11, 12, 14
 
 ## Comments
 
+- **2026-09-09 范围修订：** 总交付范围统一引用 [15 I01](15-euler-v1-spec.md#v1-scope)；本票 D8 只映射阶段和直接依赖，后续能力的接点不成为首次切片的隐含前置。历史 D1–D8 的“已定案”只指当时设计，当前修订需复验，不新增运行 PASS。
+
 - `ai-agent-book@1111794f` 不改变既定实现范围：v1 实现聚焦记忆生命周期与上下文协作；AGENTS/policy、Skill、Tool/MCP 在本票只冻结与 Core 的集成接口、装配边界和安全门禁，不拥有 canonical memory；代码与 Harness 自修改仍留在后续地图。
 - 未来启用任何行为自修改前，新增两个硬门槛：content-addressed receipt 必须通过完整性核验；安全与回滚 verifier 必须覆盖 Windows、macOS、Linux 三个实际目标宿主。该门槛不扩张 v1。
 - 本票冻结最终 `app-id` 与首次真实 `schema v1`，明确 Pi `Agent`/`AgentSession` 接线、Host-owned ledger 契约及跨 harness API；MC 仍启用时由 MC adapter 独占唯一 context hook，不运行第二套裁剪器。
@@ -137,12 +139,12 @@ Blocked by: 05, 06, 07, 08, 09, 10, 11, 12, 14
 
 ### D8.1 Decision — five implementation phases
 
-1. **P0 contract freeze and disposable boundary:** 冻结 `app-id`、三宿主数据根、`RUNTIME/store`/`RUNTIME/core`/`RUNTIME/host` 的具体路径、schema/receipt/tool contract 及 fixture/held-out digest；窗口切换、source durable acknowledgement、head 事件 CAS、07 §4 的 intent API/载体、08 §19a/27a 的同源抑制与 Info 原子性、10 §11/23a 的 stream owner/fence、MCP discovery schema 与本票 Pi 受控接线同样在 P0 冻结；Pi 的 API/配置、逐 transport 错误传播与进程排空证明须有可执行探针，不能仅声明存在接口。scope-review 的 source_event_id/handoff_id canonical bytes、pending retention fence、cursor inventory/replay、exclusive/inclusive watermark、overview file publish/recovery、repair continuation、store-wide `max_active_drains=1`、per-scope `max_active_scope_reviews=1` 的原子 claim、raw coverage 连续前缀、source scope/membership snapshot、`resource_identity@v1` normalizer/host profile 和 Core-gated evaluation plan/result seal 同样在 P0 冻结；overview body 使用内容寻址临时文件、fsync、原子发布、SQLite hash/cursor CAS 规则；schema v1 正式写入前只允许 disposable synthetic DB，禁止真实 memory/ledger 写入和 MC 导入。scope-review 的 outbox input_seq、快照/cursor CAS、typed artifact/input refs、关系 key/自触发结算、raw-backfill 枚举交接和硬预算 schema/数值同样先在 P0 冻结；P0 仅验合成接点，完整模型/Host 行为留在 P2/P3。
-2. **P1 durable foundation:** 实现 canonical identity/control（含 intent events/head）、memory revision/event/head、Host presentation/pending/Info state、projection outbox/lease 与 scope-only `projection_artifacts`/`projection_artifact_inputs`、input watermarks/cursor/反向失效、带显式 owner 的 execution ledger、owner fence/activity，以及 assembly/started 两道 durable barrier。以 X-01、X-03、X-06 为阶段门禁；这些门禁未通过前，停止上层写路径和真实 model dispatch。
-3. **P2 Core behavior:** 在 P1 之上接通 FTS/CJK retrieval、Context Orchestrator/budget/source recovery、scope/injection gate、memory lifecycle/Verifier/inert proposal、增量 scope review/关系 fixed point/overview 与有界 raw-only backfill、memory operations/purge 与 path/capability gate；以 X-02、X-04、X-05、X-07 及 X-09/X-13 的 Core/portable 部分作为本阶段门禁。X-08 为独立课程实验，不作为 P2 target runtime gate；运行时 integrity、known-bad/negative-transfer 拒绝及 inert-only 门禁仍须目标实现证据。课程 fixture 不替代 runtime 结果，Host-dependent 部分按 D8.2 在实际接线后补齐。
-4. **P3 host wiring:** 接通 Pi adapter、自研 CLI、四个 Host 操作、presentation/approval、pending、跨调用 continuation 和 Pi 首轮未 flush 处理；先执行 X-10 正常呈现/批准路径，再执行 X-11 故障恢复，逐 adapter、目标平台以 `X-10 ∧ X-11` 联合验收写门禁，分别保留 receipt。同时补齐 X-09/X-13 的真实模型/Host 重验或实际文件访问链，并复验 X-04/X-05/X-06 的实际接线边界；局部通过不开放证据未齐的生产能力，Host presentation 或 continuation 未通过时只保留允许的只读/诊断能力。
-5. **P4 physical and integration acceptance:** 按 `X-12 → X-15 → X-14` 完成容量/backup/损坏恢复/privacy purge、bundle 往返与真实 provider/cache 测量，再按 D7.2/D7.5 完成 shadow、hard gate、control baseline 与阈值封存；按 D7.4 提交 owner 后进行单一 project/session canary，其结果决定是否扩围，不再决定是否可回 MC。X-14 测量与 D7 control baseline、阈值封存衔接，最终性能/成本门槛在 canary 前判定，不能要求先性能 PASS 再取得 baseline。共享 Core 与可自动化的 OS 矩阵测试使用 Windows/macOS/Linux GitHub Actions；声明支持的平台，其 Host-dependent X-10/X-11/X-12/X-13、真实数据根/权限/进程恢复/UI 等行为必须有该平台真实宿主 receipt。P4 内不同能力可以在已有依赖满足后并行，未声明支持的平台不阻塞目标平台 canary。
-6. 阶段是可观察 gate，不是日历承诺。阶段内或阶段间失败按 D8.5 处理；不改变已冻结 owner、durability、privacy、authority 或安全边界的纯参数失败保持未冻结并回到真实数据重测。
+1. **P0 contracts and feasibility:** 固定首次切片的 app-id/数据根、Core/Host 路径、source carrier 与 durable ack、最小 intent/bootstrap API、head_event_id CAS、操作终态、Info 原子性、stream owner、started admission 线性化点及维护模式进程退出协议。产出可执行 synthetic schema/API/receipt fixtures；先验证 CLI 首轮归档、最后发送接点和维护独占三个高风险假设。前台/worker 预算固定字段与溢出/取消语义，使用有界可配置测试初值；DDL 在 disposable 阶段可调整，不先冻结最佳数值或生产迁移。Pi 探针可并行，但只约束 Pi 切片；MCP、overview/backfill、bundle、行为评估运行设施不进入首次 P0。
+2. **P1 durable foundation:** 实现 identity/intent、memory revision/event/head、Host presentation/pending/Info、search outbox/lease、显式 owner 的 ledger、进程登记/维护 fence 和两道 durable barrier。X-01 是 X-03 与 X-06 的共同前置；X-03 验实际 search worker，X-06 验发送记账，两者无须互相串行。三项首次切片子门禁齐备前不开放上层写路径或真实 model dispatch；不等待可选 overview 文件/语义设施。Memory 操作采用 08 的 transition contract。
+3. **P2 Core behavior:** FTS/CJK、Orchestrator/硬上下文与累计运行预算/source recovery、scope/注入 gate、低风险 memory capture/独立 verification/inert proposal、memory operations 与逻辑 purge、path/capability gate。验 X-02/04/05/07 和 X-09/13 Core 部分；缺 Host 实测不阻止实现 Host，但不能声称整卡通过。运行时安全/known-bad/inert-only 必须验；X-08 课程效果实验、行为 evaluation runner、scope review/backfill 不作为此阶段前置。
+4. **P3 first Host:** 首接自研交互 CLI，验四个 Host 操作、真实批准、pending/receipt/Info 与重启恢复，按该模式的 `X-10 ∧ X-11` 联合放行。补齐 X-09/13 和 X-04/05/06 的真实接线、未知请求对账/封存正常路径，以及预算取消/迟到结果。Pi regular、RPC/JSON/print 之后按同样语义逐模式接线，未启用模式明确 unavailable，不要求一起交付或自研额外 UI 框架。
+5. **P4 first-slice acceptance:** X-12 验实际 Windows 宿主的容量、backup、维护模式 purge、损坏/中断恢复；X-14 在 ledger/transport 及受控测试前置满足后即可测 provider/cache，与 X-12 可并行，不依赖 X-15。首次真实数据前，首次切片使用的全部路径须通过相应存储/Host/backup/purge/recovery 门禁并正式冻结 schema。D7 的 shadow/hard gate/control baseline/预注册阈值齐备后，才按单向 owner 提交与 canary 扩围；合成 provider 探针不等于真实数据许可。X-15 仅在 bundle 启用前完成，不阻塞本地首次切片。
+6. 阶段是依赖 gate，不是禁止早期纵向合成探针的瀑布开发。共享 Core/portable 做三平台 CI，生产只声明实际宿主已验证范围。后续能力通过增量 schema、清除/恢复与自己的 Core/Host gate 后启用；未启用不预建空表，也不能把 deferred 记成 PASS。参数按观测调整，不扩大权限或削弱数据不变量。
 
 ### D8.2 Decision — X-card mapping and completion gates
 
@@ -150,26 +152,26 @@ Blocked by: 05, 06, 07, 08, 09, 10, 11, 12, 14
 
 | 实验 | 实施阶段 | 完整验收边界 |
 |---|---|---|
-| X-01 | P1 首项 | canonical schema/事务与 Host 状态表，以及 scope-only artifact/input refs、水位/cursor、typed evaluation_plan/result、sealed-start barrier、append-only result、FK/reverse-ref 和完整 digest 的存储约束；portable SQLite 证据与目标数据根/权限证据分列。 |
+| X-01 | P1 首项 | 首次切片的 canonical/intent/Host/ledger/outbox/fence schema、事务/FK/CAS/identity、完整 digest 与 inert proposal；不预建可选 artifact 或行为评估表。Portable 与实际数据根/权限分列。 |
 | X-02 | P2 | P1 投影基座之上的 target FTS/CJK 检索；课程检索结果不能替代。 |
-| X-03 | P1，X-01 后 | 实际 search/FTS worker、租约、损坏重建与查询复算；scope artifact 的内容寻址文件写入/fsync/原子发布、publish operation owner/fence、metadata/cursor CAS、orphan GC、已有 pin 损坏正文的 `repair_required→repairing→fresh|failed|evidence-gap` 受控同 hash 替换、repair continuation/recovery 与 query 复算，不只验证 DDL，不要求 P2 语义生成先通过。 |
+| X-03 | P1，X-01 后 | 首次只验实际 search/FTS worker、lease、乱序/重复/崩溃、损坏重建和查询复算。Overview 后续子项验 SQLite body/refs/cursor 原子提交、历史保留与新 generation 重建，不验外部文件/pin/GC/同 hash repair。 |
 | X-04 | P2；P3 接线复验 | Core admission、预算、ReAct 与 archive/source recovery；真实 Host dispatch 接线后复验相应边界。 |
-| X-05 | P2；P3 补齐 | Core scope/injection gate；实际 resource-owner/path 集成与 X-13 的 Host 证据汇合。 |
-| X-06 | P1，X-03 后；P3 接线复验 | assembly/started barrier、杀点和 unknown-sent；逻辑杀点与目标进程/文件系统证据分列，真实 transport 接线再验 payload/flush/dispatch 顺序。 |
-| X-07 | P2；P3 source/装配接线复验 | 目标 memory lifecycle、独立取源 Verifier 与可复算 assembly，加 scope-review 并发水位、跨 scope 依赖、预算、关系 fixed point、raw-only backfill，以及 evolution proposal 的 plan/result Core admission、required level/held-out/checkpoint 不可降低或替换、缺失/错误绑定保持 inert；依赖 P1 的 stream owner、intent、Info、scope artifact/outbox 和 evaluation plan/result 持久化，真实 source/Host 部分接线后补齐。 |
-| X-08 | 独立课程票；P0 先封存 | 保留完整正向改善、held-out 零回归与负迁移效果实验；不作为 P2 target runtime gate，不替代运行时安全证据。 |
+| X-05 | P2；P3 补齐 | 首次验 12 的 Core/CLI 通用隔离组，实际 resource-owner/path 与 X-13 汇合；MCP binding/discovery 和 Pi loading 分别在相应能力启用前追加，不互为前置。共享不变量失败仍阻断所有受影响路径。 |
+| X-06 | P1，X-01 后；P3 接线复验 | assembly/started barrier、admission 与撤销的并发顺序、杀点、unknown-sent 及显式对账/封存；不依赖 X-03。真实 transport 接线复验 payload/flush/dispatch/取消，mock 不升级物理证据。 |
+| X-07 | P2；P3 source/装配复验 | Memory lifecycle、独立取源、冲突/时间、抑制/rollback、Info 与 inert proposal 无行为权限；只依赖启用路径的 P1。Overview、跨 scope 关系和 backfill 为后续独立子项，行为评估执行不在 v1。 |
+| X-08 | 独立课程票 | 课程效果实验运行前才封存其 owner pre-image/held-out；不阻塞首次 P0，不替代目标运行时安全/完整性。 |
 | X-09 | P2 Core；P3 Host | P2 验证 CAS、batch 与逻辑 purge；P3 补真实模型 tool-call、originating input 重验和呈现闭环；物理副本 purge 归 P4 X-12。 |
-| X-10 | P3 正常路径 | 逐 adapter/consumer 验真实呈现与批准；完整 PASS 必须同时包含 X-11 故障点，不能单独放行写能力。 |
-| X-11 | P3 故障恢复 | 在 X-10 路径上验 durable pending、continuation 与首轮未 flush；与 X-10 联合关闭该 adapter 的写门禁。 |
-| X-12 | P4 首项 | 依赖已有 ledger、逻辑 purge、projection、archive/source 与 Host operation state，覆盖恢复、容量及全部受控副本的物理 purge。 |
+| X-10 | P3 正常路径 | 首次交互 CLI、之后逐 adapter/mode 验呈现与批准；每个已启用模式必须联合 X-11 放行，不能因其他模式 deferred 降低本模式保证。 |
+| X-11 | P3 故障恢复 | 按 12 的首次 CLI 必测组验证首轮 source、pending/commit/Info 和维护恢复；后续模式启用前追加各自 source/consumer/continuation 子项。与同一 adapter/mode 的 X-10 联合验收，不以 CLI PASS 代替后续模式。 |
+| X-12 | P4 | 已启用路径的 ledger、archive/source、Host、projection、backup/恢复和所有受控副本维护 purge；先验退出/独占再删除，不要求在线 UI/cache quiesce。 |
 | X-13 | P2 Core；P3 Host | P2 parser/policy 子门禁；P3 走实际 parse→normalize→policy→open 全链并核对 file ID，验证 `resource_identity@v1` 的 bounded decode、Unicode/case/UNC、symlink/junction、URL origin/redirect 和 `applies_to` wildcard 规则；目标宿主证据齐备后才开放对应文件/URL 能力。 |
-| X-14 | P4，X-15 后 | 真实 provider/cache/性能测量；最终性能门槛结合 D7 control baseline 与预注册阈值判定，不把本实验后置误作禁止此前受控真实模型测试。 |
-| X-15 | P4，X-12 后 | Windows export→macOS import/re-export→Linux import/re-export→Windows import；三平台 runner 可完成 portable 环路，真实 Host/filesystem 集成按目标平台补齐。 |
+| X-14 | P4；可早期受控测量 | 依赖 X-06/真实 transport 与相关 Core gate，不依赖 bundle；最终性能门槛结合 D7 baseline/预注册阈值判定。 |
+| X-15 | Bundle 切片 | 启用前验 selector/完整闭包/导入重验/幂等/purge 排除与三平台 runner 往返；扩展的清除/恢复先有 X-12 证据，不是首次本地上线前置。 |
 
-1. P0 先封存契约与 fixture/held-out 身份和判定规则，不宣称实验通过。X-02 的套件 locator/case IDs/digest、X-08 的 owner pre-image 与封存/释放顺序、X-10 的摘要字段白名单与最大序列化 bytes 均按 Ticket 12 的时机落实；尚缺的制品保持 `evidence-gap`，本次不自拟数值或补写虚假 receipt。
+1. P0 准备首次切片可执行契约与 fixture 身份/判定规则，不宣称运行通过。X-02 以冻结的本地需求覆盖语料为必需基线，历史 60 用例可取得则追加，不把不可取得的外部套件设为开跑前置；替代/来源/覆盖差异明确登记，测试后不得换 gold 降门槛。X-08 在该独立实验前封存，X-10 在对应模式测试前固定摘要字段和 bytes 上限。缺制品如实报缺，但不虚构已有 receipt 或“最优”参数。
 2. Core/portable、课程和 Host-dependent 结果分别判定。X-09/X-13 可在 P2 完成子门禁、P3 补齐实际闭环；不得要求 P2 整卡 PASS 才能实施其所依赖的 Host 接线，也不得凭子门禁开放证据未齐的生产能力。X-09 所需真实模型调用可在 barrier/安全前置满足的受控测试路径完成，不推迟到 X-14，也不以 mock 替代。
 3. X-08 另票完成，不扩张生产 v1；P2 的 integrity、known-bad/negative-transfer 拒绝和 inert-only 门禁仍按 D7.5 取目标实现证据。任何课程 PASS 都不能关闭运行时门禁；任何 schema-only 检查也不能把 X-08 的完整效果实验标为 PASS。
-4. 阶段通过不解除合成 DB 边界；正式 schema v1 和真实 memory/ledger 写入仍须满足 Physical contract 的全部前置，包括 Host receipt、backup、purge 与恢复。X-card 通过也不自动授权 canary/cutover，D7 的唯一 live context unit、shadow、capability × host、hook ownership 与 durable epoch 门禁不变。三平台 CI 与 Windows-first 按 D8.3/D8.4 执行，三轴状态仍分别更新。
+4. P0/P1 不解除合成 DB 边界；首次真实 memory/ledger 须满足首次切片全部已启用路径的 Physical contract，包括 Host receipt、backup、维护 purge 与恢复，正式冻结初始 schema。后续未启用能力不阻塞，新增持久能力须前进迁移和增量验收。X-card 通过不自动授权 cutover，D7 唯一 context unit、shadow、owner 互斥与 durable epoch 不变；三平台 CI 不等于三平台生产支持。
 
 ### D8.5 Decision — global fail-closed and local degradation
 
@@ -201,10 +203,10 @@ Blocked by: 05, 06, 07, 08, 09, 10, 11, 12, 14
 
 ## Decisions — Physical contract
 
-1. 在全部 v1 表族、约束、CAS、事件重建 head、Host presentation/pending/receipt、projection outbox、backup、purge 与失败回滚门槛通过前，只使用合成、可删除数据库；禁止真实 memory/ledger 写入和 MC 导入。冻结产物为 `migrations/001-initial.sql`、schema version、DDL SHA-256 与对应 Git commit。冻结后 `001` 不改写，只能增加前进迁移；迁移前建立恢复点，未知更高版本拒绝打开。
-2. v1 最小 DDL 采用 Ticket 10 的关系型公共核心：identity/control（`schema_meta`、`projects`、`project_resources`、`workspaces`、`workspace_projects`、`intent_events`、`intent_heads`）；memory（`memory_records`、`memory_revisions`、`memory_heads`、`memory_events`）；ownership/evidence（`provenance_refs`、`conflict_sets`/members、`capture_jobs`、`verification_runs`/evidence、`feedback_events`、`evolution_proposals`（含 Core-gated typed `evaluation_plan`/`evaluation_result`、`evaluation_plan_events`/sealed plan snapshots、append-only `evaluation_attempts`/`evaluation_results`、canonical plan/result digest、owner seal、plan seal barrier、attempt binding、superseding 引用与 purge reverse refs））；execution（`execution_streams`、typed `execution_events`、结构化 reverse refs 与可清除 manifest payload）；v1 projection（`projection_jobs`/outbox、`projection_state`、`projection_leases`、scope-only `projection_artifacts`/`projection_artifact_inputs`、`projection_publish_operations`/`projection_artifact_pins`、typed `scope_review_watermarks`/`scope_review_missing_intervals`/`projection_dependency_edges`、`search_documents`、external-content `search_fts`）；maintenance（`purge_receipts`、`owner_fences`、`owner_activities`）；字段/约束分别满足 07 §4、08 §27a 与 10 §11/23a/Scope-review projection contract。artifact 元数据及可反查 input refs、水位/cursor、稳定 relation key 进入 `001`，具体列/FK/索引按 P0 冻结，P1 验实际存储，P2 验 review 语义。当前不纳入 `operation_receipts`、embedding、通用图、插件 registry、云同步、完整 source/archive 表或其他生成式文件能力；Wiki/insight/diagram 的新消费者未来独立定案，不借 scope-only 表自动启用。
+1. 首次切片实际使用的表族、约束/CAS/head 重建、Host presentation/pending/receipt、outbox、backup/维护 purge 和恢复通过前，只用合成可删除库。P0 固定身份、接口、事务边界和失败语义；正常路径/故障 fixture 可推动 disposable DDL 调整，不编写原型兼容迁移。首次真实数据前才正式冻结 `migrations/001-initial.sql`、schema version、DDL SHA-256 与实现 commit；以后不改 `001`、只前进迁移，有恢复点，未知更高版本拒开。后续未启用能力不阻塞首次许可，也不因设计已存在就预建空表。
+2. 首次最小 DDL 按 10 §7：identity/intent、memory revision/event/head、provenance/conflict/capture/verification/feedback/inert proposal、显式 owner 的 execution stream/event/reverse refs、search outbox/state/lease/FTS、Host presentations/pending、content-free purge receipts 与进程登记/维护 fence。不建行为 evaluation plan/attempt/result 表族。Scope review 启用前增加 SQLite 有界 body/typed input refs/cursor；不建外部 publish/pin/GC/repair 表。Raw-backfill 进度 schema 到该能力实施时定案。列/FK/索引按实际操作和查询收窄，逻辑 owner 不自动变成独立 package、服务或表族；无 embedding/通用图/registry/云同步。
 3. `host_presentations` 与 `pending_operations` 是 Host-owned operation state：前者保存不可变 canonical snapshot/diff、presentation 顺序、token/payload digest 与 durable acknowledgement，也以不同类型记录 Info batch manifest/投递及显式 read ack；batch 唯一身份和 mutation event 真值仍来自 08 §27a，不能按卡片数量生成第二份批次。后者保存跨调用 pending/终态、expected revision/`head_event_id`/manifest 与 receipt 引用，并按 10 §23 保存已结算 purge 的最小 cleanup continuation；仅 `state='pending'` 是等待批准，清理状态不另占批准槽；`UNIQUE(session_id) WHERE state='pending'` 建在 pending 层。真实 memory mutation 的不可变 owner receipt 仍在同一事务追加到 `memory_events`，两张 Host 表不成为第二份 receipt 真值，也不写入 `execution_events`；execution ledger 只记录模型 attempt、assembly 与 context lifecycle。
-4. Insight 的规范本体是 verified canonical memory。scope-review 的 `scope_overview` 是 v1 已批准的 scope-only、非权威 app-data projection，使用 `projection_artifacts` 与类型化 input refs，writer 为 Core review worker，reader 为 Orchestrator，受 P1/P2 的 CAS/stale/purge/recovery 门禁约束。Wiki、insight 页面和架构图仍暂不生成，也不能复用 scope metadata 冒充自己的消费者契约；未来启用须独立契约和前进迁移。overview 文件可删除重建，不能静默写回 canonical memory 或项目仓库。
+4. Insight 本体仍是 verified canonical memory；scope_overview 是后续非权威 SQLite 派生正文，writer 为现有 worker、reader 为 Orchestrator，与 refs/generation/cursor 同事务提交。新生成版本用新 identity/hash，旧 assembly 所引用字节不能被新摘要替代；历史保留、失效和 purge 按 10。Wiki/insight/diagram 文件继续 deferred，不因 overview 存在而自动启用。
 
 ## Decisions — Background work wiring
 
@@ -213,7 +215,7 @@ Blocked by: 05, 06, 07, 08, 09, 10, 11, 12, 14
 3. Historian 只读取 immutable raw archive，在完整任务边界、可压缩前缀形成或 token 压力时运行。每段原文只生成一次稳定 compartment，记录 range、原文 hash、compartment hash、model attempt ID 和 locator；原文及正文由 session/archive owner 管理，数据库保存 locator、hash 与 metadata。Historian 失败只保留 raw history，不落残缺摘要。
 4. 当 archive 与恢复入口已经就绪时，允许选择 fresh-window rollover 而不生成新的有损 summary；窗口切换必须写入 Host-owned lifecycle/ledger receipt，并由 Context Orchestrator 重建有界、可验证的 baseline。该路径不替代 raw archive、immutable compartment、source recovery 或唯一 prompt assembly。
 5. canonical head 变化时，在同一事务中追加 `projection_jobs`。自动 active 更新同时按 08 §27a 固定 batch identity/有序成员并写 `kind=host-info` outbox；consumer 幂等补 Host manifest/unread/投递，失败不重做 activation。FTS 与 Info 使用不同 job type/幂等键，不能以 FTS 的 current-head 覆盖旧批次成员。FTS/projection worker 确定性读取 current head，以 revision/hash/generation 幂等更新；失败标记为 `dirty/failed`，不得静默返回旧索引并假装是最新结果。
-6. v1 的 scope review 按 08/10 的单一 outbox 水位、快照/cursor CAS、反向依赖、关系 fixed point 和累计硬预算生成可选 overview；用户明确的历史梳理、首次导入或恢复才复用 source owner/capture 管线做 raw-only 分批 backfill，标明 processed/evidence-gap 及覆盖边界。Wiki、insight 文件或架构图仍不生成；Insight 先作为 verified canonical memory，其他未来文件投影另行定案。scope projection 失败只降级自身，不阻塞普通 memory lifecycle。
+6. Scope review 与 raw-backfill 是独立后续切片：先当前 project 的有界 SQLite overview，再按需求增加跨 scope/关系维护/历史覆盖；08/10 定义准入、cursor CAS、预算、历史证据与清除边界。未启用时不启动 worker，不影响 memory lifecycle 或单次 source recovery；没有全量分析能力就不宣称全部历史已处理。Wiki/insight/diagram 文件不生成。
 7. worker 采用进程内 cooperative drain，不建 daemon、IPC 或通用任务框架；在宿主启动、canonical 写入后、`agent_end`/空闲期及显式 maintenance 时运行。每次只获取短租约、处理有界 batch 和 deadline；快速通道未完成时记录 pending/blocked，不阻塞主 Agent，也不伪装为 active。
 8. 一次 lease 只执行一条 primary + fallback chain。仅超时、限流、暂时不可用、协议或结构化输出失败可有界重试；`integrity FAIL`、语义 `block`、`evidence-gap` 只有在 source 变化或显式 maintenance 后才能重新验证。`started` 无 `finished` receipt 时记为 `unknown`，先查询实际状态，不盲目重复执行；重复失败进入可观察 `blocked`。job 以 owner revision、输入 hash、generation 幂等，重启可接管过期 job lease 但不能重复 mutation 或 receipt，也不能据 lease 到期宣称旧进程已无外部写能力；purge 的终止证据按 10 §23a。后台 stream 按 10 §11 绑定实际 job/maintenance/migration owner，快照恢复 gap、来源 purge 和晚到结果均先对账或隔离，不借新 session 重发。
 
@@ -232,7 +234,7 @@ Blocked by: 05, 06, 07, 08, 09, 10, 11, 12, 14
 ## Decisions — App identity and runtime topology
 
 1. 产品名为 **Euler**，稳定 `app-id` 为小写 `euler`；它标识整个个人 Agent，而非仅 memory/context 子系统，也不绑定 Magic Context、Pi、`.pi` 或课程仓库名。
-2. 每宿主、每 OS user 的数据根固定为 Windows `%LOCALAPPDATA%\euler\`、macOS `~/Library/Application Support/euler/`、Linux `${XDG_DATA_HOME:-~/.local/share}/euler/`；各自包含 10 已定案的 `store.sqlite3`、`projections/`、`backups/`，不得跨宿主共享 SQLite 文件。
+2. 每宿主、每 OS user 的数据根固定为 Windows `%LOCALAPPDATA%\euler\`、macOS `~/Library/Application Support/euler/`、Linux `${XDG_DATA_HOME:-~/.local/share}/euler/`；store/backup 与 owner 绑定的 instruction/source 目录分别管理，不为未启用文件投影创建 `projections/`，不得跨宿主共享 SQLite 文件。
 3. v1 只有一份共享 TypeScript core implementation。Control Plane、Context Orchestrator、canonical store、memory lifecycle/gate、retrieval/source recovery gate、Host-owned execution ledger、capability/tool dispatch gate 与后台作业状态机封闭在 core；不让两个宿主各自复制这些不变量。
 4. v1 不建 daemon、IPC 或网络控制面。Pi adapter 与 Euler CLI 在各自进程内直接加载 core；跨进程并发由 SQLite WAL、事务、CAS、短 job 租约及 10 §23a 的 durable owner fence/activity 协调；外部资源不因同库而自动获得事务原子性。
 5. Pi adapter 复用 Pi 稳定 `Agent`/`AgentSession`、tool loop、session/source surface 与 受控 provider transport（按下节先关闭原生内容选择/额外发送路径）；Euler CLI 只复用 `@earendil-works/pi-ai` 的 provider/model 接口，自有 Agent loop 与 TUI。两者的 adapter 只做宿主事件/session/source/transport 转换及 14 的四个呈现操作，不直接写 canonical 表、不自行批准 mutation，也不复制预算或安全规则。
@@ -243,7 +245,7 @@ Blocked by: 05, 06, 07, 08, 09, 10, 11, 12, 14
 
 ### Pi runtime ownership and startup contract
 
-以下是已批准的接线路径，需在 P0 钉住实际 Pi/Node/adapter 版本和探针、P3 验完整消费者，不表示当前安装已受控：
+以下是 Pi 切片的接线路径，不是首次 CLI 的前置。先钉住该切片实际 Pi/Node/adapter 版本，用合成探针证明首轮 source ack、最终发送 gate 以及正常输入/维护退出，再决定支持哪些模式并接完整 Core/Host。探针失败先收窄该模式或记录不可行，不通过更多 wrapper 或全部禁用主流程假称支持；不表示当前安装已受控。
 
 1. `packages/pi` 在受控 SDK bootstrap 中创建 Pi `Agent`/`AgentSession`，复用其 UI/tool loop/会话能力；使用 versioned ResourceLoader 的封闭输入，加载前只接受构建时已批准的 Euler adapter artifact、入口和依赖内容 hash。allowlist 初始只有该 adapter，不建用户维护的扩展市场或签名体系；不导入用户/项目自动发现的扩展、settings 中额外路径、CLI `-e` 或未批准 inline factory。`noExtensions` 只禁自动发现，`additionalExtensionPaths`/factory 仍可能加载；`extensionsOverride` 在加载后执行，不能当代码执行前的防线。必须在 import/factory 之前决定集合，再校验实际 loaded set/hook/tool owner 与预期一致；不合格就不创建 live runtime。loader/settings 在新建、resume/fork、cwd 切换和 reload 时仍使用同一封闭规则，旧实例停止 dispatch 后才能替换。
 2. Core 提供完整 instruction、intent 与 context snapshot；默认 AGENTS/Skill/template 的自动注入必须禁用或由受控 loader 返回 Core 已选集合，不能再叠加一份。Pi auto-compaction 通过进程内 settings `compaction.enabled=false` 关闭；manual/overflow/tree summary 入口取消 Pi 原有生成，转由 Euler 已定 raw-only/fresh-window 路径处理。取消失败或出现非 Core summarization 请求由 transport 拒绝，不能默认 fallback 到 Pi。`context`/`before_agent_start` 仅为 Euler 宿主转换，`convertToLlm` 不拥有裁剪、摘要或改 scope 的权限；重放有旧 Pi compaction 时仍从合格 archive 重建，不把旧 summary 当唯一来源。
@@ -255,20 +257,20 @@ Blocked by: 05, 06, 07, 08, 09, 10, 11, 12, 14
 
 ### Source/archive contract on HostAdapter
 
-P0 必须在既有 versioned `HostAdapter` 内冻结以下语义、实际载体/受控根及 Pi/CLI 各自可兑现的 API，不新增 source 子系统、数据库表族或通用 registry。只有接口草图或 Pi entry ID，不算完成该项 P0；真实行为仍由 X-04/X-09/X-12 验证。
+首次 P0 在 versioned `HostAdapter` 内落实 CLI 的实际 source carrier/root、API 与下列契约；Pi 在自己的切片接线前另验，不阻塞 CLI。只有接口草图或 entry ID 不算可兑现：要有 synthetic 首轮 append/read/重启正常与失败探针。复用各 source owner 的载体，不另建通用 source registry；raw 全量枚举设施仅在 backfill 切片启用前加入。
 
 1. **绑定与身份：** 每个 source/archive 绑定真实 owner、host/session、logical scope、受控 root 与 immutable locator/version/hash；调用者不能自报更高 scope 或切换 owner。仓库文件、外部 source 仍归原 owner，Core 只持验证后的引用及 gate。
 2. **append 与恢复确认：** 原始事件先由 owner 按稳定 event identity/hash 追加并 durable flush，返回可重启后复读的 locator/hash/commit acknowledgement；在 Core handoff ack 前 source owner 以 pending retention fence 保留正文、逐项 inventory 和 source_event_id，Core 可按不可变 identity 重放，不只依赖可变 cursor 高水位。相同 identity+bytes 重放幂等，identity 相同而内容不同即 integrity failure；unknown 先按 identity 查询，不能当成功或重复追加。未取得 durable acknowledgement 时，不创建 dependent capture job、不卸载原文、不通过依赖该输入的模型 dispatch。Pi 首轮未 flush 的内存 session entry 不能满足该条件；若当前 adapter 不能提供合格持久载体，显式 unavailable，不能靠发出首个模型请求来绕过前置。
 3. **read/expand：** 请求携带 locator、scope 和有界 offset/limit；返回原始版本与总范围/截断信息，并能对恢复 bytes 校验 hash。失配、越权、缺失、已清除或 stale 均明确报缺，不以当前版本或摘要替代。Archive 已持久而 canonical capture job 尚未提交时重启，可按原 event identity 补 job；反向存在 job 却无 archive ack 时阻断，不制造原文。
-4. **retention/purge：** 每个 owner 说明受控根与不可控残留，支持 10 §23a 的 fence admission、跨进程 activity/quiesce ack、结构化 manifest、实际 resource identity 重验、幂等删除及 durable acknowledgement；未知结果先查证。只有读取权限的来源不能假称已删除。按 10 §23 汇总各 owner 的实际后置条件，清除中的内容禁止正常恢复或再捕获；缺 ack 不能签 controlled-complete。接口版本、root/identity 变化必须使旧 capability/receipt 失效或重新验证，不能静默扩权。
+4. **retention/purge：** 每个 owner 说明受控根与不可控残留，支持 10 §23a 的启动 admission、进程登记/维护退出与结构化 manifest，实际 identity 重验、幂等删除及 durable ack；首版不要求在线细粒度 quiesce。仅有读取权限的 source 不假称删除；已承诺受控者失联仍 blocked。清除中的内容禁止恢复/再捕获，缺 ack 不签完成；接口/root/identity 变化使旧绑定失效或重验，不静默扩权。
 
 ### Pi P0 public-API probe boundary
 
-以下是既有 bootstrap/HostAdapter 内、以 Pi `0.85.1` 公开 API 为依据的可构造接线路径，不是目标实现或运行 PASS。P0 冻结具体版本、接口/格式和 synthetic 接点探针；依赖完整 Core、Host consumer 或物理恢复的验收仍按 D8 在原 X-card 的相应阶段完成。公开字段或一次成功回调本身不算全链通过。
+以下是历史 Pi `0.85.1` 源码推导的候选接线，不是当前安装保证。这里的 Pi P0 指 Pi 切片自己的可行性探针，可并行探索但不阻塞首次 CLI；实际版本/bytes 必须重新绑定。先证首轮 ack、最终发送及正常输入/维护退出，再冻结该模式接口；依赖完整消费者/物理恢复的结果仍按 X-card 分层。公开字段或一次成功回调不是全链 PASS。
 
 1. **同一 Pi carrier 的首轮 ack：** 在 Core 已登记 owner/root activity、live AgentSession 尚未创建时，排他准备新的正常 Pi JSONL，并通过公开 `SessionManager.open` 初始化；已存在的空文件会写合法 header，使后续无 assistant 的 append 也实际写文件。也可先持久保存公开 `getHeader()` 取得的原生 header 再 open，以保留已选 session id。空文件重新初始化会生成新 id，不能拿它恢复已绑定但意外丢失/变空的 session；非空分支必须保留完整 header/entries，不能只播种 header 丢掉已有事件。SDK 初始化会追加 model/thinking 等 metadata，所以持久载体准备与公开 append 包装须先完成。HostAdapter 对同一实际 file identity 在 append 后 fsync、严格复读 event bytes/hash，再签 source ack；公开同步 `append*` 仍返回原同步结果，不能改成无人 await 的 Promise。Pi 的 `flushed`、内存 leaf/entry 或 `message_end` 通知都不是 ack。P0 冻结 stable raw-event identity/domain 与 native entry 的映射、去重及恢复格式；可复用同一文件的原生 custom entry，不伪造 assistant、不新增 source owner/表族或调用私有持久化方法。unknown 按原始文件严格查询同 identity/bytes，不盲重写，不只查当前 branch 或信任会跳过坏行的原生 loader。new/resume/fork/reload 每次重新绑定都重验受控根、实际文件、完整事件序列与 fsync；resume 缺失/损坏不被当成合法新建，factory 之前发生的 open/复制也须先有外层 admission。X-04/X-11 验正常首轮、幂等、未知/部分写与重绑；文件/目录 durability 和 file identity 按真实宿主记录，不把仅重启复读升级为断电证明。Host presentation/approval 的权威仍是 14 的 Host-owned 记录。
 2. **保留原 Pi 界面的输入接线：** P0 以 Pi 自带 `regular` 界面冻结公开接点和 synthetic 探针；完整 Euler 呈现/批准主流程仍在 P3 按 X-10/X-11 联合验收。受控实现公开 `EditorComponent`，保存 Pi 在 factory 后赋入的 `onSubmit` callback，经 Core gate 后才委托；只在 factory 中一次赋值会被覆盖。adapter 持有自己创建的实例，在公开 app action Map/特殊 callback 完成复制后包装实际动作，或以前置 `handleInput` 分发。异步 gate 先消费并冻结展开后的文本/action/runtime identity，再自行跟踪完成；不能假定 void callback 会被 Pi await。Alt+Enter、paste/autocomplete、图像临时文件、外部 editor、selector 内实际选择/删除/rename 均各有前置 gate；可受控组合 SDK 已有 selector 的公开 callback，不只守打开 selector。`/share` 必须在进入原生副作用链前接 Core 或 unavailable，单包 export 不够。公开 session/runtime factory/rebind 及对象 wrapper 只转入同一 Core，保留 receiver、同步/异步返回和错误语义；startup/reload/new/resume/fork 替换期间保持 admission 关闭，复核所有绑定后才开放，失败不得恢复直通默认 editor。RPC 的 steer/follow-up/bash/export 和 JSON/print initial prompt、extension command 另验，不能继承 TUI 输入探针的 PASS。fullscreen viewport 可早于后加的 raw input hook 消费鼠标并打开链接/复制；未取得更早控制证据时不开放这些附加路径，切换到未验证模式也须在实际切换前拒绝，仅拦 settings 写入不够。不使用 private mode patch、新 TUI 或通用黑名单框架；未接入附加能力须真正 unavailable，不能用全部禁用 Euler 主流程冒充 14 的 full。
-3. **session/window activity 的释放：** 从第一次读取 source、构造含内容 runtime 前登记已有 owner activity，持续覆盖 SessionManager/Agent、next-turn/steering/bash/TUI 队列、展示、editor history/undo/paste、provider continuation 及迟到 callback。短 run/transport activity 结束时，内容若还存在，必须仍由有效 session/window activity 覆盖。公开 append 在调用原方法前重验 fence/epoch；closing 后的晚到 append 不得进原生写入。底层 `session.agent.subscribe` 会依序 await，可在内部持久化后观察；`session.subscribe` 不 await 异步 listener，adapter 必须自行 join/取消这些工作。agent_end 之后仍可能续跑，agent_settled/waitForIdle/dispose/清空可见 editor 均不能单独证明所有输出能力消失。先关闭 admission，join 受控 Promise、pending flush、独立 shell/compact/navigation 和回调，再失效全部旧 window/cache；不能在正被 Agent await 的 handler 内等待同一 run 结束而自锁。公开 API 无法证明失效时沿用 10 §23a 的真实进程及子任务退出/残留证明与维护重启路径，不按 timeout 签 ack。证据齐备才 quiesce、重验 manifest 并进入原分阶段清除；X-12 必须覆盖最后 transport 之后/append 之前、异步 subscriber、post-run/UI 延迟发布、旧 undo/next-turn 复活及正常完成。
+3. **维护退出：** Pi 切片从首次读取 source 前登记实际 runtime process/root/epoch，source append 和 transport 重验 fence。Purge 只由独立维护入口在旧 Pi 进程及受控子任务真实退出、残留核验和独占取得后执行；无需证明运行中每个 UI/history/undo 缓存已被逐项清空。agent_end/idle/dispose/窗口消失/lease 超时不等于退出，不在被 await 的 handler 中等待同一 run 自锁。X-12 验仍活跃进程、迟到 append/子任务及正常退出对照；旧进程未停时不得逻辑删除，重启不能恢复已 purge 的 source/pending/cache。在线 quiesce 将来有需求再单独验收。
 
 ## Decisions — Prompt/cache ownership and ordering
 
@@ -324,6 +326,8 @@ P0 必须在既有 versioned `HostAdapter` 内冻结以下语义、实际载体/
 3. 每个 Core 工具在源码中拥有稳定的 `tool_name@schema_version` 与 canonical schema hash，例如 `memory.search@v1`。schema 的字段、参数约束、返回结构、关键描述或权限语义发生外部可见变化时，产生新的 schema identity；不原地改变已发送请求使用的 schema。Git 中的 schema 常量和实现是权威，不建通用 tool registry 或数据库版本表；assembly/attempt receipt 记录 tool name、schema version 与 hash，schema 变化创建新的 assembly 与 cache epoch。
 4. Tool schema 只描述调用契约，不授予权限。每次模型 tool call 都必须由 Core 重新检查 active policy、capability、credential、scope、参数、真实 resource owner、审批条件与 receipt；AGENTS、Skill、memory/source、provider metadata、`allowed-tools` 或模型自述不能修改 schema 或放宽 gate。tool result 是有界的不可信数据，不能反向激活指令、改变 scope 或注册新工具。
 5. 文件、命令和交互能力不归 Core 实现。Pi 的 `read/write/edit/bash` 等以及 Euler CLI 的对应宿主工具由各自 HostAdapter 提供；Core 只拥有统一的 schema admission、policy/capability/resource gate、调用生命周期与 receipt。HostAdapter 是既有宿主接入边界，不是可由任意第三方调用的插件 registry；宿主没有某项能力时返回 `unavailable`。
+
+   路径解析/文件 API gate 不约束任意 shell/脚本内部的文件、网络和子进程行为。首次切片不向模型直通未隔离的任意执行工具；owner 需要运行时，可通过真实 Host 的高权限维护动作明确批准具体命令、cwd 和实际权限范围，这不宣称为 sandboxed 模型工具，也不作为 Core 隔离 PASS。后续开放模型执行能力前，须明确并验证真实执行环境的隔离边界，或明确采用逐次 owner 批准的高权限模式；不得把后一种包装成 root 限制。产品数据根/canonical store 是否可被进程直接访问必须明示，不以“同用户攻击者不在威胁模型内”掩盖已提供工具的权限。Skill 激活不授权脚本；无需先自研沙箱。
 6. v1 不提供通用 Euler plugin tool registration，不动态加载同进程 JS/TS tool handler，也不允许 Pi extension 在 `euler-active` 下绕过 Core 直接把工具送入 Pi tool loop。第三方工具优先通过 D6.5 的 MCP 或进程外 provider 接入；若未来出现 MCP 无法覆盖的真实消费者，再单独设计带 manifest、schema hash、scope/capability、隔离、超时/取消与 receipt 的进程外 `ToolProvider` 协议。当前不预留空 registry、plugin_tools 表或假定的公共插件 API。
 7. 少量固定 Core schema 放入 P0；大量可选工具不进入 Core，具体 MCP 的发现、描述、注入、命名冲突和优先级已由 D6.5 定案。Provider adapter 可以转换 Core schema 的 wire representation，但不得增删、重排或语义改写已冻结的 tool contract；动态工具也必须服从 D5.4 的最终 transport barrier。
 

@@ -56,24 +56,35 @@ Blocked by: 01, 03, 05, 06
 同一来源内容换 capture event、重复导入、路径别名或摘要重述不能绕过抑制；同 lineage 的新版本若仍表达同一被忘记 claim，只追加合格证据/候选并保持抑制，不自动恢复旧 record 或另起同义 active record。不同 owner/scope/claim 或可证实不同有效期的独立新事实按 08 §9 重新验证，不按全局正文 hash 连带封禁；不承诺识别任意跨来源语义抄写。只有独立 owner restore 通过当前资格/CAS 后才能解除该 record 的抑制并继续 correct；验证未过的恢复内容仍不得正常注入。restore 事件保留原 tombstone 历史并移动 head_event_id，旧 preview 永不复活。抑制字段属于正文可关联数据，purge 必须清除，不能把 forget 规则偷作 purge 后的永久内容指纹。
 20. 生命周期维护以 source-change、时间索引和 feedback event 驱动，周期扫描仅作漏处理恢复，不每晚让 LLM 重审全库。任何自动重验、退役或回滚仍通过同一 Harness gate 和 append-only transition receipt，不允许维护任务原地改写历史记录。
 
+### Canonical transition contract for implementation
+
+以下是 P1/P2 的最小操作表，不新增 lifecycle/verification 值或通用状态机引擎。正常事实注入始终要求 `active + verified`，并同时通过 scope/source/time/integrity；`active + stale/conflicted/unverified` 只保留工作状态，不可当事实使用。Storage 约束身份、枚举和事务一致性；语义资格由 Core 检查，不能把两者混成数据库会验证自然语言。
+
+| 操作 | 前置与结果 | 同事务事实 |
+|---|---|---|
+| Capture | durable source/scope 合格后创建 candidate + unverified；scope 未确定仅 session-local | 新 record/revision/event 与必要 job；重放 source identity 幂等 |
+| Verify | 对固定 revision/source 独立取证；pass 标 verified，block/evidence-gap 记录理由，不自动得到 active | verification event/evidence 与 head_event_id；旧输入结果不能覆盖新 head |
+| Activate/自动修订 | verified 且满足当前资格，无 unresolved conflict；新 head 为 active | event/head、冻结 before/after、batch 和 host-info/search outbox 原子提交 |
+| Correct | 唯一非 tombstoned current 目标、实际新正文、真实批准与 CAS；新 revision 保留 lifecycle，先标 unverified 待复验 | correction receipt 只说修改/排入复验；不把旧 verification 复制给新正文；当前未验证版本不注入 |
+| Supersede/Conflict/Stale | 同对象时间/环境与可信证据按 §9–10 区分；旧版本 superseded，真实冲突成员 conflicted，失效来源 stale | 追加关系/状态事件、移动 head_event_id、失效相关投影；不改旧 revision |
+| Forget | 可操作 active head 经批准变 tombstoned，保留历史与原 verification，但停止正常召回 | tombstone/suppression、head_event_id、搜索删除 outbox 与 receipt |
+| Restore | 独立批准、当前 source/scope/verification 资格合格及 CAS 后 tombstoned → active | restore event、解除该 record 抑制、head/outbox/receipt；资格不合格不恢复 active |
+| Rollback | 仅合格自动 update event；历史 before 的业务资格与本次 preview head_event_id 分开比较 | 恢复 before 的 revision/业务状态，追加 revocation；首次 activation 撤销回 before 且无 active 结论，不写 inactive |
+| Reject/负迁移 | 明确不合格或强可归因负迁移；后者可保持 verified + rejected | 原证据与原因保留，移出正常投影；普通失败/曝光不改变真值 |
+| Purge | 只在维护模式，完整 manifest、批准与独占检查通过 | 按 10 §23/23a 的逻辑清除与 content-free receipt，之后向前清理，不增加 lifecycle 枚举 |
+
+纯曝光、相同输入重放、规范化正文相同的 correct 是 no-op，不新增 mutation receipt/head_event_id。任何资格/引用字段变化必须追加新事件并移动 head_event_id；stale CAS 整次失败、不暗中重读重试。验证结果与 owner mutation 是不同事实；仅明确 owner preference/decision 的确定性快速验证也须落独立验证事件，不能把“用户批准修改”通用于客观 fact 的验证。P1 以事务、枚举与重建 fixture 核验，P2 再验独立证据和语义，不要求 P1 已实现 LLM Verifier。
+
 ### Decision addendum — Incremental cross-session scope review
 
-1. Euler 为 logical project，以及明确请求的 workspace/personal scope 维护 `scope-review`。它复用现有 cooperative worker、`projection_jobs`（兼作 projection outbox）、`projection_state` 和 lease；`projection_outbox` 是该 outbox 角色的称谓，不新增同名表、独立 agent、daemon 或跨项目共享池。默认输入范围是当前 project；更宽 scope 只沿已授权 membership/`derived_from` 获取适用材料，不由相似 claim 或调用方自报 scope 扩权。
-2. 日常增量消费 Core-owned outbox 的本机单调 `input_seq`；canonical memory/capture/verification、受控 source-change、scope/membership、supersession/conflict/rollback 等有效变化进入该序列。跨宿主事件先经过导入门禁，再分配本机 seq；origin seq/时间不作为全局水位。job 冻结一致性快照的 `start_seq/end_seq`、generation、输入 identity/head/hash 和 digest，只覆盖 `(start_seq,end_seq]`。发布与 cursor 协议归 10 的 Scope-review projection contract：同事务 CAS 提交关系结果、overview metadata 和 cursor；期间新到的外部事件保持待消费，不能跳过或被旧 generation 清掉 dirty。
-2a. 外部 source-change 先由 source owner 为每个不可变 source event 分配 `source_event_id`，以 canonical bytes（字段顺序、空值、range/cursor 编码、Unicode/path 规范化和 SHA-256 算法均由 P0 冻结）生成 `handoff_id = H(source_owner, source_event_id)`；`cursor_digest` 是独立的 inventory consistency 字段，不参与幂等 identity。source owner 必须在一个 owner-side durable transaction 内原子提交正文、`source_event_id`、canonical bytes/hash、pending retention fence、逐项 inventory record、scope/membership snapshot、locator 和 replay cursor；只有该提交成功后才能向 Core 发起 handoff。Core handoff ack 前 pending fence 持续保留正文和 cursor，Core 重启通过 inventory/replay API 枚举未确认 source event，而不是只读取可变高水位。`projection_jobs(kind=source-ingress)` 对 `handoff_id` 施加唯一约束，重放只返回既有状态和 `input_seq`，不得重复分配。Core 只有在同一事务提交 handoff 状态、`input_seq` 与 projection outbox 后才返回 Core handoff ack；unknown outcome 先按 source_event_id 查证，无法枚举/重建时写入带 identity 的 `evidence-gap`，阻止相关 scope overview 变 fresh。
+2026-09-09：scope review 是首次闭环后的独立切片；先做当前 project 的有界 overview，跨 scope 汇总、关系 fixed point、raw-backfill 不捆绑首次上线。正常 memory capture/verification 与单次 source recovery 不依赖它。物理事务、历史保留和新版本重建只由 10 的 Scope-review projection contract 定义，本节不重复文件协议。
 
-`start_seq` 是 exclusive cursor、`end_seq` 是 inclusive high watermark；所有 SQL、receipt、continuation 和 recovery 统一读取 `(start_seq,end_seq]`。期间新到的外部事件只能进入下一 generation/dirty continuation，不能被当前 job 计入完成水位。
-
-3. 输入是增量、同 subject/resource/适用环境/有效期的受影响邻域、当前 overview 的逐条引用及确定性 gate 标出的缺口；不逐轮重读全部 session archive。Harness 负责规范 identity、稳定排序和资格门禁；语义相似、替代或矛盾不能只凭“deterministic”名义自动定案。Proposer 提议、Verifier 独立取源，只有原有验证门禁通过后，Harness 才以稳定 relation key 向现有 append-only `memory_events` 追加合法关系/状态事件；不建通用关系图。相同关系与证据重放是 no-op，不因 job/generation/模型措辞改变再写事件；自身已体现在本次 post-state 的关系通知按 10 精确结算，其他 scope/新证据仍待消费。不能判断则保留 `evidence-gap`，也不能把已有 memory 同义改写直接晋升为新 memory。
-4. `scope_overview` 是有界、可重建的 app-data projection，没有 memory、instruction、policy、权限或批准权威。每个可事实化 claim 绑定 canonical record/revision/head event 或 source owner/lineage/version/range/hash；模型生成的新 insight 先做 candidate，不能先在 overview 中当成 verified 事实。已确认决策、约束、变化只能引用当前 eligible 输入；未决问题是有来源的状态，candidate/rejected/tombstoned 正文不进入正常 overview，stale/conflicted 只给有界状态标记。旧 overview 只用于定位受影响引用和替换显示条目，不能作为新事实或递归有损摘要的证据。
-5. 允许更宽 scope 使用已授权的 project 派生材料，但 source-ingress 与每条 `projection_artifact_inputs` 必须保存 source owner scope、logical project/resource identity、`applies_to`、目标 scope、membership/`derived_from` snapshot digest 和授权边界；聚合 refs digest 不能替代这些明细。project/source/关系变化或 membership/权限撤回时，Core 在接受该变化的事务中失效所有直接或沿 `derived_from` 间接依赖的 overview；无法完整确认依赖闭包则保守阻断相关 scope。Core 必须在 ingest、overview publish 和 Orchestrator read/dispatch 三处重验当前 membership、owner、scope、source version 与 snapshot digest。Context Orchestrator 读取及 dispatch 前重验 scope、当前 head/qualification/source version、覆盖水位和 hash，不能只信 fresh 标签。未请求的其他 project 内容仍不允许混入。
-6. review、各模型角色及全部 `source.search/expand` 共用不可重置的累计预算。P0 必须冻结预算 schema、数值与版本：输入记录/字节/token、邻域深度/扇出、source 调用/读取量、模型 attempts/输出、总成本、wall-clock，以及单次 drain 的 batch/时间/成本上限；没有有效预算不启动。按稳定 input identity 顺序选取，超限记录 selected/omitted refs 或可复读范围摘要、实际用量、continuation 与 `partial/evidence-gap`，禁止发布 fresh overview。跨 batch 保留原 workset 快照和累计进度，不能续做时偷偷重置作业预算；需要更多资源则暂停待新的合格预算。drain 在预算内按 scope 轮转，一个持续 dirty scope 不得吞尽批次，前台关键路径不等待 review。具体数值由 P0/真实 workload 校准，架构硬上限及溢出语义现在生效。
-6a. v1 的 store-wide `max_active_drains=1` 与每个 scope `max_active_scope_reviews=1` 必须由 `projection_leases/state` 的单例 drain slot、scope 唯一 active claim 和同一 SQLite 写事务中的 compare-and-register 原子取得；lease 记录 process incarnation、generation 和 lease epoch。过期只允许重新核验并竞争 claim，不能证明旧 worker 已停止；持续 dirty generation 合并为同一 scope 的 durable continuation，不能并行启动。
-
-7. scope review 正常读取 fresh 且所有引用合格的 overview；失败、cursor gap、未完成 workset 或新外部输入使其 stale/partial/evidence-gap，不修改 canonical truth，也不将缺口写成事实。purge 先阻断依赖 overview/正在运行的 job/assembly，依 10 §23a 排空；清除正文、临时 artifact、input/claim refs、locator/hash、cursor/continuation 的敏感关联和跨 scope 派生副本。purge 后只留合法无内容终态，不以“保留旧 projection”恢复已清除内容。
-8. raw-only 历史纳入显式首次导入、全局重审或 recovery/backfill，不放进普通 turn path。既有 source owner 经 HostAdapter 在授权 scope/time 的固定 source 快照上枚举有界 batch，复用 capture job：durable source ack→capture/integrity→candidate+unverified→verification→关系/scope review。同一 source identity/range/hash 不重复捕获；每批落 `processed`（已完成枚举/捕获交接，含有据拒绝或无候选）或 `evidence-gap`，候选验证 pending/rejected/verified 另列，processed 不等于 active。每批维护四条独立覆盖水位：`raw_enumerated_through`、`captured_through`、`verified_through`、`relation_reviewed_through`；另记录 `evidence_gap_through`。每条水位绑定 `source_snapshot_id`、source owner、scope/time selector、cursor domain 和 snapshot/inventory digest，只表示该 domain 内最高连续前缀；缺失或乱序成员必须保存为结构化 missing intervals/continuation，不能以最大已见位置越过缺口。`processed` 只表示枚举/捕获交接已完成，不代表 candidate 已验证或关系已结算；只有 source snapshot 枚举终结、capture/integrity 终结、verification/relation 均进入 `verified|rejected|evidence-gap`，且无 pending/unknown/cursor gap，才允许对外显示“全部历史已分析”。否则只能显示已枚举/已捕获至某水位及剩余 pending/evidence-gap。
-
-raw source cursor、批次成员/快照 digest、capture IDs、未决项和 continuation 与批次交接同事务持久，崩溃只补缺项。无法枚举、未解析 scope、来源损坏或被清除均报告缺口，不扩大读取范围；source owner 的枚举只证明声明快照，快照后的来源留给下一批。overview 标明 canonical 与 raw-backfill 的覆盖边界；显式全局请求的 raw-only 批次未完成时不得宣称历史已完整分析。
+1. 复用 cooperative worker/outbox/lease，读取增量与受影响的有限邻域，而不是逐轮扫描全部 archive。只有 verifier 通过的关系变化才能追加 memory event；相同语义 key、当前关系状态和证据重放为 no-op，不能因 job/generation/措辞改变无界自触发。
+2. Overview 正文、input refs、generation 与 cursor 存于 SQLite 派生投影并同事务 CAS；不会变成 canonical memory、instruction 或权限。正文只包含 eligible 决策、约束、变化及有来源的未决状态；新的 insight 先走 candidate。旧 overview 只作定位，不作为新事实或递归摘要证据。
+3. 每条事实绑定 canonical revision/head 或 immutable source owner/lineage/version/range/hash；扩展到 workspace/personal 前须有显式授权与 typed 反向依赖。Source/scope/资格变化使相关投影失效，装配与 admission 重新核验，不只信 fresh 标志；其他 project 不因相似度进入。
+4. Job 的输入/输出、source calls、attempt、token/成本和 wall-clock 累计有界，换 batch 不重置；超限记 continuation 和 partial/evidence-gap，不能发布 fresh。具体数值在该切片用合成 workload 初值与实测调校，不要求首次 P0 冻结最优参数。失败只降级 overview，memory 仍走原 gate。
+5. 重建产生新 artifact identity/generation/hash，不能要求 LLM 复现旧 bytes；旧 assembly 引用的正文留作历史或在原字节缺失时明确报缺，不能拿新摘要改写过去。Purge 按维护模式清除当前/历史 body、refs、hash、job/cursor 敏感关联。
+6. Raw-backfill 启用前另补稳定 source snapshot/inventory、幂等 durable handoff、连续覆盖水位和缺口恢复的 fixture。Source ack 前不能卸载或 capture；Core ack 前来源必须可重放，unknown 先查 identity。枚举/捕获/验证/关系处理进度分开，processed 不等于 active，未处理项和 gap 不因最大已见 cursor 被跳过。正常 turn 不自动全量分析，未完成不能声称“全部历史已分析”。仅选少量原始来源或 owner bootstrap 的首次切片不要求此完整历史处理设施。
 
 ## Decisions — Interface to system self-evolution
 
@@ -82,6 +93,8 @@ raw source cursor、批次成员/快照 digest、capture IDs、未决项和 cont
 23. 未来只有候选隔离、目标平台验证、未参与迭代的 held-out、canary 和自动回滚齐备时才允许无人值守发布；权限、安全、凭据、公共接口和不可机器判断的价值变化继续升级给用户。v1 只实现 memory 生命周期与 inert proposal 的保存/导出接口，不自动修改 prompt、skill 或代码。
 
 ## Decisions — Minimum-sufficient evaluation contract
+
+本节对 v1 行为 proposal 只定义评估建议的表达方式；关于 Skill/AGENTS/policy 发布的条款是未来消费者启用前的要求，不授权或要求 v1 实现评估 runner、sealed plan、attempt/result 表族。Memory 本身仍按 §5–18 独立验证。Proposal 的 target/expected change/owner/scope/evidence refs、版本化建议、完整 digest 和 supersedes 引用即可保存；缺具体 target/evaluation 时继续作为 insight。外部 accepted/result 或正文内指令不能自动执行。
 
 24. 每个 evolution proposal 必须携带 evaluation contract，并按风险选择最低充分层级，而不是默认完整重跑旧任务：L0 用确定性代码检查 source/hash/scope/conflict/schema；L1 检查触发、注入和首个关键选择；L2 从最接近目标行为的旧任务 checkpoint 做 baseline/treatment 局部分叉；L3 才使用未参与生成的相似 held-out、越界负例和线上 canary。旧任务只能证明回归，不单独证明泛化。
 25. 验证强度按 target 区分：明确 owner memory 与客观 fact 通常止于 L0/L1，普通 project insight 核验来源和边界，只有广域/高 salience/反复影响行动的 insight 进入 L2/L3；Skill 发布至少覆盖应触发、不应触发、关键步骤/工具调用、一个旧失败样例和一个 held-out；AGENTS/policy 还必须做 baseline/candidate、适用正例、不适用负例、边界/安全样例以及优先级、scope 与 token 成本检查。

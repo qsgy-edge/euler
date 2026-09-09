@@ -11,9 +11,11 @@ Blocks: 13
 
 ## Scope and result
 
-本票只冻结宿主契约，不选择自研 TUI 框架、不实现生产代码，也不修改 11 的 canonical 语义。本文件是 14 的唯一权威契约；`map.md` 只保留状态与摘要，不另建第二份规范。v1 首接的自研 CLI 与 Pi 必须遵守同一状态机语义（实现可独立）；宿主能力只能改善呈现和往返次数，不能产生不同的批准、CAS、receipt 或隐私语义。
+本票只冻结宿主契约，不选择自研 TUI 框架、不实现生产代码，也不修改 11 的 canonical 语义。本文件是宿主行为的权威契约；总交付范围见 [15 I01](15-euler-v1-spec.md#v1-scope)。已启用宿主必须遵守同一状态机语义（实现可独立）；宿主能力只能改善呈现和往返次数，不能产生不同的批准、CAS、receipt 或隐私语义。
 
 结论是：宿主必须在模型外呈现 canonical 预览，取得模型无法自行生成的批准信号，持久化 owner 可回看的不可变结果，并把最小变更摘要送回模型。无法满足某项能力时必须返回可观察的 `unavailable`，不得把“宿主无能力”冒充“用户拒绝”。
+
+下表描述各模式启用时的契约，而非当前支持声明或同时交付要求。Privacy purge 按 10 §23a 转入独立维护入口：旧运行进程及子任务退出并取得独占后，才呈现完整 manifest/取得批准；原运行 session 只提供维护指引，不在线清除。Core identity/CAS/receipt 和批准来源不因模式不同而改变。
 
 上游已回填：09 的 Q6 写“运行时使用 Pi 已能运行的 `Agent`/`AgentSession`、context conversion、compaction 与 tool loop”时，Pi 是当时唯一运行时；本票 Self-built CLI/TUI 定案自研 CLI 只借 `@earendil-works/pi-ai`、自有 Agent loop，因此该复用只约束 Pi 宿主 adapter。两者的预算与 receipt 约束继续相同；Pi 复用的 context/compaction 接线以 13 受控 runtime 为准，Euler-active 不保留第二套内容选择或无 ledger 摘要调用。09 的 Host-owned ledger、预算、receipt 与安全不变量仍同时约束两者。11 的“同一时刻只允许一项等待确认”也已补上 per-session 唯一约束 + 跨 session CAS 兜底的说明。
 
@@ -130,7 +132,7 @@ Pi tool 路径以 session `toolResult` entry 作为展示面；extension command
 
 ### Pending lifecycle
 
-同一 session 同时只允许一个 pending operation。这是对 11“同一时刻只允许一项变更等待确认”的显式细化：唯一约束建在 session 层，跨 session 并发由提交时的 canonical CAS 兜底（第二个提交转 `stale`）。pending 必须跨进程持久，因为 JSON 的 preview/commit 可跨 invocation；它位于同一 SQLite 的独立 Host-owned operation state，不能混入 10 已限定用途的 context/attempt execution ledger。该 presentation/pending 表族是对 10 最小表族的**新增 Host-owned domain**，不在 10 已冻结的 owner 集合内；12 选 DDL 时需回填 10 的表族清单，并保持 memory/execution/projection 的原有 owner 与不变量不变。具体 DDL 归 12/13。
+同一 session 同时只允许一个 pending operation，跨 session 并发由 canonical CAS 兜底（第二个提交 stale）。Pending 持久化首先服务重启恢复，后续 JSON 跨 invocation 也复用它；不因 JSON deferred 而删掉。Presentation/pending 已纳入 10 的独立 Host-owned domain，不能写入 context/attempt execution ledger。DDL 由 10/13 的首次实际路径落实，12 验可观察约束，不另建一份 receipt 真值。
 
 不设置 TTL：时效由提交时的 canonical CAS 决定。pending 仅在三种情况下结算：新 preview 明确作废旧 pending、显式 cancel、commit 时成功或 stale/failure 终结。新 preview 必须在自己的 presentation 中指出被作废的旧 operation ID。缺失、未知、歧义或已结算 token 均返回各自可观察的 fail-closed 终态。
 
@@ -165,6 +167,8 @@ purge **之前**已签发的 owner operation receipt 按 10 的显式例外保�
 `notify()` 只可作为非权威的一次性提示，不能满足任一持久面。自动更新 `Info` 的固定 batch/event 与 outbox 在 activation 同事务落盘（08 §27a），Host canonical 状态保存 manifest、投递状态及 unread/read acknowledgement，不写回旧卡。重启从固定 batch/outbox 对账，不能重新圈选 current active；未有活动宿主时保持 owner 可查询的待投递批次，不假称已呈现。被动 append/notify 不结算 unread。只有显式查询或宿主可核验的 owner open/expand 动作在完整 batch presentation 持久化后才能结算，并追加或返回当前状态。
 
 canonical mutation 与 canonical receipt 必须在同一 DB 事务内提交；该 receipt 的唯一真值按 13 Physical contract 位于 `memory_events`，Host-owned store 是其所属边界，不要求另一张 receipt 表。owner entry 与模型摘要是以 receipt ID 去重、可从 canonical receipt 重放的 presentation。任一 presentation 写入失败不能回滚或改写已签 receipt：Host 返回带已知 outcome 的 `error`，并在后续模型 dispatch 前恢复缺失面。若提交结果未知，先按 operation/receipt ID 查询 canonical store，禁止盲目重试 mutation。
+
+维护 purge 没有继续运行的旧模型会话：不得为补模型面向已退出 session 重新投递被清除的目标/正文。维护 Host 持久呈现 content-free 结果；新 runtime 通过持久 fence/completion 与当前合格 source 重建新 window，仅给必要的无敏感状态。旧 session/source 因 purge 已不可恢复时明确报缺。正常 correct/forget/restore/rollback 仍执行原两面投递和恢复，不因维护例外省略摘要。
 
 ## Host capability and degradation matrix
 
@@ -214,7 +218,7 @@ stale   · op-79 · expected r3 / current r4 · 未发生变更
 
 - **correct**：目标 tombstoned 时只返回 `not_actionable`/`tombstoned-not-actionable`，提示先独立恢复，不创建可批准 preview。合格目标显示旧正文、用户实际提交的新正文及有界 diff；commit 缺新正文时 fail closed，不得回退到 preview draft；preview 后生命周期变化走 stale。
 - **forget / restore**：显示 current canonical snapshot 与明确 lifecycle 迁移，分别说明“停止检索/注入但保留历史”和“重新 active”。
-- **privacy purge**：显示删除闭包、受控范围、外部残留与不可恢复后果，再显示绑定 target 或完整 batch manifest 的精确 nonce 口令（单目标 `确认清除 <target-id> <nonce4>`；批量 `确认清除 <N> 项 <nonce4>`）。明确 10 §23 的逻辑提交是不可取消点，物理清理失败只能显示未完成及残留；未全部完成不宣称 purge 成功。receipt 不重复已清除内容。
+- **privacy purge**：普通 Host 返回维护入口及停止运行的影响，不创建可直接删除的在线批准。按 10 §23a 关闭 admission、验证旧进程及子任务退出、取得维护独占后，维护 Host 才完整显示实际删除闭包、受控范围、外部残留和不可恢复后果，并铸造新的 token/精确 nonce（单目标 `确认清除 <target-id> <nonce4>`；批量 `确认清除 <N> 项 <nonce4>`），取得一次批准。旧运行 session 的 token 不沿用；逻辑提交后不可取消，物理失败报告已提交/未完成及残留，只按同一 manifest 续做。协调者自己的输入/呈现/continuation 同样自清除，全部完成才签 content-free 成功。
 - **rollback 自动 revision**：同时显示 current/target revision 和有界 before/after diff，说明恢复旧正文 revision、追加新的 revocation event/receipt，`head_event_id` 随新事件改变，不创建重复正文的 forward revision，也不改写旧事件。按 11，rollback 只适用于自动 memory revision/activation；owner 自己的手动 correction 不走 rollback 路由，要改就再开一次 correct。
 - **rollback activation/promotion**：显示将不再注入的完整 snapshot 与 rollback 后 lifecycle；具体 lifecycle 值由 08/10 决定，宿主不得笼统写成“删除”。
 - **自动更新 Info**：显示稳定、可复述的 batch/operation/update event ID；冻结完整 manifest/digest，分别呈现不可变 event outcome/before/after snapshot 与查询时 canonical lifecycle。自然语言“撤销刚才那次”可作为便利，但 Host 必须解析到这些 ID 并在 rollback preview 回显。
@@ -251,22 +255,25 @@ Agent 叙述不构成上述任一终态。只有 Host canonical result/receipt �
 
 ## Handoff to 12 and 13
 
-12 负责为 durable pending/presentation reference 选择最小 DDL（含 pending 唯一约束建在 session 层），并验证 WAL/崩溃边界、privacy purge reverse refs、跨进程 JSON continuation 及 Windows/macOS/Linux 行为；不得把 pending 塞入 09 的 context/attempt execution ledger。
+12 定义最小 DDL、fixture 和验收，13 D8 映射实施依赖；这些设计票的 resolved 不表示运行验证完成。后续实现任务按 [12 的 X-04/X-10/X-11 分组](12-build-evidence-experiment-matrix.md) 逐模式取得实际证据；pending 唯一约束仍在 session 层，不进入 context/attempt execution ledger。
 
-13 负责实现两个薄 Host adapter、自研 CLI 的直接入口与 Pi extension command/tool 路径，并按本票矩阵做真实验收。最低检查包括：
+### 首次 CLI 必测（后续宿主复用）
 
-1. 自研 CLI 的依赖边界只到 `pi-ai` provider/model 接口，不接 `Agent`/`AgentSession`/Pi TUI；Pi adapter 复用 Pi 运行时。两个宿主分别证明 canonical presentation、批准、cancel、stale、no-op、receipt 与重启回放；无发现项也明确记录。
-2. Pi TUI/RPC/JSON/`-p` 四种模式分别实跑；不得用一个模式的结果代替其余模式。
-3. 模型在同一轮 preview 后直接 commit、缺 token、换 token、修改 expected head、缩减 batch、复用已结算 token，均 fail closed。
-4. 调查/疑问输入只走只读路径，误调 mutation-preview 返回 `not_actionable` 且不创建 pending；注入的 `sendUserMessage`、含糊回复与历史 purge 口令不得意外授权，当前精确 nonce 口令可通过。
-5. owner entry 不进入模型 context；模型摘要有界；privacy purge 后旧 preview/ref/manifest 按 10/11 清除，但已签 content-free receipt 不被改写。
-6. 自研 CLI 的点击/多选/重绘关闭后仍能退回持久 user-turn baseline，语义与 receipt 不变。
-7. 在 canonical commit 后、owner entry 或模型摘要前故障时，重启按 receipt ID 只补缺失 presentation，不重复 mutation/receipt；unknown outcome 必须先查询再决定。
-8. Pi 新 session 首轮即走 extension command 时，宿主 entry 尚未落盘；必须验证此时的 presentation 顺序校对与 owner receipt 仍以 Host-owned 记录为准，并在该时机崩溃后重启能正确重建或报缺；该场景下“复用旧卡”必须退回完整重显。
-9. 批准判定只采信活输入/turn 事件：`InputEvent.source === "extension"` 的注入不得授权，dialog 超时/abort 必须返回 `unavailable` 而不是 `rejected`，且批准类 dialog 不得传 `timeout`。
-10. RPC 与 JSON 同样按“合规消费者”验收：必须验证客户端确实原样展示完整 canonical 正文，不得仅凭事件已输出就认定合规。
+1. 自研交互 CLI 的直接入口、实际 canonical 呈现/批准、cancel/stale/no-op、receipt 与重启回放均完成正常/拒绝对照；依赖仅到 `pi-ai` provider/model，不接 Pi `Agent`/`AgentSession`/TUI。首次只要求文本/持久 user-turn baseline；已有点击/多选/重绘能力时再验开/关语义一致，不为验收另建富 UI。
+2. 无真实批准的同轮 commit、缺/换 token、伪造 expected head、缩减 batch、复用 settled token 不能 mutation；调查疑问只读、误调 preview 为 not_actionable 且无 pending，非 owner 输入不能授权。批准 dialog 不传 timeout，abort/失去应答能力为 unavailable 而非 rejected。
+3. owner entry 不进入模型 context，摘要符合预先固定的字段/bytes 上限；维护 purge 在退出/独占后展示实际 manifest 和 nonce，含糊/历史口令不授权，当前口令只批准冻结范围。运行 session 不在线清除，清理完成前不报成功，已签合法 content-free receipt 不改写。
+4. 首轮真实 source 的 durable ack、Host presentation/pending、commit 后缺 owner entry/summary 和 unknown outcome 按 X-04/X-11 测试。重启先按 identity/receipt 对账，仅补缺失呈现，不重复 mutation；缺展示确认则完整重显，新真实输入后合法操作可继续。
+5. activation/batch/outbox 原子性以及 manifest/unread/输出/read ack 各杀点按 X-11 通用组执行；成员不缩小、不重复 activation、不丢已读状态，维护 purge 后旧 Info 不复活。CLI 的 X-10/X-11 联合通过不需要任何后续模式先完成。
 
-11. 自动 activation 同事务 outbox 后，在 Host manifest/unread 持久化前、owner 输出前/后、read ack 前/后强杀；按固定 batch 幂等补投递，成员不缩小、不重复 activation、不丢已读状态；purge 后迟到 Info 不复活正文。其 canonical truth 仍在 memory events，Host state 只拥有 presentation/ack，不能成为第二份 mutation receipt。
+### 后续模式启用前追加
+
+各模式只在计划启用自身能力前复验适用通用组与对应追加项；共享 Core 证据可按版本复用，实际 Host/消费者证据不可互代。未启用记 deferred，不阻塞 CLI；已声明启用但缺证不得借 deferred 放行。
+
+1. **Pi regular：** 按 13 的 Pi 接点、12 的后续组验证 tool/extension command、首轮未 flush、source ack、真实输入来源和非模型入口。`InputEvent.source === "extension"`/`sendUserMessage` 不授权；旧展示缺确认时完整重显，合法主流程仍可完成。
+2. **RPC / JSON：** 分别在各自启用前验证合规消费者真实呈现及批准，event 已输出不等于已展示。RPC 追加 UI 应答丢失/重启；JSON 追加同 session 跨 invocation pending/commit、旧 token/nonce 和 head 变化。二者互不替代，也不继承 TUI PASS。
+3. **Pi `-p` text：** 启用其诊断能力前验证允许诊断能完成，有呈现义务的操作（含 inspect）及写入不可用；不要求或允许完成成功 mutation 用例，不以模型复述或文件旁路补呈现。
+
+每个模式只按其实际能力取得有范围限定的 X-10/X-11 结论；发现共享 invariant 失败时仍阻断全部受影响路径，不能用模式分组掩盖。
 
 ## Non-goals
 

@@ -3,7 +3,7 @@
 Type: grilling
 Status: resolved
 Blocked by: 05, 06, 07, 08
-Resolution scope: 设计裁决已完成；实现、迁移与故障注入验证仍待 11、12、13。
+Resolution scope: Status: resolved 仅表示设计裁决已定案；11/12/13 定义呈现、验收和实施契约，不代表实现或验证已完成。本次修订尚待独立复验，目标 runtime、运行时迁移与故障注入仍未验收。
 
 ## Question
 
@@ -12,11 +12,13 @@ Resolution scope: 设计裁决已完成；实现、迁移与故障注入验证�
 ## Decisions — Eligibility, ranking and project isolation
 
 1. 不把相关性、权威、时效与可信度压成一个可互相补偿的万能加权分数。Memory Retriever 先以 logical scope、`applies_to`、lifecycle/verification、temporal validity 和 source integrity 做硬准入；未通过权威或验证门禁的对象不能靠高语义相似度进入正常上下文。
-2. Eligible set 内以当前用户请求 + active intent 做 sparse lexical/BM25 与 dense semantic 召回，并用 RRF 等简单、可复算方法融合排名；融合分只表示检索相关性，不获得真值或指令权威。随后按规范 claim、subject/resource、适用环境和有效时间归一去重，只保留该语义单元的 current eligible version。
+2. Eligible set 内以当前用户请求 + active intent 做 v1 FTS/BM25 lexical 召回，并在确有多 lane 时用 RRF 等简单、可复算方法融合排名；不建 embedding/dense semantic 路径，后续只有可复现漏召回和实验胜出才增加。融合分只表示检索相关性，不获得真值或指令权威。随后按规范 claim、subject/resource、适用环境和有效时间归一去重，只保留该语义单元的 current eligible version。
 3. 最终选择在 Orchestrator 的动态 token 预算内优先覆盖当前任务的不同问题子项，避免近重复结果占满窗口；不为“多样性”维护万能 MMR 权重，不设固定 top-k，也不注入弱相关内容。没有强相关 eligible memory 时返回空，由主 Agent 决定是否进入 Agentic RAG 慢路径。
 4. 多项目会话每轮维护由 active intent/task、实际 resource owner、manifest 与工具路径共同验证的 `active_project_set`；默认只含 `primary_project`，workspace/personal 中适用对象正常参与。`affected_project_ids` 只记录本会话曾触碰的项目，不自动扩大本轮检索。明确跨项目任务才加入所需项目，返回结果保留 project 标签且不跨项目折叠 claim；项目身份仍未确定时只使用 session-local context。
 
 ## Decisions — Scope overview as a derived projection
+
+本节是独立后续 scope-review 切片启用时的语义，不要求首次切片生成 overview。正文在 SQLite 派生投影表中与 refs/generation/cursor 事务提交；物理协议以 10 的 Scope-review projection contract 为准，不再使用文件发布/pin/同 hash repair。未启用时 canonical retrieval 与 source recovery 正常可用。
 
 4a. 跨会话整体分析按 logical scope 运行，不把所有项目合成一个全局检索池。`scope_overview` 只作为 Context Orchestrator 可选的有界 baseline/projection：它记录当前 scope 的 verified/active 决策、适用约束、重大变化、未决问题和 evidence-gap，并携带覆盖 input watermark、逐条 input identity、claim→source/memory ref、content hash 与可重建状态；它没有 memory、instruction、policy、权限或批准权威。project→workspace/personal 只允许通过显式 membership/`derived_from`，不按相似 claim 或模型自报 scope 扩大。
 4b. project/source/head/关系变化或 membership/权限撤回时，Core 通过类型化 artifact-input 反向依赖使直接及更宽 scope 的 overview stale；Orchestrator 注入前重验当前 head、scope、lifecycle、verification、source version 和覆盖水位。当前请求仍先走 canonical retrieval，只有项目全貌/规划、跨主题关系或局部 evidence-gap 需要时才读取适用 overview；任何依赖闭包、purge、cursor gap 或 verifier 状态无法证明时，只返回状态标记或触发局部 review/source recovery，不把旧 overview 当事实注入。
@@ -38,6 +40,10 @@ Resolution scope: 设计裁决已完成；实现、迁移与故障注入验证�
 13. Q6 采用 explicit hybrid：Pi adapter 复用稳定 `Agent`/`AgentSession`、会话与 tool loop；`euler-active` 的 context conversion 只做 Euler 批准的表示转换，内容选择、compaction 与预算归唯一 Euler Orchestrator。Pi 原生自动/手动/overflow/branch summarization 不得另行压缩或发无 ledger 请求，具体受控启动与 transport 按 13 的 Pi 接线契约；execution ledger 由 Host/Harness 核心自有并单独写入。该复用只约束 Pi 宿主 adapter：本条写定时 Pi 是唯一运行时，14 后来定案 v1 首接的自研 CLI 只借 `@earendil-works/pi-ai` 的 provider/model 接口、自有 Agent loop 与 TUI，因此不受该复用约束；但本票的 Host-owned ledger、预算、receipt 与安全不变量仍同时约束两个宿主，13 按此拆分运行时接线。Pi 当前 `SessionManager` persistence 与 `AgentHarness` 只作设计/运行时参考，不能直接充当 Q6 receipt ledger；DSH 当前 agent loop 同样不能被表述为已提供 per-attempt receipt。模型历史只由 surface events 投影，receipt 是类型上禁止 `surfaceOp` 的 log-only core event；以后 Trajectory/metrics/audit 都是同一 ledger 的只读投影。
 14. Q6 由 Host/Harness 核心生成、模型不可修改的 versioned events 组成：`context/assembly@v1` 记录 intent/project/policy/cache epoch、retrieval、selected/rejected refs+hash+顺序+token+reason、P0–P3 预算、reserve/margin/degradation 与 assembled-context hash；每个真实 transport attempt 各写一条 `model/request-attempt-started@v1` 和 `model/request-attempt-finished@v1`，以 `attempt_id/ordinal` 记录最终 route/provider/model、冻结后的 canonical transport payload hash、start/TTFT/end、usage/cache、finish/error/cancel。正文仍由规范 owner 保存，receipt 不重复敏感内容。存储层只借 DSH 的 typed append-only log、连续 seq、durable flush 与冷恢复/repair 语义，不直接复用 DSH 当前 agent loop。
 15. Assembly ID 标识完整不可变 assembly payload：intent/project、policy、route/model/context limit、tokenizer/estimator、retrieval/selection/order/content、P0–P3、cache epoch、reserve/margin/degradation 或 assembled model-request bytes 任一变化都创建新 ID；只有这些完全不变、仅 attempt-specific transport metadata 不同的重发才增加 attempt ordinal。持久化使用两个有序、非原子的 barrier：先 append+flush assembly，预算通过后再冻结 final transport payload、append+flush started，随后才调用网络；失败即禁发。`assembly/no-started` 是预算阻断、取消、预计算或两 barrier 间崩溃形成的 `not-dispatched`，`started/no-finished = orphaned/unknown-sent`。最终 transport boundary 记录 canonical encoding/hash algorithm/adapter version 后禁止改写。
+
+15a. 对同库状态，started 事务是 admission 线性化点：读取并重验完整 intent/qualification/policy/owner/fence/epoch 快照，与 attempt/activity 登记原子提交，不能先检查再另起事务登记。先提交的撤销阻止旧请求 admission；后提交的撤销将已 admission 请求视为 in-flight。Transport 在实际发送前检查可观察取消并停止尚可停止者，不能承诺撤回已发送字节，purge 必须等待整个进程/子任务失去迟到输出能力。外部文件与权限按 Host 的实际接点重验，不声称数据库与网络或任意外部文件原子提交。X-06 验两种顺序、崩溃点与合法发送。
+
+15b. Host 提供只读对账及显式封存旧 run 的维护入口，不新增模型恢复工具。能从 provider/operation owner 取得证据则追加对账事件；不能查询时展示 unknown 与可能的费用/副作用，owner 可封存而不能把原状态改写成未发送或成功。新工作须新 run/operation、重新授权及预算检查；非幂等副作用先对账，或取得明确知情的重复风险批准。旧 unknown 和实际结果始终保留，换 session、lease 接管或后台 retry 不构成批准。
 16. canonical store 完整时，v1 保证选择/顺序/预算与 content refs 可复算、attempt 状态可恢复、receipt-to-prompt exclusion 有自动测试；10-22 定义的显式 privacy purge 是唯一由 policy 主动授权的破坏性例外，它可删除含 locator/hash 的 manifest payload、保留无内容 envelope/seq/attempt 状态并将 stream 标记为不可完整复算。canonical store 损坏后从已验证快照恢复属于完整性失败而非授权例外，必须按 10-27 显式标记 recovery gap。单 event checksum 不冒充防篡改 ledger，hash chain/checkpoint root/signature 留到出现审计威胁模型后。不实现 Trajectory UI、分布式 trace、全量 prompt diff 或通用 plugin event bus；11 票只决定显示与指标。
 
 ## Cross-cutting decision — Extension boundary
