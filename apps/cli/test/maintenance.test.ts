@@ -16,7 +16,8 @@ test('a live process that closed its probe remains a maintenance blocker', { tim
     const blocked = await maintenance!.waitFor('maintenance-blocked');
     assert.equal(blocked.acquired, false);
     assert.ok((blocked.observations as { absent: boolean }[]).some(item => !item.absent));
-    runtime.child.kill();
+    runtime.command('stop');
+    await runtime.waitFor('controlled-task-exit');
     await runtime.exit;
     maintenance!.command('acquire');
     const acquired = await maintenance!.waitFor('maintenance-exclusive');
@@ -24,7 +25,7 @@ test('a live process that closed its probe remains a maintenance blocker', { tim
     maintenance!.command('release');
     await maintenance!.waitFor('maintenance-released');
   } finally {
-    if (runtime.child.exitCode === null && runtime.child.signalCode === null) runtime.child.kill();
+    if (runtime.child.exitCode === null && runtime.child.signalCode === null) runtime.command('stop');
     if (maintenance && maintenance.child.exitCode === null && maintenance.child.signalCode === null) maintenance.child.stdin.end();
     await Promise.allSettled([runtime.exit, maintenance?.exit ?? Promise.resolve()]);
     rmSync(sandbox.root, { recursive: true, force: true });
