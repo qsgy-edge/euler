@@ -143,17 +143,30 @@ async function maintenanceDemo(sandbox: Sandbox) {
   }
 }
 
+async function memoryDemo(sandbox: Sandbox) {
+  const probe = openProbe(sandbox);
+  try {
+    const input = probe.archive.append(sandbox.fixture.eventId, sandbox.fixture.text);
+    const options = { type: 'decision' as const,
+      scope: { kind: 'project' as const, id: sandbox.fixture.projectId, resolved: true }, appliesTo: ['cli'] };
+    const captured = probe.store.captureMemory(probe.activity, input, sandbox.fixture.text, options);
+    const verified = probe.store.verifyMemory(probe.activity, captured.record.recordId, captured.record, 'pass', [input]);
+    const activated = probe.store.activateMemory(probe.activity, verified.record.recordId, verified.record);
+    emit('memory-result', { captured, verified, activated, eligible: probe.store.listEligibleMemories(probe.activity) });
+  } finally { probe.close(); }
+}
+
 async function main() {
   const args = parseArgs({ allowPositionals: true, options: {
     sandbox: { type: 'string' }, scenario: { type: 'string', default: 'success' }, budget: { type: 'string' },
   } });
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
-  check(['create', 'run', 'recover', 'hold', 'task', 'maintain', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
+  check(['create', 'run', 'recover', 'memory', 'hold', 'task', 'maintain', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
   const options = args.values.budget ? JSON.parse(args.values.budget) as Partial<ProbeBudget> : {};
   check(Object.keys(options).every(key => key in DEFAULT_BUDGET), 'invalid-budget');
   const budget = { ...DEFAULT_BUDGET, ...options };
-  if (['run', 'recover', 'hold', 'task', 'maintain'].includes(command)) check(args.values.sandbox, 'sandbox-required');
+  if (['run', 'recover', 'memory', 'hold', 'task', 'maintain'].includes(command)) check(args.values.sandbox, 'sandbox-required');
   // Fault injection never modifies a caller-selected existing sandbox.
   if (command === 'archive-failure' || args.values.scenario === 'archive-failure') check(!args.values.sandbox, 'fault-requires-fresh-sandbox');
   const sandbox = args.values.sandbox ? openSandbox(args.values.sandbox) : createSandbox();
@@ -164,10 +177,11 @@ async function main() {
   if (command === 'maintenance') return maintenanceDemo(sandbox);
   if (command === 'recover') {
     const probe = openProbe(sandbox);
-    try { emit('recovered', { source: probe.archive.lookup(sandbox.fixture.eventId), intent: probe.session.recoverIntent(), eventCount: probe.archive.inspect().eventCount, sends: 0 }); }
+    try { emit('recovered', { source: probe.archive.lookup(sandbox.fixture.eventId), intent: probe.session.recoverIntent(), memories: probe.store.recoverMemories(probe.activity), eventCount: probe.archive.inspect().eventCount, sends: 0 }); }
     finally { probe.close(); }
     return;
   }
+  if (command === 'memory') return memoryDemo(sandbox);
   run(sandbox, command === 'run' ? args.values.scenario : command, budget);
 }
 
