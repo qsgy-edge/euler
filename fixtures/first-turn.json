@@ -1,0 +1,12 @@
+{
+  "schema": "euler-t01-fixture@1",
+  "ownerId": "00000000-0000-4000-8000-000000000001",
+  "hostId": "00000000-0000-4000-8000-000000000002",
+  "projectId": "00000000-0000-4000-8000-000000000003",
+  "sessionId": "00000000-0000-4000-8000-000000000004",
+  "branchId": "00000000-0000-4000-8000-000000000005",
+  "eventId": "00000000-0000-4000-8000-000000000006",
+  "text": "Synthetic first turn: preserve this input before dispatch.",
+  "constraints": ["synthetic-only", "local-counting-transport-only"],
+  "expectedSends": {"archive-only": 0, "archive-failure": 0, "blocked": 0, "success": 1}
+}

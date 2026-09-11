@@ -1,2 +1,5 @@
 # Local CodeGraph data and daemon artifacts
 .codegraph
+node_modules/
+dist/
+artifacts/

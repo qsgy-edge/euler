@@ -1,0 +1,19 @@
+{
+  "name": "euler",
+  "private": true,
+  "type": "module",
+  "workspaces": ["packages/core", "apps/cli"],
+  "engines": { "node": ">=24.18.0 <25" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "node --test apps/cli/test/*.test.ts",
+    "check": "npm run typecheck && npm run build && npm test",
+    "demo": "node apps/cli/src/main.ts",
+    "evidence": "node scripts/evidence.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "~5.9.3"
+  }
+}

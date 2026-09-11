@@ -6,7 +6,9 @@ The repository began with architecture and implementation documents migrated fro
 
 Delivery scope is defined in [I01 of the implementation specification](docs/architecture/issues/15-euler-v1-spec.md#v1-scope). Phase dependencies and mode-specific acceptance criteria are maintained in the referenced contracts, not duplicated here.
 
-Implementation, P0 artifacts, runtime tests, CI evidence, host acceptance, migration receipts, and MC cutover have **not** been completed or verified. This repository must not be treated as production-ready and must not be used to claim an Euler runtime or MC cutover.
+Issue #1 adds a runnable **synthetic P0 probe** for first-turn source durability, a local counting transport, and maintenance exclusion/recovery. See [commands, contracts, and evidence boundaries](docs/implementation/t01-synthetic-probes.md). It uses generated disposable databases and never opens MC or a production data root.
+
+Full X-card acceptance, real provider dispatch, production schema/host acceptance, migration, and MC cutover remain unverified. CI and host results must be read from the artifact for the specific implementation and platform; this repository is not production-ready.
 
 - [Euler v1 implementation specification](docs/architecture/issues/15-euler-v1-spec.md)
 - [Migration manifest](docs/architecture/migration-manifest.json)

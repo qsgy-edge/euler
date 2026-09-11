@@ -1,0 +1,3 @@
+# Keep executable contract and fixture bytes stable across CI checkouts.
+*.ts text eol=lf
+fixtures/*.json text eol=lf
