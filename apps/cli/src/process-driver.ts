@@ -7,8 +7,8 @@ export interface Observation { event: string; [key: string]: unknown }
 export const cliEntry = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? './main.ts' : './main.js', import.meta.url));
 
 // Drives only this repository's synthetic CLI, never arbitrary commands.
-export function startCli(args: string[], timeoutMs = 15000) {
-  const child: ChildProcessWithoutNullStreams = spawn(process.execPath, [cliEntry, ...args], { stdio: 'pipe', windowsHide: true });
+export function startCli(args: string[], timeoutMs = 15000, cwd?: string) {
+  const child: ChildProcessWithoutNullStreams = spawn(process.execPath, [cliEntry, ...args], { stdio: 'pipe', windowsHide: true, ...(cwd ? { cwd } : {}) });
   const observations: Observation[] = [];
   const waiters = new Set<() => void>();
   let stderr = '';

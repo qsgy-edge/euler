@@ -2,6 +2,8 @@
 
 本切片对应 [Issue #1](https://github.com/qsgy-edge/euler/issues/1)，规范基线为 `a3f253f9bef0415364b3b224e5eb4ba150111325` 的 I01–I03、I08–I11、I18、D8.1/P0 和 X-04/X-06/X-12 的合成子项。这里冻结可执行的 P0 接口和失败语义；不冻结生产 DDL，也不宣称整张 X-card 通过。
 
+本文的 schema/恢复表描述 T01 原始切片；当前实现已由 [T02](t02-scoped-memory.md) 扩展 memory 表族与恢复输出，旧 disposable schema 拒开后重新生成沙箱。
+
 ## 运行
 
 要求 Node **24.18.x** 或更高的 Node 24、npm。无需 provider、凭据、Pi、MC 或生产数据库。

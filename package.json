@@ -10,7 +10,8 @@
     "test": "node --test apps/cli/test/*.test.ts",
     "check": "npm run typecheck && npm run build && npm test",
     "demo": "node apps/cli/src/main.ts",
-    "evidence": "node scripts/evidence.ts"
+    "evidence": "node scripts/evidence.ts",
+    "evidence:memory": "node scripts/evidence-memory.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

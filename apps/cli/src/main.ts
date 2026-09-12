@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
-import { openSync, closeSync, ftruncateSync, fsyncSync } from 'node:fs';
+import { openSync, closeSync, ftruncateSync, fsyncSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
@@ -10,6 +10,7 @@ import { createSandbox, openSandbox, bindingOf, resourcesOf } from './sandbox.ts
 import type { Sandbox } from './sandbox.ts';
 import { openProbe } from './probe.ts';
 import { startCli } from './process-driver.ts';
+import memoryFixture from '../../../fixtures/scoped-memory.json' with { type: 'json' };
 
 function emit(event: string, fields: Record<string, unknown> = {}) {
   process.stdout.write(JSON.stringify({ ...fields, event }) + '\n');
@@ -146,27 +147,66 @@ async function maintenanceDemo(sandbox: Sandbox) {
 async function memoryDemo(sandbox: Sandbox) {
   const probe = openProbe(sandbox);
   try {
-    const input = probe.archive.append(sandbox.fixture.eventId, sandbox.fixture.text);
-    const options = { type: 'decision' as const,
-      scope: { kind: 'project' as const, id: sandbox.fixture.projectId, resolved: true }, appliesTo: ['cli'] };
-    const captured = probe.store.captureMemory(probe.activity, input, sandbox.fixture.text, options);
+    const { intent } = probe.session.prepare(sandbox.fixture.eventId, sandbox.fixture.text);
+    const input = probe.archive.append(memoryFixture.sourceEventId, memoryFixture.sourceText);
+    const options = { type: 'decision' as const, claimKey: memoryFixture.claimKey,
+      scope: { kind: 'project' as const, id: sandbox.fixture.projectId, resolved: true }, appliesTo: memoryFixture.appliesTo };
+    const captured = probe.store.captureMemory(probe.activity, input, memoryFixture.memoryText, options);
     const verified = probe.store.verifyMemory(probe.activity, captured.record.recordId, captured.record, 'pass', [input]);
     const activated = probe.store.activateMemory(probe.activity, verified.record.recordId, verified.record);
-    emit('memory-result', { captured, verified, activated, eligible: probe.store.listEligibleMemories(probe.activity) });
+    const proposalInput = { target: 'synthetic/AGENTS.md', expectedChange: 'Explain the synthetic receipt rule', owner: sandbox.fixture.ownerId,
+      scope: options.scope, evidenceRefs: [input], evaluation: { schema: 'evaluation-contract@1' as const, level: 'L0' as const, assertions: ['Check synthetic source bytes'] } };
+    const proposal = probe.store.saveEvolutionProposal(probe.activity, input, proposalInput);
+    const revision = probe.store.saveEvolutionProposal(probe.activity, input, { ...proposalInput,
+      expectedChange: 'Explain the synthetic receipt rule and scope', supersedes: proposal.proposalId });
+    emit('memory-result', { synthetic: true, intent, captured, verified, activated, proposals: [proposal, revision],
+      eligible: probe.store.listEligibleMemories(probe.activity), inspection: probe.store.inspectMemory(probe.activity, activated.record.recordId),
+      outbox: probe.store.pendingMemoryProjections(probe.activity) });
   } finally { probe.close(); }
+}
+
+async function memoryWorker(sandbox: Sandbox, scenario: string) {
+  check(['compete', 'crash-in-transaction', 'crash-after-commit'].includes(scenario), 'invalid-memory-scenario');
+  const probe = openProbe(sandbox);
+  const lines = createInterface({ input: process.stdin });
+  try {
+    const expected = probe.store.recoverMemories(probe.activity)[0];
+    check(expected, 'memory-required');
+    const source = probe.archive.append(randomUUID(), 'Synthetic correction evidence');
+    emit('memory-ready', { pid: process.pid, expected, scenario });
+    for await (const line of lines) {
+      if (line !== 'commit') break;
+      const change = () => probe.store.correctMemory(probe.activity, expected.recordId, expected, source, memoryFixture.correctionText);
+      const checkpoint = (stage: string) => {
+        writeSync(1, JSON.stringify({ event: 'memory-checkpoint', stage, pid: process.pid }) + '\n');
+        // Deliberately leave the transaction/process open for the parent kill probe.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);
+        throw new Error('checkpoint-was-not-killed');
+      };
+      if (scenario === 'crash-in-transaction') {
+        probe.store.withActivity(probe.activity, () => { change(); checkpoint('uncommitted'); });
+      } else {
+        const result = change();
+        if (scenario === 'crash-after-commit') checkpoint('committed-before-ack');
+        emit('memory-written', { result });
+      }
+      break;
+    }
+  } finally { lines.close(); probe.close(); }
 }
 
 async function main() {
   const args = parseArgs({ allowPositionals: true, options: {
     sandbox: { type: 'string' }, scenario: { type: 'string', default: 'success' }, budget: { type: 'string' },
+    expected: { type: 'string' }, record: { type: 'string' },
   } });
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
-  check(['create', 'run', 'recover', 'memory', 'hold', 'task', 'maintain', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
+  check(['create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
   const options = args.values.budget ? JSON.parse(args.values.budget) as Partial<ProbeBudget> : {};
   check(Object.keys(options).every(key => key in DEFAULT_BUDGET), 'invalid-budget');
   const budget = { ...DEFAULT_BUDGET, ...options };
-  if (['run', 'recover', 'memory', 'hold', 'task', 'maintain'].includes(command)) check(args.values.sandbox, 'sandbox-required');
+  if (['run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain'].includes(command)) check(args.values.sandbox, 'sandbox-required');
   // Fault injection never modifies a caller-selected existing sandbox.
   if (command === 'archive-failure' || args.values.scenario === 'archive-failure') check(!args.values.sandbox, 'fault-requires-fresh-sandbox');
   const sandbox = args.values.sandbox ? openSandbox(args.values.sandbox) : createSandbox();
@@ -179,6 +219,16 @@ async function main() {
     const probe = openProbe(sandbox);
     try { emit('recovered', { source: probe.archive.lookup(sandbox.fixture.eventId), intent: probe.session.recoverIntent(), memories: probe.store.recoverMemories(probe.activity), eventCount: probe.archive.inspect().eventCount, sends: 0 }); }
     finally { probe.close(); }
+    return;
+  }
+  if (command === 'memory-worker') return memoryWorker(sandbox, args.values.scenario);
+  if (command === 'memory-reconcile') {
+    check(args.values.record && args.values.expected, 'memory-identity-required');
+    const probe = openProbe(sandbox);
+    try {
+      emit('memory-reconciled', { operation: probe.store.lookupMemoryOperation(probe.activity, args.values.record, args.values.expected, 'correct'),
+        recovered: probe.store.recoverMemory(probe.activity, args.values.record), outbox: probe.store.pendingMemoryProjections(probe.activity) });
+    } finally { probe.close(); }
     return;
   }
   if (command === 'memory') return memoryDemo(sandbox);

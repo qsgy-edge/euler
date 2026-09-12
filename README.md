@@ -8,6 +8,8 @@ Delivery scope is defined in [I01 of the implementation specification](docs/arch
 
 Issue #1 adds a runnable **synthetic P0 probe** for first-turn source durability, a local counting transport, and maintenance exclusion/recovery. See [commands, contracts, and evidence boundaries](docs/implementation/t01-synthetic-probes.md). It uses generated disposable databases and never opens MC or a production data root.
 
+Issue #2 adds synthetic scoped memory transitions, source-backed verification fixtures, event replay, inert proposal versions, and process-crash/concurrent-writer probes. See [commands, storage behavior, and evidence boundaries](docs/implementation/t02-scoped-memory.md). Semantic verification and production acceptance remain separate work.
+
 Full X-card acceptance, real provider dispatch, production schema/host acceptance, migration, and MC cutover remain unverified. CI and host results must be read from the artifact for the specific implementation and platform; this repository is not production-ready.
 
 - [Euler v1 implementation specification](docs/architecture/issues/15-euler-v1-spec.md)

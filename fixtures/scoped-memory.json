@@ -1,0 +1,12 @@
+{
+  "schema": "euler-t02-fixture@1",
+  "mode": "synthetic-only",
+  "sourceEventId": "00000000-0000-4000-8000-000000000020",
+  "sourceText": "Synthetic owner decision: keep this project's receipts in its local store.",
+  "memoryText": "Keep synthetic project receipts in the local store.",
+  "type": "decision",
+  "claimKey": "synthetic/project-receipt-location",
+  "appliesTo": ["cli"],
+  "verification": "synthetic-pass-not-semantic-evidence",
+  "correctionText": "Synthetic corrected memory"
+}

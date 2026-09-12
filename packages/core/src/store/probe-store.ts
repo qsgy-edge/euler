@@ -31,12 +31,12 @@ export type MemoryLifecycle = 'candidate' | 'active' | 'superseded' | 'rejected'
 export type MemoryVerification = 'unverified' | 'verified' | 'conflicted' | 'stale';
 export type MemoryScopeKind = 'project' | 'workspace' | 'personal' | 'session';
 export interface MemoryScope { kind: MemoryScopeKind; id: string; resolved: boolean }
-export interface MemoryCaptureOptions { type: MemoryType; scope: MemoryScope; appliesTo: string[] }
+export interface MemoryCaptureOptions { type: MemoryType; scope: MemoryScope; appliesTo: string[]; claimKey?: string }
 export interface MemoryRecord {
-  schema: 'memory-record@1'; recordId: string; revisionId: string; revision: number;
+  schema: 'memory-record@1'; recordId: string; revisionId: string; revision: number; claimKey: string;
   content: string; contentHash: string; type: MemoryType; lifecycle: MemoryLifecycle;
   verification: MemoryVerification; scope: MemoryScope; appliesTo: string[]; source: SourceAck;
-  conflictSetId: string | null; headEventId: string; hash: string;
+  conflictSetId: string | null; verificationRunId: string | null; headEventId: string; hash: string;
 }
 export interface MemoryOperation { status: 'committed' | 'no_op'; record: MemoryRecord; eventId: string | null }
 export interface ConflictOperation { status: 'committed' | 'no_op'; left: MemoryOperation; right: MemoryOperation; conflictSetId: string | null }
@@ -44,10 +44,13 @@ export interface EvolutionProposalInput {
   target: string; expectedChange: string; owner: string; scope: MemoryScope; evidenceRefs: SourceAck[];
   evaluation: { schema: 'evaluation-contract@1'; level: 'L0' | 'L1' | 'L2' | 'L3'; assertions: string[] };
   supersedes?: string;
+  targetType?: 'guidance' | 'skill' | 'code' | 'policy';
+  risk?: 'low' | 'high';
 }
 export interface EvolutionProposal {
   schema: 'evolution-proposal@1'; proposalId: string; version: number; target: string;
-  expectedChange: string; owner: string; scope: MemoryScope; evidenceRefs: SourceAck[];
+  expectedChange: string; owner: string; scope: MemoryScope; evidenceRefs: SourceAck[]; input: SourceAck;
+  targetType: 'guidance' | 'skill' | 'code' | 'policy'; risk: 'low' | 'high';
   evaluation: EvolutionProposalInput['evaluation']; supersedes: string | null; inert: true; hash: string;
 }
 const processIdentity = Object.freeze({ pid: process.pid, incarnation: randomUUID(), startedAt: new Date(performance.timeOrigin).toISOString() });
@@ -108,16 +111,35 @@ CREATE TABLE intent_heads (
 ) STRICT;
 CREATE TRIGGER immutable_intent_update BEFORE UPDATE ON intent_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_intent_delete BEFORE DELETE ON intent_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TABLE projects (project_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL) STRICT;
+CREATE TABLE project_resources (
+  project_id TEXT NOT NULL REFERENCES projects(project_id), path TEXT NOT NULL, dev TEXT NOT NULL, ino TEXT NOT NULL,
+  PRIMARY KEY(project_id,path)
+) STRICT;
+CREATE TABLE memory_scopes (
+  kind TEXT NOT NULL CHECK(kind IN ('project','personal','session')), scope_id TEXT NOT NULL,
+  resolved INTEGER NOT NULL CHECK(resolved IN (0,1)), owner_id TEXT NOT NULL,
+  project_id TEXT REFERENCES projects(project_id), session_id TEXT,
+  CHECK((kind='project' AND scope_id=project_id AND project_id IS NOT NULL AND session_id IS NULL AND resolved=1)
+    OR (kind='personal' AND scope_id=owner_id AND project_id IS NULL AND session_id IS NULL AND resolved=1)
+    OR (kind='session' AND scope_id=session_id AND session_id IS NOT NULL AND project_id IS NULL AND resolved=0)),
+  PRIMARY KEY(kind,scope_id), UNIQUE(kind,scope_id,resolved)
+) STRICT;
 CREATE TABLE memory_records (
-  record_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, created_at TEXT NOT NULL
+  record_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, claim_key TEXT NOT NULL, source_lineage TEXT NOT NULL, created_at TEXT NOT NULL
 ) STRICT;
 CREATE TABLE memory_revisions (
   revision_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), revision INTEGER NOT NULL CHECK(revision > 0),
   content TEXT NOT NULL, content_hash TEXT NOT NULL, type TEXT NOT NULL CHECK(type IN ('fact','preference','decision','insight','episode')),
   scope_kind TEXT NOT NULL CHECK(scope_kind IN ('project','workspace','personal','session')), scope_id TEXT NOT NULL,
-  scope_resolved INTEGER NOT NULL CHECK(scope_resolved IN (0,1)), applies_to TEXT NOT NULL, source_json TEXT NOT NULL,
-  source_event_id TEXT NOT NULL UNIQUE, source_hash TEXT NOT NULL, source_content_hash TEXT NOT NULL, source_locator TEXT NOT NULL,
-  UNIQUE(record_id, revision)
+  scope_resolved INTEGER NOT NULL CHECK(scope_resolved IN (0,1)), source_json TEXT NOT NULL,
+  source_event_id TEXT NOT NULL, source_hash TEXT NOT NULL, source_content_hash TEXT NOT NULL, source_locator TEXT NOT NULL,
+  UNIQUE(record_id, revision), UNIQUE(record_id,revision_id),
+  FOREIGN KEY(scope_kind,scope_id,scope_resolved) REFERENCES memory_scopes(kind,scope_id,resolved)
+) STRICT;
+CREATE TABLE memory_applicability (
+  revision_id TEXT NOT NULL REFERENCES memory_revisions(revision_id), ordinal INTEGER NOT NULL CHECK(ordinal>=0), value TEXT NOT NULL,
+  PRIMARY KEY(revision_id,ordinal), UNIQUE(revision_id,value)
 ) STRICT;
 CREATE TABLE capture_jobs (
   job_id TEXT PRIMARY KEY, source_event_id TEXT NOT NULL UNIQUE, record_id TEXT NOT NULL REFERENCES memory_records(record_id),
@@ -126,7 +148,8 @@ CREATE TABLE capture_jobs (
 CREATE TABLE provenance_refs (
   ref_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), revision_id TEXT NOT NULL REFERENCES memory_revisions(revision_id),
   owner_kind TEXT NOT NULL, owner_id TEXT NOT NULL, source_json TEXT NOT NULL, source_event_id TEXT NOT NULL, locator TEXT NOT NULL,
-  content_hash TEXT NOT NULL, payload TEXT NOT NULL, payload_hash TEXT NOT NULL
+  content_hash TEXT NOT NULL, payload TEXT NOT NULL, payload_hash TEXT NOT NULL,
+  FOREIGN KEY(record_id,revision_id) REFERENCES memory_revisions(record_id,revision_id)
 ) STRICT;
 CREATE TABLE memory_heads (
   record_id TEXT PRIMARY KEY REFERENCES memory_records(record_id), revision_id TEXT NOT NULL REFERENCES memory_revisions(revision_id),
@@ -134,16 +157,37 @@ CREATE TABLE memory_heads (
   verification TEXT NOT NULL CHECK(verification IN ('unverified','verified','conflicted','stale')),
   scope_kind TEXT NOT NULL CHECK(scope_kind IN ('project','workspace','personal','session')), scope_id TEXT NOT NULL,
   scope_resolved INTEGER NOT NULL CHECK(scope_resolved IN (0,1)), head_event_id TEXT NOT NULL,
-  snapshot TEXT NOT NULL, snapshot_hash TEXT NOT NULL, conflict_set_id TEXT
+  snapshot TEXT NOT NULL, snapshot_hash TEXT NOT NULL, conflict_set_id TEXT REFERENCES conflict_sets(conflict_set_id),
+  verification_run_id TEXT REFERENCES verification_runs(run_id),
+  CHECK(verification!='verified' OR verification_run_id IS NOT NULL),
+  FOREIGN KEY(record_id,revision_id) REFERENCES memory_revisions(record_id,revision_id),
+  FOREIGN KEY(record_id,head_event_id,revision_id) REFERENCES memory_events(record_id,event_id,revision_id),
+  FOREIGN KEY(scope_kind,scope_id,scope_resolved) REFERENCES memory_scopes(kind,scope_id,resolved)
 ) STRICT;
 CREATE TABLE memory_events (
-  event_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), seq INTEGER NOT NULL CHECK(seq > 0), kind TEXT NOT NULL,
+  event_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), seq INTEGER NOT NULL CHECK(seq > 0), kind TEXT NOT NULL CHECK(kind IN ('capture','verify','activate','correct','auto-revise','forget','restore','conflict','rollback')),
   revision_id TEXT NOT NULL REFERENCES memory_revisions(revision_id), before_snapshot TEXT, after_snapshot TEXT NOT NULL,
-  payload TEXT NOT NULL, payload_hash TEXT NOT NULL, source_event_id TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(record_id, seq)
+  request_hash TEXT NOT NULL UNIQUE, origin_host_id TEXT NOT NULL, origin_seq INTEGER NOT NULL CHECK(origin_seq>0), batch_id TEXT,
+  target_event_id TEXT REFERENCES memory_events(event_id),
+  payload TEXT NOT NULL, payload_hash TEXT NOT NULL, source_event_id TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(record_id, seq),
+  UNIQUE(origin_host_id,origin_seq),
+  UNIQUE(record_id,event_id,revision_id),
+  FOREIGN KEY(record_id,revision_id) REFERENCES memory_revisions(record_id,revision_id)
+) STRICT;
+CREATE TABLE projection_jobs (
+  job_id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('search','host-info')), event_id TEXT NOT NULL REFERENCES memory_events(event_id),
+  owner_id TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL, batch_id TEXT,
+  payload TEXT NOT NULL, payload_hash TEXT NOT NULL, UNIQUE(kind,event_id)
+) STRICT;
+CREATE TABLE feedback_events (
+  feedback_id TEXT PRIMARY KEY, record_id TEXT NOT NULL, head_event_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind='retrieved'),
+  FOREIGN KEY(record_id,head_event_id,revision_id) REFERENCES memory_events(record_id,event_id,revision_id)
 ) STRICT;
 CREATE TABLE verification_runs (
   run_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), revision_id TEXT NOT NULL REFERENCES memory_revisions(revision_id),
-  result TEXT NOT NULL CHECK(result IN ('pass','block','evidence-gap')), evidence_json TEXT NOT NULL, evidence_hash TEXT NOT NULL, created_at TEXT NOT NULL
+  result TEXT NOT NULL CHECK(result IN ('pass','block','evidence-gap')), evidence_json TEXT NOT NULL, evidence_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+  FOREIGN KEY(record_id,revision_id) REFERENCES memory_revisions(record_id,revision_id)
 ) STRICT;
 CREATE TABLE conflict_sets (conflict_set_id TEXT PRIMARY KEY, created_at TEXT NOT NULL) STRICT;
 CREATE TABLE conflict_members (
@@ -154,8 +198,23 @@ CREATE TABLE evolution_proposals (
   proposal_id TEXT PRIMARY KEY, version INTEGER NOT NULL CHECK(version > 0), target TEXT NOT NULL, expected_change TEXT NOT NULL,
   owner TEXT NOT NULL, scope_json TEXT NOT NULL, evidence_json TEXT NOT NULL, evaluation_json TEXT NOT NULL,
   supersedes TEXT REFERENCES evolution_proposals(proposal_id), payload TEXT NOT NULL, payload_hash TEXT NOT NULL, created_at TEXT NOT NULL,
-  UNIQUE(target, version)
+  scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL, scope_resolved INTEGER NOT NULL,
+  request_hash TEXT NOT NULL UNIQUE, target_type TEXT NOT NULL, risk TEXT NOT NULL,
+  UNIQUE(owner,scope_kind,scope_id,target,version),
+  FOREIGN KEY(scope_kind,scope_id,scope_resolved) REFERENCES memory_scopes(kind,scope_id,resolved)
 ) STRICT;
+CREATE TABLE verification_evidence (
+  run_id TEXT NOT NULL REFERENCES verification_runs(run_id), ordinal INTEGER NOT NULL,
+  source_owner TEXT NOT NULL, source_event_id TEXT NOT NULL, locator TEXT NOT NULL, hash TEXT NOT NULL, content_hash TEXT NOT NULL,
+  PRIMARY KEY(run_id,ordinal)
+) STRICT;
+CREATE TABLE proposal_evidence (
+  proposal_id TEXT NOT NULL REFERENCES evolution_proposals(proposal_id), ordinal INTEGER NOT NULL,
+  source_owner TEXT NOT NULL, source_event_id TEXT NOT NULL, locator TEXT NOT NULL, hash TEXT NOT NULL, content_hash TEXT NOT NULL,
+  PRIMARY KEY(proposal_id,ordinal)
+) STRICT;
+CREATE INDEX verification_source ON verification_evidence(source_owner,source_event_id);
+CREATE INDEX proposal_source ON proposal_evidence(source_owner,source_event_id);
 CREATE TRIGGER immutable_memory_records_update BEFORE UPDATE ON memory_records BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_memory_records_delete BEFORE DELETE ON memory_records BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_memory_revisions_update BEFORE UPDATE ON memory_revisions BEGIN SELECT RAISE(ABORT, 'append-only'); END;
@@ -171,8 +230,15 @@ CREATE TRIGGER immutable_provenance_refs_delete BEFORE DELETE ON provenance_refs
 CREATE TRIGGER immutable_evolution_proposals_update BEFORE UPDATE ON evolution_proposals BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_proposals BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=2;
-`;
+PRAGMA user_version=3;
+` + ['memory_applicability','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events'].map(table => `
+CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
+`).join('') + ['memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
+  'verification_runs','verification_evidence','proposal_evidence','projection_jobs','feedback_events','conflict_sets','conflict_members','evolution_proposals'].map(table => `
+CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
+WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
+`).join('');
 export const probeSchemaDigest = sha256(DDL);
 
 // P0 disposable schema; not migrations/001-initial.sql and not the execution ledger.
@@ -181,15 +247,19 @@ export class ProbeStore {
   readonly #storeId: string;
   readonly #binding: Binding;
   readonly #resources: StoreResources;
+  readonly #readSource: ((input: SourceAck) => { text: string }) | undefined;
   #depth = 0;
 
-  constructor(resources: StoreResources, storeId: string, binding: Binding, initialize = false) {
+  constructor(resources: StoreResources, storeId: string, binding: Binding, initialize = false,
+    readSource?: (input: SourceAck) => { text: string }) {
+    this.#readSource = readSource;
     this.#storeId = storeId;
     this.#binding = structuredClone(binding);
     this.#resources = structuredClone(resources);
     this.#verifyResources();
     this.#db = new DatabaseSync(resources.store.path);
     try {
+      this.#db.function('euler_store_writer', () => this.#depth > 0 ? 1 : 0);
       this.#db.exec('PRAGMA busy_timeout=2000; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;');
       const version = this.#db.prepare('PRAGMA user_version').get()!.user_version;
       if (initialize) {
@@ -202,9 +272,16 @@ export class ProbeStore {
               resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.source.path, resources.source.identity.dev, resources.source.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino, 'open');
+          this.#db.prepare('INSERT INTO projects VALUES (?,?)').run(binding.projectId, binding.ownerId);
+          this.#db.prepare('INSERT INTO project_resources VALUES (?,?,?,?)')
+            .run(binding.projectId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino);
+          this.#db.prepare('INSERT INTO memory_scopes VALUES (?,?,?,?,?,?), (?,?,?,?,?,?), (?,?,?,?,?,?)')
+            .run('project', binding.projectId, 1, binding.ownerId, binding.projectId, null,
+              'personal', binding.ownerId, 1, binding.ownerId, null, null,
+              'session', binding.sessionId, 0, binding.ownerId, null, binding.sessionId);
         });
       } else {
-        check(version === 2, 'unsupported-probe-schema');
+        check(version === 3, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
@@ -220,17 +297,18 @@ export class ProbeStore {
 
   #transaction<T>(action: () => T): T {
     this.#verifyResources();
-    if (this.#depth) return action();
-    this.#db.exec('BEGIN IMMEDIATE');
+    const nested = this.#depth > 0;
+    const savepoint = `store_${this.#depth}`;
+    this.#db.exec(nested ? `SAVEPOINT ${savepoint}` : 'BEGIN IMMEDIATE');
     this.#depth++;
     try {
       const value = action();
       check(!(value instanceof Promise), 'async-store-transaction');
       this.#verifyResources();
-      this.#db.exec('COMMIT');
+      this.#db.exec(nested ? `RELEASE ${savepoint}` : 'COMMIT');
       return value;
     } catch (error) {
-      this.#db.exec('ROLLBACK');
+      this.#db.exec(nested ? `ROLLBACK TO ${savepoint}; RELEASE ${savepoint}` : 'ROLLBACK');
       throw error;
     } finally { this.#depth--; }
   }
@@ -354,27 +432,35 @@ export class ProbeStore {
 
   captureMemory(activity: Activity, input: SourceAck, content: string, options: MemoryCaptureOptions): MemoryOperation {
     return this.withActivity(activity, () => {
-      check(Object.keys(options).every(key => key === 'type' || key === 'scope' || key === 'appliesTo'), 'invalid-memory-options');
+      check(Object.keys(options).every(key => ['type','scope','appliesTo','claimKey'].includes(key)), 'invalid-memory-options');
       this.#validateSource(input, content);
       const scope = this.#validateScope(options.scope);
       const appliesTo = this.#normalizeAppliesTo(options.appliesTo);
+      const claimKey = options.claimKey ?? content.trim().normalize('NFC');
+      check(typeof claimKey === 'string' && claimKey.length > 0 && Buffer.byteLength(claimKey) <= 65536, 'invalid-claim-key');
       check(['fact', 'preference', 'decision', 'insight', 'episode'].includes(options.type), 'invalid-memory-type');
       const existing = this.#db.prepare('SELECT * FROM memory_revisions WHERE source_event_id=?').get(input.eventId);
       if (existing) {
         const same = existing.content === content && existing.type === options.type && existing.scope_kind === scope.kind
           && existing.scope_id === scope.id && Number(existing.scope_resolved) === (scope.resolved ? 1 : 0)
-          && existing.applies_to === JSON.stringify(appliesTo) && existing.source_json === JSON.stringify(input);
+          && JSON.stringify(this.#readAppliesTo(String(existing.revision_id))) === JSON.stringify(appliesTo)
+          && existing.source_json === JSON.stringify(input);
         check(same, 'identity-conflict');
-        return { status: 'no_op', record: this.#readMemoryUnsafe(String(existing.record_id)), eventId: null };
+        const record = this.#readMemoryUnsafe(String(existing.record_id));
+        check(record.claimKey === claimKey, 'identity-conflict');
+        return { status: 'no_op', record, eventId: null };
       }
+      const suppressed = this.#suppressed(claimKey, input.binding.sessionId, scope, appliesTo);
+      if (suppressed) return { status: 'no_op', record: suppressed, eventId: null };
       const recordId = randomUUID();
       const revisionId = randomUUID();
       const eventId = randomUUID();
-      const base = { schema: 'memory-record@1' as const, recordId, revisionId, revision: 1,
+      const base = { schema: 'memory-record@1' as const, recordId, revisionId, revision: 1, claimKey,
         content, contentHash: sha256(content), type: options.type, lifecycle: 'candidate' as const,
-        verification: 'unverified' as const, scope, appliesTo, source: structuredClone(input), conflictSetId: null, headEventId: eventId };
+        verification: 'unverified' as const, scope, appliesTo, source: structuredClone(input), conflictSetId: null, verificationRunId: null, headEventId: eventId };
       const record = this.#withMemoryHash(base);
-      this.#db.prepare('INSERT INTO memory_records VALUES (?, ?, ?)').run(recordId, this.#binding.ownerId, new Date().toISOString());
+      this.#db.prepare('INSERT INTO memory_records VALUES (?, ?, ?, ?, ?)')
+        .run(recordId, this.#binding.ownerId, claimKey, input.binding.sessionId, new Date().toISOString());
       this.#insertRevision(record);
       const capturePayload = JSON.stringify({ schema: 'capture-job@1', source: input, recordId });
       this.#db.prepare('INSERT INTO capture_jobs VALUES (?, ?, ?, ?, ?, ?, ?)')
@@ -382,6 +468,27 @@ export class ProbeStore {
       this.#appendMemoryEvent(null, record, 'capture', input.eventId, { automatic: true });
       return { status: 'committed', record, eventId };
     });
+  }
+
+  inspectMemory(activity: Activity, recordId: string) {
+    return this.withActivity(activity, () => ({
+      record: this.#readMemoryUnsafe(recordId),
+      history: this.#db.prepare('SELECT event_id,seq,kind,payload,payload_hash FROM memory_events WHERE record_id=? ORDER BY seq').all(recordId)
+        .map(row => ({ eventId: String(row.event_id), seq: Number(row.seq), kind: String(row.kind), payload: String(row.payload), digest: String(row.payload_hash) })),
+    }));
+  }
+
+  pendingMemoryProjections(activity: Activity) {
+    return this.withActivity(activity, () => this.#db.prepare('SELECT * FROM projection_jobs WHERE owner_id=? ORDER BY rowid').all(this.#binding.ownerId)
+      .map(row => {
+        check(sha256(String(row.payload)) === row.payload_hash, 'outbox-evidence-gap');
+        const manifest = JSON.parse(String(row.payload));
+        const event = this.#db.prepare('SELECT payload FROM memory_events WHERE event_id=?').get(String(row.event_id));
+        check(event && manifest.schema === 'memory-outbox@1' && manifest.kind === row.kind && manifest.batchId === row.batch_id
+          && manifest.events.length === 1 && JSON.stringify(manifest.events[0]) === event.payload, 'outbox-evidence-gap');
+        return { jobId: String(row.job_id), kind: String(row.kind), eventId: String(row.event_id), batchId: row.batch_id,
+          payload: String(row.payload), digest: String(row.payload_hash) };
+      }));
   }
 
   readMemory(activity: Activity, recordId: string): MemoryRecord {
@@ -392,24 +499,39 @@ export class ProbeStore {
   }
 
   recoverMemory(activity: Activity, recordId: string): MemoryRecord {
-    return this.readMemory(activity, recordId);
+    return this.withActivity(activity, () => {
+      uuid(recordId);
+      const record = this.#replayMemory(recordId);
+      if (!this.#db.prepare('SELECT 1 FROM memory_heads WHERE record_id=?').get(recordId)) this.#saveHead(record);
+      return this.#readMemoryUnsafe(recordId);
+    });
   }
 
   recoverMemories(activity: Activity): MemoryRecord[] {
-    return this.withActivity(activity, () => this.#db.prepare('SELECT record_id FROM memory_heads ORDER BY rowid').all()
-      .map(row => this.#readMemoryUnsafe(String(row.record_id))));
+    return this.withActivity(activity, () => this.#db.prepare('SELECT record_id FROM memory_records WHERE owner_id=? ORDER BY rowid')
+      .all(this.#binding.ownerId).map(row => this.recoverMemory(activity, String(row.record_id))));
   }
 
   listEligibleMemories(activity: Activity): MemoryRecord[] {
-    return this.withActivity(activity, () => this.#db.prepare(`SELECT record_id FROM memory_heads
-      WHERE lifecycle='active' AND verification='verified' AND scope_resolved=1
-      AND ((scope_kind='project' AND scope_id=?) OR (scope_kind='personal' AND scope_id=?))
-      ORDER BY rowid`).all(this.#binding.projectId, this.#binding.ownerId)
-      .map(row => this.#readMemoryUnsafe(String(row.record_id))));
+    return this.withActivity(activity, () => {
+      const records = this.#db.prepare(`SELECT record_id FROM memory_heads
+        WHERE lifecycle='active' AND verification='verified' AND scope_resolved=1
+        AND ((scope_kind='project' AND scope_id=?) OR (scope_kind='personal' AND scope_id=?)) ORDER BY rowid`)
+        .all(this.#binding.projectId, this.#binding.ownerId).map(row => this.#readMemoryUnsafe(String(row.record_id)))
+        .filter(record => !record.conflictSetId && record.appliesTo.every(condition => ['cli', process.platform].includes(condition)));
+      for (const record of records) {
+        this.#db.prepare('INSERT INTO feedback_events VALUES (?,?,?,?,?)')
+          .run(randomUUID(), record.recordId, record.headEventId, record.revisionId, 'retrieved');
+      }
+      return records;
+    });
   }
 
   verifyMemory(activity: Activity, recordId: string, expected: MemoryRecord, result: 'pass' | 'block' | 'evidence-gap', evidence: SourceAck[]): MemoryOperation {
     return this.withActivity(activity, () => {
+      const request = this.#requestDigest('verify', expected, { recordId, result, evidence });
+      const replay = this.#replayed(request);
+      if (replay) return replay;
       const current = this.#assertMemoryExpected(recordId, expected);
       check(['pass', 'block', 'evidence-gap'].includes(result), 'invalid-verification');
       check(Array.isArray(evidence), 'invalid-verification');
@@ -417,82 +539,131 @@ export class ProbeStore {
       check(result !== 'pass' || evidence.length > 0, 'verification-evidence-required');
       const evidenceJson = JSON.stringify(evidence);
       const evidenceHash = sha256(evidenceJson);
-      const prior = this.#db.prepare('SELECT 1 FROM verification_runs WHERE record_id=? AND revision_id=? AND result=? AND evidence_hash=?')
-        .get(recordId, current.revisionId, result, evidenceHash);
-      if (prior) return { status: 'no_op', record: current, eventId: null };
-      const runId = randomUUID();
-      this.#db.prepare('INSERT INTO verification_runs VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .run(runId, recordId, current.revisionId, result, evidenceJson, evidenceHash, new Date().toISOString());
-      const after = this.#withMemoryHash({ ...current, verification: result === 'pass' ? 'verified' : 'unverified', headEventId: randomUUID() });
-      this.#appendMemoryEvent(current, after, 'verify', current.source.eventId, { runId, result, evidence: JSON.parse(evidenceJson) });
+      const prior = this.#db.prepare('SELECT 1 FROM verification_runs WHERE run_id=? AND record_id=? AND revision_id=? AND result=? AND evidence_hash=?')
+        .get(current.verificationRunId, recordId, current.revisionId, result, evidenceHash);
+      if (prior && current.verification === (result === 'pass' ? 'verified' : 'unverified')) return { status: 'no_op', record: current, eventId: null };
+      const runId = this.#saveVerification(current, result, evidence);
+      const after = this.#withMemoryHash({ ...current, verificationRunId: runId,
+        lifecycle: result === 'block' && current.lifecycle !== 'tombstoned' ? 'rejected' : current.lifecycle,
+        verification: result === 'pass' ? 'verified' : 'unverified', headEventId: randomUUID() });
+      this.#appendMemoryEvent(current, after, 'verify', current.source.eventId, { runId, result, evidence: JSON.parse(evidenceJson), synthetic: true }, request);
       return { status: 'committed', record: after, eventId: after.headEventId };
     });
   }
 
   activateMemory(activity: Activity, recordId: string, expected: MemoryRecord): MemoryOperation {
     return this.withActivity(activity, () => {
+      const request = this.#requestDigest('activate', expected, { recordId });
+      const replay = this.#replayed(request);
+      if (replay) return replay;
       const current = this.#assertMemoryExpected(recordId, expected);
       if (current.lifecycle === 'active' && current.verification === 'verified') return { status: 'no_op', record: current, eventId: null };
-      check(current.lifecycle === 'candidate' && current.verification === 'verified' && current.scope.resolved, 'memory-not-eligible');
+      check(current.lifecycle === 'candidate' && current.verification === 'verified' && current.scope.resolved && !current.conflictSetId, 'memory-not-eligible');
+      check(!this.#suppressed(current.claimKey, current.source.binding.sessionId, current.scope, current.appliesTo), 'memory-suppressed');
       const after = this.#withMemoryHash({ ...current, lifecycle: 'active', headEventId: randomUUID() });
-      this.#appendMemoryEvent(current, after, 'activate', current.source.eventId, { automatic: true });
+      this.#eligible(after);
+      this.#appendMemoryEvent(current, after, 'activate', current.source.eventId, { automatic: true }, request);
       return { status: 'committed', record: after, eventId: after.headEventId };
     });
   }
 
   forgetMemory(activity: Activity, recordId: string, expected: MemoryRecord): MemoryOperation {
     return this.withActivity(activity, () => {
+      const request = this.#requestDigest('forget', expected, { recordId });
+      const replay = this.#replayed(request);
+      if (replay) return replay;
       const current = this.#assertMemoryExpected(recordId, expected);
       check(current.lifecycle === 'active', 'memory-not-active');
       const after = this.#withMemoryHash({ ...current, lifecycle: 'tombstoned', headEventId: randomUUID() });
-      this.#appendMemoryEvent(current, after, 'forget', current.source.eventId, { reversible: true });
+      this.#appendMemoryEvent(current, after, 'forget', current.source.eventId, { reversible: true }, request);
       return { status: 'committed', record: after, eventId: after.headEventId };
     });
   }
 
   restoreMemory(activity: Activity, recordId: string, expected: MemoryRecord): MemoryOperation {
     return this.withActivity(activity, () => {
+      const request = this.#requestDigest('restore', expected, { recordId });
+      const replay = this.#replayed(request);
+      if (replay) return replay;
       const current = this.#assertMemoryExpected(recordId, expected);
       check(current.lifecycle === 'tombstoned', 'memory-not-tombstoned');
       check(current.verification === 'verified', 'memory-not-eligible');
+      this.#eligible(current);
       const after = this.#withMemoryHash({ ...current, lifecycle: 'active', headEventId: randomUUID() });
-      this.#appendMemoryEvent(current, after, 'restore', current.source.eventId, { reversible: true });
+      this.#appendMemoryEvent(current, after, 'restore', current.source.eventId, { reversible: true }, request);
       return { status: 'committed', record: after, eventId: after.headEventId };
     });
   }
 
   correctMemory(activity: Activity, recordId: string, expected: MemoryRecord, input: SourceAck, content: string): MemoryOperation {
     return this.withActivity(activity, () => {
+      const request = this.#requestDigest('correct', expected, { recordId, input, content });
+      const replay = this.#replayed(request);
+      if (replay) return replay;
       const current = this.#assertMemoryExpected(recordId, expected);
       check(current.lifecycle !== 'tombstoned', 'tombstoned-not-actionable');
+      check(typeof content === 'string', 'invalid-memory-content');
+      if (content.trim().normalize('NFC') === '' || content.trim().normalize('NFC') === current.content.trim().normalize('NFC')) {
+        return { status: 'no_op', record: current, eventId: null };
+      }
       this.#validateSource(input, content);
-      if (sha256(content) === current.contentHash) return { status: 'no_op', record: current, eventId: null };
       const revisionId = randomUUID();
       const eventId = randomUUID();
-      const base = { ...current, revisionId, revision: current.revision + 1, content, contentHash: sha256(content),
-        lifecycle: current.lifecycle, verification: 'unverified' as const, source: structuredClone(input), headEventId: eventId };
+      const base = { ...current, revisionId, revision: this.#nextRevision(recordId), content, contentHash: sha256(content),
+        lifecycle: current.lifecycle, verification: 'unverified' as const, verificationRunId: null, source: structuredClone(input), headEventId: eventId };
       const after = this.#withMemoryHash(base);
       this.#insertRevision(after);
-      this.#appendMemoryEvent(current, after, 'correct', input.eventId, { automatic: false });
+      this.#appendMemoryEvent(current, after, 'correct', input.eventId, { automatic: false }, request);
       return { status: 'committed', record: after, eventId };
+    });
+  }
+
+  // Synthetic Store input only. A semantic verifier and live approval remain Core work.
+  reviseMemory(activity: Activity, recordId: string, expected: MemoryRecord, input: SourceAck, content: string, evidence: SourceAck[]): MemoryOperation {
+    return this.withActivity(activity, () => {
+      const request = this.#requestDigest('auto-revise', expected, { recordId, input, content, evidence });
+      const replay = this.#replayed(request);
+      if (replay) return replay;
+      const current = this.#assertMemoryExpected(recordId, expected);
+      check(current.lifecycle === 'active', 'memory-not-active');
+      this.#eligible(current);
+      this.#validateSource(input, content);
+      if (content.trim().normalize('NFC') === current.content.trim().normalize('NFC')) return { status: 'no_op', record: current, eventId: null };
+      let after = this.#withMemoryHash({ ...current, revisionId: randomUUID(), revision: this.#nextRevision(recordId),
+        content, contentHash: sha256(content), source: structuredClone(input), headEventId: randomUUID(), verificationRunId: null });
+      this.#insertRevision(after);
+      const verificationRunId = this.#saveVerification(after, 'pass', evidence);
+      after = this.#withMemoryHash({ ...after, verificationRunId });
+      this.#appendMemoryEvent(current, after, 'auto-revise', input.eventId, { automatic: true, synthetic: true, evidence }, request);
+      return { status: 'committed', record: after, eventId: after.headEventId };
     });
   }
 
   conflictMemory(activity: Activity, leftId: string, leftExpected: MemoryRecord, rightId: string, rightExpected: MemoryRecord): ConflictOperation {
     return this.withActivity(activity, () => {
       check(leftId !== rightId, 'invalid-conflict');
+      const leftRequest = this.#requestDigest('conflict', leftExpected, { leftId, rightId, rightExpected });
+      const rightRequest = this.#requestDigest('conflict', rightExpected, { leftId, rightId, leftExpected });
+      const replayLeft = this.#replayed(leftRequest);
+      const replayRight = this.#replayed(rightRequest);
+      if (replayLeft || replayRight) {
+        check(replayLeft && replayRight && replayLeft.record.conflictSetId === replayRight.record.conflictSetId, 'memory-stale');
+        return { status: 'no_op', left: replayLeft, right: replayRight, conflictSetId: replayLeft.record.conflictSetId };
+      }
       const left = this.#assertMemoryExpected(leftId, leftExpected);
       const right = this.#assertMemoryExpected(rightId, rightExpected);
-      if (left.verification === 'conflicted' && right.verification === 'conflicted') {
+      if (left.verification === 'conflicted' && right.verification === 'conflicted' && left.conflictSetId === right.conflictSetId) {
         return { status: 'no_op', left: { status: 'no_op', record: left, eventId: null }, right: { status: 'no_op', record: right, eventId: null }, conflictSetId: null };
       }
+      check(left.verification === 'verified' && right.verification === 'verified' && left.lifecycle !== 'tombstoned' && right.lifecycle !== 'tombstoned'
+        && JSON.stringify(left.scope) === JSON.stringify(right.scope) && JSON.stringify(left.appliesTo) === JSON.stringify(right.appliesTo), 'invalid-conflict');
       const conflictSetId = randomUUID();
       this.#db.prepare('INSERT INTO conflict_sets VALUES (?, ?)').run(conflictSetId, new Date().toISOString());
       this.#db.prepare('INSERT INTO conflict_members VALUES (?, ?), (?, ?)').run(conflictSetId, leftId, conflictSetId, rightId);
       const nextLeft = this.#withMemoryHash({ ...left, verification: 'conflicted', conflictSetId, headEventId: randomUUID() });
       const nextRight = this.#withMemoryHash({ ...right, verification: 'conflicted', conflictSetId, headEventId: randomUUID() });
-      this.#appendMemoryEvent(left, nextLeft, 'conflict', left.source.eventId, { conflictSetId, members: [leftId, rightId] });
-      this.#appendMemoryEvent(right, nextRight, 'conflict', right.source.eventId, { conflictSetId, members: [leftId, rightId] });
+      this.#appendMemoryEvent(left, nextLeft, 'conflict', left.source.eventId, { conflictSetId, members: [leftId, rightId] }, leftRequest);
+      this.#appendMemoryEvent(right, nextRight, 'conflict', right.source.eventId, { conflictSetId, members: [leftId, rightId] }, rightRequest);
       return { status: 'committed', left: { status: 'committed', record: nextLeft, eventId: nextLeft.headEventId },
         right: { status: 'committed', record: nextRight, eventId: nextRight.headEventId }, conflictSetId };
     });
@@ -501,63 +672,142 @@ export class ProbeStore {
   rollbackMemory(activity: Activity, recordId: string, expected: MemoryRecord, targetEventId: string): MemoryOperation {
     return this.withActivity(activity, () => {
       uuid(targetEventId);
+      const request = this.#requestDigest('rollback', expected, { recordId, targetEventId });
+      const replay = this.#replayed(request);
+      if (replay) return replay;
       const current = this.#assertMemoryExpected(recordId, expected);
       const event = this.#db.prepare('SELECT * FROM memory_events WHERE event_id=?').get(targetEventId);
-      check(event && event.record_id === recordId && event.kind === 'activate' && event.before_snapshot, 'rollback-not-actionable');
+      check(event && event.record_id === recordId && ['activate','auto-revise'].includes(String(event.kind)) && event.before_snapshot, 'rollback-not-actionable');
       const targetAfter = this.#parseMemorySnapshot(String(event.after_snapshot));
-      check(this.#snapshotBytes(current) === this.#snapshotBytes(targetAfter), 'memory-stale');
+      check(this.#businessSnapshot(current) === this.#businessSnapshot(targetAfter), 'memory-stale');
+      check(!this.#db.prepare("SELECT 1 FROM memory_events WHERE record_id=? AND kind='rollback' AND target_event_id=?")
+        .get(recordId, targetEventId), 'rollback-not-actionable');
       const before = this.#parseMemorySnapshot(String(event.before_snapshot));
-      check(before.verification === 'verified' && before.lifecycle === 'candidate', 'rollback-not-actionable');
+      check(before.verification === 'verified' && ['candidate','active'].includes(before.lifecycle), 'rollback-not-actionable');
+      this.#eligible(before);
       const after = this.#withMemoryHash({ ...before, headEventId: randomUUID() });
-      this.#appendMemoryEvent(current, after, 'rollback', current.source.eventId, { targetEventId, automatic: true });
+      this.#appendMemoryEvent(current, after, 'rollback', current.source.eventId, { targetEventId, automatic: true }, request);
       return { status: 'committed', record: after, eventId: after.headEventId };
     });
   }
 
-  saveEvolutionProposal(activity: Activity, input: SourceAck, proposal: EvolutionProposalInput & Record<string, unknown>): EvolutionProposal {
+  saveEvolutionProposal(activity: Activity, input: SourceAck, proposal: EvolutionProposalInput): EvolutionProposal {
     return this.withActivity(activity, () => {
       this.#validateSource(input);
-      const keys = Object.keys(proposal);
-      check(keys.every(key => ['target', 'expectedChange', 'owner', 'scope', 'evidenceRefs', 'evaluation', 'supersedes'].includes(key)), 'invalid-proposal');
+      check(Object.keys(proposal).every(key => ['target','expectedChange','owner','scope','evidenceRefs','evaluation','supersedes','targetType','risk'].includes(key)), 'invalid-proposal');
       check(typeof proposal.target === 'string' && proposal.target.length > 0 && Buffer.byteLength(proposal.target) <= 4096
-        && typeof proposal.expectedChange === 'string' && proposal.expectedChange.length > 0
-        && typeof proposal.owner === 'string' && proposal.owner === this.#binding.ownerId, 'invalid-proposal');
+        && typeof proposal.expectedChange === 'string' && proposal.expectedChange.length > 0 && Buffer.byteLength(proposal.expectedChange) <= 65536
+        && proposal.owner === this.#binding.ownerId, 'invalid-proposal');
       const scope = this.#validateScope(proposal.scope);
-      check(scope.kind !== 'session', 'invalid-proposal');
-      check(proposal.evidenceRefs.length > 0, 'invalid-proposal');
+      check(scope.resolved && Array.isArray(proposal.evidenceRefs) && proposal.evidenceRefs.length > 0 && proposal.evidenceRefs.length <= 32, 'invalid-proposal');
       for (const ref of proposal.evidenceRefs) this.#validateSource(ref);
-      check(proposal.evaluation?.schema === 'evaluation-contract@1' && ['L0', 'L1', 'L2', 'L3'].includes(proposal.evaluation.level)
-        && Array.isArray(proposal.evaluation.assertions), 'invalid-proposal');
-      const prior = proposal.supersedes ? this.#db.prepare('SELECT * FROM evolution_proposals WHERE proposal_id=?').get(proposal.supersedes) : null;
-      if (proposal.supersedes) check(prior && prior.target === proposal.target, 'invalid-proposal');
-      const version = Number(this.#db.prepare('SELECT COALESCE(MAX(version), 0) AS version FROM evolution_proposals WHERE target=?').get(proposal.target)!.version) + 1;
+      const evaluation = proposal.evaluation;
+      check(evaluation?.schema === 'evaluation-contract@1' && ['L0','L1','L2','L3'].includes(evaluation.level)
+        && Object.keys(evaluation).every(key => ['schema','level','assertions'].includes(key))
+        && Array.isArray(evaluation.assertions) && evaluation.assertions.length > 0 && evaluation.assertions.length <= 32
+        && evaluation.assertions.every(value => typeof value === 'string' && value.length > 0 && Buffer.byteLength(value) <= 4096), 'invalid-proposal');
+      const targetType = proposal.targetType ?? 'guidance';
+      const risk = proposal.risk ?? 'low';
+      check(['guidance','skill','code','policy'].includes(targetType) && ['low','high'].includes(risk), 'invalid-proposal');
+      const request = sha256(JSON.stringify({ input, proposal }));
+      const existing = this.#db.prepare('SELECT proposal_id FROM evolution_proposals WHERE request_hash=?').get(request);
+      if (existing) return this.readEvolutionProposal(activity, String(existing.proposal_id));
+      const prior = proposal.supersedes ? this.readEvolutionProposal(activity, proposal.supersedes) : null;
+      if (prior) check(prior.target === proposal.target && prior.owner === proposal.owner
+        && JSON.stringify(prior.scope) === JSON.stringify(scope), 'invalid-proposal');
+      const latest = this.#db.prepare(`SELECT proposal_id,version FROM evolution_proposals
+        WHERE target=? AND owner=? AND scope_kind=? AND scope_id=? ORDER BY version DESC LIMIT 1`)
+        .get(proposal.target, proposal.owner, scope.kind, scope.id);
+      check((latest?.proposal_id ?? null) === (proposal.supersedes ?? null), 'proposal-stale');
+      const version = Number(latest?.version ?? 0) + 1;
       const proposalId = randomUUID();
-      const value = { schema: 'evolution-proposal@1' as const, proposalId, version, target: proposal.target,
-        expectedChange: proposal.expectedChange, owner: proposal.owner, scope, evidenceRefs: structuredClone(proposal.evidenceRefs),
-        evaluation: structuredClone(proposal.evaluation), supersedes: proposal.supersedes ?? null, inert: true as const };
+      const value: Omit<EvolutionProposal, 'hash'> = { schema: 'evolution-proposal@1', proposalId, version, target: proposal.target,
+        expectedChange: proposal.expectedChange, owner: proposal.owner, scope, input: structuredClone(input),
+        targetType, risk, evidenceRefs: structuredClone(proposal.evidenceRefs), evaluation: structuredClone(evaluation),
+        supersedes: proposal.supersedes ?? null, inert: true };
       const payload = JSON.stringify(value);
       const result = { ...value, hash: sha256(payload) };
-      this.#db.prepare('INSERT INTO evolution_proposals VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      this.#db.prepare('INSERT INTO evolution_proposals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
         .run(proposalId, version, proposal.target, proposal.expectedChange, proposal.owner, JSON.stringify(scope),
-          JSON.stringify(proposal.evidenceRefs), JSON.stringify(proposal.evaluation), proposal.supersedes ?? null, payload, result.hash, new Date().toISOString());
+          JSON.stringify(proposal.evidenceRefs), JSON.stringify(evaluation), proposal.supersedes ?? null, payload, result.hash,
+          new Date().toISOString(), scope.kind, scope.id, 1, request, targetType, risk);
+      for (const [ordinal, ref] of [input, ...proposal.evidenceRefs].entries()) {
+        this.#db.prepare('INSERT INTO proposal_evidence VALUES (?,?,?,?,?,?,?)')
+          .run(proposalId, ordinal, ref.binding.sessionId, ref.eventId, ref.locator, ref.hash, ref.contentHash);
+      }
       return result;
     });
   }
 
+  readEvolutionProposal(activity: Activity, proposalId: string): EvolutionProposal {
+    return this.withActivity(activity, () => {
+      uuid(proposalId);
+      const row = this.#db.prepare('SELECT * FROM evolution_proposals WHERE proposal_id=? AND owner=?').get(proposalId, this.#binding.ownerId);
+      check(row && sha256(String(row.payload)) === row.payload_hash, 'proposal-evidence-gap');
+      const value = JSON.parse(String(row.payload)) as Omit<EvolutionProposal, 'hash'>;
+      check(value.schema === 'evolution-proposal@1' && value.proposalId === row.proposal_id && value.version === row.version
+        && value.target === row.target && value.expectedChange === row.expected_change && value.owner === row.owner
+        && value.supersedes === row.supersedes && value.inert === true && value.targetType === row.target_type && value.risk === row.risk
+        && JSON.stringify(value.scope) === row.scope_json && value.scope.kind === row.scope_kind && value.scope.id === row.scope_id
+        && JSON.stringify(value.evaluation) === row.evaluation_json && JSON.stringify(value.evidenceRefs) === row.evidence_json, 'proposal-evidence-gap');
+      this.#validateScope(value.scope);
+      const refs = [value.input, ...value.evidenceRefs];
+      this.#checkEvidenceRows('proposal_evidence', 'proposal_id', proposalId, refs);
+      for (const ref of refs) this.#validateSource(ref);
+      return { ...value, hash: String(row.payload_hash) };
+    });
+  }
+
+  #checkEvidenceRows(table: 'verification_evidence' | 'proposal_evidence', key: 'run_id' | 'proposal_id', id: string, refs: SourceAck[]): void {
+    const rows = this.#db.prepare(`SELECT * FROM ${table} WHERE ${key}=? ORDER BY ordinal`).all(id);
+    check(rows.length === refs.length, 'evidence-reference-gap');
+    for (const [ordinal, ref] of refs.entries()) {
+      const row = rows[ordinal]!;
+      check(row.ordinal === ordinal && row.source_owner === ref.binding.sessionId && row.source_event_id === ref.eventId
+        && row.locator === ref.locator && row.hash === ref.hash && row.content_hash === ref.contentHash, 'evidence-reference-gap');
+    }
+  }
+
+  #saveVerification(record: MemoryRecord, result: 'pass' | 'block' | 'evidence-gap', evidence: SourceAck[]): string {
+    check(result !== 'pass' || evidence.length > 0, 'verification-evidence-required');
+    const runId = randomUUID();
+    const bytes = JSON.stringify(evidence);
+    this.#db.prepare('INSERT INTO verification_runs VALUES (?,?,?,?,?,?,?)')
+      .run(runId, record.recordId, record.revisionId, result, bytes, sha256(bytes), new Date().toISOString());
+    for (const [ordinal, ref] of evidence.entries()) {
+      this.#validateSource(ref);
+      this.#db.prepare('INSERT INTO verification_evidence VALUES (?,?,?,?,?,?,?)')
+        .run(runId, ordinal, ref.binding.sessionId, ref.eventId, ref.locator, ref.hash, ref.contentHash);
+    }
+    return runId;
+  }
+  #suppressed(claimKey: string, lineage: string, scope: MemoryScope, appliesTo: string[]): MemoryRecord | null {
+    const rows = this.#db.prepare(`SELECT r.record_id FROM memory_records r JOIN memory_heads h ON h.record_id=r.record_id
+      WHERE r.owner_id=? AND r.claim_key=? AND r.source_lineage=? AND h.scope_kind=? AND h.scope_id=? AND h.lifecycle='tombstoned'`)
+      .all(this.#binding.ownerId, claimKey, lineage, scope.kind, scope.id);
+    for (const row of rows) {
+      const record = this.#readMemoryUnsafe(String(row.record_id));
+      if (JSON.stringify(record.appliesTo) === JSON.stringify(appliesTo)) return record;
+    }
+    return null;
+  }
   #validateSource(input: SourceAck, content?: string): void {
     check(input?.schema === 'cli-source-ack@1' && input.status === 'durable' && sameBinding(input.binding, this.#binding), 'source-scope-mismatch');
     uuid(input.eventId);
     check(/^[0-9a-f]{64}$/i.test(input.hash) && /^[0-9a-f]{64}$/i.test(input.contentHash)
       && typeof input.locator === 'string' && input.locator.length > 0 && Number.isSafeInteger(input.byteLength) && input.byteLength > 0, 'invalid-source-ref');
+    check(this.#readSource, 'source-reader-unavailable');
+    check(sha256(this.#readSource(input).text) === input.contentHash, 'source-evidence-gap');
     if (content !== undefined) check(typeof content === 'string' && content.length > 0 && Buffer.byteLength(content) <= 65536, 'invalid-memory-content');
   }
   #validateScope(scope: MemoryScope): MemoryScope {
     check(scope && ['project', 'workspace', 'personal', 'session'].includes(scope.kind) && typeof scope.id === 'string', 'invalid-memory-scope');
     uuid(scope.id);
+    check(Object.keys(scope).every(key => ['kind','id','resolved'].includes(key)) && typeof scope.resolved === 'boolean', 'invalid-memory-scope');
     if (scope.kind === 'project') check(scope.id === this.#binding.projectId && scope.resolved, 'invalid-memory-scope');
     if (scope.kind === 'personal') check(scope.id === this.#binding.ownerId && scope.resolved, 'invalid-memory-scope');
     if (scope.kind === 'session') check(scope.id === this.#binding.sessionId && !scope.resolved, 'invalid-memory-scope');
-    if (scope.kind === 'workspace') check(scope.resolved, 'invalid-memory-scope');
+    if (scope.kind === 'workspace') throw new Error('workspace-unavailable');
     return structuredClone(scope);
   }
   #normalizeAppliesTo(value: string[]): string[] {
@@ -565,6 +815,25 @@ export class ProbeStore {
     const normalized = [...value].sort();
     check(new Set(normalized).size === normalized.length, 'invalid-memory-scope');
     return normalized;
+  }
+  #businessSnapshot(record: MemoryRecord): string {
+    const { hash: _hash, headEventId: _event, ...business } = record;
+    return JSON.stringify(business);
+  }
+  #eligible(record: MemoryRecord): void {
+    check(record.scope.resolved && record.verification === 'verified' && !record.conflictSetId, 'memory-not-eligible');
+    this.#validateSource(record.source);
+    this.#checkVerification(record, true);
+  }
+  #checkVerification(record: MemoryRecord, readSources = false): void {
+    if (!record.verificationRunId) { check(record.verification !== 'verified', 'verification-evidence-gap'); return; }
+    const row = this.#db.prepare('SELECT * FROM verification_runs WHERE run_id=?').get(record.verificationRunId);
+    check(row && row.record_id === record.recordId && row.revision_id === record.revisionId
+      && sha256(String(row.evidence_json)) === row.evidence_hash
+      && (record.verification !== 'verified' || row.result === 'pass'), 'verification-evidence-gap');
+    const evidence = JSON.parse(String(row.evidence_json)) as SourceAck[];
+    this.#checkEvidenceRows('verification_evidence', 'run_id', record.verificationRunId, evidence);
+    if (readSources) for (const ref of evidence) this.#validateSource(ref);
   }
   #withMemoryHash(record: Omit<MemoryRecord, 'hash'> & { hash?: string }): MemoryRecord {
     const { hash: _hash, ...snapshot } = record;
@@ -579,34 +848,58 @@ export class ProbeStore {
     check(record.schema === 'memory-record@1' && typeof record.recordId === 'string' && typeof record.headEventId === 'string', 'memory-evidence-gap');
     return this.#withMemoryHash(record);
   }
-  #readMemoryUnsafe(recordId: string): MemoryRecord {
-    const row = this.#db.prepare('SELECT * FROM memory_heads WHERE record_id=?').get(recordId);
-    check(row, 'memory-not-found');
-    check(sha256(String(row.snapshot)) === String(row.snapshot_hash), 'memory-evidence-gap');
-    const record = this.#parseMemorySnapshot(String(row.snapshot));
-    const revision = this.#db.prepare('SELECT * FROM memory_revisions WHERE revision_id=?').get(String(row.revision_id));
-    check(revision && revision.record_id === recordId && revision.content === record.content && revision.content_hash === record.contentHash
+  #verifyRevision(record: MemoryRecord): void {
+    const revision = this.#db.prepare('SELECT * FROM memory_revisions WHERE revision_id=?').get(record.revisionId);
+    check(revision && revision.record_id === record.recordId && revision.revision === record.revision
+      && revision.content === record.content && revision.content_hash === record.contentHash
       && revision.type === record.type && revision.scope_kind === record.scope.kind && revision.scope_id === record.scope.id
-      && Number(revision.scope_resolved) === (record.scope.resolved ? 1 : 0) && revision.applies_to === JSON.stringify(record.appliesTo)
+      && Number(revision.scope_resolved) === (record.scope.resolved ? 1 : 0)
+      && JSON.stringify(this.#readAppliesTo(record.revisionId)) === JSON.stringify(record.appliesTo)
       && revision.source_json === JSON.stringify(record.source) && revision.source_event_id === record.source.eventId
       && revision.source_hash === record.source.hash && revision.source_content_hash === record.source.contentHash
       && revision.source_locator === record.source.locator && sha256(record.content) === record.contentHash, 'memory-evidence-gap');
+  }
+  #replayMemory(recordId: string): MemoryRecord {
+    const owner = this.#db.prepare('SELECT owner_id,claim_key,source_lineage FROM memory_records WHERE record_id=?').get(recordId);
+    check(owner?.owner_id === this.#binding.ownerId, 'memory-not-found');
     const events = this.#db.prepare('SELECT * FROM memory_events WHERE record_id=? ORDER BY seq').all(recordId);
     let previous: string | null = null;
+    let current: MemoryRecord | null = null;
     for (const [index, event] of events.entries()) {
       check(Number(event.seq) === index + 1 && event.record_id === recordId && sha256(String(event.payload)) === event.payload_hash
-        && (event.before_snapshot === previous), 'memory-evidence-gap');
+        && event.before_snapshot === previous, 'memory-evidence-gap');
       const after = this.#parseMemorySnapshot(String(event.after_snapshot));
-      const payload = JSON.parse(String(event.payload)) as { after?: unknown };
-      check(after.recordId === recordId && after.revisionId === event.revision_id && JSON.stringify(payload.after) === String(event.after_snapshot), 'memory-evidence-gap');
+      const payload = JSON.parse(String(event.payload));
+      check(payload.schema === 'memory-event@1' && payload.eventId === event.event_id && payload.recordId === recordId
+        && payload.seq === event.seq && payload.kind === event.kind && payload.request === event.request_hash
+        && JSON.stringify(payload.after) === event.after_snapshot
+        && (payload.before === null ? null : JSON.stringify(payload.before)) === event.before_snapshot
+        && payload.originHostId === event.origin_host_id && payload.originSeq === event.origin_seq && payload.batchId === event.batch_id
+        && (payload.targetEventId ?? null) === event.target_event_id
+        && after.recordId === recordId && after.headEventId === event.event_id && after.revisionId === event.revision_id,
+      'memory-evidence-gap');
+      this.#verifyRevision(after);
+      check(after.claimKey === owner.claim_key && after.source.binding.sessionId === owner.source_lineage, 'memory-evidence-gap');
+      this.#checkVerification(after);
       previous = String(event.after_snapshot);
+      current = after;
     }
-    check(events.length > 0 && String(events.at(-1)!.event_id) === String(row.head_event_id)
-      && previous === String(row.snapshot), 'memory-evidence-gap');
-    check(record.recordId === recordId && record.revisionId === row.revision_id && record.lifecycle === row.lifecycle
+    check(current, 'memory-evidence-gap');
+    return current;
+  }
+  #readMemoryUnsafe(recordId: string): MemoryRecord {
+    const row = this.#db.prepare('SELECT * FROM memory_heads WHERE record_id=?').get(recordId);
+    check(row, 'memory-evidence-gap');
+    const record = this.#replayMemory(recordId);
+    check(this.#snapshotBytes(record) === row.snapshot && record.hash === row.snapshot_hash
+      && record.revisionId === row.revision_id && record.lifecycle === row.lifecycle
       && record.verification === row.verification && record.scope.kind === row.scope_kind && record.scope.id === row.scope_id
-      && record.scope.resolved === Boolean(row.scope_resolved) && record.conflictSetId === (row.conflict_set_id === null ? null : String(row.conflict_set_id))
+      && record.scope.resolved === Boolean(row.scope_resolved) && record.conflictSetId === row.conflict_set_id
+      && record.verificationRunId === row.verification_run_id
       && record.headEventId === row.head_event_id, 'memory-evidence-gap');
+    this.#validateScope(record.scope);
+    this.#validateSource(record.source);
+    this.#checkVerification(record, true);
     return record;
   }
   #assertMemoryExpected(recordId: string, expected: MemoryRecord): MemoryRecord {
@@ -616,33 +909,78 @@ export class ProbeStore {
       && this.#snapshotBytes(expected) === this.#snapshotBytes(current) && expected.headEventId === current.headEventId, 'memory-stale');
     return current;
   }
+  #nextRevision(recordId: string): number {
+    return Number(this.#db.prepare('SELECT MAX(revision) AS version FROM memory_revisions WHERE record_id=?').get(recordId)!.version) + 1;
+  }
+  #readAppliesTo(revisionId: string): string[] {
+    return this.#db.prepare('SELECT value FROM memory_applicability WHERE revision_id=? ORDER BY ordinal').all(revisionId)
+      .map(row => String(row.value));
+  }
   #insertRevision(record: MemoryRecord): void {
-    this.#db.prepare('INSERT INTO memory_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    this.#db.prepare('INSERT INTO memory_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(record.revisionId, record.recordId, record.revision, record.content, record.contentHash, record.type,
-        record.scope.kind, record.scope.id, record.scope.resolved ? 1 : 0, JSON.stringify(record.appliesTo), JSON.stringify(record.source),
+        record.scope.kind, record.scope.id, record.scope.resolved ? 1 : 0, JSON.stringify(record.source),
         record.source.eventId, record.source.hash, record.source.contentHash, record.source.locator);
+    for (const [ordinal, value] of record.appliesTo.entries()) {
+      this.#db.prepare('INSERT INTO memory_applicability VALUES (?,?,?)').run(record.revisionId, ordinal, value);
+    }
     const provenance = { schema: 'provenance-ref@1', recordId: record.recordId, revisionId: record.revisionId,
-      ownerKind: 'source', ownerId: record.source.binding.sessionId, source: record.source };
+      ownerKind: 'session', ownerId: record.source.binding.sessionId, source: record.source };
     const payload = JSON.stringify(provenance);
     this.#db.prepare('INSERT INTO provenance_refs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(randomUUID(), record.recordId, record.revisionId, 'session', record.source.binding.sessionId, JSON.stringify(record.source),
         record.source.eventId, record.source.locator, record.source.contentHash, payload, sha256(payload));
   }
-  #appendMemoryEvent(before: MemoryRecord | null, after: MemoryRecord, kind: string, sourceEventId: string, metadata: Record<string, unknown>): void {
+  #requestDigest(kind: string, expected: MemoryRecord | null, args: unknown): string {
+    return sha256(JSON.stringify({ schema: 'memory-request@1', kind, expected, args }));
+  }
+  #replayed(request: string): MemoryOperation | null {
+    const row = this.#db.prepare('SELECT * FROM memory_events WHERE request_hash=?').get(request);
+    if (!row) return null;
+    const record = this.#readMemoryUnsafe(String(row.record_id));
+    check(record.headEventId === row.event_id, 'memory-stale');
+    return { status: 'no_op', record, eventId: null };
+  }
+  // Reconcile a lost acknowledgement before deciding whether a mutation may be retried.
+  lookupMemoryOperation(activity: Activity, recordId: string, expectedEventId: string, kind: string): MemoryOperation | null {
+    return this.withActivity(activity, () => {
+      this.#replayMemory(recordId);
+      const rows = this.#db.prepare('SELECT * FROM memory_events WHERE record_id=? AND kind=? ORDER BY seq').all(recordId, kind);
+      const row = rows.find(event => event.before_snapshot !== null
+        && this.#parseMemorySnapshot(String(event.before_snapshot)).headEventId === expectedEventId);
+      return row ? { status: 'committed', record: this.#parseMemorySnapshot(String(row.after_snapshot)), eventId: String(row.event_id) } : null;
+    });
+  }
+  #appendMemoryEvent(before: MemoryRecord | null, after: MemoryRecord, kind: string, sourceEventId: string,
+    metadata: Record<string, unknown>, request = this.#requestDigest(kind, before, { sourceEventId, metadata })): void {
     const seq = Number(this.#db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM memory_events WHERE record_id=?').get(after.recordId)!.seq) + 1;
     const beforeSnapshot = before ? this.#snapshotBytes(before) : null;
     const afterSnapshot = this.#snapshotBytes(after);
+    const batchId = ['activate','auto-revise'].includes(kind) ? randomUUID() : null;
+    const originSeq = Number(this.#db.prepare('SELECT COALESCE(MAX(origin_seq),0)+1 AS seq FROM memory_events WHERE origin_host_id=?').get(this.#binding.hostId)!.seq);
     const payload = JSON.stringify({ schema: 'memory-event@1', eventId: after.headEventId, recordId: after.recordId, seq, kind,
-      before: before ? JSON.parse(beforeSnapshot!) : null, after: JSON.parse(afterSnapshot), ...metadata });
-    this.#db.prepare('INSERT INTO memory_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(after.headEventId, after.recordId, seq, kind, after.revisionId, beforeSnapshot, afterSnapshot, payload, sha256(payload), sourceEventId, new Date().toISOString());
-    this.#db.prepare(`INSERT INTO memory_heads(record_id,revision_id,lifecycle,verification,scope_kind,scope_id,scope_resolved,head_event_id,snapshot,snapshot_hash,conflict_set_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      originHostId: this.#binding.hostId, originSeq, batchId,
+      request, before: before ? JSON.parse(beforeSnapshot!) : null, after: JSON.parse(afterSnapshot), ...metadata });
+    this.#db.prepare('INSERT INTO memory_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(after.headEventId, after.recordId, seq, kind, after.revisionId, beforeSnapshot, afterSnapshot, request,
+        this.#binding.hostId, originSeq, batchId, typeof metadata.targetEventId === 'string' ? metadata.targetEventId : null,
+        payload, sha256(payload), sourceEventId, new Date().toISOString());
+    this.#saveHead(after);
+    for (const jobKind of batchId ? ['search','host-info'] : ['search']) {
+      const manifest = JSON.stringify({ schema: 'memory-outbox@1', kind: jobKind, batchId, events: [JSON.parse(payload)] });
+      this.#db.prepare('INSERT INTO projection_jobs VALUES (?,?,?,?,?,?,?,?,?)')
+        .run(randomUUID(), jobKind, after.headEventId, this.#binding.ownerId, after.scope.kind, after.scope.id, batchId, manifest, sha256(manifest));
+    }
+  }
+  #saveHead(after: MemoryRecord): void {
+    const afterSnapshot = this.#snapshotBytes(after);
+    this.#db.prepare(`INSERT INTO memory_heads(record_id,revision_id,lifecycle,verification,scope_kind,scope_id,scope_resolved,head_event_id,snapshot,snapshot_hash,conflict_set_id,verification_run_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(record_id) DO UPDATE SET revision_id=excluded.revision_id,lifecycle=excluded.lifecycle,verification=excluded.verification,
       scope_kind=excluded.scope_kind,scope_id=excluded.scope_id,scope_resolved=excluded.scope_resolved,head_event_id=excluded.head_event_id,
-      snapshot=excluded.snapshot,snapshot_hash=excluded.snapshot_hash,conflict_set_id=excluded.conflict_set_id`)
+      snapshot=excluded.snapshot,snapshot_hash=excluded.snapshot_hash,conflict_set_id=excluded.conflict_set_id,verification_run_id=excluded.verification_run_id`)
       .run(after.recordId, after.revisionId, after.lifecycle, after.verification, after.scope.kind, after.scope.id, after.scope.resolved ? 1 : 0,
-        after.headEventId, afterSnapshot, sha256(afterSnapshot), after.conflictSetId);
+        after.headEventId, afterSnapshot, sha256(afterSnapshot), after.conflictSetId, after.verificationRunId);
   }
 
   beginMaintenance(coordinator: string): Fence {

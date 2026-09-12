@@ -28,9 +28,12 @@ jobs:
       - name: Record synthetic observations
         if: always()
         run: npm run evidence
+      - name: Record scoped memory observations
+        if: always()
+        run: npm run evidence:memory
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: t01-${{ matrix.os }}
+          name: synthetic-${{ matrix.os }}
           path: artifacts/
           if-no-files-found: error

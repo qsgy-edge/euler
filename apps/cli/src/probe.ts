@@ -19,10 +19,11 @@ export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET
   validateBudget(budget);
   sandbox = openSandbox(sandbox.root);
   const binding = bindingOf(sandbox);
-  const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, binding);
+  let archive: CliArchive;
+  const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, binding, false, input => archive.read(input));
   try {
     const activity = store.register();
-    const archive = new CliArchive(sandbox, action => store.withActivity(activity, action));
+    archive = new CliArchive(sandbox, action => store.withActivity(activity, action));
     const transport = new CountingTransport();
     const session = new ProbeSession(store, activity, { version: API_VERSION, binding, source: archive, transport }, budget);
     return { store, activity, archive, transport, session, close: () => { session.cancel(); store.close(); } };
