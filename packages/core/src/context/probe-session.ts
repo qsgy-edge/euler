@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { API_VERSION, CORE_TOOLS, DEFAULT_BUDGET, check, sameBinding, sha256, validateBudget } from '../contracts.ts';
 import type { HostAdapter, ProbeBudget, SourceAck, SourceExcerpt } from '../contracts.ts';
-import type { Activity, Intent, IntentTransition, ProbeStore } from '../store/probe-store.ts';
+import type { Activity, ExecutionStream, Intent, IntentTransition, ProbeStore } from '../store/probe-store.ts';
 
 export interface PreparedTurn {
   assemblyId: string;
@@ -14,8 +14,10 @@ export interface PreparedTurn {
 export interface ProbeReceipt {
   schema: 'local-dispatch-probe@1';
   runId: string;
-  ownerKind: 'session';
+  ownerKind: ExecutionStream['ownerKind'];
   ownerId: string;
+  streamId: string;
+  attemptId: string;
   assemblyId: string;
   payloadHash: string;
   byteLength: number;
@@ -109,10 +111,12 @@ export class ProbeSession {
       this.#consumed.add(prepared);
       this.#attempts++;
       this.#tokens += reserved;
+      const ownership = this.#store.bindAttempt(this.#activity, this.runId);
       const received = this.#host.transport.send(prepared.payload);
       check(received.hash === prepared.payloadHash && received.byteLength === Buffer.byteLength(prepared.payload), 'transport-payload-mismatch');
       return {
-        schema: 'local-dispatch-probe@1', runId: this.runId, ownerKind: 'session', ownerId: this.#host.binding.sessionId,
+        schema: 'local-dispatch-probe@1', runId: this.runId, ownerKind: ownership.ownerKind, ownerId: ownership.ownerId,
+        streamId: ownership.streamId, attemptId: ownership.attemptId,
         assemblyId: prepared.assemblyId, payloadHash: received.hash, byteLength: received.byteLength,
         encoding: 'utf8-json@1', adapterVersion: API_VERSION, transport: 'local-counting@1',
         count: received.count, outcome: 'received', formalLedger: false,

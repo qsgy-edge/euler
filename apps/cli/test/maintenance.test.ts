@@ -1,8 +1,66 @@
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
+import { rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import test from 'node:test';
-import { createSandbox } from '../src/sandbox.ts';
+import { createSandbox, resourcesOf, bindingOf } from '../src/sandbox.ts';
+import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
+import { ProbeStore } from '@euler/core';
 import { startCli } from '../src/process-driver.ts';
+
+test('stop evidence and maintenance stream survive coordinator restart and release', { timeout: 15000 }, async () => {
+  const sandbox = createSandbox();
+  const runtime = startCli(['task', '--sandbox', sandbox.root]);
+  let store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox));
+  try {
+    const ready = await runtime.waitFor('task-ready');
+    const coordinator = randomUUID();
+    store.beginMaintenance(coordinator);
+    const blocked = store.acquireMaintenance(coordinator);
+    assert.equal(blocked.acquired, false);
+    assert.equal(store.maintenanceStatus().activities[0]?.stop?.state, 'alive');
+    runtime.command('stop');
+    assert.equal((await runtime.exit).code, 0);
+    assert.equal(store.acquireMaintenance(coordinator).acquired, true);
+    const status = store.maintenanceStatus();
+    assert.equal(status.activities[0]?.stop?.state, 'absent');
+    assert.equal(status.activities[0]?.incarnation, ready.incarnation);
+    assert.equal(status.coordinatorStream?.ownerKind, 'maintenance');
+    store.close();
+    store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox));
+    assert.deepEqual(store.maintenanceStatus(), status);
+    store.releaseMaintenance(coordinator);
+    assert.deepEqual(store.maintenanceStatus().activities, status.activities);
+  } finally {
+    if (runtime.child.exitCode === null && runtime.child.signalCode === null) runtime.child.kill();
+    await runtime.exit;
+    store.close();
+    rmSync(sandbox.root, { recursive: true, force: true });
+  }
+});
+
+test('maintenance enumerates residuals and rechecks exclusive release without deleting unknown files', () => {
+  const sandbox = createSandbox();
+  let store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox));
+  const residual = join(sandbox.root, 'unregistered-worker.lock');
+  try {
+    const coordinator = randomUUID();
+    store.beginMaintenance(coordinator);
+    assert.equal(store.acquireMaintenance(coordinator).acquired, true);
+    writeFileSync(residual, 'synthetic unexplained residual');
+    assert.throws(() => store.releaseMaintenance(coordinator), /maintenance-residuals-or-participants/);
+    const status = store.maintenanceStatus();
+    assert.equal(status.fence.state, 'closing');
+    assert.ok(status.residuals.some(item => item.path === 'unregistered-worker.lock' && item.state === 'unexpected'));
+    store.close();
+    store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox));
+    assert.deepEqual(store.maintenanceStatus().residuals, status.residuals);
+    assert.equal(store.acquireMaintenance(coordinator).acquired, false);
+    rmSync(residual);
+    assert.equal(store.acquireMaintenance(coordinator).acquired, true);
+    assert.equal(store.releaseMaintenance(coordinator).state, 'open');
+  } finally { store.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
 
 test('a live process that closed its probe remains a maintenance blocker', { timeout: 15000 }, async () => {
   const sandbox = createSandbox();
@@ -29,6 +87,108 @@ test('a live process that closed its probe remains a maintenance blocker', { tim
     if (maintenance && maintenance.child.exitCode === null && maintenance.child.signalCode === null) maintenance.child.stdin.end();
     await Promise.allSettled([runtime.exit, maintenance?.exit ?? Promise.resolve()]);
     rmSync(sandbox.root, { recursive: true, force: true });
+  }
+});
+
+test('CLI cancellation opens a fresh epoch while the old runtime stays fenced', { timeout: 15000 }, async () => {
+  const sandbox = createSandbox();
+  const runtime = startCli(['hold', '--sandbox', sandbox.root]);
+  const children = [runtime];
+  try {
+    const ready = await runtime.waitFor('runtime-ready');
+    const maintenance = startCli(['maintain', '--sandbox', sandbox.root]); children.push(maintenance);
+    await maintenance.waitFor('maintenance-blocked');
+    maintenance.command('inspect');
+    const status = await maintenance.waitFor('maintenance-status');
+    assert.equal((status.activities as { parentId: string | null }[]).filter(row => row.parentId !== null).length, 1);
+    maintenance.command('cancel');
+    const cancelled = await maintenance.waitFor('maintenance-cancelled');
+    assert.ok(Number(cancelled.epoch) > Number(ready.epoch));
+    assert.equal((await maintenance.exit).code, 0);
+    runtime.command('append');
+    assert.equal((await runtime.waitFor('late-append-blocked')).reason, 'admission-closed');
+    const fresh = startCli(['run', '--sandbox', sandbox.root]); children.push(fresh);
+    assert.equal((await fresh.exit).code, 0);
+    assert.equal(fresh.observations.find(item => item.event === 'run-result')?.sends, 1);
+    runtime.command('stop');
+    assert.equal((await runtime.exit).code, 0);
+  } finally {
+    for (const child of children) {
+      if (child.child.exitCode === null && child.child.signalCode === null) child.child.kill();
+      await child.exit;
+    }
+    rmSync(sandbox.root, { recursive: true, force: true });
+  }
+});
+
+test('racing startup and closing never leave an admitted unregistered process', { timeout: 20000 }, async () => {
+  for (let round = 0; round < 3; round++) {
+    const sandbox = createSandbox();
+    const worker = startCli(['task', '--sandbox', sandbox.root]);
+    const maintenance = startCli(['maintain', '--sandbox', sandbox.root]);
+    try {
+      await maintenance.waitFor('maintenance-closing');
+      maintenance.command('inspect');
+      const status = await maintenance.waitFor('maintenance-status');
+      const rows = (status.activities as { pid: number | null; incarnation: string | null; epoch: number; owner: { ownerKind: string } }[])
+        .filter(row => row.owner.ownerKind !== 'maintenance');
+      if (rows.length) {
+        assert.equal(rows[0]?.pid, worker.child.pid);
+        assert.equal(typeof rows[0]?.incarnation, 'string');
+        assert.ok(rows[0]!.epoch < Number((status.fence as { epoch: number }).epoch));
+      }
+      if (worker.child.exitCode === null && worker.child.signalCode === null) worker.command('stop');
+      const result = await worker.exit;
+      assert.ok(result.code === 0 || result.code === 1);
+      if (result.code === 0) assert.equal(rows.length, 1);
+      else assert.match(JSON.stringify(worker.observations), /admission-closed/);
+      maintenance.command('acquire');
+      await maintenance.waitFor('maintenance-exclusive');
+      maintenance.command('release');
+      assert.equal((await maintenance.exit).code, 0);
+    } finally {
+      for (const child of [worker, maintenance]) {
+        if (child.child.exitCode === null && child.child.signalCode === null) child.child.kill();
+        await child.exit;
+      }
+      rmSync(sandbox.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('a child refused after reservation exits with its parent and maintenance can resume', { timeout: 15000 }, async () => {
+  const sandbox = createSandbox();
+  const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox));
+  const runtime = startCli(['hold', '--sandbox', sandbox.root], 4000);
+  let resumed: ReturnType<typeof startCli> | undefined;
+  try {
+    const deadline = Date.now() + 4000;
+    let reservation: ReturnType<ProbeStore['maintenanceStatus']>['activities'][number] | undefined;
+    while (!reservation && Date.now() < deadline) {
+      reservation = store.maintenanceStatus().activities.find(row => row.parentId !== null && row.incarnation === null);
+      if (!reservation) await delay(1);
+    }
+    assert.ok(reservation, 'controlled launch reservation observed before child acknowledgement');
+    const coordinator = randomUUID();
+    store.beginMaintenance(coordinator);
+    const childExit = await runtime.waitFor('controlled-task-exit');
+    assert.equal(childExit.code, 1);
+    const parentExit = await runtime.waitFor('process-exit');
+    assert.equal(parentExit.code, 1);
+    const acquired = store.acquireMaintenance(coordinator);
+    assert.equal(acquired.acquired, true);
+    assert.ok(acquired.observations.some(row => row.id === reservation.id && row.absent));
+    assert.equal(store.releaseMaintenance(coordinator).state, 'open');
+    resumed = startCli(['run', '--sandbox', sandbox.root]);
+    assert.equal((await resumed.exit).code, 0);
+    assert.equal(resumed.observations.find(row => row.event === 'run-result')?.sends, 1);
+  } finally {
+    for (const child of [runtime, resumed]) {
+      if (!child) continue;
+      if (child.child.exitCode === null && child.child.signalCode === null) child.child.kill();
+      await child.exit;
+    }
+    store.close(); rmSync(sandbox.root, { recursive: true, force: true });
   }
 });
 
@@ -69,11 +229,19 @@ test('maintenance excludes live runtime and controlled task, then reopens after 
     assert.equal(result.eventCount, 1);
     const owner = start(['maintain']);
     await owner.waitFor('maintenance-exclusive');
+    owner.command('inspect');
+    const beforeTakeover = await owner.waitFor('maintenance-status');
     owner.child.kill();
     const ownerExit = await owner.exit;
     assert.notEqual(ownerExit.code, 0);
     const takeover = start(['maintain']);
     await takeover.waitFor('maintenance-exclusive');
+    takeover.command('inspect');
+    const afterTakeover = await takeover.waitFor('maintenance-status');
+    assert.deepEqual(afterTakeover.coordinatorStream, beforeTakeover.coordinatorStream);
+    const oldCoordinator = (afterTakeover.activities as { pid: number; owner: { ownerKind: string }; stop: { state: string } | null }[])
+      .find(item => item.pid === owner.child.pid && item.owner.ownerKind === 'maintenance');
+    assert.equal(oldCoordinator?.stop?.state, 'absent');
     takeover.command('release');
     assert.equal((await takeover.exit).code, 0);
   } finally {

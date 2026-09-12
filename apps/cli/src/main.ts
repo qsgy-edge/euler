@@ -16,19 +16,23 @@ function emit(event: string, fields: Record<string, unknown> = {}) {
   process.stdout.write(JSON.stringify({ ...fields, event }) + '\n');
 }
 
-async function hold(sandbox: Sandbox, task: boolean) {
-  let probe: ReturnType<typeof openProbe> | undefined = openProbe(sandbox);
-  const input = probe.archive.append(sandbox.fixture.eventId, sandbox.fixture.text);
-  probe.archive.read(input);
+async function hold(sandbox: Sandbox, task: boolean, reservationId?: string) {
+  const jobId = randomUUID();
+  let probe: ReturnType<typeof openProbe> | undefined = openProbe(sandbox, DEFAULT_BUDGET,
+    task ? reservationId ?? { kind: 'job', id: jobId, authorizationId: jobId } : undefined);
   let child: ReturnType<typeof startCli> | undefined;
   const lines = createInterface({ input: process.stdin });
   const keepAlive = setInterval(() => {}, 1000);
   try {
+    const input = probe.archive.append(sandbox.fixture.eventId, sandbox.fixture.text);
+    probe.archive.read(input);
     if (!task) {
-      child = startCli(['task', '--sandbox', sandbox.root]);
+      const reservation = probe.store.reserveChild(probe.activity);
+      child = startCli(['task', '--sandbox', sandbox.root, '--reservation', reservation]);
+      if (child.child.pid !== undefined) probe.store.recordChildLaunch(probe.activity, reservation, child.child.pid);
       await child.waitFor('task-ready');
     }
-    emit(task ? 'task-ready' : 'runtime-ready', { pid: process.pid, incarnation: probe.activity.incarnation, epoch: probe.activity.epoch, childPid: child?.child.pid ?? null, source: input });
+    emit(task ? 'task-ready' : 'runtime-ready', { pid: process.pid, activityId: probe.activity.id, streamId: probe.activity.streamId, incarnation: probe.activity.incarnation, epoch: probe.activity.epoch, childPid: child?.child.pid ?? null, source: input });
     for await (const line of lines) {
       if (line === 'stop') break;
       if (line === 'close') {
@@ -45,16 +49,19 @@ async function hold(sandbox: Sandbox, task: boolean) {
       }
     }
   } finally {
-    probe?.session.cancel();
-    if (child) {
-      child.command('stop');
-      const result = await child.exit;
-      emit('controlled-task-exit', { pid: child.child.pid, ...result });
-      check(result.code === 0, 'controlled-task-failed');
+    try {
+      probe?.session.cancel();
+      if (child) {
+        if (child.child.exitCode === null && child.child.signalCode === null) child.command('stop');
+        const result = await child.exit;
+        emit('controlled-task-exit', { pid: child.child.pid, ...result });
+        check(result.code === 0, 'controlled-task-failed');
+      }
+    } finally {
+      lines.close();
+      clearInterval(keepAlive);
+      probe?.close();
     }
-    lines.close();
-    clearInterval(keepAlive);
-    probe?.close();
   }
 }
 
@@ -72,6 +79,12 @@ async function maintain(sandbox: Sandbox) {
     acquire();
     for await (const line of lines) {
       if (line === 'acquire') acquire();
+      if (line === 'inspect') emit('maintenance-status', store.maintenanceStatus());
+      if (line === 'cancel') {
+        const cancelled = store.cancelMaintenance(coordinator);
+        emit('maintenance-cancelled', { epoch: cancelled.epoch, fence: cancelled });
+        break;
+      }
       if (line === 'release') {
         const released = store.releaseMaintenance(coordinator);
         emit('maintenance-released', { epoch: released.epoch, fence: released });
@@ -201,22 +214,28 @@ async function memoryWorker(sandbox: Sandbox, scenario: string) {
 async function main() {
   const args = parseArgs({ allowPositionals: true, options: {
     sandbox: { type: 'string' }, scenario: { type: 'string', default: 'success' }, budget: { type: 'string' },
-    request: { type: 'string' }, record: { type: 'string' },
+    request: { type: 'string' }, record: { type: 'string' }, reservation: { type: 'string' },
   } });
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
-  check(['create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
+  check(['create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
   const options = args.values.budget ? JSON.parse(args.values.budget) as Partial<ProbeBudget> : {};
   check(Object.keys(options).every(key => key in DEFAULT_BUDGET), 'invalid-budget');
   const budget = { ...DEFAULT_BUDGET, ...options };
-  if (['run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain'].includes(command)) check(args.values.sandbox, 'sandbox-required');
+  if (['run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status'].includes(command)) check(args.values.sandbox, 'sandbox-required');
   // Fault injection never modifies a caller-selected existing sandbox.
   if (command === 'archive-failure' || args.values.scenario === 'archive-failure') check(!args.values.sandbox, 'fault-requires-fresh-sandbox');
   const sandbox = args.values.sandbox ? openSandbox(args.values.sandbox) : createSandbox();
   emit('sandbox', { root: sandbox.root, storeId: sandbox.storeId, fixtureDigest: sandbox.fixtureDigest, mode: 'synthetic-only' });
   if (command === 'create') return;
-  if (command === 'hold' || command === 'task') return hold(sandbox, command === 'task');
+  if (command === 'hold' || command === 'task') return hold(sandbox, command === 'task', args.values.reservation);
   if (command === 'maintain') return maintain(sandbox);
+  if (command === 'maintenance-status') {
+    const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox));
+    try { emit('maintenance-status', store.maintenanceStatus()); }
+    finally { store.close(); }
+    return;
+  }
   if (command === 'maintenance') return maintenanceDemo(sandbox);
   if (command === 'recover') {
     const probe = openProbe(sandbox);

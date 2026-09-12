@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { lstatSync } from 'node:fs';
+import { lstatSync, readdirSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { check, sameBinding, sha256, uuid } from '../contracts.ts';
 import type { Binding, SourceAck } from '../contracts.ts';
@@ -25,6 +26,20 @@ export interface Activity {
   startedAt: string;
   epoch: number;
   root: BoundFile;
+  streamId: string;
+}
+export interface ExecutionOwner {
+  kind: 'session' | 'job' | 'migration';
+  id: string;
+  authorizationId: string;
+}
+export interface ExecutionStream {
+  streamId: string; ownerKind: 'session' | 'job' | 'maintenance' | 'migration'; ownerId: string;
+  principalId: string; originHostId: string; projectId: string;
+  authorization: { kind: 'synthetic-host-command'; id: string };
+}
+export interface AttemptOwnership {
+  attemptId: string; runId: string; streamId: string; ownerKind: ExecutionStream['ownerKind']; ownerId: string;
 }
 export type MemoryType = 'fact' | 'preference' | 'decision' | 'insight' | 'episode';
 export type MemoryLifecycle = 'candidate' | 'active' | 'superseded' | 'rejected' | 'tombstoned';
@@ -75,6 +90,10 @@ interface Fence {
   epoch: number;
   coordinator: string | null;
   coordinator_pid: number | null;
+  coordinator_incarnation: string | null;
+  coordinator_started_at: string | null;
+  coordinator_stream: string | null;
+  coordinator_activity: string | null;
 }
 
 const DDL = `
@@ -86,12 +105,47 @@ CREATE TABLE owner_fences (
   store_path TEXT NOT NULL, store_dev TEXT NOT NULL, store_ino TEXT NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('open','closing','exclusive')),
   epoch INTEGER NOT NULL CHECK(epoch > 0), coordinator TEXT, coordinator_pid INTEGER,
+  coordinator_incarnation TEXT, coordinator_started_at TEXT,
+  coordinator_stream TEXT REFERENCES execution_streams(stream_id), coordinator_activity TEXT REFERENCES owner_activities(id),
+  CHECK((state='open' AND coordinator IS NULL AND coordinator_pid IS NULL AND coordinator_incarnation IS NULL AND coordinator_started_at IS NULL AND coordinator_activity IS NULL)
+    OR (state!='open' AND coordinator IS NOT NULL AND coordinator_pid>0 AND coordinator_incarnation IS NOT NULL
+      AND coordinator_started_at IS NOT NULL AND coordinator_stream IS NOT NULL AND coordinator_activity IS NOT NULL)),
   UNIQUE(store_id, root_path, root_dev, root_ino)
 ) STRICT;
+CREATE TABLE maintenance_residuals (
+  store_id TEXT NOT NULL REFERENCES owner_fences(store_id), path TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('expected','unexpected','unknown')), observed_at TEXT NOT NULL,
+  dev TEXT, ino TEXT, reason TEXT NOT NULL, PRIMARY KEY(store_id,path)
+) STRICT;
+CREATE TABLE execution_streams (
+  stream_id TEXT PRIMARY KEY, store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
+  owner_kind TEXT NOT NULL CHECK(owner_kind IN ('session','job','maintenance','migration')), owner_id TEXT NOT NULL,
+  principal_id TEXT NOT NULL, origin_host_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(project_id),
+  authorization_kind TEXT NOT NULL CHECK(authorization_kind='synthetic-host-command'), authorization_id TEXT NOT NULL,
+  UNIQUE(store_id,owner_kind,owner_id), UNIQUE(store_id,stream_id)
+) STRICT;
+CREATE TABLE execution_events (
+  event_id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES execution_streams(stream_id),
+  seq INTEGER NOT NULL CHECK(seq>0), kind TEXT NOT NULL CHECK(kind='attempt-bound'),
+  attempt_id TEXT NOT NULL UNIQUE, run_id TEXT NOT NULL, activity_id TEXT NOT NULL REFERENCES owner_activities(id),
+  created_at TEXT NOT NULL, UNIQUE(stream_id,seq)
+) STRICT;
+CREATE TRIGGER execution_run_owner BEFORE INSERT ON execution_events
+WHEN EXISTS(SELECT 1 FROM execution_events WHERE run_id=NEW.run_id AND stream_id!=NEW.stream_id)
+BEGIN SELECT RAISE(ABORT,'run-owner-conflict'); END;
 CREATE TABLE owner_activities (
   id TEXT PRIMARY KEY, store_id TEXT NOT NULL,
-  pid INTEGER NOT NULL, incarnation TEXT NOT NULL, started_at TEXT NOT NULL, epoch INTEGER NOT NULL,
+  pid INTEGER CHECK(pid>0), incarnation TEXT, started_at TEXT, epoch INTEGER NOT NULL CHECK(epoch>0),
+  parent_id TEXT REFERENCES owner_activities(id), launch_pid INTEGER CHECK(launch_pid>0),
   root_path TEXT NOT NULL, root_dev TEXT NOT NULL, root_ino TEXT NOT NULL,
+  stream_id TEXT NOT NULL,
+  stop_state TEXT CHECK(stop_state IN ('alive','absent','unknown')), stop_observed_at TEXT, stop_method TEXT,
+  CHECK((pid IS NULL AND incarnation IS NULL AND started_at IS NULL AND parent_id IS NOT NULL)
+    OR (pid IS NOT NULL AND incarnation IS NOT NULL AND started_at IS NOT NULL)),
+  CHECK(launch_pid IS NULL OR (parent_id IS NOT NULL AND (pid IS NULL OR pid=launch_pid))),
+  CHECK((stop_state IS NULL AND stop_observed_at IS NULL AND stop_method IS NULL)
+    OR (stop_state IS NOT NULL AND stop_observed_at IS NOT NULL AND stop_method IS NOT NULL)),
+  FOREIGN KEY(store_id,stream_id) REFERENCES execution_streams(store_id,stream_id),
   FOREIGN KEY(store_id, root_path, root_dev, root_ino) REFERENCES owner_fences(store_id, root_path, root_dev, root_ino)
 ) STRICT;
 CREATE TABLE intent_events (
@@ -234,15 +288,18 @@ CREATE TRIGGER immutable_provenance_refs_delete BEFORE DELETE ON provenance_refs
 CREATE TRIGGER immutable_evolution_proposals_update BEFORE UPDATE ON evolution_proposals BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_proposals BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=4;
-` + ['memory_applicability','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events'].map(table => `
+PRAGMA user_version=5;
+` + ['execution_streams','execution_events','memory_applicability','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
-`).join('') + ['memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
+`).join('') + ['owner_activities','maintenance_residuals','execution_streams','execution_events','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
   'verification_runs','verification_evidence','proposal_evidence','projection_jobs','feedback_events','conflict_sets','conflict_members','evolution_proposals'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
-`).join('');
+`).join('') + ['owner_activities','maintenance_residuals'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
+CREATE TRIGGER owned_${table}_${operation.toLowerCase()} BEFORE ${operation} ON ${table}
+WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
+`)).join('');
 export const probeSchemaDigest = sha256(DDL);
 
 // P0 disposable schema; not migrations/001-initial.sql and not the execution ledger.
@@ -271,7 +328,7 @@ export class ProbeStore {
         this.#db.exec('PRAGMA journal_mode=WAL;');
         this.#transaction(() => {
           this.#db.exec(DDL);
-          this.#db.prepare('INSERT INTO owner_fences VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, NULL)')
+          this.#db.prepare('INSERT INTO owner_fences VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, NULL, NULL, NULL, NULL, NULL)')
             .run(storeId, binding.ownerId, binding.hostId, binding.projectId, binding.sessionId, binding.branchId,
               resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.source.path, resources.source.identity.dev, resources.source.identity.ino,
@@ -285,7 +342,7 @@ export class ProbeStore {
               'session', binding.sessionId, 0, binding.ownerId, null, binding.sessionId);
         });
       } else {
-        check(version === 4, 'unsupported-probe-schema');
+        check(version === 5, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
@@ -329,15 +386,124 @@ export class ProbeStore {
     return row as unknown as Fence;
   }
 
-  register(): Activity {
+  register(owner: ExecutionOwner = { kind: 'session', id: this.#binding.sessionId, authorizationId: this.#binding.sessionId }): Activity {
     return this.#transaction(() => {
       const fence = this.fence();
       check(fence.state === 'open', 'admission-closed');
-      const activity = { ...processIdentity, id: randomUUID(), epoch: fence.epoch, root: structuredClone(this.#resources.root) };
-      this.#db.prepare('INSERT INTO owner_activities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      check(!this.#db.prepare('SELECT 1 FROM owner_activities WHERE store_id=? AND incarnation=? AND epoch!=?')
+        .get(this.#storeId, processIdentity.incarnation, fence.epoch), 'stale-runtime-incarnation');
+      check(owner && Object.keys(owner).every(key => ['kind','id','authorizationId'].includes(key))
+        && ['session','job','migration'].includes(owner.kind), 'invalid-stream-owner');
+      check(owner.kind !== 'session' || (owner.id === this.#binding.sessionId && owner.authorizationId === owner.id), 'invalid-stream-owner');
+      const stream = this.#ensureStream(owner.kind, owner.id, owner.authorizationId);
+      const activity = { ...processIdentity, id: randomUUID(), epoch: fence.epoch, root: structuredClone(this.#resources.root), streamId: stream.streamId };
+      this.#db.prepare(`INSERT INTO owner_activities
+        (id,store_id,pid,incarnation,started_at,epoch,root_path,root_dev,root_ino,stream_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
         .run(activity.id, this.#storeId, activity.pid, activity.incarnation, activity.startedAt, activity.epoch,
-          activity.root.path, activity.root.identity.dev, activity.root.identity.ino);
+          activity.root.path, activity.root.identity.dev, activity.root.identity.ino, activity.streamId);
       return activity;
+    });
+  }
+
+  reserveChild(activity: Activity): string {
+    return this.withActivity(activity, () => {
+      const id = randomUUID();
+      const stream = this.#ensureStream('job', randomUUID(), activity.id);
+      this.#db.prepare(`INSERT INTO owner_activities
+        (id,store_id,epoch,parent_id,root_path,root_dev,root_ino,stream_id) VALUES (?,?,?,?,?,?,?,?)`)
+        .run(id, this.#storeId, activity.epoch, activity.id, this.#resources.root.path,
+          this.#resources.root.identity.dev, this.#resources.root.identity.ino, stream.streamId);
+      return id;
+    });
+  }
+
+  recordChildLaunch(parent: Activity, reservationId: string, pid: number): void {
+    uuid(reservationId);
+    check(Number.isSafeInteger(pid) && pid > 0, 'invalid-child-pid');
+    this.#transaction(() => {
+      // Reporting a previously reserved launch is control evidence, not new
+      // admission; it must remain possible after closing or cancellation.
+      const registered = this.#db.prepare(`SELECT * FROM owner_activities WHERE id=? AND store_id=? AND pid=?
+        AND incarnation=? AND started_at=? AND epoch=? AND stream_id=?`)
+        .get(parent.id, this.#storeId, processIdentity.pid, processIdentity.incarnation, processIdentity.startedAt, parent.epoch, parent.streamId);
+      check(registered && registered.stop_state !== 'absent' && parent.pid === processIdentity.pid
+        && parent.incarnation === processIdentity.incarnation && parent.startedAt === processIdentity.startedAt, 'invalid-parent-activity');
+      const row = this.#db.prepare('SELECT * FROM owner_activities WHERE id=? AND store_id=?').get(reservationId, this.#storeId);
+      check(row && row.parent_id === parent.id && (row.launch_pid === null || row.launch_pid === pid)
+        && (row.pid === null || row.pid === pid), 'invalid-child-reservation');
+      this.#db.prepare('UPDATE owner_activities SET launch_pid=? WHERE id=?').run(pid, reservationId);
+    });
+  }
+
+  claimChild(reservationId: string): Activity {
+    uuid(reservationId);
+    return this.#transaction(() => {
+      const fence = this.fence();
+      check(fence.state === 'open', 'admission-closed');
+      check(!this.#db.prepare('SELECT 1 FROM owner_activities WHERE store_id=? AND incarnation=? AND epoch!=?')
+        .get(this.#storeId, processIdentity.incarnation, fence.epoch), 'stale-runtime-incarnation');
+      const row = this.#db.prepare('SELECT * FROM owner_activities WHERE id=? AND store_id=?').get(reservationId, this.#storeId);
+      check(row && row.parent_id !== null && row.pid === null && row.epoch === fence.epoch && row.stop_state !== 'absent'
+        && (row.launch_pid === null || row.launch_pid === processIdentity.pid), 'invalid-child-reservation');
+      const stream = this.#readStream(String(row.stream_id));
+      check(stream.ownerKind === 'job' && stream.authorization.id === row.parent_id, 'stream-owner-evidence-gap');
+      this.#db.prepare('UPDATE owner_activities SET pid=?,incarnation=?,started_at=?,launch_pid=? WHERE id=?')
+        .run(processIdentity.pid, processIdentity.incarnation, processIdentity.startedAt, processIdentity.pid, reservationId);
+      return { ...processIdentity, id: reservationId, epoch: fence.epoch, root: structuredClone(this.#resources.root), streamId: stream.streamId };
+    });
+  }
+
+  #ensureStream(kind: ExecutionStream['ownerKind'], ownerId: string, authorizationId: string): ExecutionStream {
+    uuid(ownerId); uuid(authorizationId);
+    const existing = this.#db.prepare('SELECT stream_id FROM execution_streams WHERE store_id=? AND owner_kind=? AND owner_id=?')
+      .get(this.#storeId, kind, ownerId);
+    if (existing) {
+      const stream = this.#readStream(String(existing.stream_id));
+      check(stream.authorization.id === authorizationId, 'stream-authorization-conflict');
+      return stream;
+    }
+    const id = randomUUID();
+    this.#db.prepare('INSERT INTO execution_streams VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(id, this.#storeId, kind, ownerId, this.#binding.ownerId, this.#binding.hostId,
+        this.#binding.projectId, 'synthetic-host-command', authorizationId);
+    return this.#readStream(id);
+  }
+
+  #readStream(streamId: string): ExecutionStream {
+    uuid(streamId);
+    const row = this.#db.prepare('SELECT * FROM execution_streams WHERE stream_id=? AND store_id=?').get(streamId, this.#storeId);
+    check(row && row.principal_id === this.#binding.ownerId && row.origin_host_id === this.#binding.hostId
+      && row.project_id === this.#binding.projectId, 'stream-owner-evidence-gap');
+    return { streamId, ownerKind: row.owner_kind as ExecutionStream['ownerKind'], ownerId: String(row.owner_id),
+      principalId: String(row.principal_id), originHostId: String(row.origin_host_id), projectId: String(row.project_id),
+      authorization: { kind: 'synthetic-host-command', id: String(row.authorization_id) } };
+  }
+
+  readStream(activity: Activity, streamId: string): ExecutionStream {
+    return this.withActivity(activity, () => this.#readStream(streamId));
+  }
+
+  bindAttempt(activity: Activity, runId: string): AttemptOwnership {
+    return this.withActivity(activity, () => {
+      uuid(runId);
+      const stream = this.#readStream(activity.streamId);
+      check(stream.ownerKind !== 'maintenance', 'maintenance-business-unavailable');
+      const attemptId = randomUUID();
+      const seq = Number(this.#db.prepare('SELECT COALESCE(MAX(seq),0)+1 AS seq FROM execution_events WHERE stream_id=?').get(stream.streamId)!.seq);
+      this.#db.prepare('INSERT INTO execution_events VALUES (?,?,?,?,?,?,?,?)')
+        .run(randomUUID(), stream.streamId, seq, 'attempt-bound', attemptId, runId, activity.id, new Date().toISOString());
+      return { attemptId, runId, streamId: stream.streamId, ownerKind: stream.ownerKind, ownerId: stream.ownerId };
+    });
+  }
+
+  readAttempt(activity: Activity, attemptId: string): AttemptOwnership | null {
+    return this.withActivity(activity, () => {
+      uuid(attemptId);
+      const row = this.#db.prepare(`SELECT e.* FROM execution_events e JOIN execution_streams s ON s.stream_id=e.stream_id
+        WHERE e.attempt_id=? AND s.store_id=?`).get(attemptId, this.#storeId);
+      if (!row) return null;
+      const stream = this.#readStream(String(row.stream_id));
+      return { attemptId, runId: String(row.run_id), streamId: stream.streamId, ownerKind: stream.ownerKind, ownerId: stream.ownerId };
     });
   }
 
@@ -350,7 +516,10 @@ export class ProbeStore {
         && row.root_path === this.#resources.root.path && row.root_dev === this.#resources.root.identity.dev
         && row.root_ino === this.#resources.root.identity.ino
         && JSON.stringify(activity.root) === JSON.stringify(this.#resources.root)
-        && row.epoch === activity.epoch, 'admission-closed');
+        && row.epoch === activity.epoch && row.stream_id === activity.streamId
+        && activity.pid === processIdentity.pid && activity.incarnation === processIdentity.incarnation
+        && activity.startedAt === processIdentity.startedAt, 'admission-closed');
+      check(this.#readStream(activity.streamId).ownerKind !== 'maintenance', 'maintenance-business-unavailable');
       return action();
     });
   }
@@ -992,42 +1161,139 @@ export class ProbeStore {
   }
 
   beginMaintenance(coordinator: string): Fence {
+    uuid(coordinator);
     return this.#transaction(() => {
       const fence = this.fence();
-      if (fence.state !== 'open' && fence.coordinator !== coordinator) {
+      if (fence.state !== 'open') {
+        if (fence.coordinator === coordinator && fence.coordinator_pid === process.pid
+          && fence.coordinator_incarnation === processIdentity.incarnation) return fence;
         check(fence.coordinator_pid !== null && processAbsent(fence.coordinator_pid), 'maintenance-owned');
+        this.#db.prepare(`UPDATE owner_activities SET stop_state='absent',stop_observed_at=?,stop_method='node-process-kill-0/ESRCH' WHERE id=?`)
+          .run(new Date().toISOString(), fence.coordinator_activity);
       }
-      if (fence.coordinator !== coordinator) {
-        this.#db.prepare(`UPDATE owner_fences SET state='closing',epoch=epoch+1,coordinator=?,coordinator_pid=? WHERE store_id=?`)
-          .run(coordinator, process.pid, this.#storeId);
-      }
+      const streamId = fence.state === 'open'
+        ? this.#ensureStream('maintenance', coordinator, coordinator).streamId : fence.coordinator_stream!;
+      this.#readStream(streamId);
+      const activityId = randomUUID();
+      this.#db.prepare(`INSERT INTO owner_activities
+        (id,store_id,pid,incarnation,started_at,epoch,root_path,root_dev,root_ino,stream_id,stop_state,stop_observed_at,stop_method)
+        VALUES (?,?,?,?,?,?,?,?,?,?,'alive',?,'coordinator-registration')`)
+        .run(activityId, this.#storeId, process.pid, processIdentity.incarnation, processIdentity.startedAt, fence.epoch + 1,
+          this.#resources.root.path, this.#resources.root.identity.dev, this.#resources.root.identity.ino, streamId, new Date().toISOString());
+      this.#db.prepare(`UPDATE owner_fences SET state='closing',epoch=epoch+1,coordinator=?,coordinator_pid=?,
+        coordinator_incarnation=?,coordinator_started_at=?,coordinator_stream=?,coordinator_activity=? WHERE store_id=?`)
+        .run(coordinator, process.pid, processIdentity.incarnation, processIdentity.startedAt, streamId, activityId, this.#storeId);
       return this.fence();
     });
   }
 
-  acquireMaintenance(coordinator: string): { acquired: boolean; observations: { id: string; pid: number; incarnation: string; absent: boolean; observedAt: string; method: string }[] } {
+  #assertCoordinator(coordinator: string): Fence {
+    const fence = this.fence();
+    check(fence.state !== 'open' && fence.coordinator === coordinator && fence.coordinator_pid === process.pid
+      && fence.coordinator_incarnation === processIdentity.incarnation && fence.coordinator_started_at === processIdentity.startedAt, 'maintenance-owned');
+    return fence;
+  }
+
+  acquireMaintenance(coordinator: string) {
     return this.#transaction(() => {
-      const fence = this.fence();
-      check(fence.coordinator === coordinator && fence.coordinator_pid === process.pid && fence.state !== 'open', 'maintenance-owned');
-      const rows = this.#db.prepare('SELECT * FROM owner_activities WHERE store_id=?').all(this.#storeId);
-      const observations = rows.map(row => ({
-        id: String(row.id), pid: Number(row.pid), incarnation: String(row.incarnation),
-        absent: processAbsent(Number(row.pid)), observedAt: new Date().toISOString(), method: 'node-process-kill-0/ESRCH',
-      }));
-      const acquired = observations.every(item => item.absent);
-      if (acquired) this.#db.prepare("UPDATE owner_fences SET state='exclusive' WHERE store_id=?").run(this.#storeId);
-      return { acquired, observations };
+      const fence = this.#assertCoordinator(coordinator);
+      const rows = this.#db.prepare('SELECT * FROM owner_activities WHERE store_id=? AND id!=?').all(this.#storeId, fence.coordinator_activity);
+      const observations = rows.map(row => {
+        let state: 'alive' | 'absent' | 'unknown' = 'absent';
+        let method = 'node-process-kill-0/ESRCH';
+        let observedAt = String(row.stop_observed_at ?? new Date().toISOString());
+        const pid = row.pid ?? row.launch_pid;
+        if (row.stop_state !== 'absent') {
+          observedAt = new Date().toISOString();
+          try {
+            if (pid === null) { state = 'unknown'; method = 'unacknowledged-controlled-launch'; }
+            else state = processAbsent(Number(pid)) ? 'absent' : 'alive';
+          }
+          catch { state = 'unknown'; method = 'process-exit-evidence-gap'; }
+          this.#db.prepare('UPDATE owner_activities SET stop_state=?,stop_observed_at=?,stop_method=? WHERE id=?')
+            .run(state, observedAt, method, String(row.id));
+        }
+        return { id: String(row.id), pid: pid === null ? null : Number(pid), incarnation: row.incarnation === null ? null : String(row.incarnation),
+          absent: state === 'absent', state, observedAt, method };
+      });
+      const residuals = this.#scanResiduals();
+      const acquired = observations.every(item => item.absent) && residuals.every(item => item.state === 'expected');
+      this.#db.prepare('UPDATE owner_fences SET state=? WHERE store_id=?').run(acquired ? 'exclusive' : 'closing', this.#storeId);
+      return { acquired, observations, residuals };
     });
+  }
+
+  #scanResiduals() {
+    const observedAt = new Date().toISOString();
+    const entries: { path: string; state: 'expected' | 'unexpected' | 'unknown'; observedAt: string; dev: string | null; ino: string | null; reason: string }[] = [];
+    // These are the existing disposable adapter's carriers, not a cleanup allowlist.
+    const known = new Set(['sandbox.json', basename(this.#resources.source.path), basename(this.#resources.store.path),
+      `${basename(this.#resources.store.path)}-wal`, `${basename(this.#resources.store.path)}-shm`]);
+    try {
+      const names = readdirSync(this.#resources.root.path).sort();
+      check(names.length <= 1024, 'residual-enumeration-limit');
+      for (const path of names) {
+        try {
+          const stat = lstatSync(join(this.#resources.root.path, path), { bigint: true });
+          const expected = known.has(path) && stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n;
+          entries.push({ path, state: expected ? 'expected' : 'unexpected', observedAt,
+            dev: stat.dev.toString(), ino: stat.ino.toString(), reason: expected ? 'known-disposable-carrier' : 'unexplained-residual' });
+        } catch {
+          entries.push({ path, state: 'unknown', observedAt, dev: null, ino: null, reason: 'residual-inspection-evidence-gap' });
+        }
+      }
+    } catch {
+      entries.push({ path: '.', state: 'unknown', observedAt, dev: null, ino: null, reason: 'residual-enumeration-evidence-gap' });
+    }
+    this.#db.prepare('DELETE FROM maintenance_residuals WHERE store_id=?').run(this.#storeId);
+    const insert = this.#db.prepare('INSERT INTO maintenance_residuals VALUES (?,?,?,?,?,?,?)');
+    for (const entry of entries) insert.run(this.#storeId, entry.path, entry.state, observedAt, entry.dev, entry.ino, entry.reason);
+    return entries;
   }
 
   releaseMaintenance(coordinator: string): Fence {
-    return this.#transaction(() => {
-      const fence = this.fence();
-      check(fence.coordinator === coordinator && fence.coordinator_pid === process.pid && fence.state === 'exclusive', 'maintenance-not-exclusive');
-      this.#db.prepare('DELETE FROM owner_activities WHERE store_id=?').run(this.#storeId);
-      this.#db.prepare("UPDATE owner_fences SET state='open',epoch=epoch+1,coordinator=NULL,coordinator_pid=NULL WHERE store_id=?").run(this.#storeId);
-      return this.fence();
+    const released = this.#transaction(() => {
+      const fence = this.#assertCoordinator(coordinator);
+      check(fence.state === 'exclusive', 'maintenance-not-exclusive');
+      if (!this.acquireMaintenance(coordinator).acquired) return null;
+      return this.#reopenMaintenance();
     });
+    // Commit the new blocked evidence even when release is rejected.
+    check(released, 'maintenance-residuals-or-participants');
+    return released;
+  }
+
+  cancelMaintenance(coordinator: string): Fence {
+    return this.#transaction(() => {
+      this.#assertCoordinator(coordinator);
+      // No irreversible maintenance operation is enabled in this synthetic slice.
+      return this.#reopenMaintenance();
+    });
+  }
+
+  #reopenMaintenance(): Fence {
+    this.#db.prepare(`UPDATE owner_fences SET state='open',epoch=epoch+1,coordinator=NULL,coordinator_pid=NULL,
+      coordinator_incarnation=NULL,coordinator_started_at=NULL,coordinator_activity=NULL WHERE store_id=?`).run(this.#storeId);
+    return this.fence();
+  }
+
+  maintenanceStatus() {
+    return this.#transaction(() => ({
+      fence: this.fence(),
+      coordinatorStream: this.fence().coordinator_stream ? this.#readStream(this.fence().coordinator_stream!) : null,
+      streams: this.#db.prepare('SELECT stream_id FROM execution_streams WHERE store_id=? ORDER BY rowid').all(this.#storeId)
+        .map(row => this.#readStream(String(row.stream_id))),
+      residuals: this.#db.prepare('SELECT * FROM maintenance_residuals WHERE store_id=? ORDER BY path').all(this.#storeId)
+        .map(row => ({ path: String(row.path), state: String(row.state), observedAt: String(row.observed_at),
+          dev: row.dev === null ? null : String(row.dev), ino: row.ino === null ? null : String(row.ino), reason: String(row.reason) })),
+      activities: this.#db.prepare('SELECT * FROM owner_activities WHERE store_id=? ORDER BY rowid').all(this.#storeId)
+        .map(row => ({ id: String(row.id), pid: row.pid === null ? null : Number(row.pid), incarnation: row.incarnation === null ? null : String(row.incarnation),
+          parentId: row.parent_id === null ? null : String(row.parent_id),
+          launchPid: row.launch_pid === null ? null : Number(row.launch_pid), startedAt: row.started_at === null ? null : String(row.started_at),
+          epoch: Number(row.epoch), streamId: String(row.stream_id), owner: this.#readStream(String(row.stream_id)),
+          stop: row.stop_state === null ? null : { state: String(row.stop_state), observedAt: String(row.stop_observed_at), method: String(row.stop_method) },
+          root: { path: String(row.root_path), identity: { dev: String(row.root_dev), ino: String(row.root_ino) } } })),
+    }));
   }
 
   diagnostics(): { sqlite: string; journalMode: unknown; synchronous: unknown; foreignKeys: unknown; busyTimeout: unknown } {

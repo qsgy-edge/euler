@@ -10,6 +10,8 @@ Issue #1 adds a runnable **synthetic P0 probe** for first-turn source durability
 
 Issue #2 adds synthetic scoped memory transitions, source-backed verification fixtures, event replay, inert proposal versions, and process-crash/concurrent-writer probes. See [commands, storage behavior, and evidence boundaries](docs/implementation/t02-scoped-memory.md). Semantic verification and production acceptance remain separate work.
 
+Issue #3 adds durable synthetic session/job/maintenance/migration stream ownership, controlled child registration, recoverable stop/residual evidence, maintenance cancellation and coordinator takeover. See [commands and evidence boundaries](docs/implementation/t03-process-maintenance.md).
+
 Full X-card acceptance, real provider dispatch, production schema/host acceptance, migration, and MC cutover remain unverified. CI and host results must be read from the artifact for the specific implementation and platform; this repository is not production-ready.
 
 - [Euler v1 implementation specification](docs/architecture/issues/15-euler-v1-spec.md)

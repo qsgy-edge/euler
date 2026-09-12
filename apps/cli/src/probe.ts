@@ -1,5 +1,5 @@
 import { API_VERSION, DEFAULT_BUDGET, ProbeSession, ProbeStore, sha256, validateBudget } from '@euler/core';
-import type { ProbeBudget } from '@euler/core';
+import type { ExecutionOwner, ProbeBudget } from '@euler/core';
 import { CliArchive } from './archive.ts';
 import { bindingOf, openSandbox, resourcesOf } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
@@ -15,14 +15,14 @@ export class CountingTransport {
   }
 }
 
-export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET) {
+export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET, registration?: ExecutionOwner | string) {
   validateBudget(budget);
   sandbox = openSandbox(sandbox.root);
   const binding = bindingOf(sandbox);
   let archive: CliArchive;
   const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, binding, false, input => archive.read(input));
   try {
-    const activity = store.register();
+    const activity = typeof registration === 'string' ? store.claimChild(registration) : store.register(registration);
     archive = new CliArchive(sandbox, action => store.withActivity(activity, action));
     const transport = new CountingTransport();
     const session = new ProbeSession(store, activity, { version: API_VERSION, binding, source: archive, transport }, budget);
