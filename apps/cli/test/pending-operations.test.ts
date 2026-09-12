@@ -28,6 +28,8 @@ test('a preview persists its full canonical snapshot, replaces the session pendi
     const first = probe.store.previewMemoryOperation(probe.activity, inspect.token, { kind: 'correct', input: source, content: 'Corrected fact' });
     const replacement = probe.store.previewMemoryOperation(probe.activity, inspect.token, { kind: 'correct', input: source, content: 'Corrected fact' });
     assert.equal(replacement.supersedesOperationId, first.operationId);
+    assert.equal(replacement.updateEventIds.length, 1);
+    assert.match(replacement.updateEventIds[0]!, /^[0-9a-f-]{36}$/);
     assert.equal(probe.store.memoryOperationStatus(probe.activity, first.token).status, 'superseded');
     assert.deepEqual(replacement.targets, [captured.record]);
     probe.close();
@@ -37,11 +39,47 @@ test('a preview persists its full canonical snapshot, replaces the session pendi
     const result = probe.store.commitMemoryOperation(probe.activity, replacement.token);
     assert.equal(result.status, 'committed');
     assert.equal(result.receiptIds.length, 1);
+    assert.equal(probe.store.readOwnerReceipt(probe.activity, result.receiptIds[0]!).operationId, replacement.operationId);
     assert.equal(probe.store.readMemory(probe.activity, captured.record.recordId).content, 'Corrected fact');
+    assert.equal(probe.store.readMemory(probe.activity, captured.record.recordId).headEventId, replacement.updateEventIds[0]);
     assert.deepEqual(probe.store.memoryOperationStatus(probe.activity, replacement.token), result);
     assert.equal(probe.store.commitMemoryOperation(probe.activity, replacement.token).status, 'settled');
     assert.throws(() => probe.session.tool('memory.commit', input), /tool-unavailable/);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('shared-scope previews admit member evidence consistently with direct correction', () => {
+  const sandbox = createSandbox();
+  const member = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
+  const outsider = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
+  for (const binding of [member, outsider]) createSandboxSession(sandbox, binding);
+  const first = openProbe(sandbox);
+  const second = openProbe(sandbox, undefined, undefined, member);
+  const third = openProbe(sandbox, undefined, undefined, outsider);
+  try {
+    const workspaceId = randomUUID();
+    first.store.bindWorkspace(first.activity, workspaceId, [sandbox.fixture.projectId, member.projectId]);
+    for (const scope of [
+      { kind: 'workspace' as const, id: workspaceId, resolved: true },
+      { kind: 'personal' as const, id: sandbox.fixture.ownerId, resolved: true },
+    ]) {
+      const source = first.archive.append(randomUUID(), `${scope.kind} original`);
+      const record = first.store.captureMemory(first.activity, source, 'Original', { type: 'fact', scope, appliesTo: [] }).record;
+      const inspect = first.store.inspectMemoryPresentation(first.activity, [record.recordId]);
+      const input = second.archive.append(randomUUID(), `${scope.kind} corrected`);
+      if (scope.kind === 'workspace') {
+        const foreign = third.archive.append(randomUUID(), 'Unauthorized correction');
+        assert.throws(() => first.store.previewMemoryOperation(first.activity, inspect.token,
+          { kind: 'correct', input: foreign, content: 'Unauthorized correction' }), /source-scope-mismatch/);
+      }
+      const preview = first.store.previewMemoryOperation(first.activity, inspect.token, { kind: 'correct', input, content: 'Corrected' });
+      first.store.acknowledgeMemoryPresentation(first.activity, preview.token, preview.hash);
+      const committed = first.store.commitMemoryOperation(first.activity, preview.token);
+      assert.equal(committed.status, 'committed');
+      assert.equal(committed.current[0]!.source.binding.projectId, member.projectId);
+      assert.deepEqual(second.store.readMemory(second.activity, record.recordId), committed.current[0]);
+    }
+  } finally { third.close(); second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
 test('two sessions keep separate pending slots and only one correction of a shared head can commit', () => {
@@ -145,6 +183,88 @@ test('storage rejects forged presentation identities and re-signed batch payload
     assert.throws(() => probe.store.readActivationBatch(probe.activity, batch.batchId), /batch-evidence-gap/);
     assert.throws(() => probe.store.readMemoryPresentation(probe.activity, preview.token), /batch-evidence-gap/);
     assert.equal(probe.store.readMemory(probe.activity, batch.events[0]!.recordId).headEventId, batch.events[0]!.eventId);
+  } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('forget, restore and rollback commit only their own frozen event identities', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const { input, record } = candidate(probe, sandbox.fixture.projectId);
+    const verified = probe.store.verifyMemory(probe.activity, record.recordId, record, 'pass', [input]);
+    const batch = probe.store.activateMemoryBatch(probe.activity, [verified.record]);
+    for (const kind of ['forget', 'restore', 'rollback'] as const) {
+      const inspect = probe.store.inspectMemoryPresentation(probe.activity, [record.recordId]);
+      const preview = probe.store.previewMemoryOperation(probe.activity, inspect.token, kind === 'rollback'
+        ? { kind, batchId: batch.batchId, eventIds: [batch.events[0]!.eventId] } : { kind });
+      const reserved = preview.updateEventIds[0]!;
+      assert.notEqual(reserved, inspect.targets[0]!.headEventId);
+      if (kind === 'rollback') {
+        assert.deepEqual(preview.eventIds, [batch.events[0]!.eventId]);
+        assert.notEqual(preview.eventIds[0], inspect.targets[0]!.headEventId);
+      }
+      probe.store.acknowledgeMemoryPresentation(probe.activity, preview.token, preview.hash);
+      const result = probe.store.commitMemoryOperation(probe.activity, preview.token);
+      assert.equal(result.status, 'committed');
+      assert.equal(result.current[0]!.headEventId, reserved);
+      assert.equal(probe.store.readOwnerReceipt(probe.activity, result.receiptIds[0]!).kind, kind);
+    }
+    assert.equal(probe.store.readMemory(probe.activity, record.recordId).lifecycle, 'candidate');
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('pending identity binds the complete displayed correction and rollback selection', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
+  try {
+    const { input, record } = candidate(probe, sandbox.fixture.projectId);
+    const verified = probe.store.verifyMemory(probe.activity, record.recordId, record, 'pass', [input]);
+    const batch = probe.store.activateMemoryBatch(probe.activity, [verified.record]);
+    const inspect = probe.store.inspectMemoryPresentation(probe.activity, [record.recordId]);
+    const correction = probe.archive.append(randomUUID(), 'Displayed body');
+    const differentSource = probe.archive.append(randomUUID(), 'Unapproved source');
+    db.function('euler_store_writer', () => 1);
+    db.exec('DROP TRIGGER immutable_presentation_update');
+    for (const field of ['content', 'input', 'eventIds']) {
+      const preview = probe.store.previewMemoryOperation(probe.activity, inspect.token, field === 'eventIds'
+        ? { kind: 'rollback', batchId: batch.batchId, eventIds: [batch.events[0]!.eventId] }
+        : { kind: 'correct', input: correction, content: 'Displayed body' });
+      const original = db.prepare('SELECT payload,payload_hash FROM host_presentations WHERE token=?').get(preview.token)!;
+      const body = JSON.parse(String(original.payload));
+      if (field === 'content') body.content = 'Changed after display';
+      if (field === 'input') body.input = differentSource;
+      if (field === 'eventIds') body.eventIds.push(randomUUID());
+      const payload = JSON.stringify(body);
+      db.prepare('UPDATE host_presentations SET payload=?,payload_hash=? WHERE token=?')
+        .run(payload, createHash('sha256').update(payload).digest('hex'), preview.token);
+      assert.throws(() => probe.store.readMemoryPresentation(probe.activity, preview.token), /presentation-evidence-gap/);
+      assert.deepEqual(probe.store.readMemory(probe.activity, record.recordId), batch.events[0]!.after);
+      db.prepare('UPDATE host_presentations SET payload=?,payload_hash=? WHERE token=?').run(original.payload!, original.payload_hash!, preview.token);
+      probe.store.cancelMemoryOperation(probe.activity, preview.token);
+    }
+  } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('a re-signed presentation cannot replace its reserved mutation event', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
+  try {
+    const { record } = candidate(probe, sandbox.fixture.projectId);
+    const inspected = probe.store.inspectMemoryPresentation(probe.activity, [record.recordId]);
+    const input = probe.archive.append(randomUUID(), 'Correction');
+    const preview = probe.store.previewMemoryOperation(probe.activity, inspected.token, { kind: 'correct', input, content: 'Correction' });
+    db.function('euler_store_writer', () => 1);
+    db.exec('DROP TRIGGER immutable_presentation_update');
+    const row = db.prepare('SELECT payload FROM host_presentations WHERE token=?').get(preview.token)!;
+    const body = JSON.parse(String(row.payload));
+    body.updateEventIds[0] = randomUUID();
+    const payload = JSON.stringify(body);
+    db.prepare('UPDATE host_presentations SET payload=?,payload_hash=? WHERE token=?')
+      .run(payload, createHash('sha256').update(payload).digest('hex'), preview.token);
+    assert.throws(() => probe.store.readMemoryPresentation(probe.activity, preview.token), /presentation-evidence-gap/);
+    assert.deepEqual(probe.store.readMemory(probe.activity, record.recordId), record);
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 

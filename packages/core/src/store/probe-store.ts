@@ -62,7 +62,7 @@ export interface MemoryPresentation {
   sessionId: string; branchId: string; epoch: number; ordinal: number; kind: 'inspect' | MemoryChange['kind'];
   originatingPresentationId: string | null; supersedesOperationId: string | null;
   targets: MemoryRecord[]; input: SourceAck | null; content: string | null;
-  batchId: string | null; eventIds: string[]; batchPayload: string | null; batchDigest: string | null; hash: string;
+  batchId: string | null; eventIds: string[]; updateEventIds: string[]; batchPayload: string | null; batchDigest: string | null; hash: string;
 }
 export interface MemoryOperationResult {
   status: 'pending' | 'committed' | 'superseded' | 'cancelled' | 'stale' | 'no_op' | 'unavailable' | 'error' | 'settled' | 'invalid_identity';
@@ -123,7 +123,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=6), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=7), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -242,8 +242,9 @@ CREATE TABLE memory_applicability (
   PRIMARY KEY(revision_id,ordinal), UNIQUE(revision_id,value)
 ) STRICT;
 CREATE TABLE capture_jobs (
-  job_id TEXT PRIMARY KEY, source_event_id TEXT NOT NULL UNIQUE, record_id TEXT NOT NULL REFERENCES memory_records(record_id),
-  status TEXT NOT NULL CHECK(status IN ('captured','complete')), payload TEXT NOT NULL, payload_hash TEXT NOT NULL, created_at TEXT NOT NULL
+  job_id TEXT PRIMARY KEY, source_event_id TEXT NOT NULL, record_id TEXT NOT NULL UNIQUE REFERENCES memory_records(record_id),
+  status TEXT NOT NULL CHECK(status IN ('captured','complete')), payload TEXT NOT NULL, payload_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+  source_owner TEXT NOT NULL REFERENCES sessions(session_id), UNIQUE(source_owner,source_event_id)
 ) STRICT;
 CREATE TABLE provenance_refs (
   ref_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), revision_id TEXT NOT NULL REFERENCES memory_revisions(revision_id),
@@ -303,16 +304,19 @@ CREATE TABLE presentation_targets (
   presentation_id TEXT NOT NULL REFERENCES host_presentations(presentation_id), ordinal INTEGER NOT NULL CHECK(ordinal>=0),
   record_id TEXT NOT NULL, revision_id TEXT NOT NULL, head_event_id TEXT NOT NULL,
   lifecycle TEXT NOT NULL, verification TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
-  selected_event_id TEXT, snapshot TEXT NOT NULL, snapshot_hash TEXT NOT NULL,
+  selected_event_id TEXT, snapshot TEXT NOT NULL, snapshot_hash TEXT NOT NULL, update_event_id TEXT UNIQUE,
   PRIMARY KEY(presentation_id,ordinal), UNIQUE(presentation_id,record_id),
   FOREIGN KEY(record_id,head_event_id,revision_id) REFERENCES memory_events(record_id,event_id,revision_id),
   FOREIGN KEY(record_id,selected_event_id) REFERENCES memory_events(record_id,event_id),
   FOREIGN KEY(scope_kind,scope_id) REFERENCES memory_scopes(kind,scope_id)
 ) STRICT;
+CREATE TRIGGER presentation_event_reservation BEFORE INSERT ON presentation_targets
+WHEN (SELECT kind='inspect' FROM host_presentations WHERE presentation_id=NEW.presentation_id) != (NEW.update_event_id IS NULL)
+BEGIN SELECT RAISE(ABORT,'presentation-event-mismatch'); END;
 CREATE TABLE pending_operations (
   operation_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, presentation_id TEXT NOT NULL UNIQUE,
   state TEXT NOT NULL CHECK(state IN ('pending','committed','superseded','cancelled','stale','no_op','unavailable','error')),
-  result TEXT, result_hash TEXT,
+  result TEXT, result_hash TEXT, presentation_hash TEXT NOT NULL,
   CHECK((state='pending' AND result IS NULL AND result_hash IS NULL) OR (state!='pending' AND result IS NOT NULL AND result_hash IS NOT NULL)),
   FOREIGN KEY(session_id,presentation_id) REFERENCES host_presentations(session_id,presentation_id),
   UNIQUE(session_id,operation_id),
@@ -322,13 +326,15 @@ CREATE TRIGGER operation_event_target BEFORE INSERT ON memory_events
 WHEN NEW.operation_id IS NOT NULL AND NOT EXISTS (
   SELECT 1 FROM pending_operations o JOIN host_presentations p ON p.presentation_id=o.presentation_id
   JOIN presentation_targets t ON t.presentation_id=p.presentation_id
-  WHERE o.operation_id=NEW.operation_id AND o.state='pending' AND p.kind=NEW.kind
-    AND t.record_id=NEW.record_id AND t.snapshot=NEW.before_snapshot
+  WHERE o.operation_id=NEW.operation_id AND o.state='pending' AND p.kind=NEW.kind AND o.presentation_hash=p.payload_hash
+    AND t.record_id=NEW.record_id AND t.snapshot=NEW.before_snapshot AND t.update_event_id=NEW.event_id
+    AND t.selected_event_id IS NEW.target_event_id
 )
 BEGIN SELECT RAISE(ABORT,'operation-target-mismatch'); END;
 CREATE UNIQUE INDEX session_pending ON pending_operations(session_id) WHERE state='pending';
 CREATE TRIGGER settled_operation_immutable BEFORE UPDATE ON pending_operations
 WHEN OLD.state!='pending' OR NEW.operation_id!=OLD.operation_id OR NEW.session_id!=OLD.session_id OR NEW.presentation_id!=OLD.presentation_id
+  OR NEW.presentation_hash!=OLD.presentation_hash
 BEGIN SELECT RAISE(ABORT,'settled-operation-immutable'); END;
 CREATE TABLE activation_batches (
   batch_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
@@ -392,15 +398,15 @@ CREATE TRIGGER immutable_provenance_refs_delete BEFORE DELETE ON provenance_refs
 CREATE TRIGGER immutable_evolution_proposals_update BEFORE UPDATE ON evolution_proposals BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_proposals BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=6;
+PRAGMA user_version=7;
 ` + ['workspaces','workspace_projects','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
-`).join('') + ['workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
+`).join('') + ['memory_heads','intent_heads','owner_fences','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
   'verification_runs','verification_evidence','proposal_evidence','projection_jobs','feedback_events','conflict_sets','conflict_members','evolution_proposals'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
-`).join('') + ['host_presentations','pending_operations','owner_activities','maintenance_residuals'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
+`).join('') + ['memory_heads','intent_heads','owner_fences','host_presentations','pending_operations','owner_activities','maintenance_residuals'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
 CREATE TRIGGER owned_${table}_${operation.toLowerCase()} BEFORE ${operation} ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
 `)).join('') + `
@@ -446,15 +452,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,6,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,7,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 6, 'unsupported-probe-schema');
+        check(version === 7, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 6 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 7 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -791,14 +797,19 @@ export class ProbeStore {
   captureMemory(activity: Activity, input: SourceAck, content: string, options: MemoryCaptureOptions): MemoryOperation {
     return this.withActivity(activity, () => {
       check(Object.keys(options).every(key => ['type','scope','appliesTo','claimKey'].includes(key)), 'invalid-memory-options');
-      this.#validateSource(input, content);
       const scope = this.#validateScope(options.scope);
+      this.#validateSource(input, content, scope);
       const appliesTo = this.#normalizeAppliesTo(options.appliesTo);
       const claimKey = options.claimKey ?? content.trim().normalize('NFC');
       check(typeof claimKey === 'string' && claimKey.length > 0 && Buffer.byteLength(claimKey) <= 65536, 'invalid-claim-key');
       check(['fact', 'preference', 'decision', 'insight', 'episode'].includes(options.type), 'invalid-memory-type');
-      const existing = this.#db.prepare('SELECT * FROM memory_revisions WHERE source_event_id=?').get(input.eventId);
+      const existing = this.#db.prepare(`SELECT r.*,j.payload AS capture_payload,j.payload_hash AS capture_hash FROM capture_jobs j
+        JOIN memory_revisions r ON r.record_id=j.record_id AND r.revision=1
+        WHERE j.source_owner=? AND j.source_event_id=?`).get(input.binding.sessionId, input.eventId);
       if (existing) {
+        const job = JSON.parse(String(existing.capture_payload));
+        check(sha256(String(existing.capture_payload)) === existing.capture_hash && job.schema === 'capture-job@1'
+          && job.recordId === existing.record_id && JSON.stringify(job.source) === JSON.stringify(input), 'capture-evidence-gap');
         const same = existing.content === content && existing.type === options.type && existing.scope_kind === scope.kind
           && existing.scope_id === scope.id && Number(existing.scope_resolved) === (scope.resolved ? 1 : 0)
           && JSON.stringify(this.#readAppliesTo(String(existing.revision_id))) === JSON.stringify(appliesTo)
@@ -821,9 +832,10 @@ export class ProbeStore {
         .run(recordId, this.#binding.ownerId, claimKey, input.binding.sessionId, new Date().toISOString());
       this.#insertRevision(record);
       const capturePayload = JSON.stringify({ schema: 'capture-job@1', source: input, recordId });
-      this.#db.prepare('INSERT INTO capture_jobs VALUES (?, ?, ?, ?, ?, ?, ?)')
-        .run(randomUUID(), input.eventId, recordId, 'complete', capturePayload, sha256(capturePayload), new Date().toISOString());
-      this.#appendMemoryEvent(null, record, 'capture', input.eventId, { automatic: true });
+      this.#db.prepare('INSERT INTO capture_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(randomUUID(), input.eventId, recordId, 'complete', capturePayload, sha256(capturePayload), new Date().toISOString(), input.binding.sessionId);
+      this.#appendMemoryEvent(null, record, 'capture', input.eventId, { automatic: true },
+        this.#requestDigest('capture', null, { input, content, scope, type: options.type, appliesTo, claimKey }));
       return { status: 'committed', record, eventId };
     });
   }
@@ -842,7 +854,7 @@ export class ProbeStore {
         && new Set(recordIds).size === recordIds.length, 'invalid-presentation-targets');
       const targets = recordIds.map(id => this.readMemory(activity, id));
       return this.#savePresentation(activity, { kind: 'inspect', targets, operationId: null, originatingPresentationId: null,
-        supersedesOperationId: null, input: null, content: null, batchId: null, batchPayload: null, batchDigest: null, eventIds: [] });
+        supersedesOperationId: null, input: null, content: null, batchId: null, eventIds: [], updateEventIds: [], batchPayload: null, batchDigest: null });
     });
   }
 
@@ -858,8 +870,7 @@ export class ProbeStore {
       if (change.kind === 'correct') {
         check(targets.length === 1 && targets[0]!.lifecycle !== 'tombstoned', 'tombstoned-not-actionable');
         check(typeof change.content === 'string' && Buffer.byteLength(change.content) <= 65536, 'invalid-memory-content');
-        this.#validateSource(change.input);
-        check(sameBinding(change.input.binding, this.#binding), 'source-scope-mismatch');
+        this.#validateSource(change.input, undefined, targets[0]!.scope);
       } else if (change.kind === 'rollback') {
         batch = this.#readActivationBatch(change.batchId);
         check(Array.isArray(change.eventIds) && change.eventIds.length === targets.length
@@ -883,16 +894,16 @@ export class ProbeStore {
         originatingPresentationId: inspect.presentationId, supersedesOperationId: old?.operationId ?? null,
         input: change.kind === 'correct' ? change.input : null, content: change.kind === 'correct' ? change.content : null,
         batchId: batch?.batchId ?? null, batchPayload: batch?.payload ?? null, batchDigest: batch?.digest ?? null,
-        eventIds: change.kind === 'rollback' ? change.eventIds : [] });
-      this.#db.prepare("INSERT INTO pending_operations VALUES (?,?,?,'pending',NULL,NULL)")
-        .run(presentation.operationId!, presentation.sessionId, presentation.presentationId);
+        eventIds: change.kind === 'rollback' ? change.eventIds : [], updateEventIds: targets.map(() => randomUUID()) });
+      this.#db.prepare("INSERT INTO pending_operations VALUES (?,?,?,'pending',NULL,NULL,?)")
+        .run(presentation.operationId!, presentation.sessionId, presentation.presentationId, presentation.hash);
       return presentation;
     });
   }
 
   #savePresentation(activity: Activity,
     body: Pick<MemoryPresentation, 'kind' | 'targets' | 'operationId' | 'originatingPresentationId' | 'supersedesOperationId'
-      | 'input' | 'content' | 'batchId' | 'batchPayload' | 'batchDigest' | 'eventIds'>): MemoryPresentation {
+      | 'input' | 'content' | 'batchId' | 'batchPayload' | 'batchDigest' | 'eventIds' | 'updateEventIds'>): MemoryPresentation {
     const ordinal = Number(this.#db.prepare('SELECT COALESCE(MAX(ordinal),0)+1 AS n FROM host_presentations WHERE session_id=?').get(this.#binding.sessionId)!.n);
     const snapshot: Omit<MemoryPresentation, 'hash'> = { schema: 'memory-presentation@1', presentationId: randomUUID(), token: randomUUID(),
       sessionId: this.#binding.sessionId, branchId: this.#binding.branchId, epoch: activity.epoch, ordinal, ...structuredClone(body) };
@@ -904,9 +915,9 @@ export class ProbeStore {
       .run(snapshot.presentationId, snapshot.sessionId, snapshot.branchId, ordinal, snapshot.epoch, snapshot.token, snapshot.kind,
         snapshot.operationId, snapshot.originatingPresentationId, snapshot.supersedesOperationId, snapshot.batchId, snapshot.batchDigest, payload, hash);
     for (const [index, target] of snapshot.targets.entries()) {
-      this.#db.prepare('INSERT INTO presentation_targets VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+      this.#db.prepare('INSERT INTO presentation_targets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
         .run(snapshot.presentationId, index, target.recordId, target.revisionId, target.headEventId, target.lifecycle, target.verification,
-          target.scope.kind, target.scope.id, snapshot.eventIds[index] ?? null, this.#snapshotBytes(target), target.hash);
+          target.scope.kind, target.scope.id, snapshot.eventIds[index] ?? null, this.#snapshotBytes(target), target.hash, snapshot.updateEventIds[index] ?? null);
     }
     return { ...snapshot, hash };
   }
@@ -920,16 +931,28 @@ export class ProbeStore {
       check(value.schema === 'memory-presentation@1' && value.presentationId === row.presentation_id && value.token === row.token
         && value.sessionId === row.session_id && value.branchId === row.branch_id && value.epoch === row.epoch && value.ordinal === row.ordinal
         && value.kind === row.kind && value.operationId === row.operation_id && value.originatingPresentationId === row.originating_id
-        && value.supersedesOperationId === row.supersedes_operation_id && value.batchId === row.batch_id && value.batchDigest === row.batch_digest,
+        && value.supersedesOperationId === row.supersedes_operation_id && value.batchId === row.batch_id && value.batchDigest === row.batch_digest
+        && Array.isArray(value.eventIds) && Array.isArray(value.updateEventIds)
+        && value.updateEventIds.length === (value.kind === 'inspect' ? 0 : value.targets.length)
+        && value.eventIds.length === (value.kind === 'rollback' ? value.targets.length : 0)
+        && (value.kind === 'correct' ? typeof value.content === 'string' && value.input !== null && value.targets.length === 1
+          : value.content === null && value.input === null),
       'presentation-evidence-gap');
+      if (value.operationId) {
+        const operation = this.#db.prepare('SELECT presentation_hash FROM pending_operations WHERE operation_id=? AND presentation_id=?')
+          .get(value.operationId, value.presentationId);
+        check(operation?.presentation_hash === row.payload_hash, 'presentation-evidence-gap');
+      }
       const targets = this.#db.prepare('SELECT * FROM presentation_targets WHERE presentation_id=? ORDER BY ordinal').all(value.presentationId);
       check(targets.length === value.targets.length && targets.length > 0, 'presentation-evidence-gap');
       for (const [index, target] of value.targets.entries()) {
         const stored = targets[index]!;
+        if (value.kind !== 'inspect') uuid(value.updateEventIds[index]!);
         check(stored.ordinal === index && stored.record_id === target.recordId && stored.revision_id === target.revisionId
           && stored.head_event_id === target.headEventId && stored.lifecycle === target.lifecycle && stored.verification === target.verification
           && stored.scope_kind === target.scope.kind && stored.scope_id === target.scope.id
-          && stored.selected_event_id === (value.eventIds[index] ?? null) && stored.snapshot === this.#snapshotBytes(target)
+          && stored.selected_event_id === (value.eventIds[index] ?? null) && stored.update_event_id === (value.updateEventIds[index] ?? null)
+          && stored.snapshot === this.#snapshotBytes(target)
           && stored.snapshot_hash === target.hash && target.hash === sha256(String(stored.snapshot)), 'presentation-evidence-gap');
         const event = this.#db.prepare('SELECT after_snapshot FROM memory_events WHERE event_id=? AND record_id=?').get(target.headEventId, target.recordId);
         check(event?.after_snapshot === stored.snapshot, 'presentation-evidence-gap');
@@ -1147,7 +1170,7 @@ export class ProbeStore {
       const current = this.#assertMemoryExpected(recordId, expected);
       check(['pass', 'block', 'evidence-gap'].includes(result), 'invalid-verification');
       check(Array.isArray(evidence), 'invalid-verification');
-      for (const ref of evidence) this.#validateSource(ref);
+      for (const ref of evidence) this.#validateSource(ref, undefined, current.scope);
       check(result !== 'pass' || evidence.length > 0, 'verification-evidence-required');
       const evidenceJson = JSON.stringify(evidence);
       const evidenceHash = sha256(evidenceJson);
@@ -1239,6 +1262,17 @@ export class ProbeStore {
     this.#saveOutbox('host-info', String(events[0]!.event_id), scope, batchId, events.map(event => JSON.parse(String(event.payload))));
   }
 
+  #ownerEventId(recordId: string): string {
+    if (!this.#committingOperation) return randomUUID();
+    const row = this.#db.prepare(`SELECT t.update_event_id FROM pending_operations o
+      JOIN presentation_targets t ON t.presentation_id=o.presentation_id
+      WHERE o.operation_id=? AND o.state='pending' AND t.record_id=?`).get(this.#committingOperation, recordId);
+    check(row, 'operation-target-mismatch');
+    const eventId = String(row.update_event_id);
+    uuid(eventId);
+    return eventId;
+  }
+
   forgetMemory(activity: Activity, recordId: string, expected: MemoryRecord): MemoryOperation {
     return this.withActivity(activity, () => {
       const request = this.#requestDigest('forget', expected, { recordId });
@@ -1246,7 +1280,7 @@ export class ProbeStore {
       if (replay) return replay;
       const current = this.#assertMemoryExpected(recordId, expected);
       check(current.lifecycle === 'active', 'memory-not-active');
-      const after = this.#withMemoryHash({ ...current, lifecycle: 'tombstoned', headEventId: randomUUID() });
+      const after = this.#withMemoryHash({ ...current, lifecycle: 'tombstoned', headEventId: this.#ownerEventId(recordId) });
       this.#appendMemoryEvent(current, after, 'forget', current.source.eventId, { reversible: true }, request);
       return { status: 'committed', record: after, eventId: after.headEventId };
     });
@@ -1261,7 +1295,7 @@ export class ProbeStore {
       check(current.lifecycle === 'tombstoned', 'memory-not-tombstoned');
       check(current.verification === 'verified', 'memory-not-eligible');
       this.#eligible(current);
-      const after = this.#withMemoryHash({ ...current, lifecycle: 'active', headEventId: randomUUID() });
+      const after = this.#withMemoryHash({ ...current, lifecycle: 'active', headEventId: this.#ownerEventId(recordId) });
       this.#appendMemoryEvent(current, after, 'restore', current.source.eventId, { reversible: true }, request);
       return { status: 'committed', record: after, eventId: after.headEventId };
     });
@@ -1278,15 +1312,16 @@ export class ProbeStore {
       if (content.trim().normalize('NFC') === '' || content.trim().normalize('NFC') === current.content.trim().normalize('NFC')) {
         return { status: 'no_op', record: current, eventId: null };
       }
-      this.#validateSource(input, content);
+      this.#validateSource(input, content, current.scope);
       const revisionId = randomUUID();
-      const eventId = randomUUID();
+      const nextEventId = this.#ownerEventId(recordId);
+      uuid(nextEventId);
       const base = { ...current, revisionId, revision: this.#nextRevision(recordId), content, contentHash: sha256(content),
-        lifecycle: current.lifecycle, verification: 'unverified' as const, verificationRunId: null, source: structuredClone(input), headEventId: eventId };
+        lifecycle: current.lifecycle, verification: 'unverified' as const, verificationRunId: null, source: structuredClone(input), headEventId: nextEventId };
       const after = this.#withMemoryHash(base);
       this.#insertRevision(after);
       this.#appendMemoryEvent(current, after, 'correct', input.eventId, { automatic: false }, request);
-      return { status: 'committed', record: after, eventId };
+      return { status: 'committed', record: after, eventId: nextEventId };
     });
   }
 
@@ -1299,7 +1334,7 @@ export class ProbeStore {
       const current = this.#assertMemoryExpected(recordId, expected);
       check(current.lifecycle === 'active', 'memory-not-active');
       this.#eligible(current);
-      this.#validateSource(input, content);
+      this.#validateSource(input, content, current.scope);
       if (content.trim().normalize('NFC') === current.content.trim().normalize('NFC')) return { status: 'no_op', record: current, eventId: null };
       let after = this.#withMemoryHash({ ...current, revisionId: randomUUID(), revision: this.#nextRevision(recordId),
         content, contentHash: sha256(content), source: structuredClone(input), headEventId: randomUUID(), verificationRunId: null });
@@ -1349,7 +1384,7 @@ export class ProbeStore {
       if (replay) return replay;
       const current = this.#assertMemoryExpected(recordId, expected);
       const before = this.#assertRollbackTarget(current, targetEventId);
-      const after = this.#withMemoryHash({ ...before, headEventId: randomUUID() });
+      const after = this.#withMemoryHash({ ...before, headEventId: this.#ownerEventId(recordId) });
       this.#appendMemoryEvent(current, after, 'rollback', current.source.eventId, { targetEventId, automatic: true }, request);
       return { status: 'committed', record: after, eventId: after.headEventId };
     });
@@ -1357,14 +1392,14 @@ export class ProbeStore {
 
   saveEvolutionProposal(activity: Activity, input: SourceAck, proposal: EvolutionProposalInput): EvolutionProposal {
     return this.withActivity(activity, () => {
-      this.#validateSource(input);
       check(Object.keys(proposal).every(key => ['target','expectedChange','owner','scope','evidenceRefs','evaluation','supersedes','targetType','risk'].includes(key)), 'invalid-proposal');
       check(typeof proposal.target === 'string' && proposal.target.length > 0 && Buffer.byteLength(proposal.target) <= 4096
         && typeof proposal.expectedChange === 'string' && proposal.expectedChange.length > 0 && Buffer.byteLength(proposal.expectedChange) <= 65536
         && proposal.owner === this.#binding.ownerId, 'invalid-proposal');
       const scope = this.#validateScope(proposal.scope);
+      this.#validateSource(input, undefined, scope);
       check(scope.resolved && Array.isArray(proposal.evidenceRefs) && proposal.evidenceRefs.length > 0 && proposal.evidenceRefs.length <= 32, 'invalid-proposal');
-      for (const ref of proposal.evidenceRefs) this.#validateSource(ref);
+      for (const ref of proposal.evidenceRefs) this.#validateSource(ref, undefined, scope);
       const evaluation = proposal.evaluation;
       check(evaluation?.schema === 'evaluation-contract@1' && ['L0','L1','L2','L3'].includes(evaluation.level)
         && Object.keys(evaluation).every(key => ['schema','level','assertions'].includes(key))
@@ -1417,7 +1452,7 @@ export class ProbeStore {
       this.#validateScope(value.scope);
       const refs = [value.input, ...value.evidenceRefs];
       this.#checkEvidenceRows('proposal_evidence', 'proposal_id', proposalId, refs);
-      for (const ref of refs) this.#validateSource(ref);
+      for (const ref of refs) this.#validateSource(ref, undefined, value.scope);
       return { ...value, hash: String(row.payload_hash) };
     });
   }
@@ -1439,7 +1474,7 @@ export class ProbeStore {
     this.#db.prepare('INSERT INTO verification_runs VALUES (?,?,?,?,?,?,?)')
       .run(runId, record.recordId, record.revisionId, result, bytes, sha256(bytes), new Date().toISOString());
     for (const [ordinal, ref] of evidence.entries()) {
-      this.#validateSource(ref);
+      this.#validateSource(ref, undefined, record.scope);
       this.#db.prepare('INSERT INTO verification_evidence VALUES (?,?,?,?,?,?,?)')
         .run(runId, ordinal, ref.binding.sessionId, ref.eventId, ref.locator, ref.hash, ref.contentHash);
     }
@@ -1455,9 +1490,12 @@ export class ProbeStore {
     }
     return null;
   }
-  #validateSource(input: SourceAck, content?: string): void {
+  #validateSource(input: SourceAck, content?: string,
+    targetScope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true }): void {
     check(input?.schema === 'cli-source-ack@1' && input.status === 'durable'
       && input.binding.ownerId === this.#binding.ownerId && input.binding.hostId === this.#binding.hostId, 'source-scope-mismatch');
+    this.#validateScope(targetScope);
+    check(this.#sourceAllowedForScope(input.binding, targetScope), 'source-scope-mismatch');
     const source = this.sessionSource(input.binding);
     sameFile(source.path, source.identity);
     uuid(input.eventId);
@@ -1466,10 +1504,17 @@ export class ProbeStore {
     check(this.#readSource, 'source-reader-unavailable');
     check(sha256(this.#readSource(input).text) === input.contentHash, 'source-evidence-gap');
     if (content !== undefined) {
-      check(input.binding.projectId === this.#binding.projectId, 'source-scope-mismatch');
       check(typeof content === 'string' && content.length > 0 && Buffer.byteLength(content) <= 65536, 'invalid-memory-content');
     }
   }
+  #sourceAllowedForScope(binding: Binding, scope: MemoryScope): boolean {
+    if (scope.kind === 'project') return binding.projectId === scope.id;
+    if (scope.kind === 'session') return binding.sessionId === scope.id;
+    if (scope.kind === 'personal') return binding.ownerId === scope.id;
+    return Boolean(this.#db.prepare(`SELECT 1 FROM workspace_projects m JOIN workspaces w ON w.workspace_id=m.workspace_id
+      WHERE m.workspace_id=? AND m.project_id=? AND w.owner_id=?`).get(scope.id, binding.projectId, this.#binding.ownerId));
+  }
+
   #validateScope(scope: MemoryScope): MemoryScope {
     check(scope && ['project', 'workspace', 'personal', 'session'].includes(scope.kind) && typeof scope.id === 'string', 'invalid-memory-scope');
     uuid(scope.id);
@@ -1495,7 +1540,7 @@ export class ProbeStore {
   }
   #eligible(record: MemoryRecord): void {
     check(record.scope.resolved && record.verification === 'verified' && !record.conflictSetId, 'memory-not-eligible');
-    this.#validateSource(record.source);
+    this.#validateSource(record.source, undefined, record.scope);
     this.#checkVerification(record, true);
   }
   #checkVerification(record: MemoryRecord, readSources = false): void {
@@ -1506,7 +1551,7 @@ export class ProbeStore {
       && (record.verification !== 'verified' || row.result === 'pass'), 'verification-evidence-gap');
     const evidence = JSON.parse(String(row.evidence_json)) as SourceAck[];
     this.#checkEvidenceRows('verification_evidence', 'run_id', record.verificationRunId, evidence);
-    if (readSources) for (const ref of evidence) this.#validateSource(ref);
+    if (readSources) for (const ref of evidence) this.#validateSource(ref, undefined, record.scope);
   }
   #withMemoryHash(record: Omit<MemoryRecord, 'hash'> & { hash?: string }): MemoryRecord {
     const { hash: _hash, ...snapshot } = record;
@@ -1576,7 +1621,7 @@ export class ProbeStore {
       && record.verificationRunId === row.verification_run_id
       && record.headEventId === row.head_event_id, 'memory-evidence-gap');
     this.#validateScope(record.scope);
-    this.#validateSource(record.source);
+    this.#validateSource(record.source, undefined, record.scope);
     this.#checkVerification(record, true);
     return record;
   }
@@ -1628,10 +1673,12 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       uuid(recordId);
       check(typeof requestHash === 'string' && /^[0-9a-f]{64}$/.test(requestHash), 'invalid-memory-request-hash');
-      const record = this.#readMemoryUnsafe(recordId);
+      this.#readMemoryUnsafe(recordId);
       const row = this.#db.prepare('SELECT * FROM memory_events WHERE record_id=? AND request_hash=?').get(recordId, requestHash);
-      check(!row || row.event_id === record.headEventId, 'memory-stale');
-      return row ? { status: 'committed', record: this.#parseMemorySnapshot(String(row.after_snapshot)), eventId: String(row.event_id) } : null;
+      if (!row) return null;
+      const record = this.#parseMemorySnapshot(String(row.after_snapshot));
+      this.#validateScope(record.scope);
+      return { status: 'committed', record, eventId: String(row.event_id) };
     });
   }
   #appendMemoryEvent(before: MemoryRecord | null, after: MemoryRecord, kind: string, sourceEventId: string,

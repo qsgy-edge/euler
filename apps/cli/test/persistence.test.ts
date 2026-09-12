@@ -104,6 +104,70 @@ test('explicit workspace membership shares only workspace and personal facts acr
   } finally { second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('capture replay is keyed by source session and event, independent of later revisions', () => {
+  const sandbox = createSandbox();
+  const binding = { ...bindingOf(sandbox), sessionId: randomUUID() };
+  createSandboxSession(sandbox, binding);
+  const first = openProbe(sandbox);
+  const second = openProbe(sandbox, undefined, undefined, binding);
+  try {
+    const eventId = randomUUID();
+    const options = { type: 'fact' as const, scope: { kind: 'project' as const, id: sandbox.fixture.projectId, resolved: true }, appliesTo: [] };
+    const inputA = first.archive.append(eventId, 'Session A fact');
+    const inputB = second.archive.append(eventId, 'Session B fact');
+    const a = first.store.captureMemory(first.activity, inputA, 'A', options);
+    const b = second.store.captureMemory(second.activity, inputB, 'B', options);
+    assert.notEqual(a.record.recordId, b.record.recordId);
+    for (const [probe, input, content, captured] of [[first,inputA,'A',a], [second,inputB,'B',b]] as const) {
+      const replay = probe.store.captureMemory(probe.activity, input, content, options);
+      assert.equal(replay.status, 'no_op');
+      assert.deepEqual(replay.record, captured.record);
+    }
+    const revisionInput = first.archive.append(randomUUID(), 'Correction also used as capture input');
+    first.store.correctMemory(first.activity, a.record.recordId, a.record, revisionInput, 'Corrected');
+    const newCapture = first.store.captureMemory(first.activity, revisionInput, 'Separate capture', options);
+    assert.equal(newCapture.status, 'committed');
+    assert.notEqual(newCapture.record.recordId, a.record.recordId);
+  } finally { second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('verification keeps session evidence local and admits only explicit workspace members', () => {
+  const sandbox = createSandbox();
+  const sameProject = { ...bindingOf(sandbox), sessionId: randomUUID() };
+  const member = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
+  const outsider = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
+  for (const binding of [sameProject, member, outsider]) createSandboxSession(sandbox, binding);
+  const [first, peer, second, third] = [bindingOf(sandbox), sameProject, member, outsider].map(binding => openProbe(sandbox, undefined, undefined, binding));
+  try {
+    const local = first!.archive.append(randomUUID(), 'Local');
+    const peerRef = peer!.archive.append(randomUUID(), 'Another session');
+    const memberRef = second!.archive.append(randomUUID(), 'Workspace member');
+    const outsiderRef = third!.archive.append(randomUUID(), 'Workspace outsider');
+    const workspaceId = randomUUID();
+    first!.store.bindWorkspace(first!.activity, workspaceId, [sandbox.fixture.projectId, member.projectId]);
+    for (const scope of [
+      { kind: 'session' as const, id: sandbox.fixture.sessionId, resolved: false },
+      { kind: 'project' as const, id: sandbox.fixture.projectId, resolved: true },
+      { kind: 'workspace' as const, id: workspaceId, resolved: true },
+      { kind: 'personal' as const, id: sandbox.fixture.ownerId, resolved: true },
+    ]) {
+      const captureSource = first!.archive.append(randomUUID(), `${scope.kind} capture`);
+      const record = first!.store.captureMemory(first!.activity, captureSource, scope.kind, { type: 'fact', scope, appliesTo: [] }).record;
+      const rejected = scope.kind === 'session' ? peerRef : scope.kind === 'project' ? memberRef : outsiderRef;
+      if (scope.kind !== 'personal') {
+        assert.throws(() => first!.store.verifyMemory(first!.activity, record.recordId, record, 'pass', [rejected]), /source-scope-mismatch/);
+        assert.deepEqual(first!.store.readMemory(first!.activity, record.recordId), record);
+      }
+      const allowed = scope.kind === 'session' ? local : scope.kind === 'project' ? peerRef : scope.kind === 'workspace' ? memberRef : outsiderRef;
+      const verified = first!.store.verifyMemory(first!.activity, record.recordId, record, 'pass', [allowed]);
+      assert.equal(verified.record.verification, 'verified');
+      if (scope.kind === 'workspace' || scope.kind === 'personal') {
+        assert.deepEqual(second!.store.readMemory(second!.activity, record.recordId), verified.record);
+      }
+    }
+  } finally { for (const probe of [third, second, peer, first]) probe!.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('unknown schema and another app identity are rejected, and high-frequency filters use declared indexes', () => {
   const sandbox = createSandbox();
   const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
@@ -120,6 +184,52 @@ test('unknown schema and another app identity are rejected, and high-frequency f
   } finally { db.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('head pointers reject external writes while Store recovery may rebuild them', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
+  try {
+    const intent = probe.session.prepare(sandbox.fixture.eventId, sandbox.fixture.text).intent;
+    const input = probe.archive.append(randomUUID(), 'Memory source');
+    const record = probe.store.captureMemory(probe.activity, input, 'Fact', {
+      type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+    }).record;
+    db.function('euler_store_writer', () => 0);
+    for (const table of ['memory_heads', 'intent_heads']) {
+      const key = table === 'memory_heads' ? 'record_id' : 'session_id';
+      for (const sql of [`UPDATE ${table} SET ${key}=${key}`, `DELETE FROM ${table}`, `INSERT INTO ${table} SELECT * FROM ${table}`]) {
+        assert.throws(() => db.prepare(sql).run(), /store-owned-identity/);
+      }
+    }
+    assert.deepEqual(probe.store.readIntent(probe.activity), intent);
+    assert.deepEqual(probe.store.readMemory(probe.activity, record.recordId), record);
+    // Deliberately bypass only connection ownership to simulate lost read models.
+    db.function('euler_store_writer', () => 1);
+    db.exec('DELETE FROM memory_heads; DELETE FROM intent_heads');
+    assert.deepEqual(probe.store.recoverIntent(probe.activity), intent);
+    assert.deepEqual(probe.store.recoverMemory(probe.activity, record.recordId), record);
+  } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('an external SQLite connection cannot mutate the owner fence', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
+  try {
+    const coordinator = randomUUID();
+    const closing = probe.store.beginMaintenance(coordinator);
+    assert.throws(() => db.prepare('UPDATE owner_fences SET epoch=epoch+1').run(), /euler_store_writer/);
+    db.function('euler_store_writer', () => 0);
+    assert.throws(() => db.prepare(`UPDATE owner_fences SET state='open', epoch=epoch+1,
+      coordinator=NULL, coordinator_pid=NULL, coordinator_incarnation=NULL, coordinator_started_at=NULL, coordinator_activity=NULL`).run(), /store-owned-identity/);
+    assert.throws(() => db.prepare('DELETE FROM owner_fences').run(), /store-owned-identity/);
+    assert.throws(() => db.prepare('INSERT INTO owner_fences SELECT * FROM owner_fences').run(), /store-owned-identity/);
+    assert.deepEqual(probe.store.fence(), closing);
+    assert.throws(() => probe.store.register(), /admission-closed/);
+    assert.equal(probe.store.cancelMaintenance(coordinator).state, 'open');
+  } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('an intent head cannot be rolled back to an older otherwise valid event', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);
@@ -128,6 +238,7 @@ test('an intent head cannot be rolled back to an older otherwise valid event', (
     const first = probe.session.prepare(sandbox.fixture.eventId, sandbox.fixture.text).intent;
     const input = probe.archive.append(randomUUID(), 'Advance');
     probe.store.transitionIntent(probe.activity, first.eventId, input, { step: 'Next', status: 'active' });
+    db.function('euler_store_writer', () => 1); // Test chain integrity after deliberately bypassing ownership.
     db.prepare('UPDATE intent_heads SET event_id=?').run(first.eventId);
     assert.throws(() => probe.store.readIntent(probe.activity), /intent-evidence-gap/);
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
@@ -159,6 +270,7 @@ test('intent recovery rebuilds a missing head from immutable events and preserve
     const first = probe.session.prepare(sandbox.fixture.eventId, sandbox.fixture.text).intent;
     const input = probe.archive.append(randomUUID(), 'Continue with the next step');
     const latest = probe.store.transitionIntent(probe.activity, first.eventId, input, { step: 'Check persistence', status: 'active' });
+    db.function('euler_store_writer', () => 1); // Simulate a lost read model, not an admitted external write.
     db.exec('DELETE FROM intent_heads');
     assert.deepEqual(probe.store.recoverIntent(probe.activity), latest);
     assert.deepEqual(probe.store.readIntent(probe.activity), latest);

@@ -15,7 +15,7 @@ const args = parseArgs({ allowPositionals: true, options: {
 const command = args.positionals[0];
 const phase = args.values.phase;
 check(['prepare','run','recover','identity'].includes(command!), 'invalid-fixture-command');
-check(['intent','activate','preview','commit','rollback'].includes(phase), 'invalid-fixture-phase');
+check(['intent','activate','preview','commit','rollback','cancel'].includes(phase), 'invalid-fixture-phase');
 const emit = (event: string, value: unknown) => writeSync(1, JSON.stringify({ event, value }) + '\n');
 
 async function main() {
@@ -48,7 +48,7 @@ async function main() {
       const source = probe.archive.append(fixture.correctionSourceId, fixture.correction);
       probe.archive.append(fixture.intentSourceId, fixture.nextStep);
       let token: string | null = null;
-      if (['preview','commit','rollback'].includes(phase)) {
+      if (['preview','commit','rollback','cancel'].includes(phase)) {
         const inspect = probe.store.inspectMemoryPresentation(probe.activity,
           phase === 'rollback' ? targets.map(target => target.recordId) : [targets[0]!.recordId]);
         const preview = probe.store.previewMemoryOperation(probe.activity, inspect.token, phase === 'rollback'
@@ -126,6 +126,7 @@ async function main() {
           else if (phase === 'activate') result = probe.store.activateMemoryBatch(probe.activity, expected);
           else if (phase === 'preview') result = probe.store.previewMemoryOperation(probe.activity, token!,
             { kind: 'correct', input: source, content: fixture.correction });
+          else if (phase === 'cancel') result = probe.store.cancelMemoryOperation(probe.activity, token!);
           else result = probe.store.commitMemoryOperation(probe.activity, token!);
         } finally { armed = false; }
         emit('result', { result, trace });

@@ -26,6 +26,9 @@ test('a losing correction cannot reconcile another request as its own commit', (
     const differentContent = probe.store.memoryCorrectionRequestHash(c.record.recordId, c.record, winnerSource, 'Another correction');
     assert.equal(probe.store.lookupMemoryOperation(probe.activity, c.record.recordId, differentContent), null);
     assert.throws(() => probe.store.lookupMemoryOperation(probe.activity, c.record.recordId, c.record.headEventId), /invalid-memory-request-hash/);
+    const laterSource = probe.archive.append(randomUUID(), 'A later correction');
+    probe.store.correctMemory(probe.activity, c.record.recordId, winner.record, laterSource, 'Later value');
+    assert.deepEqual(probe.store.lookupMemoryOperation(probe.activity, c.record.recordId, winnerRequest), winner);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
@@ -41,6 +44,8 @@ test('cross-project reconciliation cannot read another project operation or rece
     const captured = first.store.captureMemory(first.activity, input, 'Project A fact', {
       type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
     });
+    const evidenceFromOtherProject = second.archive.append(randomUUID(), 'Project B evidence');
+    assert.throws(() => first.store.verifyMemory(first.activity, captured.record.recordId, captured.record, 'pass', [evidenceFromOtherProject]), /source-scope-mismatch/);
     const correction = first.archive.append(randomUUID(), 'Project A correction source');
     const request = first.store.memoryCorrectionRequestHash(captured.record.recordId, captured.record, correction, 'Project A corrected');
     const committed = first.store.correctMemory(first.activity, captured.record.recordId, captured.record, correction, 'Project A corrected');
@@ -49,12 +54,36 @@ test('cross-project reconciliation cannot read another project operation or rece
     assert.throws(() => second.store.readOwnerReceipt(second.activity, receiptId), /invalid-memory-scope/);
   } finally { db.close(); second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
+test('automatic revision and proposal evidence cannot cross unrelated project boundaries', () => {
+  const sandbox = createSandbox();
+  const otherBinding = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
+  createSandboxSession(sandbox, otherBinding);
+  const first = openProbe(sandbox);
+  const second = openProbe(sandbox, undefined, undefined, otherBinding);
+  try {
+    const input = first.archive.append(randomUUID(), 'Local evidence');
+    const foreign = second.archive.append(randomUUID(), 'Unrelated evidence');
+    const scope = { kind: 'project' as const, id: sandbox.fixture.projectId, resolved: true };
+    const c = first.store.captureMemory(first.activity, input, 'Local fact', { type: 'fact', scope, appliesTo: [] });
+    const v = first.store.verifyMemory(first.activity, c.record.recordId, c.record, 'pass', [input]);
+    const a = first.store.activateMemory(first.activity, c.record.recordId, v.record);
+    assert.throws(() => first.store.reviseMemory(first.activity, c.record.recordId, a.record, input, 'Revised fact', [foreign]), /source-scope-mismatch/);
+    assert.deepEqual(first.store.readMemory(first.activity, c.record.recordId), a.record);
+    const proposal = { target: 'synthetic/source-check', expectedChange: 'Use local evidence', owner: sandbox.fixture.ownerId,
+      scope, evidenceRefs: [foreign], evaluation: { schema: 'evaluation-contract@1' as const, level: 'L0' as const, assertions: ['Source is authorized'] } };
+    assert.throws(() => first.store.saveEvolutionProposal(first.activity, input, proposal), /source-scope-mismatch/);
+    assert.throws(() => first.store.saveEvolutionProposal(first.activity, foreign, { ...proposal, evidenceRefs: [input] }), /source-scope-mismatch/);
+  } finally { second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 for (const relationship of ['verification-record', 'verification-revision', 'rollback-record', 'conflict-member']) {
   test(`SQLite independently rejects a mismatched ${relationship} relationship`, () => {
     const sandbox = createSandbox();
     const probe = openProbe(sandbox);
     const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
     db.exec('PRAGMA foreign_keys=ON');
+    // Exercise FK checks independently of the connection ownership guard.
+    db.function('euler_store_writer', () => 1);
     try {
       const input = probe.archive.append(sandbox.fixture.eventId, sandbox.fixture.text);
       const options = { type: 'fact' as const, scope: { kind: 'project' as const, id: sandbox.fixture.projectId, resolved: true }, appliesTo: [] };
@@ -120,6 +149,7 @@ test('SQLite rejects forged identities and cross-record references; caught failu
     const otherInput = probe.archive.append(randomUUID(), 'Second source');
     const d = probe.store.captureMemory(probe.activity, otherInput, 'Two', options);
     assert.throws(() => db.prepare('INSERT INTO memory_records VALUES (?,?,?,?,?)').run(randomUUID(), sandbox.fixture.ownerId, 'x', 'y', 'now'), /euler_store_writer|store-owned/);
+    db.function('euler_store_writer', () => 1); // Isolate FK checks from writer admission.
     for (const [column, value] of [['revision_id', d.record.revisionId], ['head_event_id', d.record.headEventId], ['conflict_set_id', randomUUID()]]) {
       assert.throws(() => db.prepare(`UPDATE memory_heads SET ${column}=? WHERE record_id=?`).run(value!, c.record.recordId), /FOREIGN KEY/);
     }
@@ -216,7 +246,10 @@ test('a missing memory head is rebuilt from its events without new history', () 
       type: 'decision', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
     });
     const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
-    try { db.prepare('DELETE FROM memory_heads WHERE record_id=?').run(captured.record.recordId); }
+    try {
+      db.function('euler_store_writer', () => 1); // Simulate a missing read model after admission.
+      db.prepare('DELETE FROM memory_heads WHERE record_id=?').run(captured.record.recordId);
+    }
     finally { db.close(); }
     assert.deepEqual(probe.store.recoverMemories(probe.activity), [captured.record]);
     assert.deepEqual(probe.store.readMemory(probe.activity, captured.record.recordId), captured.record);
@@ -263,6 +296,7 @@ test('a rewritten head with a recomputed digest cannot override the immutable ev
     probe.close();
     const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
     try {
+      db.function('euler_store_writer', () => 1); // Test replay integrity independently of writer ownership.
       const row = db.prepare('SELECT snapshot FROM memory_heads WHERE record_id=?').get(captured.record.recordId)!;
       const changed = JSON.parse(String(row.snapshot));
       changed.lifecycle = 'active';
