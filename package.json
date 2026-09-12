@@ -12,7 +12,8 @@
     "demo": "node apps/cli/src/main.ts",
     "evidence": "node scripts/evidence.ts",
     "evidence:memory": "node scripts/evidence-memory.ts",
-    "evidence:maintenance": "node scripts/evidence-maintenance.ts"
+    "evidence:maintenance": "node scripts/evidence-maintenance.ts",
+    "evidence:persistence": "node scripts/evidence-persistence.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import test from 'node:test';
-import { createSandbox, openSandbox } from '../src/sandbox.ts';
+import { createSandbox, createSandboxSession, openSandbox, bindingOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 import { startCli } from '../src/process-driver.ts';
 
@@ -29,6 +29,26 @@ test('a losing correction cannot reconcile another request as its own commit', (
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('cross-project reconciliation cannot read another project operation or receipt', () => {
+  const sandbox = createSandbox();
+  const otherBinding = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
+  createSandboxSession(sandbox, otherBinding);
+  const first = openProbe(sandbox);
+  const second = openProbe(sandbox, undefined, undefined, otherBinding);
+  const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
+  try {
+    const input = first.archive.append(sandbox.fixture.eventId, 'Project A source');
+    const captured = first.store.captureMemory(first.activity, input, 'Project A fact', {
+      type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+    });
+    const correction = first.archive.append(randomUUID(), 'Project A correction source');
+    const request = first.store.memoryCorrectionRequestHash(captured.record.recordId, captured.record, correction, 'Project A corrected');
+    const committed = first.store.correctMemory(first.activity, captured.record.recordId, captured.record, correction, 'Project A corrected');
+    assert.throws(() => second.store.lookupMemoryOperation(second.activity, captured.record.recordId, request), /invalid-memory-scope/);
+    const receiptId = String(db.prepare('SELECT receipt_id FROM memory_events WHERE event_id=?').get(committed.eventId)!.receipt_id);
+    assert.throws(() => second.store.readOwnerReceipt(second.activity, receiptId), /invalid-memory-scope/);
+  } finally { db.close(); second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
 for (const relationship of ['verification-record', 'verification-revision', 'rollback-record', 'conflict-member']) {
   test(`SQLite independently rejects a mismatched ${relationship} relationship`, () => {
     const sandbox = createSandbox();
@@ -60,7 +80,7 @@ for (const relationship of ['verification-record', 'verification-revision', 'rol
         // Deliberately bypass only the writer guard to test the independent SQL relationship.
         db.function('euler_store_writer', () => 1);
         assert.throws(() => db.prepare(`INSERT INTO memory_events
-          SELECT ?,record_id,seq+100,'rollback',revision_id,before_snapshot,after_snapshot,?,origin_host_id,origin_seq+100,NULL,?,payload,payload_hash,source_event_id,created_at
+          SELECT ?,record_id,seq+100,'rollback',revision_id,before_snapshot,after_snapshot,?,origin_host_id,origin_seq+100,NULL,?,payload,payload_hash,source_event_id,created_at,NULL,NULL,NULL,NULL,NULL
           FROM memory_events WHERE event_id=?`).run(randomUUID(), randomUUID(), other.record.headEventId, c.record.headEventId), /FOREIGN KEY/);
       }
     } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }

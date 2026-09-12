@@ -6,5 +6,6 @@ export { ProbeStore, fileIdentity, sameFile, probeSchemaDigest } from './store/p
 export type {
   Activity, ExecutionOwner, ExecutionStream, AttemptOwnership, Intent, IntentTransition, MemoryType, MemoryLifecycle, MemoryVerification, MemoryScopeKind,
   MemoryScope, MemoryCaptureOptions, MemoryRecord, MemoryOperation, ConflictOperation,
+  MemoryChange, MemoryPresentation, MemoryOperationResult, OwnerReceipt, ActivationBatch,
   EvolutionProposalInput, EvolutionProposal,
 } from './store/probe-store.ts';

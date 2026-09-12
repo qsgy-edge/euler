@@ -12,6 +12,8 @@ Issue #2 adds synthetic scoped memory transitions, source-backed verification fi
 
 Issue #3 adds durable synthetic session/job/maintenance/migration stream ownership, controlled child registration, recoverable stop/residual evidence, maintenance cancellation and coordinator takeover. See [commands and evidence boundaries](docs/implementation/t03-process-maintenance.md).
 
+Issue #4 adds the synthetic X-01 persistence foundation: app/store identity, multiple logical sessions, durable preview/pending settlement, immutable owner receipts, fixed activation batches and statement-by-statement crash recovery. See [commands, ownership and evidence boundaries](docs/implementation/t04-persistence.md). Its app identity fixtures use disposable test app-ids under the OS user data directory; real approval and Info delivery remain later work.
+
 Full X-card acceptance, real provider dispatch, production schema/host acceptance, migration, and MC cutover remain unverified. CI and host results must be read from the artifact for the specific implementation and platform; this repository is not production-ready.
 
 - [Euler v1 implementation specification](docs/architecture/issues/15-euler-v1-spec.md)

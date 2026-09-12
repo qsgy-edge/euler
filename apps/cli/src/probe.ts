@@ -1,5 +1,6 @@
+import { basename } from 'node:path';
 import { API_VERSION, DEFAULT_BUDGET, ProbeSession, ProbeStore, sha256, validateBudget } from '@euler/core';
-import type { ExecutionOwner, ProbeBudget } from '@euler/core';
+import type { Activity, Binding, SourceAck, ExecutionOwner, ProbeBudget } from '@euler/core';
 import { CliArchive } from './archive.ts';
 import { bindingOf, openSandbox, resourcesOf } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
@@ -15,15 +16,28 @@ export class CountingTransport {
   }
 }
 
-export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET, registration?: ExecutionOwner | string) {
+export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET, registration?: ExecutionOwner | string, selectedBinding?: Binding) {
   validateBudget(budget);
   sandbox = openSandbox(sandbox.root);
-  const binding = bindingOf(sandbox);
-  let archive: CliArchive;
-  const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, binding, false, input => archive.read(input));
+  const binding = selectedBinding ?? bindingOf(sandbox);
+  let activity: Activity;
+  const readSource = (input: SourceAck) => archiveFor(input.binding).read(input);
+  let store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox), false, readSource, sandbox.appId);
+  if (selectedBinding) {
+    try {
+      const source = store.sessionSource(binding);
+      store.close();
+      store = new ProbeStore({ ...resourcesOf(sandbox), source }, sandbox.storeId, binding, false, readSource, sandbox.appId);
+    } catch (error) { try { store.close(); } catch {} throw error; }
+  }
+  function archiveFor(sourceBinding: Binding): CliArchive {
+    const source = store.sessionSource(sourceBinding);
+    return new CliArchive({ ...sandbox, sourceName: basename(source.path), archiveIdentity: source.identity,
+      fixture: { ...sandbox.fixture, ...sourceBinding } }, action => store.withActivity(activity, action));
+  }
   try {
-    const activity = typeof registration === 'string' ? store.claimChild(registration) : store.register(registration);
-    archive = new CliArchive(sandbox, action => store.withActivity(activity, action));
+    activity = typeof registration === 'string' ? store.claimChild(registration) : store.register(registration);
+    const archive = archiveFor(binding);
     const transport = new CountingTransport();
     const session = new ProbeSession(store, activity, { version: API_VERSION, binding, source: archive, transport }, budget);
     return { store, activity, archive, transport, session, close: () => { session.cancel(); store.close(); } };

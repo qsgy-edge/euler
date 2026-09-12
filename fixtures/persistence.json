@@ -1,0 +1,13 @@
+{
+  "schema": "persistence-fixture@1",
+  "secondSessionId": "00000000-0000-4000-8000-000000000104",
+  "otherSessionId": "00000000-0000-4000-8000-000000000204",
+  "otherProjectId": "00000000-0000-4000-8000-000000000203",
+  "workspaceId": "00000000-0000-4000-8000-000000000300",
+  "facts": ["Synthetic receipt rule A", "Synthetic receipt rule B"],
+  "sourceIds": ["00000000-0000-4000-8000-000000000401", "00000000-0000-4000-8000-000000000402"],
+  "correctionSourceId": "00000000-0000-4000-8000-000000000403",
+  "correction": "Synthetic corrected receipt rule",
+  "intentSourceId": "00000000-0000-4000-8000-000000000404",
+  "nextStep": "Verify the next persistence boundary"
+}

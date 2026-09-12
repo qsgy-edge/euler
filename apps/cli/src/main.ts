@@ -74,7 +74,7 @@ async function hold(sandbox: Sandbox, task: boolean, reservationId?: string, wai
 }
 
 async function maintain(sandbox: Sandbox) {
-  const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox));
+  const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox), false, undefined, sandbox.appId);
   const coordinator = randomUUID();
   const lines = createInterface({ input: process.stdin });
   try {
@@ -241,7 +241,7 @@ async function main() {
   if (command === 'hold' || command === 'task') return hold(sandbox, command === 'task', args.values.reservation, args.values['wait-child-launch']);
   if (command === 'maintain') return maintain(sandbox);
   if (command === 'maintenance-status') {
-    const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox));
+    const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox), false, undefined, sandbox.appId);
     try { emit('maintenance-status', store.maintenanceStatus()); }
     finally { store.close(); }
     return;

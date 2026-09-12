@@ -16,7 +16,7 @@ export class CliArchive {
   constructor(sandbox: Sandbox, gate: Gate) {
     this.#sandbox = sandbox;
     this.#gate = gate;
-    this.#path = join(sandbox.root, 'session.jsonl');
+    this.#path = join(sandbox.root, sandbox.sourceName ?? 'session.jsonl');
   }
 
   #scan(): { event: RawEvent; ack: SourceAck }[] {

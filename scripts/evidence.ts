@@ -107,15 +107,18 @@ function verifyRawState(snapshot: string, reportedSource: unknown, reportedInten
       const manifest = JSON.parse(readFileSync(join(snapshot, 'sandbox.json'), 'utf8'));
       const fence = db.prepare('SELECT * FROM owner_fences').get()!;
       assert.equal(fence.store_id, manifest.storeId);
-      for (const [column, value] of Object.entries({ owner_id: ownerId, host_id: hostId, project_id: projectId, session_id: sessionId, branch_id: branchId })) assert.equal(fence[column], value);
+      const session = db.prepare('SELECT * FROM sessions WHERE session_id=?').get(sessionId)!;
+      for (const [column, value] of Object.entries({ owner_id: ownerId, host_id: hostId })) assert.equal(fence[column], value);
+      for (const [column, value] of Object.entries({ owner_id: ownerId, host_id: hostId, project_id: projectId, session_id: sessionId, branch_id: branchId })) assert.equal(session[column], value);
       for (const [kind, path, identity] of [
         ['root', manifest.root, manifest.rootIdentity],
         ['source', join(manifest.root, 'session.jsonl'), manifest.archiveIdentity],
         ['store', join(manifest.root, 'probe.sqlite'), manifest.storeIdentity],
       ] as const) {
-        assert.equal(fence[`${kind}_path`], path);
-        assert.equal(fence[`${kind}_dev`], identity.dev);
-        assert.equal(fence[`${kind}_ino`], identity.ino);
+        const carrier = kind === 'source' ? session : fence;
+        assert.equal(carrier[`${kind}_path`], path);
+        assert.equal(carrier[`${kind}_dev`], identity.dev);
+        assert.equal(carrier[`${kind}_ino`], identity.ino);
       }
       const activities = db.prepare('SELECT * FROM owner_activities').all();
       assert.ok(activities.length >= 1);
@@ -149,9 +152,10 @@ function verifyMaintenanceRawState(snapshot: string, lines: Record<string, any>[
       ['source', join(manifest.root, 'session.jsonl'), manifest.archiveIdentity],
       ['store', join(manifest.root, 'probe.sqlite'), manifest.storeIdentity],
     ] as const) {
-      assert.equal(fence[`${kind}_path`], path);
-      assert.equal(fence[`${kind}_dev`], identity.dev);
-      assert.equal(fence[`${kind}_ino`], identity.ino);
+      const carrier = kind === 'source' ? db.prepare('SELECT * FROM sessions WHERE session_id=?').get(fixture.sessionId)! : fence;
+      assert.equal(carrier[`${kind}_path`], path);
+      assert.equal(carrier[`${kind}_dev`], identity.dev);
+      assert.equal(carrier[`${kind}_ino`], identity.ino);
     }
     const states = lines.filter(line => ['maintenance-closing', 'maintenance-blocked', 'maintenance-exclusive', 'maintenance-released'].includes(line.event))
       .map(line => line.fence).filter(Boolean).map(fence => ({ state: fence.state, epoch: fence.epoch }));
