@@ -16,24 +16,32 @@ function emit(event: string, fields: Record<string, unknown> = {}) {
   process.stdout.write(JSON.stringify({ ...fields, event }) + '\n');
 }
 
-async function hold(sandbox: Sandbox, task: boolean, reservationId?: string) {
+async function hold(sandbox: Sandbox, task: boolean, reservationId?: string, waitChildLaunch = false) {
   const jobId = randomUUID();
   let probe: ReturnType<typeof openProbe> | undefined = openProbe(sandbox, DEFAULT_BUDGET,
     task ? reservationId ?? { kind: 'job', id: jobId, authorizationId: jobId } : undefined);
   let child: ReturnType<typeof startCli> | undefined;
   const lines = createInterface({ input: process.stdin });
+  const commands = lines[Symbol.asyncIterator]();
   const keepAlive = setInterval(() => {}, 1000);
   try {
     const input = probe.archive.append(sandbox.fixture.eventId, sandbox.fixture.text);
     probe.archive.read(input);
     if (!task) {
       const reservation = probe.store.reserveChild(probe.activity);
+      if (waitChildLaunch) {
+        // The synthetic race probe controls ordering instead of polling a
+        // transient database state. No child exists before this acknowledgement.
+        emit('child-reserved', { reservationId: reservation, activityId: probe.activity.id });
+        const command = await commands.next();
+        check(!command.done && command.value === 'launch', 'controlled-launch-cancelled');
+      }
       child = startCli(['task', '--sandbox', sandbox.root, '--reservation', reservation]);
       if (child.child.pid !== undefined) probe.store.recordChildLaunch(probe.activity, reservation, child.child.pid);
       await child.waitFor('task-ready');
     }
     emit(task ? 'task-ready' : 'runtime-ready', { pid: process.pid, activityId: probe.activity.id, streamId: probe.activity.streamId, incarnation: probe.activity.incarnation, epoch: probe.activity.epoch, childPid: child?.child.pid ?? null, source: input });
-    for await (const line of lines) {
+    for await (const line of commands) {
       if (line === 'stop') break;
       if (line === 'close') {
         probe?.close();
@@ -215,11 +223,13 @@ async function main() {
   const args = parseArgs({ allowPositionals: true, options: {
     sandbox: { type: 'string' }, scenario: { type: 'string', default: 'success' }, budget: { type: 'string' },
     request: { type: 'string' }, record: { type: 'string' }, reservation: { type: 'string' },
+    'wait-child-launch': { type: 'boolean', default: false },
   } });
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
   check(['create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
   const options = args.values.budget ? JSON.parse(args.values.budget) as Partial<ProbeBudget> : {};
+  check(!args.values['wait-child-launch'] || command === 'hold', 'hold-only-option');
   check(Object.keys(options).every(key => key in DEFAULT_BUDGET), 'invalid-budget');
   const budget = { ...DEFAULT_BUDGET, ...options };
   if (['run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status'].includes(command)) check(args.values.sandbox, 'sandbox-required');
@@ -228,7 +238,7 @@ async function main() {
   const sandbox = args.values.sandbox ? openSandbox(args.values.sandbox) : createSandbox();
   emit('sandbox', { root: sandbox.root, storeId: sandbox.storeId, fixtureDigest: sandbox.fixtureDigest, mode: 'synthetic-only' });
   if (command === 'create') return;
-  if (command === 'hold' || command === 'task') return hold(sandbox, command === 'task', args.values.reservation);
+  if (command === 'hold' || command === 'task') return hold(sandbox, command === 'task', args.values.reservation, args.values['wait-child-launch']);
   if (command === 'maintain') return maintain(sandbox);
   if (command === 'maintenance-status') {
     const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox));

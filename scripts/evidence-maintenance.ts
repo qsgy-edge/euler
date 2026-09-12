@@ -7,7 +7,6 @@ import { join, relative } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { ProbeStore } from '@euler/core';
-import { setTimeout as delay } from 'node:timers/promises';
 import { openProbe } from '../apps/cli/src/probe.ts';
 import { bindingOf, createSandbox, fixture, fixtureDigest, resourcesOf } from '../apps/cli/src/sandbox.ts';
 import { startCli } from '../apps/cli/src/process-driver.ts';
@@ -76,8 +75,8 @@ async function runCase(name: string) {
   const path = join(destination, name);
   mkdirSync(path);
   const children: { name: string; args: string[]; proc: ReturnType<typeof startCli> }[] = [];
-  const start = (label: string, command: string) => {
-    const args = [command, '--sandbox', sandbox.root];
+  const start = (label: string, command: string, extraArgs: string[] = []) => {
+    const args = [command, '--sandbox', sandbox.root, ...extraArgs];
     const proc = startCli(args);
     children.push({ name: label, args, proc });
     return proc;
@@ -143,21 +142,20 @@ async function runCase(name: string) {
       assert.equal((await maintenance.exit).code, 0);
     } else if (name === 'child-race') {
       store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox));
-      const runtime = start('runtime', 'hold');
-      const deadline = Date.now() + 4000;
-      let reservation: ReturnType<ProbeStore['maintenanceStatus']>['activities'][number] | undefined;
-      while (!reservation && Date.now() < deadline) {
-        reservation = store.maintenanceStatus().activities.find(row => row.parentId !== null && row.incarnation === null);
-        if (!reservation) await delay(1);
-      }
+      const runtime = start('runtime', 'hold', ['--wait-child-launch']);
+      const reserved = await runtime.waitFor('child-reserved');
+      const reservation = store.maintenanceStatus().activities.find(row => row.id === reserved.reservationId)!;
       assert.ok(reservation, 'controlled launch reservation observed');
+      assert.equal(reservation.pid, null);
+      assert.equal(reservation.launchPid, null);
       record(join(path, 'reserved-launch.json'), JSON.stringify(reservation));
       const coordinator = randomUUID();
-      store.beginMaintenance(coordinator);
+      const closing = store.beginMaintenance(coordinator);
+      runtime.command('launch');
       const childExit = await runtime.waitFor('controlled-task-exit');
       const parentExit = await runtime.waitFor('process-exit');
       const acquired = store.acquireMaintenance(coordinator);
-      record(join(path, 'exit-settlement.json'), JSON.stringify({ childExit, parentExit, acquired }, null, 2));
+      record(join(path, 'exit-settlement.json'), JSON.stringify({ closing, childExit, parentExit, acquired }, null, 2));
       verify('refused child and parent exit, then known launch settles to exclusive', () => {
         assert.equal(childExit.code, 1);
         assert.equal(parentExit.code, 1);

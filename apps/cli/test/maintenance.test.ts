@@ -4,7 +4,6 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { createSandbox, resourcesOf, bindingOf } from '../src/sandbox.ts';
 import { randomUUID } from 'node:crypto';
-import { setTimeout as delay } from 'node:timers/promises';
 import { ProbeStore } from '@euler/core';
 import { startCli } from '../src/process-driver.ts';
 
@@ -159,18 +158,18 @@ test('racing startup and closing never leave an admitted unregistered process', 
 test('a child refused after reservation exits with its parent and maintenance can resume', { timeout: 15000 }, async () => {
   const sandbox = createSandbox();
   const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox));
-  const runtime = startCli(['hold', '--sandbox', sandbox.root], 4000);
+  const runtime = startCli(['hold', '--sandbox', sandbox.root, '--wait-child-launch'], 4000);
   let resumed: ReturnType<typeof startCli> | undefined;
   try {
-    const deadline = Date.now() + 4000;
-    let reservation: ReturnType<ProbeStore['maintenanceStatus']>['activities'][number] | undefined;
-    while (!reservation && Date.now() < deadline) {
-      reservation = store.maintenanceStatus().activities.find(row => row.parentId !== null && row.incarnation === null);
-      if (!reservation) await delay(1);
-    }
-    assert.ok(reservation, 'controlled launch reservation observed before child acknowledgement');
+    const reserved = await runtime.waitFor('child-reserved');
+    const reservation = store.maintenanceStatus().activities.find(row => row.id === reserved.reservationId)!;
+    assert.ok(reservation, 'controlled launch reservation is durable before acknowledgement');
+    assert.equal(reservation.pid, null);
+    assert.equal(reservation.launchPid, null);
+    assert.equal(reservation.incarnation, null);
     const coordinator = randomUUID();
     store.beginMaintenance(coordinator);
+    runtime.command('launch');
     const childExit = await runtime.waitFor('controlled-task-exit');
     assert.equal(childExit.code, 1);
     const parentExit = await runtime.waitFor('process-exit');
