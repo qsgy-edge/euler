@@ -4,7 +4,7 @@
 
 ## 运行与身份
 
-要求 Node 24.18.x 或更高的 Node 24。继续使用 [T01 disposable sandbox 的资源与身份围栏](t01-synthetic-probes.md)，不会打开真实 MC、生产数据根或切换 live owner。此切片将 disposable SQLite schema 更新为版本 3；旧版本拒开，重新生成合成沙箱即可，不做生产迁移。
+要求 Node 24.18.x 或更高的 Node 24。继续使用 [T01 disposable sandbox 的资源与身份围栏](t01-synthetic-probes.md)，不会打开真实 MC、生产数据根或切换 live owner。此切片将 disposable SQLite schema 更新为版本 4；旧版本拒开，重新生成合成沙箱即可，不做生产迁移。
 
 ```powershell
 npm ci --ignore-scripts
@@ -23,10 +23,10 @@ node apps/cli/src/main.ts recover --sandbox $probeRoot
 
 ## 已实现的存储行为
 
-- record、revision、event、verification run、conflict set、proposal 等行 identity 由 Store 分配。record 稳定；revision/event/证据与 proposal 版本 append-only；head 通过 record/revision/event 复合外键保持关联。SQLite writer guard 限制普通外部连接插入这些行；它不是防御能修改本机数据库、DDL 或注册自定义函数的恶意进程的安全边界。
+- record、revision、event、verification run、conflict set、proposal 等行 identity 由 Store 分配。record 稳定；revision/event/证据与 proposal 版本 append-only；head 通过 record/revision/event 复合外键保持关联，verification run 绑定同一 record/revision，rollback target 绑定同一 record，conflict set 必须包含该 record。SQLite writer guard 限制普通外部连接插入这些行；它不是防御能修改本机数据库、DDL 或注册自定义函数的恶意进程的安全边界。
 - 类型、lifecycle、verification 使用既有枚举。project/personal 必须匹配当前 owner binding。未解析 scope 只能是当前 session candidate。workspace membership 尚未接线，workspace scope 拒绝。`appliesTo` 用有序关系行保存；当前 CLI 要求所有条件匹配 `cli` 或当前 `process.platform`，未知条件不放行。
 - 每次来源验证都经原 CLI archive adapter 复读 immutable locator/完整事件 hash/text hash。`verifyMemory(pass/block/evidence-gap)` 的结论由**合成 fixture**提供，事件带 `synthetic:true`；这不证明语义真伪、来源独立性或模型资格。独立语义 Verifier 属于后续 Core。
-- 完整 snapshot（含 head_event_id）参加 CAS 与请求 digest。对原请求重试且其结果仍是当前 head 时返回 no-op；head 已改变时旧请求 stale。`lookupMemoryOperation` 可查询历史已提交结果，供 unknown 后先查再决定是否重试。曝光写 `feedback_events`，不写 mutation event。
+- 完整 snapshot（含 head_event_id）参加 CAS 与请求 digest。对原请求重试且其结果仍是当前 head 时返回 no-op；head 已改变时旧请求 stale。`memoryCorrectionRequestHash` 在提交前冻结完整 correction 请求（record、snapshot、source、content）的摘要；`lookupMemoryOperation(recordId, requestHash)` 只查询这一请求的历史提交，供 unknown 后先查再决定是否重试。record/旧 head/kind 相同但来源或正文不同的竞争请求不能相互对账。曝光写 `feedback_events`，不写 mutation event。
 - capture/source 重放、相同/空白 correction、重复转换不会制造 mutation receipt。correction 追加 revision 并降为 unverified；synthetic automatic revision 同事务保存验证结果。activation/自动修订分配 batch identity，与完整 event manifest 的 search/host-info outbox 一起提交；其他 mutation 保存 search outbox。此票只持久化待消费项，没有 search worker、真实 Host 通知或行为发布入口。
 - forget 留 tombstone，restore 是单独转换且重新核验来源/资格。同 lineage 与 canonical `claimKey` 的重述保持抑制；fixture 显式提供稳定 claimKey。未提供时仅使用 NFC/trim 正文作为确定性 key，**不宣称识别任意自然语言同义改写**；语义 claim 归一化仍属后续 Core。
 - conflict 将两侧隔离。rollback 只撤销可行动的自动 activation/修订，复用旧 revision，生成新 head/event 身份；连续 B→A 回滚使用最新 CAS，拒绝旧 preview 和人工 correction 回滚。
@@ -62,7 +62,7 @@ npm run evidence:memory
 - 正常完成后由另一个进程恢复 intent 与 memory；伪造并重算摘要的 snapshot 必须被原始事件链拒绝。
 - `crash-in-transaction` 在 correction 已执行、外层事务仍未提交时发出同步 checkpoint，然后父进程强杀；恢复只能看到旧 head，无部分 revision/event/outbox。另有 SQLite trigger 注入失败，覆盖 event 与 head 提交中断及 savepoint 回滚。
 - `crash-after-commit` 在事务提交后、业务回执前强杀；新进程先 `lookupMemoryOperation` 找到实际结果，再恢复同一 head，不盲目重试。
-- 两个真实 writer 从同一冻结 snapshot 竞争，恰有一个提交，另一个 stale；核对最终行数、FK 和恢复结果。
+- 两个真实 writer 从同一冻结 snapshot 竞争，恰有一个提交，另一个 stale；核对最终行数、FK 和恢复结果。组合场景再强杀已提交但尚未回执的胜者，新进程分别用两个冻结 request hash 查询：胜者查到原提交，输家返回 null。原始 request bytes 的 SHA-256 与存储 request_hash 由证据脚本独立复算。
 
 `memory-worker`/`memory-reconcile` 是 disposable CLI 测试接点；worker 的 checkpoint 最多等待 5 秒，未被父进程杀死则报错退出。不是后台自动化或产品操作 API。
 

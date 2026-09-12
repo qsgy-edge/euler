@@ -158,8 +158,10 @@ CREATE TABLE memory_heads (
   scope_kind TEXT NOT NULL CHECK(scope_kind IN ('project','workspace','personal','session')), scope_id TEXT NOT NULL,
   scope_resolved INTEGER NOT NULL CHECK(scope_resolved IN (0,1)), head_event_id TEXT NOT NULL,
   snapshot TEXT NOT NULL, snapshot_hash TEXT NOT NULL, conflict_set_id TEXT REFERENCES conflict_sets(conflict_set_id),
-  verification_run_id TEXT REFERENCES verification_runs(run_id),
+  verification_run_id TEXT,
   CHECK(verification!='verified' OR verification_run_id IS NOT NULL),
+  FOREIGN KEY(record_id,revision_id,verification_run_id) REFERENCES verification_runs(record_id,revision_id,run_id),
+  FOREIGN KEY(conflict_set_id,record_id) REFERENCES conflict_members(conflict_set_id,record_id),
   FOREIGN KEY(record_id,revision_id) REFERENCES memory_revisions(record_id,revision_id),
   FOREIGN KEY(record_id,head_event_id,revision_id) REFERENCES memory_events(record_id,event_id,revision_id),
   FOREIGN KEY(scope_kind,scope_id,scope_resolved) REFERENCES memory_scopes(kind,scope_id,resolved)
@@ -168,10 +170,11 @@ CREATE TABLE memory_events (
   event_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), seq INTEGER NOT NULL CHECK(seq > 0), kind TEXT NOT NULL CHECK(kind IN ('capture','verify','activate','correct','auto-revise','forget','restore','conflict','rollback')),
   revision_id TEXT NOT NULL REFERENCES memory_revisions(revision_id), before_snapshot TEXT, after_snapshot TEXT NOT NULL,
   request_hash TEXT NOT NULL UNIQUE, origin_host_id TEXT NOT NULL, origin_seq INTEGER NOT NULL CHECK(origin_seq>0), batch_id TEXT,
-  target_event_id TEXT REFERENCES memory_events(event_id),
+  target_event_id TEXT,
   payload TEXT NOT NULL, payload_hash TEXT NOT NULL, source_event_id TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(record_id, seq),
   UNIQUE(origin_host_id,origin_seq),
-  UNIQUE(record_id,event_id,revision_id),
+  UNIQUE(record_id,event_id,revision_id), UNIQUE(record_id,event_id),
+  FOREIGN KEY(record_id,target_event_id) REFERENCES memory_events(record_id,event_id),
   FOREIGN KEY(record_id,revision_id) REFERENCES memory_revisions(record_id,revision_id)
 ) STRICT;
 CREATE TABLE projection_jobs (
@@ -187,6 +190,7 @@ CREATE TABLE feedback_events (
 CREATE TABLE verification_runs (
   run_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), revision_id TEXT NOT NULL REFERENCES memory_revisions(revision_id),
   result TEXT NOT NULL CHECK(result IN ('pass','block','evidence-gap')), evidence_json TEXT NOT NULL, evidence_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+  UNIQUE(record_id,revision_id,run_id),
   FOREIGN KEY(record_id,revision_id) REFERENCES memory_revisions(record_id,revision_id)
 ) STRICT;
 CREATE TABLE conflict_sets (conflict_set_id TEXT PRIMARY KEY, created_at TEXT NOT NULL) STRICT;
@@ -230,7 +234,7 @@ CREATE TRIGGER immutable_provenance_refs_delete BEFORE DELETE ON provenance_refs
 CREATE TRIGGER immutable_evolution_proposals_update BEFORE UPDATE ON evolution_proposals BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_proposals BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=3;
+PRAGMA user_version=4;
 ` + ['memory_applicability','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
@@ -281,7 +285,7 @@ export class ProbeStore {
               'session', binding.sessionId, 0, binding.ownerId, null, binding.sessionId);
         });
       } else {
-        check(version === 3, 'unsupported-probe-schema');
+        check(version === 4, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
@@ -597,7 +601,7 @@ export class ProbeStore {
 
   correctMemory(activity: Activity, recordId: string, expected: MemoryRecord, input: SourceAck, content: string): MemoryOperation {
     return this.withActivity(activity, () => {
-      const request = this.#requestDigest('correct', expected, { recordId, input, content });
+      const request = this.memoryCorrectionRequestHash(recordId, expected, input, content);
       const replay = this.#replayed(request);
       if (replay) return replay;
       const current = this.#assertMemoryExpected(recordId, expected);
@@ -941,13 +945,17 @@ export class ProbeStore {
     check(record.headEventId === row.event_id, 'memory-stale');
     return { status: 'no_op', record, eventId: null };
   }
+  // Freeze the full correction identity before dispatch, so an unknown outcome can be queried exactly.
+  memoryCorrectionRequestHash(recordId: string, expected: MemoryRecord, input: SourceAck, content: string): string {
+    return this.#requestDigest('correct', expected, { recordId, input, content });
+  }
   // Reconcile a lost acknowledgement before deciding whether a mutation may be retried.
-  lookupMemoryOperation(activity: Activity, recordId: string, expectedEventId: string, kind: string): MemoryOperation | null {
+  lookupMemoryOperation(activity: Activity, recordId: string, requestHash: string): MemoryOperation | null {
     return this.withActivity(activity, () => {
+      uuid(recordId);
+      check(typeof requestHash === 'string' && /^[0-9a-f]{64}$/.test(requestHash), 'invalid-memory-request-hash');
       this.#replayMemory(recordId);
-      const rows = this.#db.prepare('SELECT * FROM memory_events WHERE record_id=? AND kind=? ORDER BY seq').all(recordId, kind);
-      const row = rows.find(event => event.before_snapshot !== null
-        && this.#parseMemorySnapshot(String(event.before_snapshot)).headEventId === expectedEventId);
+      const row = this.#db.prepare('SELECT * FROM memory_events WHERE record_id=? AND request_hash=?').get(recordId, requestHash);
       return row ? { status: 'committed', record: this.#parseMemorySnapshot(String(row.after_snapshot)), eventId: String(row.event_id) } : null;
     });
   }

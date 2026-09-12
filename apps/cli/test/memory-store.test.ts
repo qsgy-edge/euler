@@ -7,6 +7,66 @@ import { createSandbox, openSandbox } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 import { startCli } from '../src/process-driver.ts';
 
+test('a losing correction cannot reconcile another request as its own commit', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const input = probe.archive.append(sandbox.fixture.eventId, sandbox.fixture.text);
+    const c = probe.store.captureMemory(probe.activity, input, 'Original', {
+      type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+    });
+    const winnerSource = probe.archive.append(randomUUID(), 'Winner evidence');
+    const loserSource = probe.archive.append(randomUUID(), 'Loser evidence');
+    const winnerRequest = probe.store.memoryCorrectionRequestHash(c.record.recordId, c.record, winnerSource, 'Corrected');
+    const loserRequest = probe.store.memoryCorrectionRequestHash(c.record.recordId, c.record, loserSource, 'Corrected');
+    const winner = probe.store.correctMemory(probe.activity, c.record.recordId, c.record, winnerSource, 'Corrected');
+    assert.throws(() => probe.store.correctMemory(probe.activity, c.record.recordId, c.record, loserSource, 'Corrected'), /memory-stale/);
+    assert.equal(probe.store.lookupMemoryOperation(probe.activity, c.record.recordId, loserRequest), null);
+    assert.deepEqual(probe.store.lookupMemoryOperation(probe.activity, c.record.recordId, winnerRequest), winner);
+    const differentContent = probe.store.memoryCorrectionRequestHash(c.record.recordId, c.record, winnerSource, 'Another correction');
+    assert.equal(probe.store.lookupMemoryOperation(probe.activity, c.record.recordId, differentContent), null);
+    assert.throws(() => probe.store.lookupMemoryOperation(probe.activity, c.record.recordId, c.record.headEventId), /invalid-memory-request-hash/);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+for (const relationship of ['verification-record', 'verification-revision', 'rollback-record', 'conflict-member']) {
+  test(`SQLite independently rejects a mismatched ${relationship} relationship`, () => {
+    const sandbox = createSandbox();
+    const probe = openProbe(sandbox);
+    const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
+    db.exec('PRAGMA foreign_keys=ON');
+    try {
+      const input = probe.archive.append(sandbox.fixture.eventId, sandbox.fixture.text);
+      const options = { type: 'fact' as const, scope: { kind: 'project' as const, id: sandbox.fixture.projectId, resolved: true }, appliesTo: [] };
+      const c = probe.store.captureMemory(probe.activity, input, 'One', options);
+      const v = probe.store.verifyMemory(probe.activity, c.record.recordId, c.record, 'pass', [input]);
+      const source = probe.archive.append(randomUUID(), 'Other evidence');
+      const other = probe.store.captureMemory(probe.activity, source, 'Two', options);
+      const verifiedOther = probe.store.verifyMemory(probe.activity, other.record.recordId, other.record, 'pass', [source]);
+      if (relationship === 'verification-record') {
+        assert.throws(() => db.prepare('UPDATE memory_heads SET verification_run_id=? WHERE record_id=?')
+          .run(verifiedOther.record.verificationRunId, c.record.recordId), /FOREIGN KEY/);
+      } else if (relationship === 'verification-revision') {
+        probe.store.correctMemory(probe.activity, c.record.recordId, v.record, source, 'New revision');
+        assert.throws(() => db.prepare('UPDATE memory_heads SET verification_run_id=? WHERE record_id=?')
+          .run(v.record.verificationRunId, c.record.recordId), /FOREIGN KEY/);
+      } else if (relationship === 'conflict-member') {
+        const conflict = probe.store.conflictMemory(probe.activity, c.record.recordId, v.record, other.record.recordId, verifiedOther.record);
+        const thirdSource = probe.archive.append(randomUUID(), 'Unrelated record');
+        const third = probe.store.captureMemory(probe.activity, thirdSource, 'Three', options);
+        assert.throws(() => db.prepare('UPDATE memory_heads SET conflict_set_id=? WHERE record_id=?')
+          .run(conflict.conflictSetId, third.record.recordId), /FOREIGN KEY/);
+      } else {
+        // Deliberately bypass only the writer guard to test the independent SQL relationship.
+        db.function('euler_store_writer', () => 1);
+        assert.throws(() => db.prepare(`INSERT INTO memory_events
+          SELECT ?,record_id,seq+100,'rollback',revision_id,before_snapshot,after_snapshot,?,origin_host_id,origin_seq+100,NULL,?,payload,payload_hash,source_event_id,created_at
+          FROM memory_events WHERE event_id=?`).run(randomUUID(), randomUUID(), other.record.headEventId, c.record.headEventId), /FOREIGN KEY/);
+      }
+    } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+  });
+}
+
 test('same lineage and canonical claim stay suppressed until a separate restore', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);

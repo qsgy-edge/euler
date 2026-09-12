@@ -41,7 +41,7 @@ function launch(name: string, args: string[]) {
 }
 
 // Independent raw verifier: no Store or Core hashing/recovery helpers.
-function verifySnapshot(snapshot: string, corrected: boolean, reported: Record<string, any>) {
+function verifySnapshot(snapshot: string, corrected: boolean, reported: Record<string, any>, requests: { hash: string; committed: boolean }[] = []) {
   const temp = mkdtempSync(join(tmpdir(), 'euler-t02-verify-'));
   try {
     for (const file of readdirSync(snapshot)) copyFileSync(join(snapshot, file), join(temp, file));
@@ -64,6 +64,9 @@ function verifySnapshot(snapshot: string, corrected: boolean, reported: Record<s
         assert.deepEqual(JSON.parse(String(row.source_json)), refs.get(row.source_event_id));
       }
       const events = db.prepare('SELECT * FROM memory_events ORDER BY origin_seq').all();
+      for (const request of requests) {
+        assert.equal(events.filter(event => event.request_hash === request.hash).length, request.committed ? 1 : 0);
+      }
       assert.deepEqual(events.map(event => event.kind), corrected ? ['capture','verify','activate','correct'] : ['capture','verify','activate']);
       let previous: string | null = null;
       for (const [index, event] of events.entries()) {
@@ -132,29 +135,55 @@ async function scenario(name: string) {
     assert.equal((await setup.exit).code, 0);
     const written = setup.observations.find(row => row.event === 'memory-result') as Record<string, any>;
     let recovered: Record<string, any> = written.activated.record;
-    if (name === 'compete') {
-      worker = launch(`${name}/writer-a`, ['memory-worker', '--scenario', name, '--sandbox', root]);
-      competitor = launch(`${name}/writer-b`, ['memory-worker', '--scenario', name, '--sandbox', root]);
-      const ready = await Promise.all([worker.waitFor('memory-ready'), competitor.waitFor('memory-ready')]);
+    const requests: { hash: string; committed: boolean }[] = [];
+    if (name === 'compete' || name === 'compete-unknown') {
+      const mode = name === 'compete' ? 'compete' : 'crash-after-commit';
+      worker = launch(`${name}/writer-a`, ['memory-worker', '--scenario', mode, '--sandbox', root]);
+      competitor = launch(`${name}/writer-b`, ['memory-worker', '--scenario', mode, '--sandbox', root]);
+      const writers = [worker, competitor];
+      const ready = await Promise.all(writers.map(writer => writer.waitFor('memory-ready')));
       assert.deepEqual(ready[0]!.expected, ready[1]!.expected);
+      assert.notEqual(ready[0]!.requestHash, ready[1]!.requestHash);
+      for (const request of ready) assert.equal(request.requestHash, digest(JSON.stringify(request.request)));
       worker.command('commit'); competitor.command('commit');
-      const exits = await Promise.all([worker.exit, competitor.exit]);
-      const observations = [...worker.observations, ...competitor.observations];
-      verify('concurrent writers: one commit, one stale rejection', () => {
-        assert.deepEqual(exits.map(exit => exit.code).sort(), [0, 1]);
-        assert.equal(observations.filter(row => row.event === 'memory-written').length, 1);
+      if (name === 'compete-unknown') {
+        const checkpoints = await Promise.allSettled(writers.map(writer => writer.waitFor('memory-checkpoint')));
+        assert.equal(checkpoints.filter(result => result.status === 'fulfilled').length, 1);
+        for (const [index, result] of checkpoints.entries()) if (result.status === 'fulfilled') writers[index]!.child.kill('SIGKILL');
+      }
+      const exits = await Promise.all(writers.map(writer => writer.exit));
+      const observations = writers.flatMap(writer => writer.observations);
+      verify(`${name}: one commit, one stale rejection`, () => {
+        if (name === 'compete') assert.deepEqual(exits.map(exit => exit.code).sort(), [0, 1]);
+        else assert.equal(exits.every(exit => exit.code !== 0), true);
+        assert.equal(observations.filter(row => row.event === 'memory-written').length, name === 'compete' ? 1 : 0);
         assert.equal(observations.filter(row => row.event === 'error' && row.reason === 'memory-stale').length, 1);
       });
-      recovered = (observations.find(row => row.event === 'memory-written')!.result as Record<string, any>).record;
+      for (const [index, writer] of writers.entries()) {
+        const requestHash = String(ready[index]!.requestHash);
+        const committed = !writer.observations.some(row => row.event === 'error' && row.reason === 'memory-stale');
+        requests.push({ hash: requestHash, committed });
+        const lookup = launch(`${name}/reconcile-${index}`, ['memory-reconcile', '--sandbox', root,
+          '--record', recovered.recordId, '--request', requestHash]);
+        assert.equal((await lookup.exit).code, 0);
+        const observed = lookup.observations.find(row => row.event === 'memory-reconciled') as Record<string, any>;
+        verify(`${name}: request ${index} reconciles its own frozen digest`, () => {
+          if (committed) assert.deepEqual(observed.operation.record, observed.recovered);
+          else assert.equal(observed.operation, null);
+        });
+        recovered = observed.recovered;
+      }
     } else if (name !== 'normal') {
       worker = launch(`${name}/writer`, ['memory-worker', '--scenario', name, '--sandbox', root]);
-      await worker.waitFor('memory-ready');
+      const ready = await worker.waitFor('memory-ready');
+      assert.equal(ready.requestHash, digest(JSON.stringify(ready.request)));
+      requests.push({ hash: String(ready.requestHash), committed: name === 'crash-after-commit' });
       worker.command('commit');
       await worker.waitFor('memory-checkpoint');
       worker.child.kill('SIGKILL');
       assert.notEqual((await worker.exit).code, 0);
       const lookup = launch(`${name}/reconcile`, ['memory-reconcile', '--sandbox', root,
-        '--record', recovered.recordId, '--expected', recovered.headEventId]);
+        '--record', recovered.recordId, '--request', String(ready.requestHash)]);
       assert.equal((await lookup.exit).code, 0);
       const observation = lookup.observations.find(row => row.event === 'memory-reconciled') as Record<string, any>;
       verify(`${name}: query precedes any retry`, () => {
@@ -174,8 +203,8 @@ async function scenario(name: string) {
     const snapshot = join(destination, name, 'snapshot');
     mkdirSync(snapshot, { recursive: true });
     for (const file of readdirSync(root)) copyFileSync(join(root, file), join(snapshot, file));
-    const corrected = name === 'crash-after-commit' || name === 'compete';
-    verify(`${name}: independently recomputed source/revision/event/head/outbox/proposal`, () => verifySnapshot(snapshot, corrected, recovered));
+    const corrected = name === 'crash-after-commit' || name === 'compete' || name === 'compete-unknown';
+    verify(`${name}: independently recomputed source/revision/event/head/outbox/proposal`, () => verifySnapshot(snapshot, corrected, recovered, requests));
     if (name === 'normal') {
       verify('re-signed fabricated snapshot rejected against raw event history', () => {
         const changed: Record<string, unknown> = { ...recovered, content: 'forged content', contentHash: digest('forged content') };
@@ -198,7 +227,7 @@ const tests = spawnSync(process.execPath, testArgs, { cwd: repo, encoding: 'utf8
 record(join(destination, 'tests.stdout.txt'), tests.stdout ?? '');
 record(join(destination, 'tests.stderr.txt'), tests.stderr ?? '');
 verify('Store, constraints, concurrency, crash and rollback tests', () => assert.equal(tests.status, 0, tests.stderr));
-for (const name of ['normal', 'crash-in-transaction', 'crash-after-commit', 'compete']) await scenario(name);
+for (const name of ['normal', 'crash-in-transaction', 'crash-after-commit', 'compete', 'compete-unknown']) await scenario(name);
 const git = (...args: string[]) => execFileSync('git', ['--no-optional-locks', ...args], { cwd: repo, encoding: 'utf8' }).trim();
 function files(dir: string): { path: string; sha256: string }[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap(entry => entry.isDirectory() ? files(join(dir, entry.name))

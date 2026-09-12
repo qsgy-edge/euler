@@ -173,10 +173,13 @@ async function memoryWorker(sandbox: Sandbox, scenario: string) {
     const expected = probe.store.recoverMemories(probe.activity)[0];
     check(expected, 'memory-required');
     const source = probe.archive.append(randomUUID(), 'Synthetic correction evidence');
-    emit('memory-ready', { pid: process.pid, expected, scenario });
+    const request = { schema: 'memory-request@1', kind: 'correct', expected,
+      args: { recordId: expected.recordId, input: source, content: memoryFixture.correctionText } };
+    const requestHash = probe.store.memoryCorrectionRequestHash(expected.recordId, expected, source, request.args.content);
+    emit('memory-ready', { pid: process.pid, expected, scenario, request, requestHash });
     for await (const line of lines) {
       if (line !== 'commit') break;
-      const change = () => probe.store.correctMemory(probe.activity, expected.recordId, expected, source, memoryFixture.correctionText);
+      const change = () => probe.store.correctMemory(probe.activity, expected.recordId, expected, source, request.args.content);
       const checkpoint = (stage: string) => {
         writeSync(1, JSON.stringify({ event: 'memory-checkpoint', stage, pid: process.pid }) + '\n');
         // Deliberately leave the transaction/process open for the parent kill probe.
@@ -198,7 +201,7 @@ async function memoryWorker(sandbox: Sandbox, scenario: string) {
 async function main() {
   const args = parseArgs({ allowPositionals: true, options: {
     sandbox: { type: 'string' }, scenario: { type: 'string', default: 'success' }, budget: { type: 'string' },
-    expected: { type: 'string' }, record: { type: 'string' },
+    request: { type: 'string' }, record: { type: 'string' },
   } });
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
@@ -223,10 +226,10 @@ async function main() {
   }
   if (command === 'memory-worker') return memoryWorker(sandbox, args.values.scenario);
   if (command === 'memory-reconcile') {
-    check(args.values.record && args.values.expected, 'memory-identity-required');
+    check(args.values.record && args.values.request, 'memory-identity-required');
     const probe = openProbe(sandbox);
     try {
-      emit('memory-reconciled', { operation: probe.store.lookupMemoryOperation(probe.activity, args.values.record, args.values.expected, 'correct'),
+      emit('memory-reconciled', { operation: probe.store.lookupMemoryOperation(probe.activity, args.values.record, args.values.request),
         recovered: probe.store.recoverMemory(probe.activity, args.values.record), outbox: probe.store.pendingMemoryProjections(probe.activity) });
     } finally { probe.close(); }
     return;
