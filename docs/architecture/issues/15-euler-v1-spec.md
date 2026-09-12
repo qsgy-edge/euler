@@ -96,7 +96,7 @@ Pi regular、RPC/JSON/print、MCP、scope overview/raw backfill、bundle 和其�
 
 产品名 Euler，稳定 app-id 为 `euler`。采用一份共享 TypeScript Core，三个 private workspace 的职责分别为共享 Core、Pi adapter、自研 CLI；store 是 Core 内部模块，不拆独立包。
 
-Control Plane、Context Orchestrator、memory/source gate、ledger、capability/credential/tool dispatch 与后台状态机封闭在 Core。Pi adapter 通过 13 的受控 SDK bootstrap 复用 `Agent`/`AgentSession`、UI/tool loop、session/source surface；Euler 独占内容选择/compaction，最终发送经受控 transport。加载前只接受 hash 固定的 Euler adapter，user/project/package/CLI/inline 的额外 extension 不进入该进程，重载和 session 替换也重验；loader/settings/实际 hook 与 wrapper 集合记录到 runtime receipt。自研 CLI 只依赖 `@earendil-works/pi-ai` 的 provider/model 接口，自有 Agent loop 和 TUI，不依赖 Pi Agent/TUI 实现。两个宿主通过 versioned 进程内 Core/HostAdapter 接口合作，不互调远程 API，不直接访问私有 canonical 表。不建 daemon、IPC、通用插件 bus 或任意同进程 JS/TS 热加载。
+Control Plane、Context Orchestrator、memory/source gate、ledger、capability/credential/tool dispatch 与后台状态机封闭在 Core。Core 同时拥有 run/turn/attempt/tool-call 的共享运行协议与状态机，包括输入消费边界、admission、结果归类、终态转换和恢复规则；Host 只拥有宿主 I/O 与异步 pump，不拥有这些 canonical 语义。Pi adapter 通过 13 的受控 SDK bootstrap 复用 `Agent`/`AgentSession`、UI/tool loop、session/source surface；Euler 独占内容选择/compaction，最终发送经受控 transport。加载前只接受 hash 固定的 Euler adapter，user/project/package/CLI/inline 的额外 extension 不进入该进程，重载和 session 替换也重验；loader/settings/实际 hook 与 wrapper 集合记录到 runtime receipt。自研 CLI 只依赖 `@earendil-works/pi-ai` 的 provider/model 接口，自有 Agent loop 和 TUI，不依赖 Pi Agent/TUI 实现。两个宿主通过 versioned 进程内 Core/HostAdapter 接口合作，不互调远程 API，不直接访问私有 canonical 表。不建 daemon、IPC、通用插件 bus 或任意同进程 JS/TS 热加载。
 
 ### I03. 持久化、数据根与 schema 冻结
 
@@ -162,6 +162,8 @@ Memory 与 owner 明确发布的有界 session/source/repo units 分 lane；不�
 
 每次调用强制 `mandatory + selected + output_reserve + safety_margin <= context_limit`。活动 policy、当前用户输入、最小 intent、需要的核心工具契约、完整最近 ReAct 边界与输出预算为硬保留项。不得按消息条数拆 tool pair；mandatory 自身超窗则明确拒发或拆任务。
 
+运行时协议进一步区分输入和消费状态：用户输入先完成 source append/durable ack，再进入 `received`；被当前 run 接受并绑定 active intent 后为 `admitted-to-loop`；被选入冻结 model assembly 后为 `bound-to-assembly`。`bound-to-assembly` 只表示该输入被纳入一次模型请求的冻结材料，不证明模型理解或 provider 已成功接收；实际发送及结果由 attempt ledger 记录。默认普通输入是 `steer`，在完整 ReAct 工具批次结束后消费；`follow-up`、外层 `queue` 和 `cancel` 是不同生命周期。普通 steer 不取消当前批次；明确 cancel、权限/scope/safety invalidation 或 fence 失效必须在下一次 admission 前阻止旧 assembly。
+
 这不代替累计运行预算：每个前台 run 在首次 attempt 前固定可配置的 model-attempt/tool-call 上限、累计 token 或成本上限、wall-clock deadline 和工具超时；source recovery/重试计入同一 run，换窗不重置。达到限制或用户取消后停止新增调用，返回可见原因；已发请求按 ledger 结算，迟到结果不得自动执行工具或提交 memory。参数先有合成测试初值，再用 workload 校准；缺必需预算不启动，不为调参增加通用调度系统。恢复继续须新授权和新 run，不抹掉旧用量或 unknown。
 
 原文可恢复是卸载前置。按弱相关/近重复/可重建、非 pinned memory/source、已准备 compartment 的完整边界、已归档单条的分页/分块逐级降级；未归档成功、当前行动马上需要精确值或 hash 失败的内容不得卸载。Source Recovery 仅按明确原话/版本/证据需求、精确 provenance，或主 Agent 判断证据不足进入慢路径；返回带 immutable locator/hash 的有界非指令 excerpt。失败显式 evidence-gap，不能拿摘要冒充原文。
@@ -191,6 +193,10 @@ P0 输入接点亦按 13 的公开 API 边界：在原 Pi regular 界面冻结�
 ### I11. Execution ledger 与恢复
 
 execution ledger 为 Host-owned 独立 append-only stream，与 memory 同库不同 domain；stream 固定 `owner_kind=session|job|maintenance|migration`、owner ID、已验证 scope 和授权来源。前台归 session，后台模型调用归实际 durable job，无子 job 的维护/迁移请求归该 run；originating session 仅关联，不是无 session 时伪造的 owner。每次 attempt 恰属一 stream，进程接管不改 owner 或重发 unknown。普通 job 只回收可重建 payload，被引用的最小 job owner/scope 行及账本仍保留，来源 session purge 清除跨 stream 引用/授权并阻断依赖 job，不误删无关 owner；整条 owning stream 的显式 purge 按 10 §11 结算必要无内容状态，不能由账本消失推断可重发。surface history 是投影，receipt 为 log-only，不进入模型上下文。assembly receipt 记录 intent/project/policy/selection/ref/hash/order/token/reason、P0-P3 预算与降级；每个真实 transport attempt 有 started/finished、最终 route/model/payload、TTFT/usage/cache/finish/error/cancel。
+
+Tool call 的执行事实使用 provider/host-neutral 的 Core 结果信封，至少区分 `executionState=not_started|started|unknown` 与 `outcome=success|failure|cancelled|timeout|unavailable|unknown`，并保留 call identity、参数摘要/hash、错误分类和 receipt 引用。模型看到的是有界 `modelResult` 投影，不是执行事实本身。`not_started` 只表示 Core 有可靠证据表明工具未开始；已启动但没有可靠结束证据必须是 `started + unknown`。普通参数/业务错误只影响当前调用并形成错误结果；已准入的其他调用继续，executor 不自动重试。未启动调用的取消结果只用于维持 tool-call/result 配对；不能以取消文本证明已启动的副作用未发生。
+
+运行控制事件、attempt receipt、完整 tool-call/result 配对、Core 结果信封、unknown、取消/invalidation 和 run terminal 属于权威事实，必须在终态或“已完成/已批准/已结算”呈现前 durable 提交；token delta、typing、工具进度、队列长度和 UI 刷新是可丢失的 provisional 投影。`completed` 只表示最终回复及本 run 内调用已结算且没有阻塞状态；`needs-input`、`cancelled`、`budget-exhausted`、`deadline`、`failed` 和 `blocked-unknown` 不因重启、换窗或队列消息自动恢复。自然结束后，已明确提交的 `follow-up` 才创建关联的新 run；attempt retry、模型看到错误后的新调用和 unknown 对账后的恢复分别遵守各自 gate。
 
 两道有序但非原子的 barrier 为 assembly append+flush，随后冻结 payload 并 started append+flush，最后网络调用。任一失败 dispatch=0。完整 assembly 的非 attempt 内容、顺序、route、预算、epoch 等改变即新 assembly ID；只有同一完整 payload 的合法重试增加 attempt ordinal。
 
@@ -223,6 +229,8 @@ Core policy 是受保护 channel，AGENTS 为独立 P0 guidance，带 owner/scop
 八个固定 Core 模型工具为 `skill.search`、`memory.search`、`source.search`、`source.expand`、`memory.inspect`、`memory.preview`、`memory.commit`、`memory.cancel`。Memory mutation 的模型入口只有 inspect→preview→owner approval→commit，不提供通用 write/delete/update/set。Schema 由源码中的 tool-name/version/hash 标识，外部可见变更生成新 identity/assembly/epoch，不建通用 registry 或 DB tool-version 表。
 
 每次 tool call 重新检查 policy、capability、credential、scope、参数、实际 resource owner、批准与 receipt。文件/命令/交互由 HostAdapter 提供，不能绕过 Core；不可用显式返回 unavailable。Tool schema、AGENTS、Skill allowed-tools、memory/source 与模型自述都不能授权。
+
+Host tool descriptor 另外提供显式 `executionMode` 调度资格；`parallel-safe` 只表示可进入有界并行批次，不授予任何权限，也不由“只读”名称自动推出。首版只执行同质 parallel-safe 批次；`sequential` 或未知工具使整批按顺序执行，不实现通用路径冲突分析。结果仍按模型调用顺序保持 ReAct 配对，实时完成事件可以按实际完成顺序呈现。
 
 文件工具的 root/file identity 检查不等于任意 shell/脚本的运行隔离。首次切片默认不向模型开放未隔离 shell/任意脚本；需要时 owner 可在 Host 以高权限维护动作明确批准具体命令、cwd 和真实权限范围，该动作不冒充受 root 限制的模型工具，也不能作为 Core 隔离 PASS。后续向模型开放执行能力，须明确其文件/网络/子进程及产品数据根保护边界并用真实执行环境验收；可复用现成隔离机制，不预设自研沙箱。批准 Skill 不自动批准脚本。若无法限制实际进程，就明确为高权限、逐次 owner 批准，不宣称参数 gate 约束了脚本内部行为。
 
@@ -317,9 +325,9 @@ Windows-first；共享 Core/portable/可自动化 OS 用 Windows/macOS/Linux CI 
 | X-01 | P1 | 首次路径的 app-id/数据根、schema/FK/CAS/seq/head/intent、pending、Info/outbox、stream owner/fence 与 inert proposal 完整 digest；不预建可选 artifact 或行为评估表，portable/Host 分列。 |
 | X-02 | P2 | eligibility、FTS/CJK、current 去重与本地冻结需求语料/held-out；历史 60 用例取得后追加，不是开跑硬前置，不伪称复用。 |
 | X-03 | P1 | 实际 search worker 的乱序/重复/崩溃/lease、FTS 损坏重建与双向完整性；overview 后续子项验 SQLite body/refs/cursor 原子性、历史证据与新版本重建。 |
-| X-04 | P2，P3 接线复验 | bootstrap、硬上下文及累计 run 预算、取消、四级降级、完整 ReAct、source ack/recovery、单主调用快路径和失败后正常继续。 |
+| X-04 | P2，P3 接线复验 | bootstrap、硬上下文及累计 run 预算、取消、四级降级、完整 ReAct、source ack/recovery、单主调用快路径和失败后正常继续；补充验证 `received → admitted-to-loop → bound-to-assembly`、默认 steer 的完整批次边界、follow-up/queue/cancel 分流、局部工具错误隔离和严格终态；fake provider/受控工具仅用于状态机反馈回路，仍须在合成数据上用真实 provider 完成接线证据。 |
 | X-05 | P2，P3 补齐 | 按 12 通用组验 project/scope、本地 AGENTS/Skill/provider metadata 与 Core gate；MCP 和 Pi loading 分别为后续追加组。共享隔离失败与能力专属失败分开处理，未启用能力不阻塞首次 CLI。 |
-| X-06 | P1，P3 接线复验 | 两道 barrier、started 与撤销的并发线性化、payload/网络计数、unknown-sent 对账/封存与 recovery gap；有正常发送及继续路径，stub 不替代真实接线。 |
+| X-06 | P1，P3 接线复验 | 两道 barrier、started 与撤销的并发线性化、payload/网络计数、unknown-sent 对账/封存与 recovery gap；有正常发送及继续路径，stub 不替代真实接线；补充验证 Core 结果信封、未启动/已启动/unknown 区分、普通错误的兄弟调用继续、`executionMode` 批次顺序、权威事件 durable-before-terminal-presentation 和迟到结果不触发新调用。 |
 | X-07 | P2 | capture/独立取源、08 状态转换表、时间/冲突/回滚/抑制/Info、retrieved/injected 和 inert proposal 无行为权限；scope review/backfill 是后续子项，无行为 evaluation runner。 |
 | X-08 | 独立课程票 | owner 预封存 pre-image/held-out、重签篡改、known-bad、负迁移及正向严格改善/其他零回归；不替代 P2 runtime 安全门禁。 |
 | X-09 | P2 Core，P3 Host | actual-used inspect、correct/forget/restore/rollback、完整 batch CAS、结构化 cycle-safe purge 和真实模型 tool-call 后 Host 重验；物理副本归 X-12。 |
