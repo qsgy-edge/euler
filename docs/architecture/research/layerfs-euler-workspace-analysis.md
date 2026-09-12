@@ -273,6 +273,7 @@ LayerFS 最多提供其中的 workspace snapshot，不能代替整套 capsule、
 - [Euler README](../README.md)
 - [Euler v1 实施规格](../issues/15-euler-v1-spec.md)
 - [Euler 记忆演化设计](../issues/08-automate-memory-evolution.md)
+- [Euler 运行质量评估与自进化接点：实现准备记录](runtime-quality-evaluation-notes.md)（历史会话分析；目标会话仍在继续，阈值与实现尚未定案）
 - [Euler 上下文装配与执行账本设计](../issues/09-assemble-context-safely.md)
 - [Euler 存储、索引与投影设计](../issues/10-choose-storage-projections.md)
 - [Euler 目标范围、迁移和验收矩阵](../issues/13-select-target-v1-migration.md)
