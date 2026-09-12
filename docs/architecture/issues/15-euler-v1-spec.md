@@ -230,6 +230,8 @@ Core policy 是受保护 channel，AGENTS 为独立 P0 guidance，带 owner/scop
 
 每次 tool call 重新检查 policy、capability、credential、scope、参数、实际 resource owner、批准与 receipt。文件/命令/交互由 HostAdapter 提供，不能绕过 Core；不可用显式返回 unavailable。Tool schema、AGENTS、Skill allowed-tools、memory/source 与模型自述都不能授权。
 
+自研 CLI 首版必须等待整条 assistant response 完整结束，并将完整 assistant/tool-call durable 归档后，才开始调度其中的工具。模型响应仍在生成时，即使某个 tool call 及其参数已经完整，也不得提前执行。
+
 Host tool descriptor 另外提供显式 `executionMode` 调度资格；`parallel-safe` 只表示可进入有界并行批次，不授予任何权限，也不由“只读”名称自动推出。首版只执行同质 parallel-safe 批次；`sequential` 或未知工具使整批按顺序执行，不实现通用路径冲突分析。结果仍按模型调用顺序保持 ReAct 配对，实时完成事件可以按实际完成顺序呈现。
 
 文件工具的 root/file identity 检查不等于任意 shell/脚本的运行隔离。首次切片默认不向模型开放未隔离 shell/任意脚本；需要时 owner 可在 Host 以高权限维护动作明确批准具体命令、cwd 和真实权限范围，该动作不冒充受 root 限制的模型工具，也不能作为 Core 隔离 PASS。后续向模型开放执行能力，须明确其文件/网络/子进程及产品数据根保护边界并用真实执行环境验收；可复用现成隔离机制，不预设自研沙箱。批准 Skill 不自动批准脚本。若无法限制实际进程，就明确为高权限、逐次 owner 批准，不宣称参数 gate 约束了脚本内部行为。
@@ -327,7 +329,7 @@ Windows-first；共享 Core/portable/可自动化 OS 用 Windows/macOS/Linux CI 
 | X-03 | P1 | 实际 search worker 的乱序/重复/崩溃/lease、FTS 损坏重建与双向完整性；overview 后续子项验 SQLite body/refs/cursor 原子性、历史证据与新版本重建。 |
 | X-04 | P2，P3 接线复验 | bootstrap、硬上下文及累计 run 预算、取消、四级降级、完整 ReAct、source ack/recovery、单主调用快路径和失败后正常继续；补充验证 `received → admitted-to-loop → bound-to-assembly`、默认 steer 的完整批次边界、follow-up/queue/cancel 分流、局部工具错误隔离和严格终态；fake provider/受控工具仅用于状态机反馈回路，仍须在合成数据上用真实 provider 完成接线证据。 |
 | X-05 | P2，P3 补齐 | 按 12 通用组验 project/scope、本地 AGENTS/Skill/provider metadata 与 Core gate；MCP 和 Pi loading 分别为后续追加组。共享隔离失败与能力专属失败分开处理，未启用能力不阻塞首次 CLI。 |
-| X-06 | P1，P3 接线复验 | 两道 barrier、started 与撤销的并发线性化、payload/网络计数、unknown-sent 对账/封存与 recovery gap；有正常发送及继续路径，stub 不替代真实接线；补充验证 Core 结果信封、未启动/已启动/unknown 区分、普通错误的兄弟调用继续、`executionMode` 批次顺序、权威事件 durable-before-terminal-presentation 和迟到结果不触发新调用。 |
+| X-06 | P1，P3 接线复验 | 两道 barrier、started 与撤销的并发线性化、payload/网络计数、unknown-sent 对账/封存与 recovery gap；有正常发送及继续路径，stub 不替代真实接线；补充验证 Core 结果信封、未启动/已启动/unknown 区分、普通错误的兄弟调用继续、`executionMode` 批次顺序、权威事件 durable-before-terminal-presentation 和迟到结果不触发新调用；自研 CLI 须验证同一响应中已出现完整 tool call、但响应尚未结束时，工具执行次数为 0；完整响应结束并 durable 归档后，通过 gate 的调用正常执行。 |
 | X-07 | P2 | capture/独立取源、08 状态转换表、时间/冲突/回滚/抑制/Info、retrieved/injected 和 inert proposal 无行为权限；scope review/backfill 是后续子项，无行为 evaluation runner。 |
 | X-08 | 独立课程票 | owner 预封存 pre-image/held-out、重签篡改、known-bad、负迁移及正向严格改善/其他零回归；不替代 P2 runtime 安全门禁。 |
 | X-09 | P2 Core，P3 Host | actual-used inspect、correct/forget/restore/rollback、完整 batch CAS、结构化 cycle-safe purge 和真实模型 tool-call 后 Host 重验；物理副本归 X-12。 |
