@@ -7,5 +7,5 @@ export type {
   Activity, ExecutionOwner, ExecutionStream, AttemptOwnership, Intent, IntentTransition, MemoryType, MemoryLifecycle, MemoryVerification, MemoryScopeKind,
   MemoryScope, MemoryCaptureOptions, MemoryRecord, MemoryOperation, ConflictOperation,
   MemoryChange, MemoryPresentation, MemoryOperationResult, OwnerReceipt, ActivationBatch,
-  EvolutionProposalInput, EvolutionProposal,
+  EvolutionProposalInput, EvolutionProposal, SearchResult, SearchProjectionReceipt,
 } from './store/probe-store.ts';
