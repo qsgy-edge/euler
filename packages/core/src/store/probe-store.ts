@@ -1116,7 +1116,8 @@ export class ProbeStore {
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= 128, 'invalid-projection-limit');
       const jobs = this.#db.prepare(`SELECT j.*, j.rowid AS projection_rowid FROM projection_jobs j
         LEFT JOIN search_projection_jobs p ON p.job_id=j.job_id
-        WHERE j.kind='search' AND p.job_id IS NULL ORDER BY j.rowid LIMIT ?`).all(limit);
+        WHERE j.kind='search' AND p.job_id IS NULL AND j.owner_id=? AND ${this.#visibleScopeSql('j')}
+        ORDER BY j.rowid LIMIT ?`).all(this.#binding.ownerId, ...this.#scopeParameters(), limit);
       const receipts: SearchProjectionReceipt[] = [];
       for (const job of jobs) {
         const payload = String(job.payload);
@@ -1151,23 +1152,10 @@ export class ProbeStore {
 
   rebuildSearchProjection(activity: Activity): SearchProjectionReceipt[] {
     return this.withActivity(activity, () => {
-      this.#db.exec('DROP TABLE search_fts; CREATE VIRTUAL TABLE search_fts USING fts5(content, content=\'search_documents\', content_rowid=\'rowid\'); DELETE FROM search_documents;');
-      const receipts: SearchProjectionReceipt[] = [];
-      const eligible = this.#db.prepare(`SELECT record_id FROM memory_heads WHERE lifecycle='active' AND verification='verified'
-        AND scope_resolved=1 AND ${this.#visibleScopeSql('memory_heads')}`).all(...this.#scopeParameters());
-      for (const row of eligible) {
-        const record = this.#readMemoryUnsafe(String(row.record_id));
-        if (record.conflictSetId || !record.appliesTo.every(condition => ['cli', process.platform].includes(condition))) continue;
-        const indexed = `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim();
-        const generation = record.revision;
-        this.#db.prepare(`INSERT INTO search_documents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(record.recordId, this.#binding.ownerId,
-          record.recordId, record.revisionId, this.#binding.projectId, record.scope.kind, record.scope.id, record.lifecycle,
-          record.verification, 'normal', indexed, record.contentHash, record.revision, 'cjk-2gram@1', generation);
-        const inserted = this.#db.prepare('SELECT rowid FROM search_documents WHERE unit_id=?').get(record.recordId);
-        this.#db.prepare('INSERT INTO search_fts(rowid,content) VALUES (?,?)').run(Number(inserted!.rowid), indexed);
-        receipts.push({ jobId: '', eventId: record.headEventId, status: 'done', generation, reason: 'rebuild' });
-      }
-      return receipts;
+      this.#db.exec(`DROP TABLE search_fts;
+        CREATE VIRTUAL TABLE search_fts USING fts5(content, content='search_documents', content_rowid='rowid');
+        INSERT INTO search_fts(search_fts) VALUES ('rebuild');`);
+      return [];
     });
   }
 
@@ -1226,7 +1214,7 @@ export class ProbeStore {
     });
   }
 
-  #visibleScopeSql(alias: 'projection_jobs' | 'memory_heads' | 'v' | 'd'): string {
+  #visibleScopeSql(alias: 'projection_jobs' | 'memory_heads' | 'v' | 'd' | 'j'): string {
     return `((${alias}.scope_kind='project' AND ${alias}.scope_id=?) OR (${alias}.scope_kind='personal' AND ${alias}.scope_id=?)
       OR (${alias}.scope_kind='session' AND ${alias}.scope_id=?) OR (${alias}.scope_kind='workspace' AND EXISTS
         (SELECT 1 FROM workspace_projects w WHERE w.workspace_id=${alias}.scope_id AND w.project_id=?)))`;
@@ -1979,8 +1967,10 @@ function normalizeSearchText(value: string): string {
   return value.normalize('NFC').toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 }
 function cjkBigrams(value: string): string {
-  const chars = Array.from(value.normalize('NFC')).filter(char => /\p{Script=Han}/u.test(char));
-  return chars.slice(0, -1).map((char, index) => `${char}${chars[index + 1]}`).join(' ');
+  return value.normalize('NFC').match(/[\p{Script=Han}]+/gu)?.flatMap(run => {
+    const chars = Array.from(run);
+    return chars.slice(0, -1).map((char, index) => `${char}${chars[index + 1]}`);
+  }).join(' ') ?? '';
 }
 
 function processAbsent(pid: number): boolean {
