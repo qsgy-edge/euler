@@ -1152,10 +1152,27 @@ export class ProbeStore {
 
   rebuildSearchProjection(activity: Activity): SearchProjectionReceipt[] {
     return this.withActivity(activity, () => {
+      const canonical = this.#db.prepare(`SELECT record_id FROM memory_heads
+        WHERE ${this.#visibleScopeSql('memory_heads')}`).all(...this.#scopeParameters());
+      this.#db.prepare(`DELETE FROM search_documents WHERE owner_id=? AND ${this.#visibleScopeSql('search_documents')}`)
+        .run(this.#binding.ownerId, ...this.#scopeParameters());
+      const receipts: SearchProjectionReceipt[] = [];
+      for (const row of canonical) {
+        const record = this.#readMemoryUnsafe(String(row.record_id));
+        const eligible = record.lifecycle === 'active' && record.verification === 'verified' && record.scope.resolved
+          && !record.conflictSetId && record.appliesTo.every(condition => ['cli', process.platform].includes(condition));
+        if (!eligible) continue;
+        const indexed = `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim();
+        const generation = record.revision;
+        this.#db.prepare(`INSERT INTO search_documents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(record.recordId, this.#binding.ownerId,
+          record.recordId, record.revisionId, this.#binding.projectId, record.scope.kind, record.scope.id, record.lifecycle,
+          record.verification, 'normal', indexed, record.contentHash, record.revision, 'cjk-2gram@1', generation);
+        receipts.push({ jobId: '', eventId: record.headEventId, status: 'done', generation, reason: 'rebuild' });
+      }
       this.#db.exec(`DROP TABLE search_fts;
         CREATE VIRTUAL TABLE search_fts USING fts5(content, content='search_documents', content_rowid='rowid');
         INSERT INTO search_fts(search_fts) VALUES ('rebuild');`);
-      return [];
+      return receipts;
     });
   }
 
@@ -1171,7 +1188,8 @@ export class ProbeStore {
         const record = this.#readMemoryUnsafe(String(row.record_id));
         const eligible = record.lifecycle === 'active' && record.verification === 'verified' && record.scope.resolved
           && !record.conflictSetId && record.appliesTo.every(condition => ['cli', process.platform].includes(condition));
-        check(eligible, 'search-evidence-gap');
+        check(eligible && String(row.content_hash) === record.contentHash
+          && String(row.content) === `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim(), 'search-evidence-gap');
         this.#validateScope(record.scope);
         return { unitId: String(row.unit_id), record, exposureMode: String(row.exposure_mode) as 'normal' | 'status_only', rank: Number(row.rank) };
       });
@@ -1214,7 +1232,7 @@ export class ProbeStore {
     });
   }
 
-  #visibleScopeSql(alias: 'projection_jobs' | 'memory_heads' | 'v' | 'd' | 'j'): string {
+  #visibleScopeSql(alias: 'projection_jobs' | 'memory_heads' | 'v' | 'd' | 'j' | 'search_documents'): string {
     return `((${alias}.scope_kind='project' AND ${alias}.scope_id=?) OR (${alias}.scope_kind='personal' AND ${alias}.scope_id=?)
       OR (${alias}.scope_kind='session' AND ${alias}.scope_id=?) OR (${alias}.scope_kind='workspace' AND EXISTS
         (SELECT 1 FROM workspace_projects w WHERE w.workspace_id=${alias}.scope_id AND w.project_id=?)))`;
