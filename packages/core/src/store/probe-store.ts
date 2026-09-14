@@ -3,8 +3,10 @@ import { lstatSync, readdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { userInfo } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
-import { check, sameBinding, sha256, uuid } from '../contracts.ts';
-import type { Binding, SourceAck } from '../contracts.ts';
+import { check, sameBinding, sha256, uuid, validateBudget } from '../contracts.ts';
+import type { Binding, ProbeBudget, SourceAck } from '../contracts.ts';
+import { REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, assemblyIdentityHash, deriveAssemblyState, freezeRequestPayload } from './request-ledger.ts';
+import type { RequestAssembly, RequestAssemblyInput, RequestAttempt, RequestEvent, RequestEventKind, RequestRun, RequestStatus } from './request-ledger.ts';
 
 export interface FileIdentity { dev: string; ino: string }
 export interface BoundFile { path: string; identity: FileIdentity }
@@ -125,7 +127,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=7), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=8), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -207,6 +209,37 @@ WHEN NEW.version!=(SELECT COALESCE(MAX(version),0)+1 FROM intent_events WHERE se
 BEGIN SELECT RAISE(ABORT,'intent-sequence-conflict'); END;
 CREATE TRIGGER immutable_intent_update BEFORE UPDATE ON intent_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_intent_delete BEFORE DELETE ON intent_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TABLE request_runs (
+  run_id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES execution_streams(stream_id), owner_kind TEXT NOT NULL,
+  owner_id TEXT NOT NULL, authorization_id TEXT NOT NULL, activity_id TEXT NOT NULL REFERENCES owner_activities(id),
+  epoch INTEGER NOT NULL, budget TEXT NOT NULL, intent_event_id TEXT, intent_hash TEXT, related_run_id TEXT,
+  authorized_at TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('authorized','revoked','sealed'))
+) STRICT;
+CREATE TABLE request_events (
+  event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES request_runs(run_id),
+  seq INTEGER NOT NULL CHECK(seq>0),
+  kind TEXT NOT NULL CHECK(kind IN ('run-authorized','run-revoked','run-sealed','context/assembly@v1','model/request-attempt-started@v1','model/request-attempt-finished@v1')),
+  attempt_id TEXT REFERENCES request_attempts(attempt_id), activity_id TEXT NOT NULL REFERENCES owner_activities(id),
+  created_at TEXT NOT NULL, payload TEXT NOT NULL, hash TEXT NOT NULL, UNIQUE(run_id,seq)
+) STRICT;
+CREATE TABLE request_assemblies (
+  assembly_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES request_runs(run_id), epoch INTEGER NOT NULL,
+  route TEXT NOT NULL, model TEXT NOT NULL, policy_hash TEXT NOT NULL, estimator TEXT NOT NULL,
+  identity_hash TEXT NOT NULL, payload_hash TEXT NOT NULL, byte_length INTEGER NOT NULL CHECK(byte_length>0),
+  estimated_tokens INTEGER NOT NULL CHECK(estimated_tokens>0), budget TEXT NOT NULL, sources TEXT NOT NULL,
+  intent_event_id TEXT, intent_hash TEXT, zones TEXT NOT NULL, selection TEXT NOT NULL, degradation TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('not-dispatched','unknown-sent','finished')),
+  UNIQUE(run_id,identity_hash)
+) STRICT;
+CREATE TABLE request_attempts (
+  attempt_id TEXT PRIMARY KEY REFERENCES execution_events(attempt_id),
+  assembly_id TEXT NOT NULL REFERENCES request_assemblies(assembly_id),
+  run_id TEXT NOT NULL REFERENCES request_runs(run_id), ordinal INTEGER NOT NULL CHECK(ordinal>0),
+  payload_hash TEXT NOT NULL, byte_length INTEGER NOT NULL CHECK(byte_length>0), encoding TEXT NOT NULL,
+  hash_algorithm TEXT NOT NULL, adapter_version TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
+  outcome TEXT NOT NULL CHECK(outcome IN ('unknown-sent','received','cancelled-before-send')),
+  UNIQUE(assembly_id,ordinal)
+) STRICT;
 CREATE TABLE projects (project_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL) STRICT;
 CREATE TABLE project_resources (
   project_id TEXT NOT NULL REFERENCES projects(project_id), path TEXT NOT NULL, dev TEXT NOT NULL, ino TEXT NOT NULL,
@@ -414,15 +447,15 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=7;
-` + ['workspaces','workspace_projects','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events'].map(table => `
+PRAGMA user_version=8;
+` + ['workspaces','workspace_projects','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
-`).join('') + ['memory_heads','intent_heads','owner_fences','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
+`).join('') + ['memory_heads','intent_heads','owner_fences','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
   'verification_runs','verification_evidence','proposal_evidence','projection_jobs','feedback_events','search_projection_jobs','conflict_sets','conflict_members','evolution_proposals'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
-`).join('') + ['memory_heads','intent_heads','owner_fences','host_presentations','pending_operations','owner_activities','maintenance_residuals'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
+`).join('') + ['memory_heads','intent_heads','owner_fences','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
 CREATE TRIGGER owned_${table}_${operation.toLowerCase()} BEFORE ${operation} ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
 `)).join('') + `
@@ -468,15 +501,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,7,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,8,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 7, 'unsupported-probe-schema');
+        check(version === 8, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 7 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 8 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -671,6 +704,256 @@ export class ProbeStore {
     });
   }
 
+  // --- I11/T06 request ledger: durable, recoverable request facts. ----------------
+  // Content stays in the owner source archive; these rows hold only the frozen
+  // references, hashes, budgets and states. Receipts are log-only (Ticket 09 §14).
+
+  #requestEvent(runId: string, kind: RequestEventKind, attemptId: string | null, payload: string, activityId: string): RequestEvent {
+    const seq = Number(this.#db.prepare('SELECT COALESCE(MAX(seq),0)+1 AS seq FROM request_events WHERE run_id=?').get(runId)!.seq);
+    const eventId = randomUUID();
+    const createdAt = new Date().toISOString();
+    const hash = sha256(payload);
+    this.#db.prepare('INSERT INTO request_events VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(eventId, runId, seq, kind, attemptId, activityId, createdAt, payload, hash);
+    return { eventId, runId, seq, kind, attemptId, activityId, createdAt, payload, hash };
+  }
+
+  #requestRun(activity: Activity, runId: string): RequestRun {
+    uuid(runId);
+    const row = this.#db.prepare('SELECT * FROM request_runs WHERE run_id=?').get(runId);
+    check(row, 'unknown-run');
+    check(row.stream_id === activity.streamId, 'request-scope-mismatch');
+    const budget = JSON.parse(String(row.budget)) as ProbeBudget;
+    validateBudget(budget);
+    return {
+      runId, streamId: String(row.stream_id), ownerKind: String(row.owner_kind) as RequestRun['ownerKind'],
+      ownerId: String(row.owner_id), authorizationId: String(row.authorization_id), activityId: String(row.activity_id),
+      epoch: Number(row.epoch), budget, intent: row.intent_event_id ? { eventId: String(row.intent_event_id), hash: String(row.intent_hash) } : null,
+      relatedRunId: row.related_run_id ? String(row.related_run_id) : null,
+      authorizedAt: String(row.authorized_at), state: String(row.state) as RequestRun['state'],
+    };
+  }
+
+  #requestAssembly(row: Record<string, unknown>): RequestAssembly {
+    return {
+      assemblyId: String(row.assembly_id), runId: String(row.run_id), epoch: Number(row.epoch),
+      route: String(row.route), model: String(row.model), policyHash: String(row.policy_hash),
+      estimator: String(row.estimator) as RequestAssembly['estimator'], identityHash: String(row.identity_hash),
+      payloadHash: String(row.payload_hash), byteLength: Number(row.byte_length),
+      estimatedTokens: Number(row.estimated_tokens), budget: JSON.parse(String(row.budget)),
+      sources: JSON.parse(String(row.sources)),
+      intent: row.intent_event_id ? { eventId: String(row.intent_event_id), hash: String(row.intent_hash) } : null,
+      zones: JSON.parse(String(row.zones)), selection: JSON.parse(String(row.selection)),
+      degradation: String(row.degradation) as RequestAssembly['degradation'],
+    };
+  }
+
+  #requestAttempt(row: Record<string, unknown>, run: RequestRun): RequestAttempt {
+    return {
+      attemptId: String(row.attempt_id), runId: String(row.run_id), streamId: run.streamId,
+      ownerKind: run.ownerKind, ownerId: run.ownerId, assemblyId: String(row.assembly_id),
+      ordinal: Number(row.ordinal), payloadHash: String(row.payload_hash), byteLength: Number(row.byte_length),
+      encoding: String(row.encoding) as RequestAttempt['encoding'],
+      hashAlgorithm: String(row.hash_algorithm) as RequestAttempt['hashAlgorithm'],
+      adapterVersion: String(row.adapter_version), startedAt: String(row.started_at),
+      finishedAt: row.finished_at ? String(row.finished_at) : null,
+      outcome: String(row.outcome) as RequestAttempt['outcome'],
+    };
+  }
+
+  authorizeRequestRun(activity: Activity, runId: string, input: { budget: ProbeBudget; intent: { eventId: string; hash: string } | null; relatedRunId: string | null }): RequestRun {
+    return this.withActivity(activity, () => {
+      uuid(runId);
+      validateBudget(input.budget);
+      if (input.relatedRunId) uuid(input.relatedRunId);
+      if (input.intent) { uuid(input.intent.eventId); check(input.intent.hash.length === 64, 'invalid-intent-ref'); }
+      const stream = this.#readStream(activity.streamId);
+      check(stream.ownerKind !== 'maintenance', 'maintenance-business-unavailable');
+      check(!this.#db.prepare('SELECT 1 FROM request_runs WHERE run_id=?').get(runId), 'run-identity-conflict');
+      const authorizedAt = new Date().toISOString();
+      this.#db.prepare('INSERT INTO request_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(runId, stream.streamId, stream.ownerKind, stream.ownerId, stream.authorization.id, activity.id,
+          activity.epoch, JSON.stringify(input.budget), input.intent?.eventId ?? null, input.intent?.hash ?? null,
+          input.relatedRunId, authorizedAt, 'authorized');
+      this.#requestEvent(runId, 'run-authorized', null, JSON.stringify({ schema: 'run-authorized@1', runId,
+        streamId: stream.streamId, ownerKind: stream.ownerKind, ownerId: stream.ownerId,
+        authorizationId: stream.authorization.id, activityId: activity.id, epoch: activity.epoch,
+        budget: input.budget, intent: input.intent, relatedRunId: input.relatedRunId, authorizedAt }), activity.id);
+      return this.#requestRun(activity, runId);
+    });
+  }
+
+  appendRequestAssembly(activity: Activity, input: RequestAssemblyInput): RequestAssembly {
+    return this.withActivity(activity, () => {
+      const run = this.#requestRun(activity, input.runId);
+      check(run.state === 'authorized' && run.epoch === activity.epoch, 'run-not-admissible');
+      check(input.degradation === 'none' && input.estimator === 'utf8-bytes-upper-bound@1'
+        && input.route.length > 0 && input.model.length > 0 && input.policyHash.length === 64
+        && input.sources.length > 0 && input.sources.every(source => source.schema === 'cli-source-ack@1' && source.status === 'durable')
+        && input.selection.length === input.sources.length, 'invalid-assembly');
+      const frozen = freezeRequestPayload(input.payload);
+      check(frozen.payloadHash === input.payloadHash && frozen.byteLength === input.byteLength
+        && input.byteLength > 0 && input.estimatedTokens > 0, 'payload-freeze-mismatch');
+      const identityHash = assemblyIdentityHash(input);
+      const existing = this.#db.prepare('SELECT * FROM request_assemblies WHERE run_id=? AND identity_hash=?')
+        .get(input.runId, identityHash);
+      if (existing) {
+        check(existing.payload_hash === input.payloadHash && existing.byte_length === input.byteLength
+          && existing.epoch === input.epoch && existing.route === input.route && existing.model === input.model
+          && existing.policy_hash === input.policyHash && existing.estimator === input.estimator
+          && existing.estimated_tokens === input.estimatedTokens && existing.budget === JSON.stringify(input.budget)
+          && existing.sources === JSON.stringify(input.sources)
+          && existing.intent_event_id === (input.intent?.eventId ?? null)
+          && existing.intent_hash === (input.intent?.hash ?? null)
+          && existing.zones === JSON.stringify(input.zones) && existing.selection === JSON.stringify(input.selection)
+          && existing.degradation === input.degradation, 'assembly-identity-conflict');
+        return this.#requestAssembly(existing);
+      }
+      const assemblyId = randomUUID();
+      this.#db.prepare('INSERT INTO request_assemblies VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(assemblyId, input.runId, input.epoch, input.route, input.model, input.policyHash, input.estimator,
+          identityHash, input.payloadHash, input.byteLength, input.estimatedTokens, JSON.stringify(input.budget),
+          JSON.stringify(input.sources), input.intent?.eventId ?? null, input.intent?.hash ?? null,
+          JSON.stringify(input.zones), JSON.stringify(input.selection), input.degradation, 'not-dispatched');
+      this.#requestEvent(input.runId, 'context/assembly@v1', null, JSON.stringify({
+        schema: 'context/assembly@v1', assemblyId, runId: input.runId, epoch: input.epoch, route: input.route,
+        model: input.model, policyHash: input.policyHash, estimator: input.estimator, payloadHash: input.payloadHash,
+        byteLength: input.byteLength, estimatedTokens: input.estimatedTokens, budget: input.budget,
+        zones: input.zones, selection: input.selection,
+        sources: input.sources.map(source => ({ eventId: source.eventId, hash: source.hash })),
+        intent: input.intent, degradation: input.degradation,
+      }), activity.id);
+      return this.#requestAssembly(this.#db.prepare('SELECT * FROM request_assemblies WHERE assembly_id=?').get(assemblyId)!);
+    });
+  }
+
+  revokeRequestRun(activity: Activity, runId: string): RequestRun {
+    return this.withActivity(activity, () => {
+      const run = this.#requestRun(activity, runId);
+      if (run.state === 'revoked') return run;
+      check(run.state === 'authorized', 'run-sealed');
+      this.#db.prepare("UPDATE request_runs SET state='revoked' WHERE run_id=?").run(runId);
+      this.#requestEvent(runId, 'run-revoked', null, JSON.stringify({ schema: 'run-revoked@1', runId,
+        activityId: activity.id, revokedAt: new Date().toISOString() }), activity.id);
+      return this.#requestRun(activity, runId);
+    });
+  }
+
+  sealRequestRun(activity: Activity, runId: string): RequestRun {
+    return this.withActivity(activity, () => {
+      const run = this.#requestRun(activity, runId);
+      if (run.state === 'sealed') return run;
+      this.#db.prepare("UPDATE request_runs SET state='sealed' WHERE run_id=?").run(runId);
+      this.#requestEvent(runId, 'run-sealed', null, JSON.stringify({ schema: 'run-sealed@1', runId,
+        activityId: activity.id, sealedAt: new Date().toISOString() }), activity.id);
+      return this.#requestRun(activity, runId);
+    });
+  }
+
+  startRequestAttempt(activity: Activity, input: { runId: string; assemblyId: string; payloadHash: string; byteLength: number; adapterVersion: string }): RequestAttempt {
+    return this.withActivity(activity, () => {
+      const run = this.#requestRun(activity, input.runId);
+      check(run.state === 'authorized' && run.epoch === activity.epoch, 'run-not-admissible');
+      uuid(input.assemblyId);
+      check(input.payloadHash.length === 64 && input.byteLength > 0 && input.adapterVersion.length > 0, 'invalid-attempt');
+      const assembly = this.#db.prepare('SELECT * FROM request_assemblies WHERE assembly_id=? AND run_id=?')
+        .get(input.assemblyId, input.runId);
+      check(assembly, 'unknown-assembly');
+      check(assembly.state !== 'unknown-sent', 'unknown-attempt-requires-reconciliation');
+      check(assembly.payload_hash === input.payloadHash && assembly.byte_length === input.byteLength, 'attempt-payload-mismatch');
+      // Admission linearization point: the attempt/activity registration commits
+      // atomically with the re-verified authorization snapshot (Ticket 09 §15a).
+      const ownership = this.bindAttempt(activity, input.runId);
+      const ordinal = Number(this.#db.prepare('SELECT COUNT(*) AS n FROM request_attempts WHERE assembly_id=?')
+        .get(input.assemblyId)!.n) + 1;
+      const startedAt = new Date().toISOString();
+      this.#db.prepare('INSERT INTO request_attempts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(ownership.attemptId, input.assemblyId, input.runId, ordinal, input.payloadHash, input.byteLength,
+          REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, input.adapterVersion, startedAt, null, 'unknown-sent');
+      this.#db.prepare("UPDATE request_assemblies SET state='unknown-sent' WHERE assembly_id=?").run(input.assemblyId);
+      this.#requestEvent(input.runId, 'model/request-attempt-started@v1', ownership.attemptId, JSON.stringify({
+        schema: 'model/request-attempt-started@v1', attemptId: ownership.attemptId, runId: input.runId,
+        assemblyId: input.assemblyId, ordinal, route: String(assembly.route), model: String(assembly.model),
+        payloadHash: input.payloadHash, byteLength: input.byteLength, encoding: REQUEST_ENCODING,
+        hashAlgorithm: REQUEST_HASH_ALGORITHM, adapterVersion: input.adapterVersion, startedAt,
+      }), activity.id);
+      return this.#requestAttempt(this.#db.prepare('SELECT * FROM request_attempts WHERE attempt_id=?').get(ownership.attemptId)!, run);
+    });
+  }
+
+  finishRequestAttempt(activity: Activity, input: { attemptId: string; outcome: 'received' | 'cancelled-before-send'; usage?: { count: number } | null }): RequestAttempt {
+    return this.withActivity(activity, () => {
+      uuid(input.attemptId);
+      check(input.outcome === 'received' || input.outcome === 'cancelled-before-send', 'invalid-attempt-outcome');
+      const row = this.#db.prepare('SELECT * FROM request_attempts WHERE attempt_id=?').get(input.attemptId);
+      check(row, 'unknown-attempt');
+      check(row.outcome === 'unknown-sent', 'attempt-settled-or-unknown');
+      const finishedAt = new Date().toISOString();
+      this.#db.prepare('UPDATE request_attempts SET outcome=?, finished_at=? WHERE attempt_id=?')
+        .run(input.outcome, finishedAt, input.attemptId);
+      const outcomes = this.#db.prepare('SELECT outcome FROM request_attempts WHERE assembly_id=? ORDER BY ordinal')
+        .all(String(row.assembly_id)).map(attempt => ({ outcome: String(attempt.outcome) as RequestAttempt['outcome'] }));
+      this.#db.prepare('UPDATE request_assemblies SET state=? WHERE assembly_id=?')
+        .run(deriveAssemblyState(outcomes), String(row.assembly_id));
+      this.#requestEvent(String(row.run_id), 'model/request-attempt-finished@v1', input.attemptId, JSON.stringify({
+        schema: 'model/request-attempt-finished@v1', attemptId: input.attemptId, runId: String(row.run_id),
+        assemblyId: String(row.assembly_id), ordinal: Number(row.ordinal), outcome: input.outcome,
+        finishedAt, usage: input.usage ?? null,
+      }), activity.id);
+      return this.#requestAttempt(this.#db.prepare('SELECT * FROM request_attempts WHERE attempt_id=?').get(input.attemptId)!,
+        this.#requestRun(activity, String(row.run_id)));
+    });
+  }
+
+  requestStatus(activity: Activity, runId: string): RequestStatus {
+    return this.withActivity(activity, () => {
+      const run = this.#requestRun(activity, runId);
+      const events = this.#db.prepare('SELECT * FROM request_events WHERE run_id=? ORDER BY seq').all(runId);
+      const assemblies = this.#db.prepare('SELECT * FROM request_assemblies WHERE run_id=? ORDER BY rowid').all(runId);
+      const attempts = this.#db.prepare('SELECT * FROM request_attempts WHERE run_id=? ORDER BY rowid').all(runId);
+      for (const [index, row] of events.entries()) {
+        check(row.seq === index + 1 && sha256(String(row.payload)) === row.hash, 'ledger-evidence-gap');
+        const payload = JSON.parse(String(row.payload)) as Record<string, unknown>;
+        check(payload.runId === runId, 'ledger-evidence-gap');
+        if (row.kind === 'context/assembly@v1') {
+          check(row.attempt_id === null && assemblies.some(assembly => assembly.assembly_id === payload.assemblyId), 'ledger-evidence-gap');
+        } else if (row.kind === 'model/request-attempt-started@v1' || row.kind === 'model/request-attempt-finished@v1') {
+          check(row.attempt_id === payload.attemptId && attempts.some(attempt => attempt.attempt_id === row.attempt_id), 'ledger-evidence-gap');
+        } else check(row.attempt_id === null, 'ledger-evidence-gap');
+      }
+      const startedEvents = new Set(events.filter(row => row.kind === 'model/request-attempt-started@v1').map(row => String(row.attempt_id)));
+      const finishedEvents = new Set(events.filter(row => row.kind === 'model/request-attempt-finished@v1').map(row => String(row.attempt_id)));
+      const assemblyEvents = new Set(events.filter(row => row.kind === 'context/assembly@v1')
+        .map(row => (JSON.parse(String(row.payload)) as { assemblyId: string }).assemblyId));
+      check(assemblyEvents.size === assemblies.length
+        && assemblies.every(assembly => assemblyEvents.has(String(assembly.assembly_id))), 'ledger-evidence-gap');
+      check((run.state === 'authorized') === !events.some(row => row.kind === 'run-revoked' || row.kind === 'run-sealed'), 'ledger-evidence-gap');
+      check(run.state !== 'revoked' || events.some(row => row.kind === 'run-revoked'), 'ledger-evidence-gap');
+      check(run.state !== 'sealed' || events.some(row => row.kind === 'run-sealed'), 'ledger-evidence-gap');
+      for (const assembly of assemblies) {
+        const assemblyAttempts = attempts.filter(attempt => attempt.assembly_id === assembly.assembly_id);
+        for (const [index, attempt] of assemblyAttempts.entries()) {
+          check(attempt.ordinal === index + 1 && attempt.payload_hash === assembly.payload_hash
+            && attempt.byte_length === assembly.byte_length, 'ledger-evidence-gap');
+          check(startedEvents.has(String(attempt.attempt_id)), 'ledger-evidence-gap');
+          check((attempt.outcome === 'unknown-sent') === !finishedEvents.has(String(attempt.attempt_id)), 'ledger-evidence-gap');
+        }
+        check(assembly.state === deriveAssemblyState(assemblyAttempts
+          .map(attempt => ({ outcome: String(attempt.outcome) as RequestAttempt['outcome'] }))), 'ledger-evidence-gap');
+      }
+      for (const attempt of attempts) check(assemblies.some(assembly => assembly.assembly_id === attempt.assembly_id), 'ledger-evidence-gap');
+      return {
+        run,
+        events: events.map(row => ({ eventId: String(row.event_id), runId, seq: Number(row.seq),
+          kind: String(row.kind) as RequestEventKind, attemptId: row.attempt_id ? String(row.attempt_id) : null,
+          activityId: String(row.activity_id), createdAt: String(row.created_at),
+          payload: String(row.payload), hash: String(row.hash) })),
+        assemblies: assemblies.map(row => ({ ...this.#requestAssembly(row), state: String(row.state) as RequestStatus['assemblies'][number]['state'] })),
+        attempts: attempts.map(row => this.#requestAttempt(row, run)),
+        revoked: run.state === 'revoked', sealed: run.state === 'sealed',
+      };
+    });
+  }
   bindAttempt(activity: Activity, runId: string): AttemptOwnership {
     return this.withActivity(activity, () => {
       uuid(runId);

@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { API_VERSION, CORE_TOOLS, DEFAULT_BUDGET, check, sameBinding, sha256, validateBudget } from '../contracts.ts';
 import type { HostAdapter, ProbeBudget, SourceAck, SourceExcerpt } from '../contracts.ts';
+import { REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, REQUEST_POLICY_HASH, freezeRequestPayload } from '../store/request-ledger.ts';
 import type { Activity, ExecutionStream, Intent, IntentTransition, ProbeStore } from '../store/probe-store.ts';
+import type { RequestAttempt } from '../store/request-ledger.ts';
 
 export interface PreparedTurn {
   assemblyId: string;
@@ -26,7 +28,7 @@ export interface ProbeReceipt {
   transport: 'local-counting@1';
   count: number;
   outcome: 'received';
-  formalLedger: false;
+  formalLedger: true;
 }
 
 export class ProbeSession {
@@ -42,6 +44,7 @@ export class ProbeSession {
   #tools = 0;
   #tokens = 0;
   #stopped: string | null = null;
+  #completed = false;
 
   constructor(store: ProbeStore, activity: Activity, host: HostAdapter, budget: ProbeBudget = DEFAULT_BUDGET) {
     validateBudget(budget);
@@ -50,6 +53,8 @@ export class ProbeSession {
     this.#activity = activity;
     this.#host = host;
     this.#budget = { ...budget };
+    // The run authorization snapshot is durable before any admission (I11).
+    this.#store.authorizeRequestRun(activity, this.runId, { budget: this.#budget, intent: null, relatedRunId: null });
   }
 
   #active(checkBudget = true): void {
@@ -79,7 +84,19 @@ export class ProbeSession {
       intent: { goal: intent.goal, constraints: intent.constraints, step: intent.step, status: intent.status },
       tools: [],
     });
-    const prepared = { assemblyId: randomUUID(), input, intent, payload, payloadHash: sha256(payload), estimatedTokens: Buffer.byteLength(payload) };
+    // Barrier 1: the frozen assembly (content, route, policy, budget, epoch) is
+    // durably recorded before any dispatch may start (I11; Ticket 09 §15).
+    const frozen = freezeRequestPayload(payload);
+    const assembly = this.#store.appendRequestAssembly(this.#activity, {
+      runId: this.runId, epoch: this.#activity.epoch, route: 'local-counting', model: 'none',
+      policyHash: REQUEST_POLICY_HASH, estimator: 'utf8-bytes-upper-bound@1', sources: [input],
+      intent: { eventId: intent.eventId, hash: intent.hash }, payload,
+      payloadHash: frozen.payloadHash, byteLength: frozen.byteLength, estimatedTokens: frozen.byteLength,
+      budget: this.#budget, zones: { p0: frozen.byteLength, p1: 0, p2: 0, p3: 0 },
+      selection: [{ ordinal: 0, hash: input.hash, reason: 'mandatory-source' }], degradation: 'none',
+    });
+    const prepared = { assemblyId: assembly.assemblyId, input, intent, payload,
+      payloadHash: frozen.payloadHash, estimatedTokens: frozen.byteLength };
     this.#prepared.set(prepared, sha256(JSON.stringify(prepared)));
     return prepared;
   }
@@ -91,9 +108,10 @@ export class ProbeSession {
     check(this.#attempts < this.#budget.maxModelAttempts, 'attempt-budget-exhausted');
     const reserved = prepared.estimatedTokens + this.#budget.outputReserve + this.#budget.safetyMargin;
     check(reserved <= this.#budget.contextLimit && this.#tokens + reserved <= this.#budget.maxTotalTokens, 'context-budget-exhausted');
-    // Synchronous gate and local send share the fence transaction. This is NOT the
-    // production assembly/started ledger or a SQLite/network atomicity claim.
-    return this.#store.withActivity(this.#activity, () => {
+    // Barrier 2: the started transaction is the admission linearization point;
+    // it re-verifies intent/authorization/owner/fence/epoch and registers the
+    // attempt before the transport call (I11; Ticket 09 §15a).
+    const started: RequestAttempt = this.#store.withActivity(this.#activity, () => {
       const gateResult = finalGate();
       if (gateResult instanceof Promise) {
         void gateResult.catch(() => {});
@@ -111,17 +129,28 @@ export class ProbeSession {
       this.#consumed.add(prepared);
       this.#attempts++;
       this.#tokens += reserved;
-      const ownership = this.#store.bindAttempt(this.#activity, this.runId);
-      const received = this.#host.transport.send(prepared.payload);
-      check(received.hash === prepared.payloadHash && received.byteLength === Buffer.byteLength(prepared.payload), 'transport-payload-mismatch');
-      return {
-        schema: 'local-dispatch-probe@1', runId: this.runId, ownerKind: ownership.ownerKind, ownerId: ownership.ownerId,
-        streamId: ownership.streamId, attemptId: ownership.attemptId,
-        assemblyId: prepared.assemblyId, payloadHash: received.hash, byteLength: received.byteLength,
-        encoding: 'utf8-json@1', adapterVersion: API_VERSION, transport: 'local-counting@1',
-        count: received.count, outcome: 'received', formalLedger: false,
-      };
+      return this.#store.startRequestAttempt(this.#activity, { runId: this.runId, assemblyId: prepared.assemblyId,
+        payloadHash: prepared.payloadHash, byteLength: Buffer.byteLength(prepared.payload), adapterVersion: API_VERSION });
     });
+    // Observable cancellation after admission stops the attempt before the
+    // transport call without claiming already-sent bytes back (Ticket 09 §15a).
+    if (this.#stopped) {
+      this.#store.finishRequestAttempt(this.#activity, { attemptId: started.attemptId, outcome: 'cancelled-before-send' });
+      check(false, this.#stopped);
+    }
+    const received = this.#host.transport.send(prepared.payload);
+    // started/no-finished stays durable unknown-sent: a send that cannot prove
+    // completion is never silently retried or rewritten (I11).
+    check(received.hash === prepared.payloadHash && received.byteLength === Buffer.byteLength(prepared.payload), 'transport-payload-mismatch');
+    this.#store.finishRequestAttempt(this.#activity, { attemptId: started.attemptId, outcome: 'received', usage: { count: received.count } });
+    this.#completed = true;
+    return {
+      schema: 'local-dispatch-probe@1', runId: this.runId, ownerKind: started.ownerKind, ownerId: started.ownerId,
+      streamId: started.streamId, attemptId: started.attemptId,
+      assemblyId: prepared.assemblyId, payloadHash: received.hash, byteLength: received.byteLength,
+      encoding: REQUEST_ENCODING, adapterVersion: API_VERSION, transport: 'local-counting@1',
+      count: received.count, outcome: 'received', formalLedger: true,
+    };
   }
 
   #readIntentSources(intent: Intent): void {
@@ -161,7 +190,20 @@ export class ProbeSession {
     return result;
   }
 
-  cancel(): void { this.#stopped = 'run-cancelled'; }
+  close(): void {
+    if (this.#completed) return;
+    this.cancel();
+  }
+
+  cancel(): void {
+    try {
+      // The control event is durable and idempotent before the observable stop
+      // (I11). A store that cannot transact is already durably fenced, so the
+      // observable stop remains safe; the error is not a new admission fact.
+      this.#store.revokeRequestRun(this.#activity, this.runId);
+    } catch { /* fenced or sealed store: admission is already durably blocked */ }
+    finally { this.#stopped = 'run-cancelled'; }
+  }
   usage(): { attempts: number; tools: number; tokens: number; stopped: string | null } {
     return { attempts: this.#attempts, tools: this.#tools, tokens: this.#tokens, stopped: this.#stopped };
   }

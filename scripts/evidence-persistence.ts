@@ -91,7 +91,7 @@ function readRaw(path: string) {
   const db = new DatabaseSync(join(temp, dbName), { readOnly: true });
   try {
     sqliteVersion = String(db.prepare('SELECT sqlite_version() AS v').get()!.v);
-    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 7);
+    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 8);
     assert.deepEqual(db.prepare('PRAGMA quick_check').all().map(row => row.quick_check), ['ok']);
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     const tables: Record<string, Record<string, any>[]> = {};
@@ -122,8 +122,11 @@ function readRaw(path: string) {
         assert.ok(tables.workspace_projects!.some(row => row.workspace_id === scope.id && row.project_id === binding.projectId));
       }
     };
-    for (const table of Object.values(tables)) for (const row of table) for (const [body, hash] of hashFields) {
-      if (row[body] != null) assert.equal(row[hash], digest(row[body]));
+    for (const [tableName, tableRows] of Object.entries(tables)) for (const row of tableRows) for (const [body, hash] of hashFields) {
+      if (row[body] != null) {
+        const actualHash = tableName === 'request_events' && body === 'payload' ? row.hash : row[hash];
+        assert.equal(actualHash, digest(row[body]));
+      }
     }
     for (const capture of tables.capture_jobs!) {
       const payload = JSON.parse(capture.payload);
@@ -297,7 +300,8 @@ function verifyHostRows(tables: Record<string, Record<string, any>[]>) {
 }
 
 function comparable(raw: ReturnType<typeof readRaw>) {
-  const { owner_activities: _activities, ...tables } = raw.tables;
+  const { owner_activities: _activities, request_runs: _runs, request_events: _events,
+    request_assemblies: _assemblies, request_attempts: _attempts, ...tables } = raw.tables;
   return tables;
 }
 async function runCase(phase: string, cut: number | null) {
@@ -526,7 +530,7 @@ const summary = {
   schema: 'euler-t04-evidence@1', experimentId: 'X-01/T04-synthetic', schemaVersion: 1,
   specCommit: 'a3f253f9bef0415364b3b224e5eb4ba150111325',
   authorityRefs: ['docs/architecture/issues/12-build-evidence-experiment-matrix.md#x-01',
-    'docs/architecture/issues/12-build-evidence-experiment-matrix.md#统一-receipt-与复刻位置',
+    'docs/architecture/issues/12-build-evidence-experiment-matrix.md#统一-receipt-与复刻位点',
     'docs/architecture/issues/10-choose-storage-projections.md#decisions',
     'docs/architecture/issues/14-define-host-presentation.md#presentation-identity-and-ordering',
     'docs/architecture/issues/14-define-host-presentation.md#pending-lifecycle'],
