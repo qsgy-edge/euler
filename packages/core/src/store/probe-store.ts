@@ -78,6 +78,8 @@ export interface ActivationBatch {
   payload: string; digest: string;
 }
 export interface MemoryOperation { status: 'committed' | 'no_op'; record: MemoryRecord; eventId: string | null }
+export interface SearchResult { unitId: string; record: MemoryRecord; exposureMode: 'normal' | 'status_only'; rank: number }
+export interface SearchProjectionReceipt { jobId: string; eventId: string; status: 'done' | 'failed'; generation: number; reason: string | null }
 export interface ConflictOperation { status: 'committed' | 'no_op'; left: MemoryOperation; right: MemoryOperation; conflictSetId: string | null }
 export interface EvolutionProposalInput {
   target: string; expectedChange: string; owner: string; scope: MemoryScope; evidenceRefs: SourceAck[];
@@ -346,6 +348,18 @@ CREATE TABLE projection_jobs (
   owner_id TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL, batch_id TEXT,
   payload TEXT NOT NULL, payload_hash TEXT NOT NULL, UNIQUE(kind,event_id)
 ) STRICT;
+CREATE TABLE search_documents (
+  unit_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, record_id TEXT NOT NULL UNIQUE REFERENCES memory_records(record_id),
+  revision_id TEXT NOT NULL, project_id TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
+  lifecycle TEXT NOT NULL, verification TEXT NOT NULL, exposure_mode TEXT NOT NULL CHECK(exposure_mode IN ('normal','status_only')),
+  content TEXT NOT NULL, content_hash TEXT NOT NULL, source_seq INTEGER NOT NULL, tokenizer_version TEXT NOT NULL,
+  projection_generation INTEGER NOT NULL CHECK(projection_generation > 0)
+) STRICT;
+CREATE VIRTUAL TABLE search_fts USING fts5(content, content='search_documents', content_rowid='rowid');
+CREATE TABLE search_projection_jobs (
+  job_id TEXT PRIMARY KEY REFERENCES projection_jobs(job_id), status TEXT NOT NULL CHECK(status IN ('done','failed')),
+  processed_generation INTEGER NOT NULL CHECK(processed_generation > 0), processed_at TEXT NOT NULL, reason TEXT
+) STRICT;
 CREATE TABLE feedback_events (
   feedback_id TEXT PRIMARY KEY, record_id TEXT NOT NULL, head_event_id TEXT NOT NULL, revision_id TEXT NOT NULL,
   kind TEXT NOT NULL CHECK(kind='retrieved'),
@@ -397,13 +411,15 @@ CREATE TRIGGER immutable_provenance_refs_update BEFORE UPDATE ON provenance_refs
 CREATE TRIGGER immutable_provenance_refs_delete BEFORE DELETE ON provenance_refs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_evolution_proposals_update BEFORE UPDATE ON evolution_proposals BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_proposals BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
 PRAGMA user_version=7;
 ` + ['workspaces','workspace_projects','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 `).join('') + ['memory_heads','intent_heads','owner_fences','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
-  'verification_runs','verification_evidence','proposal_evidence','projection_jobs','feedback_events','conflict_sets','conflict_members','evolution_proposals'].map(table => `
+  'verification_runs','verification_evidence','proposal_evidence','projection_jobs','feedback_events','search_projection_jobs','conflict_sets','conflict_members','evolution_proposals'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
 `).join('') + ['memory_heads','intent_heads','owner_fences','host_presentations','pending_operations','owner_activities','maintenance_residuals'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
@@ -1095,6 +1111,91 @@ export class ProbeStore {
     return before;
   }
 
+  drainSearchProjection(activity: Activity, limit = 32): SearchProjectionReceipt[] {
+    return this.withActivity(activity, () => {
+      check(Number.isSafeInteger(limit) && limit > 0 && limit <= 128, 'invalid-projection-limit');
+      const jobs = this.#db.prepare(`SELECT j.*, j.rowid AS projection_rowid FROM projection_jobs j
+        LEFT JOIN search_projection_jobs p ON p.job_id=j.job_id
+        WHERE j.kind='search' AND p.job_id IS NULL AND j.owner_id=? AND ${this.#visibleScopeSql('j')}
+        ORDER BY j.rowid LIMIT ?`).all(this.#binding.ownerId, ...this.#scopeParameters(), limit);
+      const receipts: SearchProjectionReceipt[] = [];
+      for (const job of jobs) {
+        const payload = String(job.payload);
+        check(sha256(payload) === job.payload_hash, 'outbox-evidence-gap');
+        const manifest = JSON.parse(payload) as { schema: string; kind: string; events: unknown[] };
+        check(manifest.schema === 'memory-outbox@1' && manifest.kind === 'search' && manifest.events.length === 1, 'outbox-evidence-gap');
+        const event = manifest.events[0] as { eventId?: string; recordId?: string };
+        check(event.eventId === job.event_id && typeof event.recordId === 'string', 'outbox-evidence-gap');
+        const record = this.#readMemoryUnsafe(event.recordId);
+        const generation = Number(job.projection_rowid);
+        const eligible = record.lifecycle === 'active' && record.verification === 'verified' && record.scope.resolved
+          && !record.conflictSetId && record.appliesTo.every(condition => ['cli', process.platform].includes(condition));
+        const old = this.#db.prepare('SELECT rowid FROM search_documents WHERE unit_id=?').get(record.recordId);
+        if (old) this.#db.prepare('DELETE FROM search_fts WHERE rowid=?').run(Number(old.rowid));
+        this.#db.prepare('DELETE FROM search_documents WHERE unit_id=?').run(record.recordId);
+        if (eligible) {
+          const indexed = `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim();
+          this.#db.prepare(`INSERT INTO search_documents
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(record.recordId, this.#binding.ownerId, record.recordId, record.revisionId,
+            this.#binding.projectId, record.scope.kind, record.scope.id, record.lifecycle, record.verification, 'normal', indexed,
+            record.contentHash, record.revision, 'cjk-2gram@1', generation);
+          const row = this.#db.prepare('SELECT rowid FROM search_documents WHERE unit_id=?').get(record.recordId);
+          this.#db.prepare('INSERT INTO search_fts(rowid,content) VALUES (?,?)').run(Number(row!.rowid), indexed);
+        }
+        this.#db.prepare('INSERT INTO search_projection_jobs VALUES (?,?,?,?,?)')
+          .run(String(job.job_id), 'done', generation, new Date().toISOString(), null);
+        receipts.push({ jobId: String(job.job_id), eventId: String(job.event_id), status: 'done', generation, reason: null });
+      }
+      return receipts;
+    });
+  }
+
+  rebuildSearchProjection(activity: Activity): SearchProjectionReceipt[] {
+    return this.withActivity(activity, () => {
+      const canonical = this.#db.prepare(`SELECT record_id FROM memory_heads
+        WHERE ${this.#visibleScopeSql('memory_heads')}`).all(...this.#scopeParameters());
+      this.#db.prepare(`DELETE FROM search_documents WHERE owner_id=? AND ${this.#visibleScopeSql('search_documents')}`)
+        .run(this.#binding.ownerId, ...this.#scopeParameters());
+      const receipts: SearchProjectionReceipt[] = [];
+      for (const row of canonical) {
+        const record = this.#readMemoryUnsafe(String(row.record_id));
+        const eligible = record.lifecycle === 'active' && record.verification === 'verified' && record.scope.resolved
+          && !record.conflictSetId && record.appliesTo.every(condition => ['cli', process.platform].includes(condition));
+        if (!eligible) continue;
+        const indexed = `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim();
+        const generation = record.revision;
+        this.#db.prepare(`INSERT INTO search_documents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(record.recordId, this.#binding.ownerId,
+          record.recordId, record.revisionId, this.#binding.projectId, record.scope.kind, record.scope.id, record.lifecycle,
+          record.verification, 'normal', indexed, record.contentHash, record.revision, 'cjk-2gram@1', generation);
+        receipts.push({ jobId: '', eventId: record.headEventId, status: 'done', generation, reason: 'rebuild' });
+      }
+      this.#db.exec(`DROP TABLE search_fts;
+        CREATE VIRTUAL TABLE search_fts USING fts5(content, content='search_documents', content_rowid='rowid');
+        INSERT INTO search_fts(search_fts) VALUES ('rebuild');`);
+      return receipts;
+    });
+  }
+
+  searchMemories(activity: Activity, query: string, limit = 10): SearchResult[] {
+    return this.withActivity(activity, () => {
+      check(Number.isSafeInteger(limit) && limit > 0 && limit <= 32, 'invalid-search-limit');
+      const indexed = `${normalizeSearchText(query)} ${cjkBigrams(query)}`.trim();
+      const rows = this.#db.prepare(`SELECT d.*, bm25(search_fts) AS rank FROM search_fts
+        JOIN search_documents d ON d.rowid=search_fts.rowid
+        WHERE search_fts MATCH ? AND d.owner_id=? AND ${this.#visibleScopeSql('d')} ORDER BY rank LIMIT ?`).all(
+        indexed, this.#binding.ownerId, ...this.#scopeParameters(), limit);
+      return rows.map(row => {
+        const record = this.#readMemoryUnsafe(String(row.record_id));
+        const eligible = record.lifecycle === 'active' && record.verification === 'verified' && record.scope.resolved
+          && !record.conflictSetId && record.appliesTo.every(condition => ['cli', process.platform].includes(condition));
+        check(eligible && String(row.content_hash) === record.contentHash
+          && String(row.content) === `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim(), 'search-evidence-gap');
+        this.#validateScope(record.scope);
+        return { unitId: String(row.unit_id), record, exposureMode: String(row.exposure_mode) as 'normal' | 'status_only', rank: Number(row.rank) };
+      });
+    });
+  }
+
   pendingMemoryProjections(activity: Activity) {
     return this.withActivity(activity, () => this.#db.prepare(`SELECT * FROM projection_jobs
       WHERE owner_id=? AND ${this.#visibleScopeSql('projection_jobs')} ORDER BY rowid`)
@@ -1131,7 +1232,7 @@ export class ProbeStore {
     });
   }
 
-  #visibleScopeSql(alias: 'projection_jobs' | 'memory_heads' | 'v'): string {
+  #visibleScopeSql(alias: 'projection_jobs' | 'memory_heads' | 'v' | 'd' | 'j' | 'search_documents'): string {
     return `((${alias}.scope_kind='project' AND ${alias}.scope_id=?) OR (${alias}.scope_kind='personal' AND ${alias}.scope_id=?)
       OR (${alias}.scope_kind='session' AND ${alias}.scope_id=?) OR (${alias}.scope_kind='workspace' AND EXISTS
         (SELECT 1 FROM workspace_projects w WHERE w.workspace_id=${alias}.scope_id AND w.project_id=?)))`;
@@ -1878,6 +1979,16 @@ export class ProbeStore {
     };
   }
   close(): void { this.#db.close(); }
+}
+
+function normalizeSearchText(value: string): string {
+  return value.normalize('NFC').toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+function cjkBigrams(value: string): string {
+  return value.normalize('NFC').match(/[\p{Script=Han}]+/gu)?.flatMap(run => {
+    const chars = Array.from(run);
+    return chars.slice(0, -1).map((char, index) => `${char}${chars[index + 1]}`);
+  }).join(' ') ?? '';
 }
 
 function processAbsent(pid: number): boolean {

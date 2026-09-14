@@ -95,7 +95,7 @@ function readRaw(path: string) {
     assert.deepEqual(db.prepare('PRAGMA quick_check').all().map(row => row.quick_check), ['ok']);
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     const tables: Record<string, Record<string, any>[]> = {};
-    for (const table of db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all()) {
+    for (const table of db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'search_fts_%' AND name != 'search_fts' ORDER BY name").all()) {
       tables[String(table.name)] = db.prepare(`SELECT * FROM ${table.name} ORDER BY rowid`).all();
     }
     const refs = new Map<string, Record<string, unknown>>();
