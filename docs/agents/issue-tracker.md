@@ -13,24 +13,39 @@ Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all o
 
 Infer the repo from `git remote -v`; `gh` does this automatically when run inside a clone.
 
-## Implementation workflow
+## Delivery path
 
-Issues define the scope and acceptance criteria. Code changes should be made on a feature branch and submitted through a pull request so CI and Greptile can review the diff before it reaches `main`.
+Choose the delivery path by the effect of the change, not by the file extension.
 
-Recommended flow:
+### Use a pull request
 
-1. Create or select the issue.
+Use a feature branch and PR when the change can affect the product, a running process, a durable data boundary, or a required check. This includes:
+
+- application or library code, tests that change or validate implementation behavior, public APIs, schemas, migrations, and persistence;
+- dependency, build, CI, security, permission, runtime, or deployment configuration;
+- fixes or features attached to an implementation issue;
+- a mixed change containing both documentation and any change above.
+
+The PR path is:
+
+1. Create or select the issue and record its acceptance criteria.
 2. Create a feature branch from `main`.
-3. Implement and commit the change on that branch.
-4. Open a pull request that references the issue.
-5. Resolve CI and Greptile findings, then merge the pull request.
-6. Close the issue after the merged change passes acceptance, or use `Closes #<number>` in the pull request to close it automatically when GitHub merges the PR.
+3. Implement the change and run local focused checks, then the relevant full checks.
+4. Open a PR that references the issue.
+5. Resolve CI and Greptile findings, then merge the PR.
+6. Close the issue after acceptance, or use `Closes #<number>` in the PR so GitHub closes it when the PR merges.
 
-Direct commits to `main` are reserved for repository maintenance or other explicitly agreed exceptions. A direct commit should not be treated as having completed the Greptile pull-request review flow.
+### Commit directly to `main`
 
-### Greptile usage discipline
+A direct commit is appropriate for a documentation-only or repository-maintenance change that cannot alter product behavior or required checks. This includes Markdown or text documentation, issue-tracker guidance, comments, and other wording-only maintenance. It may include a small documentation correction related to a merged change; it must not include code, tests, dependencies, generated runtime assets, or configuration that affects execution.
 
-Greptile reviews the pull request diff, so do local verification before pushing and batch related fixes into one push. After a Greptile finding, reproduce it locally, fix all related findings together, run the focused tests plus the relevant full checks, and push once. Do not push speculative or cosmetic changes that would trigger another review; do not use Retrigger until the code and local evidence are ready. CI reruns and Greptile Retrigger are separate actions.
+For a direct commit, run the checks relevant to the edited files, commit on `main`, and record the change in the commit message. Do not open a PR or trigger Greptile for documentation-only maintenance. If a change is ambiguous or contains both documentation and behavior, use the PR path.
+
+Direct commits are also allowed for an explicitly approved emergency repository action. Record the reason and follow up with a PR when the action changes product behavior.
+
+### Greptile usage on the PR path
+
+Greptile reviews the pull request diff. Complete local verification before pushing and batch related fixes into one push. After a Greptile finding, reproduce it locally, fix all related findings together, run focused tests and the relevant full checks, and push once. Use Retrigger only after the code and local evidence are ready. CI reruns and Greptile Retrigger are separate actions.
 
 ## Pull requests as a triage surface
 
