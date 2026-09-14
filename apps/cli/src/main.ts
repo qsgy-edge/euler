@@ -223,20 +223,50 @@ async function main() {
   const args = parseArgs({ allowPositionals: true, options: {
     sandbox: { type: 'string' }, scenario: { type: 'string', default: 'success' }, budget: { type: 'string' },
     request: { type: 'string' }, record: { type: 'string' }, reservation: { type: 'string' },
+    attempt: { type: 'string' }, 'receipt-hash': { type: 'string' }, outcome: { type: 'string' },
+    'accept-duplicate-risk': { type: 'boolean', default: false },
     'wait-child-launch': { type: 'boolean', default: false },
   } });
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
-  check(['create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
+  const requestCommands = ['request-status', 'request-seal', 'request-reconcile', 'request-resume', 'request-gap'];
+  check([...requestCommands, 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
   const options = args.values.budget ? JSON.parse(args.values.budget) as Partial<ProbeBudget> : {};
   check(!args.values['wait-child-launch'] || command === 'hold', 'hold-only-option');
   check(Object.keys(options).every(key => key in DEFAULT_BUDGET), 'invalid-budget');
   const budget = { ...DEFAULT_BUDGET, ...options };
   if (['run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status'].includes(command)) check(args.values.sandbox, 'sandbox-required');
+  if (requestCommands.includes(command)) check(args.values.sandbox && args.values.request, 'request-identity-required');
   // Fault injection never modifies a caller-selected existing sandbox.
   if (command === 'archive-failure' || args.values.scenario === 'archive-failure') check(!args.values.sandbox, 'fault-requires-fresh-sandbox');
   const sandbox = args.values.sandbox ? openSandbox(args.values.sandbox) : createSandbox();
   emit('sandbox', { root: sandbox.root, storeId: sandbox.storeId, fixtureDigest: sandbox.fixtureDigest, mode: 'synthetic-only' });
+  if (requestCommands.includes(command)) {
+    const probe = openProbe(sandbox, budget, undefined, undefined, command === 'request-resume'
+      ? { relatedRunId: args.values.request!, acceptDuplicateRisk: args.values['accept-duplicate-risk'] } : undefined, true);
+    try {
+      if (command === 'request-gap') probe.store.markRequestRecoveryGap(probe.activity, args.values.request!);
+      if (command === 'request-seal') probe.store.sealRequestRun(probe.activity, args.values.request!);
+      if (command === 'request-reconcile') {
+        check(args.values.attempt && args.values['receipt-hash']
+          && (args.values.outcome === 'received' || args.values.outcome === 'not-received'), 'reconciliation-evidence-required');
+        const old = probe.store.requestStatus(probe.activity, args.values.request!);
+        check(old.attempts.some(attempt => attempt.attemptId === args.values.attempt), 'attempt-owner-mismatch');
+        probe.store.reconcileRequestAttempt(probe.activity, args.values.attempt,
+          { outcome: args.values.outcome, receiptHash: args.values['receipt-hash'] });
+      }
+      const status = probe.store.requestStatus(probe.activity, args.values.request!);
+      if (command === 'request-resume') {
+        const source = status.assemblies.at(-1)?.sources[0];
+        check(source, 'recovery-source-required');
+        const text = probe.archive.read(source).text;
+        const receipt = probe.session.dispatch(probe.session.prepare(source.eventId, text));
+        emit('request-resumed', { relatedRunId: status.run.runId, receipt });
+      } else emit('request-status', { ...status, warning: status.attempts.some(attempt => attempt.outcome === 'unknown-sent')
+        ? 'Unknown delivery: repeating work may duplicate cost or side effects. Reconcile or explicitly accept this risk for a linked new run.' : null });
+    } finally { probe.close(); }
+    return;
+  }
   if (command === 'create') return;
   if (command === 'hold' || command === 'task') return hold(sandbox, command === 'task', args.values.reservation, args.values['wait-child-launch']);
   if (command === 'maintain') return maintain(sandbox);

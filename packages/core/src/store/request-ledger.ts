@@ -11,9 +11,15 @@ export type RequestRunState = 'authorized' | 'revoked' | 'sealed';
 export type RequestAssemblyState = 'not-dispatched' | 'unknown-sent' | 'finished';
 export type RequestAttemptOutcome = 'unknown-sent' | 'received' | 'cancelled-before-send';
 export type RequestEventKind =
-  | 'run-authorized' | 'run-revoked' | 'run-sealed'
+  | 'run-authorized' | 'run-revoked' | 'run-sealed' | 'run-recovery-gap'
+  | 'model/request-attempt-reconciled@v1'
   | 'context/assembly@v1'
   | 'model/request-attempt-started@v1' | 'model/request-attempt-finished@v1';
+
+export interface RequestRecovery {
+  relatedRunId: string;
+  acceptDuplicateRisk: boolean;
+}
 
 export interface RequestRun {
   runId: string; streamId: string; ownerKind: RequestOwnerKind; ownerId: string;

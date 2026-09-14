@@ -1,6 +1,6 @@
 import { basename } from 'node:path';
 import { API_VERSION, DEFAULT_BUDGET, ProbeSession, ProbeStore, sha256, validateBudget } from '@euler/core';
-import type { Activity, Binding, SourceAck, ExecutionOwner, ProbeBudget } from '@euler/core';
+import type { Activity, Binding, SourceAck, ExecutionOwner, ProbeBudget, RequestRecovery } from '@euler/core';
 import { CliArchive } from './archive.ts';
 import { bindingOf, openSandbox, resourcesOf } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
@@ -16,7 +16,7 @@ export class CountingTransport {
   }
 }
 
-export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET, registration?: ExecutionOwner | string, selectedBinding?: Binding) {
+export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET, registration?: ExecutionOwner | string, selectedBinding?: Binding, recovery?: RequestRecovery, diagnosticsOnly = false) {
   validateBudget(budget);
   sandbox = openSandbox(sandbox.root);
   const binding = selectedBinding ?? bindingOf(sandbox);
@@ -39,7 +39,10 @@ export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET
     activity = typeof registration === 'string' ? store.claimChild(registration) : store.register(registration);
     const archive = archiveFor(binding);
     const transport = new CountingTransport();
-    const session = new ProbeSession(store, activity, { version: API_VERSION, binding, source: archive, transport }, budget);
-    return { store, activity, archive, transport, session, close: () => { try { session.close(); } finally { store.close(); } } };
+    let session: ProbeSession | undefined = diagnosticsOnly ? undefined
+      : new ProbeSession(store, activity, { version: API_VERSION, binding, source: archive, transport }, budget, recovery);
+    return { store, activity, archive, transport,
+      get session() { return session ??= new ProbeSession(store, activity, { version: API_VERSION, binding, source: archive, transport }, budget, recovery); },
+      close: () => { try { session?.close(); } finally { store.close(); } } };
   } catch (error) { store.close(); throw error; }
 }

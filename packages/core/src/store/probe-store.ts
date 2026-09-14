@@ -218,7 +218,7 @@ CREATE TABLE request_runs (
 CREATE TABLE request_events (
   event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES request_runs(run_id),
   seq INTEGER NOT NULL CHECK(seq>0),
-  kind TEXT NOT NULL CHECK(kind IN ('run-authorized','run-revoked','run-sealed','context/assembly@v1','model/request-attempt-started@v1','model/request-attempt-finished@v1')),
+  kind TEXT NOT NULL CHECK(kind IN ('run-authorized','run-revoked','run-sealed','run-recovery-gap','model/request-attempt-reconciled@v1','context/assembly@v1','model/request-attempt-started@v1','model/request-attempt-finished@v1')),
   attempt_id TEXT REFERENCES request_attempts(attempt_id), activity_id TEXT NOT NULL REFERENCES owner_activities(id),
   created_at TEXT NOT NULL, payload TEXT NOT NULL, hash TEXT NOT NULL, UNIQUE(run_id,seq)
 ) STRICT;
@@ -761,11 +761,38 @@ export class ProbeStore {
     };
   }
 
-  authorizeRequestRun(activity: Activity, runId: string, input: { budget: ProbeBudget; intent: { eventId: string; hash: string } | null; relatedRunId: string | null }): RequestRun {
+  #requestRecoveryGate(activity: Activity, relatedRunId: string | null, currentRunId?: string): void {
+    const stream = this.#readStream(activity.streamId);
+    // An unrelated session or already-open run must not bypass an unresolved
+    // request in the same principal/project. An explicit recovery successor
+    // consumes that recovery decision; any unknown in the successor blocks again.
+    const blockers = this.#db.prepare(`SELECT DISTINCT r.run_id FROM request_runs r
+      JOIN execution_streams s ON s.stream_id=r.stream_id
+      WHERE s.project_id=? AND s.principal_id=? AND r.run_id!=?
+      AND (EXISTS(SELECT 1 FROM request_attempts a WHERE a.run_id=r.run_id AND a.outcome='unknown-sent')
+        OR EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='run-recovery-gap'))
+      AND NOT EXISTS(SELECT 1 FROM request_runs child WHERE child.related_run_id=r.run_id)`)
+      .all(stream.projectId, stream.principalId, currentRunId ?? '');
+    check(blockers.every(row => row.run_id === relatedRunId), 'request-recovery-required');
+  }
+
+  authorizeRequestRun(activity: Activity, runId: string, input: { budget: ProbeBudget; intent: { eventId: string; hash: string } | null; relatedRunId: string | null; acceptDuplicateRisk?: boolean }): RequestRun {
     return this.withActivity(activity, () => {
       uuid(runId);
       validateBudget(input.budget);
-      if (input.relatedRunId) uuid(input.relatedRunId);
+      if (input.relatedRunId) {
+        uuid(input.relatedRunId);
+        const previous = this.requestStatus(activity, input.relatedRunId);
+        check(previous.sealed, 'recovery-run-not-sealed');
+        check(!this.#db.prepare('SELECT 1 FROM request_runs WHERE related_run_id=?').get(input.relatedRunId), 'recovery-already-authorized');
+        const unresolved = previous.attempts.some(attempt => attempt.outcome === 'unknown-sent'
+          && !previous.events.some(event => event.attemptId === attempt.attemptId && event.kind === 'model/request-attempt-reconciled@v1'
+            && (JSON.parse(event.payload) as { evidence: { outcome: string } }).evidence.outcome === 'not-received'));
+        check((!unresolved && !previous.events.some(event => event.kind === 'run-recovery-gap'))
+          || input.acceptDuplicateRisk === true, 'duplicate-risk-approval-required');
+        this.#verifyRequestSources(previous.assemblies);
+      }
+      this.#requestRecoveryGate(activity, input.relatedRunId);
       if (input.intent) { uuid(input.intent.eventId); check(input.intent.hash.length === 64, 'invalid-intent-ref'); }
       const stream = this.#readStream(activity.streamId);
       check(stream.ownerKind !== 'maintenance', 'maintenance-business-unavailable');
@@ -778,7 +805,8 @@ export class ProbeStore {
       this.#requestEvent(runId, 'run-authorized', null, JSON.stringify({ schema: 'run-authorized@1', runId,
         streamId: stream.streamId, ownerKind: stream.ownerKind, ownerId: stream.ownerId,
         authorizationId: stream.authorization.id, activityId: activity.id, epoch: activity.epoch,
-        budget: input.budget, intent: input.intent, relatedRunId: input.relatedRunId, authorizedAt }), activity.id);
+        budget: input.budget, intent: input.intent, relatedRunId: input.relatedRunId,
+        acceptDuplicateRisk: input.acceptDuplicateRisk === true, authorizedAt }), activity.id);
       return this.#requestRun(activity, runId);
     });
   }
@@ -861,6 +889,13 @@ export class ProbeStore {
       check(run.state === 'authorized' && run.epoch === activity.epoch, 'run-not-admissible');
       uuid(input.assemblyId);
       check(input.payloadHash.length === 64 && input.byteLength > 0 && input.adapterVersion.length > 0, 'invalid-attempt');
+      const status = this.requestStatus(activity, input.runId);
+      this.#requestRecoveryGate(activity, status.run.relatedRunId, input.runId);
+      const currentIntent = this.readIntent(activity);
+      const frozenAssembly = status.assemblies.find(item => item.assemblyId === input.assemblyId);
+      check(frozenAssembly && currentIntent?.eventId === frozenAssembly.intent?.eventId
+        && currentIntent?.hash === frozenAssembly.intent?.hash && currentIntent?.status === 'active', 'intent-stale');
+      this.#verifyRequestSources([frozenAssembly]);
       const assembly = this.#db.prepare('SELECT * FROM request_assemblies WHERE assembly_id=? AND run_id=?')
         .get(input.assemblyId, input.runId);
       check(assembly, 'unknown-assembly');
@@ -892,13 +927,23 @@ export class ProbeStore {
     });
   }
 
+  requestMaySend(activity: Activity, runId: string): boolean {
+    return this.withActivity(activity, () => {
+      const status = this.requestStatus(activity, runId);
+      this.#verifyRequestSources(status.assemblies);
+      return status.run.state === 'authorized' && status.run.epoch === activity.epoch;
+    });
+  }
+
   finishRequestAttempt(activity: Activity, input: { attemptId: string; outcome: 'received' | 'cancelled-before-send'; usage?: { count: number } | null }): RequestAttempt {
     return this.withActivity(activity, () => {
       uuid(input.attemptId);
       check(input.outcome === 'received' || input.outcome === 'cancelled-before-send', 'invalid-attempt-outcome');
       const row = this.#db.prepare('SELECT * FROM request_attempts WHERE attempt_id=?').get(input.attemptId);
       check(row, 'unknown-attempt');
-      this.#requestRun(activity, String(row.run_id));
+      const run = this.#requestRun(activity, String(row.run_id));
+      const status = this.requestStatus(activity, run.runId);
+      this.#verifyRequestSources(status.assemblies.filter(item => item.assemblyId === row.assembly_id));
       const ownership = this.#db.prepare("SELECT activity_id FROM execution_events WHERE attempt_id=? AND kind='attempt-bound'")
         .get(input.attemptId);
       check(ownership?.activity_id === activity.id, 'attempt-owner-mismatch');
@@ -920,19 +965,58 @@ export class ProbeStore {
     });
   }
 
+  #verifyRequestSources(assemblies: RequestAssembly[]): void {
+    for (const assembly of assemblies) for (const source of assembly.sources) this.#validateSource(source);
+  }
+
+  reconcileRequestAttempt(activity: Activity, attemptId: string, evidence: { outcome: 'received' | 'not-received'; receiptHash: string }): RequestStatus {
+    return this.withActivity(activity, () => {
+      uuid(attemptId);
+      check(/^[0-9a-f]{64}$/.test(evidence.receiptHash)
+        && ['received', 'not-received'].includes(evidence.outcome), 'invalid-reconciliation-evidence');
+      const row = this.#db.prepare('SELECT run_id FROM request_attempts WHERE attempt_id=?').get(attemptId);
+      check(row, 'unknown-attempt');
+      const status = this.requestStatus(activity, String(row.run_id));
+      check(status.attempts.some(attempt => attempt.attemptId === attemptId && attempt.outcome === 'unknown-sent'), 'attempt-not-unknown');
+      this.#verifyRequestSources(status.assemblies);
+      check(!status.events.some(event => event.attemptId === attemptId && event.kind === 'model/request-attempt-reconciled@v1'), 'attempt-already-reconciled');
+      this.#requestEvent(status.run.runId, 'model/request-attempt-reconciled@v1', attemptId, JSON.stringify({
+        schema: 'model/request-attempt-reconciled@v1', runId: status.run.runId, attemptId,
+        evidence, reconciledAt: new Date().toISOString(),
+      }), activity.id);
+      return this.requestStatus(activity, status.run.runId);
+    });
+  }
+
+  markRequestRecoveryGap(activity: Activity, runId: string): void {
+    this.withActivity(activity, () => {
+      const status = this.requestStatus(activity, runId);
+      if (status.events.some(event => event.kind === 'run-recovery-gap')) return;
+      if (status.run.state === 'authorized') this.revokeRequestRun(activity, runId);
+      this.#requestEvent(runId, 'run-recovery-gap', null, JSON.stringify({
+        schema: 'run-recovery-gap@1', runId, observedAt: new Date().toISOString(),
+      }), activity.id);
+    });
+  }
+
   requestStatus(activity: Activity, runId: string): RequestStatus {
     return this.withActivity(activity, () => {
       const run = this.#requestRun(activity, runId);
       const events = this.#db.prepare('SELECT * FROM request_events WHERE run_id=? ORDER BY seq').all(runId);
       const assemblies = this.#db.prepare('SELECT * FROM request_assemblies WHERE run_id=? ORDER BY rowid').all(runId);
       const attempts = this.#db.prepare('SELECT * FROM request_attempts WHERE run_id=? ORDER BY rowid').all(runId);
+      check(events.length > 0 && events[0]!.kind === 'run-authorized', 'ledger-evidence-gap');
+      const authorization = JSON.parse(String(events[0]!.payload));
+      check(authorization.runId === run.runId && authorization.streamId === run.streamId
+        && authorization.epoch === run.epoch && JSON.stringify(authorization.budget) === JSON.stringify(run.budget)
+        && authorization.relatedRunId === run.relatedRunId, 'ledger-evidence-gap');
       for (const [index, row] of events.entries()) {
         check(row.seq === index + 1 && sha256(String(row.payload)) === row.hash, 'ledger-evidence-gap');
         const payload = JSON.parse(String(row.payload)) as Record<string, unknown>;
         check(payload.runId === runId, 'ledger-evidence-gap');
         if (row.kind === 'context/assembly@v1') {
           check(row.attempt_id === null && assemblies.some(assembly => assembly.assembly_id === payload.assemblyId), 'ledger-evidence-gap');
-        } else if (row.kind === 'model/request-attempt-started@v1' || row.kind === 'model/request-attempt-finished@v1') {
+        } else if (row.kind === 'model/request-attempt-started@v1' || row.kind === 'model/request-attempt-finished@v1' || row.kind === 'model/request-attempt-reconciled@v1') {
           check(row.attempt_id === payload.attemptId && attempts.some(attempt => attempt.attempt_id === row.attempt_id), 'ledger-evidence-gap');
         } else check(row.attempt_id === null, 'ledger-evidence-gap');
       }
@@ -946,11 +1030,29 @@ export class ProbeStore {
       check(run.state !== 'revoked' || events.some(row => row.kind === 'run-revoked'), 'ledger-evidence-gap');
       check(run.state !== 'sealed' || events.some(row => row.kind === 'run-sealed'), 'ledger-evidence-gap');
       for (const assembly of assemblies) {
+        const decodedAssembly = this.#requestAssembly(assembly);
+        check(assemblyIdentityHash(decodedAssembly) === assembly.identity_hash, 'ledger-evidence-gap');
+        const receipt = events.find(event => event.kind === 'context/assembly@v1'
+          && (JSON.parse(String(event.payload)) as { assemblyId: string }).assemblyId === assembly.assembly_id);
+        check(receipt, 'ledger-evidence-gap');
+        const assemblyPayload = JSON.parse(String(receipt.payload));
+        for (const key of ['runId', 'epoch', 'route', 'model', 'policyHash', 'estimator', 'payloadHash', 'byteLength',
+          'estimatedTokens', 'budget', 'zones', 'selection', 'intent', 'degradation'] as const) {
+          check(JSON.stringify(assemblyPayload[key]) === JSON.stringify(decodedAssembly[key]), 'ledger-evidence-gap');
+        }
+        check(JSON.stringify(assemblyPayload.sources) === JSON.stringify(decodedAssembly.sources.map(source => ({ eventId: source.eventId, hash: source.hash }))), 'ledger-evidence-gap');
         const assemblyAttempts = attempts.filter(attempt => attempt.assembly_id === assembly.assembly_id);
         for (const [index, attempt] of assemblyAttempts.entries()) {
           check(attempt.ordinal === index + 1 && attempt.payload_hash === assembly.payload_hash
             && attempt.byte_length === assembly.byte_length, 'ledger-evidence-gap');
           check(startedEvents.has(String(attempt.attempt_id)), 'ledger-evidence-gap');
+          const startedPayload = JSON.parse(String(events.find(event => event.kind === 'model/request-attempt-started@v1'
+            && event.attempt_id === attempt.attempt_id)!.payload));
+          check(startedPayload.payloadHash === attempt.payload_hash && startedPayload.byteLength === attempt.byte_length
+            && startedPayload.assemblyId === assembly.assembly_id && startedPayload.ordinal === attempt.ordinal
+            && startedPayload.route === assembly.route && startedPayload.model === assembly.model, 'ledger-evidence-gap');
+          const finished = events.find(event => event.kind === 'model/request-attempt-finished@v1' && event.attempt_id === attempt.attempt_id);
+          if (finished) check(JSON.parse(String(finished.payload)).outcome === attempt.outcome, 'ledger-evidence-gap');
           check((attempt.outcome === 'unknown-sent') === !finishedEvents.has(String(attempt.attempt_id)), 'ledger-evidence-gap');
         }
         check(assembly.state === deriveAssemblyState(assemblyAttempts

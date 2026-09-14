@@ -265,7 +265,9 @@ test('sealing preserves unknown facts and fresh work requires a newly authorized
     // A new run re-obtains authorization, re-checks budget/resources and builds
     // its own assembly for the same content.
     const resumed = new ProbeSession(probe.store, probe.activity,
-      { version: API_VERSION, binding: bindingOf(sandbox), source: probe.archive, transport: probe.transport }, budget);
+      { version: API_VERSION, binding: bindingOf(sandbox), source: probe.archive, transport: probe.transport }, budget,
+      { relatedRunId: session.runId, acceptDuplicateRisk: true });
+    assert.equal(probe.store.requestStatus(probe.activity, resumed.runId).run.relatedRunId, session.runId);
     assert.notEqual(resumed.runId, session.runId);
     const next = resumed.prepare(sandbox.fixture.eventId, sandbox.fixture.text);
     assert.notEqual(next.assemblyId, turn.assemblyId);

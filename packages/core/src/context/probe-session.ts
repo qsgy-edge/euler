@@ -3,7 +3,7 @@ import { API_VERSION, CORE_TOOLS, DEFAULT_BUDGET, check, sameBinding, sha256, va
 import type { HostAdapter, ProbeBudget, SourceAck, SourceExcerpt } from '../contracts.ts';
 import { REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, REQUEST_POLICY_HASH, freezeRequestPayload } from '../store/request-ledger.ts';
 import type { Activity, ExecutionStream, Intent, IntentTransition, ProbeStore } from '../store/probe-store.ts';
-import type { RequestAttempt } from '../store/request-ledger.ts';
+import type { RequestAttempt, RequestRecovery } from '../store/request-ledger.ts';
 
 export interface PreparedTurn {
   assemblyId: string;
@@ -46,7 +46,7 @@ export class ProbeSession {
   #stopped: string | null = null;
   #closed = false;
 
-  constructor(store: ProbeStore, activity: Activity, host: HostAdapter, budget: ProbeBudget = DEFAULT_BUDGET) {
+  constructor(store: ProbeStore, activity: Activity, host: HostAdapter, budget: ProbeBudget = DEFAULT_BUDGET, recovery?: RequestRecovery) {
     validateBudget(budget);
     check(host.version === API_VERSION && host.transport.kind === 'local-counting@1', 'unsupported-adapter');
     this.#store = store;
@@ -54,7 +54,8 @@ export class ProbeSession {
     this.#host = host;
     this.#budget = { ...budget };
     // The run authorization snapshot is durable before any admission (I11).
-    this.#store.authorizeRequestRun(activity, this.runId, { budget: this.#budget, intent: null, relatedRunId: null });
+    this.#store.authorizeRequestRun(activity, this.runId, { budget: this.#budget, intent: null,
+      relatedRunId: recovery?.relatedRunId ?? null, acceptDuplicateRisk: recovery?.acceptDuplicateRisk ?? false });
   }
 
   #active(checkBudget = true): void {
@@ -135,9 +136,9 @@ export class ProbeSession {
     this.#tokens += reserved;
     // Observable cancellation after admission stops the attempt before the
     // transport call without claiming already-sent bytes back (Ticket 09 §15a).
-    if (this.#stopped) {
+    if (this.#stopped || !this.#store.requestMaySend(this.#activity, this.runId)) {
       this.#store.finishRequestAttempt(this.#activity, { attemptId: started.attemptId, outcome: 'cancelled-before-send' });
-      check(false, this.#stopped);
+      check(false, this.#stopped ?? 'run-cancelled');
     }
     const received = this.#host.transport.send(prepared.payload);
     // started/no-finished stays durable unknown-sent: a send that cannot prove
