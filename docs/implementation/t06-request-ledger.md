@@ -14,7 +14,7 @@ Admission checks the intent, source references, epoch, authorized request budget
 
 Opening diagnostics registers the Host activity without authorizing a new model run. An unknown request blocks unlinked new work and previously opened runs in the same principal/project, including another session. This is a conservative gate for the synthetic Host, which has no narrower operation identity.
 
-The owner can append a reconciliation outcome and an evidence hash. This is Host-provided evidence, not a model claim or an automatically queried remote provider. The old attempt stays `unknown-sent`; the reconciliation is a separate event. Evidence of `not-received` permits a linked successor without duplicate-risk approval. Evidence of receipt, or an unqueryable attempt, requires explicit acceptance of the risk before repeating work.
+The Host queries the local counting receiver's independently flushed journal, verifies its bound file identity and store identity, and matches the attempt/run/payload identity. The reconciliation API does not accept a caller-supplied outcome or hash. For a negative observation the original sending process must also be absent: an empty receiver log while that process is alive cannot prove it will not still send. The old attempt stays `unknown-sent`; the observation and journal digest are appended separately. Verified `not-received` permits a linked successor without duplicate-risk approval. Recorded receipt, evidence of receipt, or an unqueryable attempt requires explicit acceptance of the risk before repeating work. A malformed, missing or replaced receiver journal cannot establish absence.
 
 A successor requires the old run to be sealed, intact evidence, valid source references, a fresh authorization/budget and a durable `relatedRunId`. Each old run has at most one authorized recovery successor. An unknown in the successor blocks further work again.
 
@@ -29,7 +29,7 @@ Use only a disposable sandbox created by `node apps/cli/src/main.ts create`.
 ```powershell
 node apps/cli/src/main.ts request-status --sandbox <root> --request <run-id>
 node apps/cli/src/main.ts request-seal --sandbox <root> --request <run-id>
-node apps/cli/src/main.ts request-reconcile --sandbox <root> --request <run-id> --attempt <attempt-id> --outcome not-received --receipt-hash <sha256>
+node apps/cli/src/main.ts request-reconcile --sandbox <root> --request <run-id> --attempt <attempt-id>
 node apps/cli/src/main.ts request-resume --sandbox <root> --request <run-id>
 # Required when repeating a received/unqueryable request, or after a snapshot gap:
 node apps/cli/src/main.ts request-resume --sandbox <root> --request <run-id> --accept-duplicate-risk
@@ -51,15 +51,15 @@ npm run evidence:persistence
 
 | Requirement | Evidence |
 |---|---|
-| Ordered barriers and normal send | `request-crash.test.ts`: real child-process termination before/after assembly, started and finished COMMIT, after receiver persistence, plus normal control; repeated for session/job/migration |
+| Ordered barriers and normal send | `request-crash.test.ts`: real child-process termination before INSERT, after INSERT/before COMMIT, and after COMMIT for assembly, started and finished, after receiver persistence, plus normal control; repeated for session/job/maintenance/migration |
 | Independent send count and state reconstruction | Raw SQLite rows, event hashes and a separately fsynced receiver JSONL; `PRAGMA quick_check` and FK validation after process exit |
 | Revoke ordering | Two SQLite connections: revoke first versus revoke immediately after the outer started COMMIT; send count is zero in both cancellation cases |
 | No unknown blind retry | Same-run, unlinked new-run and cross-session negative tests; linked recovery positive tests |
 | Source loss / integrity | Late transport result after source removal; corrupted assembly with and without a recomputed identity hash; admission and diagnostics reject damaged canonical facts |
 | Snapshot gap | Real SQLite backup before started, later attempt, restore of the older bytes, durable gap declaration, blocked old run and explicitly authorized linked successor |
 | Host recovery | Separate CLI processes run status, reject unapproved repetition and perform approved linked recovery |
-| Maintenance boundary | Maintenance fences activities before/after started; late settlement is refused and unknown survives. The current maintenance coordinator has no model transport; no maintenance-owned send is claimed |
+| Maintenance boundary | Ordinary maintenance-owned requests obey the same open-fence admission and crash/recovery checks. Entering exclusive maintenance fences both session and maintenance workers before/after started; late settlement is refused and unknown survives. The coordinator has no exception to that gate |
 
-Crash tests save raw per-case JSON under `artifacts/t06-crash-<platform>-<timestamp>/` and print each artifact path/hash, fixture digest, runtime and observed outcomes. `npm run check` runs these same OS-process tests in the existing Windows/macOS/Linux CI jobs. Results describe those runner environments, not power-loss durability or an end user's filesystem.
+Crash tests save raw per-case JSON under `artifacts/t06-crash-<platform>-<timestamp>/` and print each artifact path/hash, fixture digest, runtime and observed outcomes. The records include implementation commit and worktree status/diff digest, OS/architecture/runner, SQLite and schema version, actual sender storage settings, sandbox/source identity and snapshot, owner/run authorization and budget, assembly route/model/payload identity, attempt/event rows and receiver bytes. Use evidence from a clean frozen commit for acceptance; dirty-tree records are development diagnostics. `npm run check` runs these same OS-process tests in the existing Windows/macOS/Linux CI jobs. Results describe those runner environments, not power-loss durability or an end user's filesystem.
 
 The existing T01/T03/T04 evidence scripts remain regression checks for their original scopes. They do not substitute for the T06 raw crash records. Physical privacy purge, complete backup orchestration, real provider reconciliation and provider telemetry remain outside this synthetic transport slice.

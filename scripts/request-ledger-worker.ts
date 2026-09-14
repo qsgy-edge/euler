@@ -1,14 +1,13 @@
 // X-06 fixture only: intercept real SQLite statements in this child, never Core.
-import { writeSync, openSync, closeSync, fsyncSync } from 'node:fs';
-import { join } from 'node:path';
+import { writeSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
-import { API_VERSION, ProbeSession, sha256 } from '@euler/core';
+import { API_VERSION, ProbeSession } from '@euler/core';
 import { bindingOf, openSandbox } from '../apps/cli/src/sandbox.ts';
 import { openProbe } from '../apps/cli/src/probe.ts';
 
 const [root, kind, ownerId, cut] = process.argv.slice(2);
 const sandbox = openSandbox(root!);
-if (kind !== 'session' && kind !== 'job' && kind !== 'migration') throw new Error('invalid-owner');
+if (kind !== 'session' && kind !== 'job' && kind !== 'maintenance' && kind !== 'migration') throw new Error('invalid-owner');
 const probe = openProbe(sandbox, undefined, kind === 'session' ? undefined : { kind, id: ownerId!, authorizationId: ownerId! });
 const emit = (event: string, fields: object = {}) => writeSync(1, JSON.stringify({ event, ...fields }) + '\n');
 function checkpoint(point: string) {
@@ -17,15 +16,12 @@ function checkpoint(point: string) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
 }
 const session = new ProbeSession(probe.store, probe.activity, { version: API_VERSION, binding: bindingOf(sandbox), source: probe.archive,
-  transport: { kind: 'local-counting@1', send(payload) {
-    // A durable independent receiver observation, outside SQLite's transaction.
-    const record = { hash: sha256(payload), byteLength: Buffer.byteLength(payload), count: 1 };
-    const fd = openSync(join(sandbox.root, 'receiver.jsonl'), 'a');
-    try { writeSync(fd, JSON.stringify(record) + '\n'); fsyncSync(fd); } finally { closeSync(fd); }
+  transport: { kind: 'local-counting@1', send(payload, attempt) {
+    const record = probe.transport.send(payload, attempt);
     checkpoint('received');
     return record;
   } } });
-emit('ready', { runId: session.runId, activityId: probe.activity.id });
+emit('ready', { runId: session.runId, activityId: probe.activity.id, storage: probe.store.diagnostics(), adapterVersion: API_VERSION });
 let phase: string | null = null;
 const prepare = DatabaseSync.prototype.prepare;
 const exec = DatabaseSync.prototype.exec;
@@ -38,7 +34,9 @@ DatabaseSync.prototype.prepare = function(sql) {
       const next = eventKind === 'context/assembly@v1' ? 'assembly' : eventKind === 'model/request-attempt-started@v1' ? 'started'
         : eventKind === 'model/request-attempt-finished@v1' ? 'finished' : null;
       if (next) { phase = next; checkpoint(`${next}-before`); }
-      return Reflect.apply(run, this, parameters);
+      const result = Reflect.apply(run, this, parameters);
+      if (next) checkpoint(`${next}-appended`);
+      return result;
     };
   }
   return statement;

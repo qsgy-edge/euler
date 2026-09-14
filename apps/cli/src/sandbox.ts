@@ -36,6 +36,7 @@ export interface Sandbox {
   archiveIdentity: FileIdentity;
   sourceName?: string;
   storeIdentity: FileIdentity;
+  receiverIdentity: FileIdentity;
   fixtureDigest: string;
   fixture: Fixture;
 }
@@ -78,8 +79,13 @@ export function createSandbox(appId = 'euler'): Sandbox {
   writeFileSync(store, '', { flag: 'wx', mode: 0o600 });
   syncFile(archive);
   syncFile(store);
+  const receiver = join(root, 'counting-receiver.jsonl');
+  const receiverStoreId = randomUUID();
+  writeFileSync(receiver, JSON.stringify({ schema: 'counting-receiver@1', storeId: receiverStoreId }) + '\n', { flag: 'wx', mode: 0o600 });
+  syncFile(receiver);
   const sandbox: Sandbox = {
-    schema: 'euler-disposable@1', appId, storeId: randomUUID(), root,
+    schema: 'euler-disposable@1', appId, storeId: receiverStoreId, root,
+    receiverIdentity: fileIdentity(receiver),
     rootIdentity: fileIdentity(root), archiveIdentity: fileIdentity(archive), storeIdentity: fileIdentity(store),
     fixtureDigest, fixture,
   };

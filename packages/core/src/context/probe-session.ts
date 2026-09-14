@@ -140,7 +140,7 @@ export class ProbeSession {
       this.#store.finishRequestAttempt(this.#activity, { attemptId: started.attemptId, outcome: 'cancelled-before-send' });
       check(false, this.#stopped ?? 'run-cancelled');
     }
-    const received = this.#host.transport.send(prepared.payload);
+    const received = this.#host.transport.send(prepared.payload, started);
     // started/no-finished stays durable unknown-sent: a send that cannot prove
     // completion is never silently retried or rewritten (I11).
     check(received.hash === prepared.payloadHash && received.byteLength === Buffer.byteLength(prepared.payload), 'transport-payload-mismatch');

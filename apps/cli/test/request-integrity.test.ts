@@ -32,9 +32,10 @@ for (const resign of [false, true]) test(`canonical assembly damage blocks statu
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
-for (const admitted of [false, true]) test(`maintenance fences request activity before/after admission (admitted=${admitted})`, () => {
+for (const kind of ['session', 'maintenance'] as const) for (const admitted of [false, true]) test(`maintenance fences ${kind} request activity before/after admission (admitted=${admitted})`, () => {
   const sandbox = createSandbox();
-  const probe = openProbe(sandbox);
+  const ownerId = randomUUID();
+  const probe = openProbe(sandbox, undefined, kind === 'maintenance' ? { kind, id: ownerId, authorizationId: ownerId } : undefined);
   try {
     const turn = probe.session.prepare(sandbox.fixture.eventId, sandbox.fixture.text);
     const input = { runId: probe.session.runId, assemblyId: turn.assemblyId, payloadHash: turn.payloadHash,

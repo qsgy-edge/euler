@@ -223,7 +223,7 @@ async function main() {
   const args = parseArgs({ allowPositionals: true, options: {
     sandbox: { type: 'string' }, scenario: { type: 'string', default: 'success' }, budget: { type: 'string' },
     request: { type: 'string' }, record: { type: 'string' }, reservation: { type: 'string' },
-    attempt: { type: 'string' }, 'receipt-hash': { type: 'string' }, outcome: { type: 'string' },
+    attempt: { type: 'string' },
     'accept-duplicate-risk': { type: 'boolean', default: false },
     'wait-child-launch': { type: 'boolean', default: false },
   } });
@@ -248,12 +248,10 @@ async function main() {
       if (command === 'request-gap') probe.store.markRequestRecoveryGap(probe.activity, args.values.request!);
       if (command === 'request-seal') probe.store.sealRequestRun(probe.activity, args.values.request!);
       if (command === 'request-reconcile') {
-        check(args.values.attempt && args.values['receipt-hash']
-          && (args.values.outcome === 'received' || args.values.outcome === 'not-received'), 'reconciliation-evidence-required');
+        check(args.values.attempt, 'reconciliation-attempt-required');
         const old = probe.store.requestStatus(probe.activity, args.values.request!);
         check(old.attempts.some(attempt => attempt.attemptId === args.values.attempt), 'attempt-owner-mismatch');
-        probe.store.reconcileRequestAttempt(probe.activity, args.values.attempt,
-          { outcome: args.values.outcome, receiptHash: args.values['receipt-hash'] });
+        probe.store.reconcileRequestAttempt(probe.activity, args.values.attempt);
       }
       const status = probe.store.requestStatus(probe.activity, args.values.request!);
       if (command === 'request-resume') {

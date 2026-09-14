@@ -9,7 +9,7 @@ import { bindingOf, createSandbox, createSandboxSession } from '../src/sandbox.t
 import { openProbe } from '../src/probe.ts';
 import { startCli } from '../src/process-driver.ts';
 
-for (const queryable of [false, true]) test(`unknown recovery requires a linked owner decision (queryable=${queryable})`, () => {
+test('unknown recovery requires a linked owner decision while the sender is still live', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);
   const host = { version: API_VERSION, binding: bindingOf(sandbox), source: probe.archive, transport: probe.transport } as const;
@@ -25,16 +25,15 @@ for (const queryable of [false, true]) test(`unknown recovery requires a linked 
     assert.throws(() => new ProbeSession(probe.store, probe.activity, host, DEFAULT_BUDGET,
       { relatedRunId: old.runId, acceptDuplicateRisk: false }), /duplicate-risk-approval-required/);
     const before = probe.store.requestStatus(probe.activity, old.runId);
-    if (queryable) probe.store.reconcileRequestAttempt(probe.activity, before.attempts[0]!.attemptId,
-      { outcome: 'not-received', receiptHash: sha256('local-counter-independent-empty-observation') });
+    assert.throws(() => probe.store.reconcileRequestAttempt(probe.activity, before.attempts[0]!.attemptId), /attempt-owner-still-live/);
     const resumed = new ProbeSession(probe.store, probe.activity, host, DEFAULT_BUDGET,
-      { relatedRunId: old.runId, acceptDuplicateRisk: !queryable });
+      { relatedRunId: old.runId, acceptDuplicateRisk: true });
     assert.equal(resumed.dispatch(resumed.prepare(sandbox.fixture.eventId, sandbox.fixture.text)).outcome, 'received');
     assert.equal(probe.store.requestStatus(probe.activity, resumed.runId).run.relatedRunId, old.runId);
     const after = probe.store.requestStatus(probe.activity, old.runId);
     assert.deepEqual(after.attempts, before.attempts);
     assert.equal(after.attempts[0]!.outcome, 'unknown-sent');
-    assert.equal(after.events.filter(e => e.kind === 'model/request-attempt-reconciled@v1').length, queryable ? 1 : 0);
+    assert.equal(after.events.filter(e => e.kind === 'model/request-attempt-reconciled@v1').length, 0);
     resumed.close();
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });

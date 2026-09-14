@@ -16,6 +16,11 @@ export type RequestEventKind =
   | 'context/assembly@v1'
   | 'model/request-attempt-started@v1' | 'model/request-attempt-finished@v1';
 
+export interface RequestReconciliation {
+  attemptId: string; runId: string; payloadHash: string; byteLength: number;
+  outcome: 'received' | 'not-received'; receiptHash: string;
+}
+
 export interface RequestRecovery {
   relatedRunId: string;
   acceptDuplicateRisk: boolean;

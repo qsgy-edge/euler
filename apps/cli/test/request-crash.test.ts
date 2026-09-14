@@ -1,21 +1,25 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
+import { release, arch } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { sha256 } from '@euler/core';
-import { createSandbox } from '../src/sandbox.ts';
+import { API_VERSION, ProbeSession, sha256 } from '@euler/core';
+import { bindingOf, createSandbox } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 
 const worker = fileURLToPath(new URL('../../../scripts/request-ledger-worker.ts', import.meta.url));
 const evidenceDirectory = fileURLToPath(new URL(`../../../artifacts/t06-crash-${process.platform}-${Date.now()}/`, import.meta.url));
 mkdirSync(evidenceDirectory, { recursive: true });
-const points = ['assembly-before', 'assembly-after', 'started-before', 'started-after', 'received', 'finished-before', 'finished-after', 'normal'];
-for (const kind of ['session', 'job', 'migration'] as const) for (const point of points) {
+const implementationCommit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+const implementationStatus = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim();
+const implementationDiffHash = sha256(execFileSync('git', ['diff', 'HEAD'], { encoding: 'utf8' }));
+const points = ['assembly-before', 'assembly-appended', 'assembly-after', 'started-before', 'started-appended', 'started-after', 'received', 'finished-before', 'finished-appended', 'finished-after', 'normal'];
+for (const kind of ['session', 'job', 'maintenance', 'migration'] as const) for (const point of points) {
   test(`real ${kind} process crash at ${point} has independently recomputable ledger`, { timeout: 15000 }, async t => {
     const sandbox = createSandbox();
     const ownerId = randomUUID();
@@ -46,9 +50,16 @@ for (const kind of ['session', 'job', 'migration'] as const) for (const point of
       let assemblies: Record<string, unknown>[];
       let attempts: Record<string, unknown>[];
       let events: Record<string, unknown>[];
+      let databaseMetadata: object;
       try {
         assert.deepEqual(db.prepare('PRAGMA quick_check').all().map(row => row.quick_check), ['ok']);
         assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
+        databaseMetadata = { sqliteVersion: db.prepare('SELECT sqlite_version() AS version').get()!.version,
+          schemaVersion: db.prepare('PRAGMA user_version').get()!.user_version,
+          journalMode: db.prepare('PRAGMA journal_mode').get()!.journal_mode,
+          synchronous: db.prepare('PRAGMA synchronous').get()!.synchronous,
+          run: db.prepare('SELECT * FROM request_runs WHERE run_id=?').get(runId),
+          owner: db.prepare('SELECT * FROM execution_streams WHERE stream_id=(SELECT stream_id FROM request_runs WHERE run_id=?)').get(runId) };
         assemblies = db.prepare('SELECT * FROM request_assemblies WHERE run_id=?').all(runId);
         attempts = db.prepare('SELECT * FROM request_attempts WHERE run_id=?').all(runId);
         events = db.prepare('SELECT * FROM request_events WHERE run_id=? ORDER BY seq').all(runId);
@@ -58,17 +69,18 @@ for (const kind of ['session', 'job', 'migration'] as const) for (const point of
         }
         assert.equal(db.prepare('SELECT owner_kind FROM request_runs WHERE run_id=?').get(runId)!.owner_kind, kind);
       } finally { db.close(); }
-      const receiverPath = join(sandbox.root, 'receiver.jsonl');
-      const receiver = existsSync(receiverPath) ? readFileSync(receiverPath, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [];
-      const sent = ['received', 'finished-before', 'finished-after', 'normal'].includes(point);
-      const started = !['assembly-before', 'assembly-after', 'started-before'].includes(point);
+      const receiverPath = join(sandbox.root, 'counting-receiver.jsonl');
+      const receiverBytes = readFileSync(receiverPath, 'utf8');
+      const receiver = receiverBytes.trim().split('\n').slice(1).map(line => JSON.parse(line).record);
+      const sent = ['received', 'finished-before', 'finished-appended', 'finished-after', 'normal'].includes(point);
+      const started = !['assembly-before', 'assembly-appended', 'assembly-after', 'started-before', 'started-appended'].includes(point);
       const finished = ['finished-after', 'normal'].includes(point);
       assert.equal(receiver.length, sent ? 1 : 0);
-      assert.equal(assemblies.length, point === 'assembly-before' ? 0 : 1);
+      assert.equal(assemblies.length, ['assembly-before', 'assembly-appended'].includes(point) ? 0 : 1);
       assert.equal(attempts.length, started ? 1 : 0);
       assert.equal(events.filter(e => e.kind === 'model/request-attempt-started@v1').length, started ? 1 : 0);
       assert.equal(events.filter(e => e.kind === 'model/request-attempt-finished@v1').length, finished ? 1 : 0);
-      if (sent) assert.equal(receiver[0].hash, attempts[0]!.payload_hash);
+      if (sent) assert.equal(receiver[0].payloadHash, attempts[0]!.payload_hash);
       if (started) assert.equal(attempts[0]!.outcome, finished ? 'received' : 'unknown-sent');
       const probe = openProbe(sandbox, undefined, kind === 'session' ? undefined : { kind, id: ownerId, authorizationId: ownerId }, undefined, undefined, true);
       try {
@@ -77,11 +89,28 @@ for (const kind of ['session', 'job', 'migration'] as const) for (const point of
         if (started && !finished) {
           assert.equal(recovered.assemblies[0]!.state, 'unknown-sent');
           assert.throws(() => probe.session, /request-recovery-required/);
+          const reconciled = probe.store.reconcileRequestAttempt(probe.activity, recovered.attempts[0]!.attemptId);
+          const observation = JSON.parse(reconciled.events.at(-1)!.payload).evidence;
+          assert.equal(observation.outcome, sent ? 'received' : 'not-received');
+          assert.equal(reconciled.attempts[0]!.outcome, 'unknown-sent');
+          probe.store.sealRequestRun(probe.activity, runId);
+          const host = { version: API_VERSION, binding: bindingOf(sandbox), source: probe.archive, transport: probe.transport } as const;
+          if (sent) assert.throws(() => new ProbeSession(probe.store, probe.activity, host, undefined,
+            { relatedRunId: runId, acceptDuplicateRisk: false }), /duplicate-risk-approval-required/);
+          else {
+            const resumed = new ProbeSession(probe.store, probe.activity, host, undefined,
+              { relatedRunId: runId, acceptDuplicateRisk: false });
+            assert.equal(resumed.dispatch(resumed.prepare(sandbox.fixture.eventId, sandbox.fixture.text)).outcome, 'received');
+            resumed.close();
+          }
         }
       } finally { probe.close(); }
       const rawEvidence = JSON.stringify({ schema: 'dispatch-barriers@v1', kind, point, runId,
         fixtureDigest: sandbox.fixtureDigest, platform: process.platform, node: process.version,
-        assemblies, attempts, events, receiver, processObservations: output }, null, 2);
+        implementationCommit, implementationStatus, implementationDiffHash, osRelease: release(), architecture: arch(),
+        runner: process.env.GITHUB_ACTIONS ? { kind: 'github-actions', runId: process.env.GITHUB_RUN_ID } : { kind: 'local' },
+        database: databaseMetadata, sandbox, sourceSnapshot: readFileSync(join(sandbox.root, 'session.jsonl'), 'utf8'),
+        receiverBytes, assemblies, attempts, events, receiver, processObservations: output }, null, 2);
       const artifact = join(evidenceDirectory, `${kind}-${point}.json`);
       writeFileSync(artifact, rawEvidence + '\n');
       t.diagnostic(JSON.stringify({ schema: 'dispatch-barriers@v1', kind, point, runId, fixtureDigest: sandbox.fixtureDigest,

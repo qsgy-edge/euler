@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { check, sameBinding, sha256, uuid, validateBudget } from '../contracts.ts';
 import type { Binding, ProbeBudget, SourceAck } from '../contracts.ts';
 import { REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, assemblyIdentityHash, deriveAssemblyState, freezeRequestPayload } from './request-ledger.ts';
-import type { RequestAssembly, RequestAssemblyInput, RequestAttempt, RequestEvent, RequestEventKind, RequestRun, RequestStatus } from './request-ledger.ts';
+import type { RequestAssembly, RequestAssemblyInput, RequestAttempt, RequestEvent, RequestEventKind, RequestRun, RequestStatus, RequestReconciliation } from './request-ledger.ts';
 
 export interface FileIdentity { dev: string; ino: string }
 export interface BoundFile { path: string; identity: FileIdentity }
@@ -32,7 +32,7 @@ export interface Activity {
   streamId: string;
 }
 export interface ExecutionOwner {
-  kind: 'session' | 'job' | 'migration';
+  kind: 'session' | 'job' | 'maintenance' | 'migration';
   id: string;
   authorizationId: string;
 }
@@ -474,12 +474,14 @@ export class ProbeStore {
   readonly #storeId: string;
   readonly #binding: Binding;
   readonly #resources: StoreResources;
+  readonly #queryRequest: ((attempt: RequestAttempt) => RequestReconciliation) | undefined;
   readonly #readSource: ((input: SourceAck) => { text: string }) | undefined;
   #depth = 0;
   #committingOperation: string | null = null;
 
   constructor(resources: StoreResources, storeId: string, binding: Binding, initialize = false,
-    readSource?: (input: SourceAck) => { text: string }, appId = 'euler') {
+    readSource?: (input: SourceAck) => { text: string }, appId = 'euler', queryRequest?: (attempt: RequestAttempt) => RequestReconciliation) {
+    this.#queryRequest = queryRequest;
     this.#readSource = readSource;
     this.#storeId = storeId;
     this.#binding = structuredClone(binding);
@@ -611,7 +613,7 @@ export class ProbeStore {
       check(!this.#db.prepare('SELECT 1 FROM owner_activities WHERE store_id=? AND incarnation=? AND epoch!=?')
         .get(this.#storeId, processIdentity.incarnation, fence.epoch), 'stale-runtime-incarnation');
       check(owner && Object.keys(owner).every(key => ['kind','id','authorizationId'].includes(key))
-        && ['session','job','migration'].includes(owner.kind), 'invalid-stream-owner');
+        && ['session','job','maintenance','migration'].includes(owner.kind), 'invalid-stream-owner');
       check(owner.kind !== 'session' || (owner.id === this.#binding.sessionId && owner.authorizationId === owner.id), 'invalid-stream-owner');
       const stream = this.#ensureStream(owner.kind, owner.id, owner.authorizationId);
       const activity = { ...processIdentity, id: randomUUID(), epoch: fence.epoch, root: structuredClone(this.#resources.root), streamId: stream.streamId };
@@ -785,9 +787,9 @@ export class ProbeStore {
         const previous = this.requestStatus(activity, input.relatedRunId);
         check(previous.sealed, 'recovery-run-not-sealed');
         check(!this.#db.prepare('SELECT 1 FROM request_runs WHERE related_run_id=?').get(input.relatedRunId), 'recovery-already-authorized');
-        const unresolved = previous.attempts.some(attempt => attempt.outcome === 'unknown-sent'
+        const unresolved = previous.attempts.some(attempt => attempt.outcome === 'received' || (attempt.outcome === 'unknown-sent'
           && !previous.events.some(event => event.attemptId === attempt.attemptId && event.kind === 'model/request-attempt-reconciled@v1'
-            && (JSON.parse(event.payload) as { evidence: { outcome: string } }).evidence.outcome === 'not-received'));
+            && (JSON.parse(event.payload) as { evidence: { outcome: string } }).evidence.outcome === 'not-received')));
         check((!unresolved && !previous.events.some(event => event.kind === 'run-recovery-gap'))
           || input.acceptDuplicateRisk === true, 'duplicate-risk-approval-required');
         this.#verifyRequestSources(previous.assemblies);
@@ -795,7 +797,6 @@ export class ProbeStore {
       this.#requestRecoveryGate(activity, input.relatedRunId);
       if (input.intent) { uuid(input.intent.eventId); check(input.intent.hash.length === 64, 'invalid-intent-ref'); }
       const stream = this.#readStream(activity.streamId);
-      check(stream.ownerKind !== 'maintenance', 'maintenance-business-unavailable');
       check(!this.#db.prepare('SELECT 1 FROM request_runs WHERE run_id=?').get(runId), 'run-identity-conflict');
       const authorizedAt = new Date().toISOString();
       this.#db.prepare('INSERT INTO request_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
@@ -969,15 +970,26 @@ export class ProbeStore {
     for (const assembly of assemblies) for (const source of assembly.sources) this.#validateSource(source);
   }
 
-  reconcileRequestAttempt(activity: Activity, attemptId: string, evidence: { outcome: 'received' | 'not-received'; receiptHash: string }): RequestStatus {
+  reconcileRequestAttempt(activity: Activity, attemptId: string): RequestStatus {
     return this.withActivity(activity, () => {
       uuid(attemptId);
-      check(/^[0-9a-f]{64}$/.test(evidence.receiptHash)
-        && ['received', 'not-received'].includes(evidence.outcome), 'invalid-reconciliation-evidence');
       const row = this.#db.prepare('SELECT run_id FROM request_attempts WHERE attempt_id=?').get(attemptId);
       check(row, 'unknown-attempt');
       const status = this.requestStatus(activity, String(row.run_id));
-      check(status.attempts.some(attempt => attempt.attemptId === attemptId && attempt.outcome === 'unknown-sent'), 'attempt-not-unknown');
+      const attempt = status.attempts.find(attempt => attempt.attemptId === attemptId);
+      check(attempt?.outcome === 'unknown-sent', 'attempt-not-unknown');
+      check(this.#queryRequest, 'reconciliation-reader-unavailable');
+      const owner = this.#db.prepare(`SELECT a.pid FROM execution_events e JOIN owner_activities a ON a.id=e.activity_id
+        WHERE e.attempt_id=? AND e.kind='attempt-bound'`).get(attemptId);
+      // Establish absence before reading the receiver, so a final send between
+      // an empty observation and process exit cannot be mistaken for absence.
+      const senderAbsent = Boolean(owner?.pid && processAbsent(Number(owner.pid)));
+      const evidence = this.#queryRequest(attempt);
+      check(evidence.attemptId === attemptId && evidence.runId === attempt.runId
+        && evidence.payloadHash === attempt.payloadHash && evidence.byteLength === attempt.byteLength
+        && /^[0-9a-f]{64}$/.test(evidence.receiptHash)
+        && ['received', 'not-received'].includes(evidence.outcome), 'invalid-reconciliation-evidence');
+      if (evidence.outcome === 'not-received') check(senderAbsent, 'attempt-owner-still-live');
       this.#verifyRequestSources(status.assemblies);
       check(!status.events.some(event => event.attemptId === attemptId && event.kind === 'model/request-attempt-reconciled@v1'), 'attempt-already-reconciled');
       this.#requestEvent(status.run.runId, 'model/request-attempt-reconciled@v1', attemptId, JSON.stringify({
@@ -1075,7 +1087,6 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       uuid(runId);
       const stream = this.#readStream(activity.streamId);
-      check(stream.ownerKind !== 'maintenance', 'maintenance-business-unavailable');
       const attemptId = randomUUID();
       const seq = Number(this.#db.prepare('SELECT COALESCE(MAX(seq),0)+1 AS seq FROM execution_events WHERE stream_id=?').get(stream.streamId)!.seq);
       this.#db.prepare('INSERT INTO execution_events VALUES (?,?,?,?,?,?,?,?)')
@@ -1108,7 +1119,8 @@ export class ProbeStore {
         && activity.pid === processIdentity.pid && activity.incarnation === processIdentity.incarnation
         && activity.startedAt === processIdentity.startedAt, 'admission-closed');
       const stream = this.#readStream(activity.streamId);
-      check(stream.ownerKind !== 'maintenance', 'maintenance-business-unavailable');
+      // Ordinary maintenance workers obey this same open-fence/epoch gate.
+      // Exclusive coordinators remain fenced; owner kind never bypasses it.
       check(stream.projectId === this.#binding.projectId
         && (stream.ownerKind !== 'session' || stream.ownerId === this.#binding.sessionId), 'stream-owner-evidence-gap');
       return action();
@@ -2296,7 +2308,7 @@ export class ProbeStore {
     // These are the existing disposable adapter's carriers, not a cleanup allowlist.
     const sources = this.#db.prepare('SELECT source_path,source_dev,source_ino FROM sessions WHERE store_id=?').all(this.#storeId);
     const sourceNames = sources.map(row => basename(String(row.source_path)));
-    const known = new Set(['sandbox.json', ...sourceNames, basename(this.#resources.store.path),
+    const known = new Set(['sandbox.json', 'counting-receiver.jsonl', ...sourceNames, basename(this.#resources.store.path),
       `${basename(this.#resources.store.path)}-wal`, `${basename(this.#resources.store.path)}-shm`]);
     try {
       const names = readdirSync(this.#resources.root.path).sort();
