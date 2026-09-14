@@ -44,7 +44,7 @@ export class ProbeSession {
   #tools = 0;
   #tokens = 0;
   #stopped: string | null = null;
-  #completed = false;
+  #closed = false;
 
   constructor(store: ProbeStore, activity: Activity, host: HostAdapter, budget: ProbeBudget = DEFAULT_BUDGET) {
     validateBudget(budget);
@@ -126,12 +126,13 @@ export class ProbeSession {
       this.#readIntentSources(current);
       this.#active();
       check(this.#tokens + reserved <= this.#budget.maxTotalTokens, 'context-budget-exhausted');
-      this.#consumed.add(prepared);
-      this.#attempts++;
-      this.#tokens += reserved;
-      return this.#store.startRequestAttempt(this.#activity, { runId: this.runId, assemblyId: prepared.assemblyId,
+      const attempt = this.#store.startRequestAttempt(this.#activity, { runId: this.runId, assemblyId: prepared.assemblyId,
         payloadHash: prepared.payloadHash, byteLength: Buffer.byteLength(prepared.payload), adapterVersion: API_VERSION });
+      return attempt;
     });
+    this.#consumed.add(prepared);
+    this.#attempts++;
+    this.#tokens += reserved;
     // Observable cancellation after admission stops the attempt before the
     // transport call without claiming already-sent bytes back (Ticket 09 §15a).
     if (this.#stopped) {
@@ -143,7 +144,6 @@ export class ProbeSession {
     // completion is never silently retried or rewritten (I11).
     check(received.hash === prepared.payloadHash && received.byteLength === Buffer.byteLength(prepared.payload), 'transport-payload-mismatch');
     this.#store.finishRequestAttempt(this.#activity, { attemptId: started.attemptId, outcome: 'received', usage: { count: received.count } });
-    this.#completed = true;
     return {
       schema: 'local-dispatch-probe@1', runId: this.runId, ownerKind: started.ownerKind, ownerId: started.ownerId,
       streamId: started.streamId, attemptId: started.attemptId,
@@ -191,18 +191,30 @@ export class ProbeSession {
   }
 
   close(): void {
-    if (this.#completed) return;
-    this.cancel();
+    if (this.#closed) return;
+    try {
+      // Closing ends admission without relabelling a received or unknown attempt.
+      this.#store.sealRequestRun(this.#activity, this.runId);
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== 'admission-closed') throw error;
+      // The current activity is already fenced; this is not a cancellation receipt.
+    }
+    this.#closed = true;
+    this.#stopped = 'run-closed';
   }
 
   cancel(): void {
     try {
-      // The control event is durable and idempotent before the observable stop
-      // (I11). A store that cannot transact is already durably fenced, so the
-      // observable stop remains safe; the error is not a new admission fact.
       this.#store.revokeRequestRun(this.#activity, this.runId);
-    } catch { /* fenced or sealed store: admission is already durably blocked */ }
-    finally { this.#stopped = 'run-cancelled'; }
+    } catch (error) {
+      this.#stopped = 'cancellation-failed';
+      if (error instanceof Error && error.message === 'admission-closed') {
+        this.#stopped = 'admission-closed';
+        return;
+      }
+      throw error;
+    }
+    this.#stopped = 'run-cancelled';
   }
   usage(): { attempts: number; tools: number; tokens: number; stopped: string | null } {
     return { attempts: this.#attempts, tools: this.#tools, tokens: this.#tokens, stopped: this.#stopped };

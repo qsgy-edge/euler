@@ -24,9 +24,9 @@ test('a received request has durable assembly, started and finished facts after 
     try {
       const ledger = reopened.store.requestStatus(reopened.activity, runId);
       assert.deepEqual(ledger.events.map(event => event.kind), ['run-authorized', 'context/assembly@v1',
-        'model/request-attempt-started@v1', 'model/request-attempt-finished@v1']);
+        'model/request-attempt-started@v1', 'model/request-attempt-finished@v1', 'run-sealed']);
       assert.equal(ledger.revoked, false);
-      assert.equal(ledger.sealed, false);
+      assert.equal(ledger.sealed, true);
       assert.equal(ledger.run.ownerKind, 'session');
       assert.equal(ledger.run.epoch, probe.activity.epoch);
       assert.equal(ledger.assemblies.length, 1);

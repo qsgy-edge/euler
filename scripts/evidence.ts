@@ -184,7 +184,7 @@ try {
         const payload = JSON.parse(result!.payloads[0]);
         assert.deepEqual(payload.messages.map((message: { role: string }) => message.role), ['system', 'user']);
         assert.equal(payload.messages[1].content, fixture.text);
-        assert.equal(result!.receipt.formalLedger, false);
+        assert.equal(result!.receipt.formalLedger, true);
       });
     }
     if (scenario === 'archive-failure') verify('archive failure has no source ack', () => assert.equal(item.lines.some(line => line.event === 'source-ack'), false));

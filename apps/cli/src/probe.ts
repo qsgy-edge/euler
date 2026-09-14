@@ -40,6 +40,6 @@ export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET
     const archive = archiveFor(binding);
     const transport = new CountingTransport();
     const session = new ProbeSession(store, activity, { version: API_VERSION, binding, source: archive, transport }, budget);
-    return { store, activity, archive, transport, session, close: () => { session.close(); store.close(); } };
+    return { store, activity, archive, transport, session, close: () => { try { session.close(); } finally { store.close(); } } };
   } catch (error) { store.close(); throw error; }
 }

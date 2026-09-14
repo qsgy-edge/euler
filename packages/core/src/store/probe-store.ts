@@ -791,9 +791,14 @@ export class ProbeStore {
         && input.route.length > 0 && input.model.length > 0 && input.policyHash.length === 64
         && input.sources.length > 0 && input.sources.every(source => source.schema === 'cli-source-ack@1' && source.status === 'durable')
         && input.selection.length === input.sources.length, 'invalid-assembly');
+      validateBudget(input.budget);
+      check(Object.entries(run.budget).every(([key, value]) => input.budget[key as keyof ProbeBudget] === value), 'assembly-budget-mismatch');
+      check(input.epoch === run.epoch, 'assembly-epoch-mismatch');
+      check(input.selection.every((item, index) => item.ordinal === index && item.hash === input.sources[index]?.hash
+        && item.reason === 'mandatory-source'), 'invalid-assembly-selection');
       const frozen = freezeRequestPayload(input.payload);
       check(frozen.payloadHash === input.payloadHash && frozen.byteLength === input.byteLength
-        && input.byteLength > 0 && input.estimatedTokens > 0, 'payload-freeze-mismatch');
+        && input.byteLength > 0 && input.estimatedTokens === input.byteLength, 'payload-freeze-mismatch');
       const identityHash = assemblyIdentityHash(input);
       const existing = this.#db.prepare('SELECT * FROM request_assemblies WHERE run_id=? AND identity_hash=?')
         .get(input.runId, identityHash);
@@ -859,7 +864,13 @@ export class ProbeStore {
       const assembly = this.#db.prepare('SELECT * FROM request_assemblies WHERE assembly_id=? AND run_id=?')
         .get(input.assemblyId, input.runId);
       check(assembly, 'unknown-assembly');
-      check(assembly.state !== 'unknown-sent', 'unknown-attempt-requires-reconciliation');
+      const attempts = Number(this.#db.prepare('SELECT COUNT(*) AS n FROM request_attempts WHERE run_id=?').get(input.runId)!.n);
+      check(attempts < run.budget.maxModelAttempts, 'attempt-budget-exhausted');
+      const usedTokens = Number(this.#db.prepare('SELECT COALESCE(SUM(byte_length),0) AS n FROM request_attempts WHERE run_id=?').get(input.runId)!.n);
+      const reserved = input.byteLength + run.budget.outputReserve + run.budget.safetyMargin;
+      check(reserved <= run.budget.contextLimit, 'context-budget-exhausted');
+      check(usedTokens + attempts * (run.budget.outputReserve + run.budget.safetyMargin) + reserved <= run.budget.maxTotalTokens, 'token-budget-exhausted');
+      check(!this.#db.prepare("SELECT 1 FROM request_attempts WHERE run_id=? AND outcome='unknown-sent'").get(input.runId), 'unknown-attempt-requires-reconciliation');
       check(assembly.payload_hash === input.payloadHash && assembly.byte_length === input.byteLength, 'attempt-payload-mismatch');
       // Admission linearization point: the attempt/activity registration commits
       // atomically with the re-verified authorization snapshot (Ticket 09 §15a).
@@ -887,6 +898,10 @@ export class ProbeStore {
       check(input.outcome === 'received' || input.outcome === 'cancelled-before-send', 'invalid-attempt-outcome');
       const row = this.#db.prepare('SELECT * FROM request_attempts WHERE attempt_id=?').get(input.attemptId);
       check(row, 'unknown-attempt');
+      this.#requestRun(activity, String(row.run_id));
+      const ownership = this.#db.prepare("SELECT activity_id FROM execution_events WHERE attempt_id=? AND kind='attempt-bound'")
+        .get(input.attemptId);
+      check(ownership?.activity_id === activity.id, 'attempt-owner-mismatch');
       check(row.outcome === 'unknown-sent', 'attempt-settled-or-unknown');
       const finishedAt = new Date().toISOString();
       this.#db.prepare('UPDATE request_attempts SET outcome=?, finished_at=? WHERE attempt_id=?')
