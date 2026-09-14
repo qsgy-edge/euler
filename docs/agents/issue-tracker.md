@@ -28,6 +28,10 @@ Recommended flow:
 
 Direct commits to `main` are reserved for repository maintenance or other explicitly agreed exceptions. A direct commit should not be treated as having completed the Greptile pull-request review flow.
 
+### Greptile usage discipline
+
+Greptile reviews the pull request diff, so do local verification before pushing and batch related fixes into one push. After a Greptile finding, reproduce it locally, fix all related findings together, run the focused tests plus the relevant full checks, and push once. Do not push speculative or cosmetic changes that would trigger another review; do not use Retrigger until the code and local evidence are ready. CI reruns and Greptile Retrigger are separate actions.
+
 ## Pull requests as a triage surface
 
 **PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
