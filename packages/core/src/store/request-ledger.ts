@@ -91,12 +91,12 @@ export function assemblyIdentityHash(input: Omit<RequestAssemblyInput, 'payload'
   }));
 }
 
-// Derived assembly state: any received attempt means finished; otherwise any
-// started-but-unresolved attempt means unknown-sent; otherwise not-dispatched.
+// An unresolved attempt takes priority over earlier received attempts. Only
+// when every attempt is settled may a received result finish the assembly.
 // A cancelled-before-send attempt proves no bytes left for that attempt, so it
 // never upgrades the assembly past the remaining attempts' evidence.
 export function deriveAssemblyState(attempts: { outcome: RequestAttemptOutcome }[]): RequestAssemblyState {
-  if (attempts.some(attempt => attempt.outcome === 'received')) return 'finished';
   if (attempts.some(attempt => attempt.outcome === 'unknown-sent')) return 'unknown-sent';
+  if (attempts.some(attempt => attempt.outcome === 'received')) return 'finished';
   return 'not-dispatched';
 }

@@ -928,11 +928,20 @@ export class ProbeStore {
     });
   }
 
+  assertDispatchBoundary(): void {
+    check(this.#depth === 0, 'dispatch-inside-transaction');
+  }
+
   requestMaySend(activity: Activity, runId: string): boolean {
     return this.withActivity(activity, () => {
       const status = this.requestStatus(activity, runId);
       this.#verifyRequestSources(status.assemblies);
-      return status.run.state === 'authorized' && status.run.epoch === activity.epoch;
+      const attempt = status.attempts.find(item => item.outcome === 'unknown-sent');
+      const assembly = status.assemblies.find(item => item.assemblyId === attempt?.assemblyId);
+      const currentIntent = this.readIntent(activity);
+      return status.run.state === 'authorized' && status.run.epoch === activity.epoch
+        && Boolean(assembly && currentIntent?.status === 'active'
+          && currentIntent.eventId === assembly.intent?.eventId && currentIntent.hash === assembly.intent?.hash);
     });
   }
 

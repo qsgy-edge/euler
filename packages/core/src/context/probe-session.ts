@@ -103,6 +103,7 @@ export class ProbeSession {
   }
 
   dispatch(prepared: PreparedTurn, finalGate: () => unknown = () => {}): ProbeReceipt {
+    this.#store.assertDispatchBoundary();
     check(!this.#consumed.has(prepared), 'attempt-settled-or-unknown');
     this.#active();
     check(this.#prepared.get(prepared) === sha256(JSON.stringify(prepared)), 'invalid-assembly');
