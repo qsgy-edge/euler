@@ -78,3 +78,11 @@ Used by `/wayfinder`. The **map** is a single issue labelled `wayfinder:map`, ho
 - **Frontier query**: list the map's open children (`gh issue list --state open`, scoped to the map's sub-issues / task list), drop any with an open blocker (`issue_dependencies_summary.blocked_by > 0`, or an open issue in the `Blocked by` line) or an assignee; first in map order wins.
 - **Claim**: `gh issue edit <n> --add-assignee @me`, the session's first write.
 - **Resolve**: after the implementation PR is merged and acceptance is complete, comment on the issue with the result, then close it with `gh issue close <n>`. If the PR body contains `Closes #<n>`, GitHub can close the issue automatically when the PR is merged; in that case, add the acceptance comment before or after the merge as appropriate.
+
+<!-- agents-md-author:begin ticket-synchronization -->
+## Ticket synchronization
+
+- When the reviewed specification baseline changes, update the human-readable `Spec references` baseline in every affected open generated ticket before implementation starts. Preserve the `euler-to-tickets:` marker; it records ticket provenance.
+- Treat GitHub native issue dependencies as the blocker source of truth. If a body `Blocked by` fallback is present, remove closed blockers and retain open ones after each dependency changes state.
+- After an implementation PR merges, compare its recorded evidence gaps with downstream ticket scope. Add a gap only when the downstream ticket already owns that behavior; create or route new scope separately.
+<!-- agents-md-author:end ticket-synchronization -->
