@@ -6,7 +6,7 @@ import { bindingOf } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
 
 type Gate = <T>(action: () => T) => T;
-interface RawEvent { schema: 'cli-input@1'; eventId: string; role: 'user'; text: string }
+interface RawEvent { schema: 'cli-input@1'; eventId: string; role: 'user' | 'assistant' | 'tool'; text: string }
 
 // The CLI owns this carrier. Core sees acknowledgements and bounded source operations.
 export class CliArchive {
@@ -37,7 +37,7 @@ export class CliArchive {
     return lines.map(line => {
       const event = JSON.parse(line) as RawEvent;
       uuid(event.eventId);
-      check(event.schema === 'cli-input@1' && event.role === 'user' && typeof event.text === 'string'
+      check(event.schema === 'cli-input@1' && ['user', 'assistant', 'tool'].includes(event.role) && typeof event.text === 'string'
         && event.text.length > 0 && Buffer.byteLength(event.text) <= 65536, 'archive-integrity');
       check(line === JSON.stringify({ schema: event.schema, eventId: event.eventId, role: event.role, text: event.text }),
         'archive-integrity: event bytes conflict');
@@ -51,15 +51,16 @@ export class CliArchive {
     });
   }
 
-  append(eventId: string, text: string): SourceAck {
+  append(eventId: string, text: string, role: RawEvent['role'] = 'user'): SourceAck {
     uuid(eventId);
+    check(['user', 'assistant', 'tool'].includes(role), 'invalid-source-role');
     check(typeof text === 'string' && text.length > 0 && Buffer.byteLength(text) <= 65536, 'invalid-input');
     return this.#gate(() => {
       const events = this.#scan();
       const previous = events.find(item => item.event.eventId === eventId);
-      const line = JSON.stringify({ schema: 'cli-input@1', eventId, role: 'user', text }) + '\n';
+      const line = JSON.stringify({ schema: 'cli-input@1', eventId, role, text }) + '\n';
       if (previous) {
-        check(previous.event.text === text, 'identity-conflict');
+        check(previous.event.text === text && previous.event.role === role, 'identity-conflict');
       } else {
         const fd = openSync(this.#path, 'a');
         try {

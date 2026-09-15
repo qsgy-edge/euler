@@ -11,6 +11,7 @@ export type RequestRunState = 'authorized' | 'revoked' | 'sealed';
 export type RequestAssemblyState = 'not-dispatched' | 'unknown-sent' | 'finished';
 export type RequestAttemptOutcome = 'unknown-sent' | 'received' | 'cancelled-before-send';
 export type RequestEventKind =
+  | 'agent/event@v1'
   | 'run-authorized' | 'run-revoked' | 'run-sealed' | 'run-recovery-gap'
   | 'model/request-attempt-reconciled@v1'
   | 'context/assembly@v1'

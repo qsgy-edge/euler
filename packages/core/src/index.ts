@@ -1,4 +1,8 @@
 export * from './contracts.ts';
+export { AgentRun } from './context/agent-run.ts';
+export type { AgentHost, ModelRequest, NeutralRequest } from './context/agent-run.ts';
+export { coreToolSchemas } from './context/tool-schemas.ts';
+export type { AgentEvent, AgentStatus, ModelReply, ModelRoute, RunTerminal, ToolCall } from './context/agent-state.ts';
 export { ProbeSession } from './context/probe-session.ts';
 export type { PreparedTurn, ProbeReceipt } from './context/probe-session.ts';
 export type { FileIdentity, BoundFile, StoreResources } from './store/probe-store.ts';

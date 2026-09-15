@@ -10,6 +10,7 @@ import { createSandbox, openSandbox, bindingOf, resourcesOf } from './sandbox.ts
 import type { Sandbox } from './sandbox.ts';
 import { openProbe } from './probe.ts';
 import { startCli } from './process-driver.ts';
+import { AGENT_BUDGET, runAgentDemo } from './agent-cli.ts';
 import memoryFixture from '../../../fixtures/scoped-memory.json' with { type: 'json' };
 
 function emit(event: string, fields: Record<string, unknown> = {}) {
@@ -223,6 +224,7 @@ async function main() {
   const args = parseArgs({ allowPositionals: true, options: {
     sandbox: { type: 'string' }, scenario: { type: 'string', default: 'success' }, budget: { type: 'string' },
     request: { type: 'string' }, record: { type: 'string' }, reservation: { type: 'string' },
+    'transport-config': { type: 'string' }, interactive: { type: 'boolean', default: false },
     attempt: { type: 'string' },
     'accept-duplicate-risk': { type: 'boolean', default: false },
     'wait-child-launch': { type: 'boolean', default: false },
@@ -230,7 +232,7 @@ async function main() {
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
   const requestCommands = ['request-status', 'request-seal', 'request-reconcile', 'request-resume', 'request-gap'];
-  check([...requestCommands, 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
+  check([...requestCommands, 'agent', 'agent-status', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
   const options = args.values.budget ? JSON.parse(args.values.budget) as Partial<ProbeBudget> : {};
   check(!args.values['wait-child-launch'] || command === 'hold', 'hold-only-option');
   check(Object.keys(options).every(key => key in DEFAULT_BUDGET), 'invalid-budget');
@@ -241,6 +243,17 @@ async function main() {
   if (command === 'archive-failure' || args.values.scenario === 'archive-failure') check(!args.values.sandbox, 'fault-requires-fresh-sandbox');
   const sandbox = args.values.sandbox ? openSandbox(args.values.sandbox) : createSandbox();
   emit('sandbox', { root: sandbox.root, storeId: sandbox.storeId, fixtureDigest: sandbox.fixtureDigest, mode: 'synthetic-only' });
+  if (command === 'agent') return runAgentDemo(sandbox, args.values.scenario === 'success' ? 'tool' : args.values.scenario,
+    { ...AGENT_BUDGET, ...options }, { interactive: args.values.interactive,
+      ...(args.values['transport-config'] ? { transportConfig: args.values['transport-config'] } : {}),
+      ...(args.values.request ? { recovery: { relatedRunId: args.values.request, acceptDuplicateRisk: args.values['accept-duplicate-risk'] } } : {}) });
+  if (command === 'agent-status') {
+    check(args.values.request && args.values.sandbox, 'request-identity-required');
+    const probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
+    try { emit('agent-status', { runId: args.values.request, status: probe.store.agentStatus(probe.activity, args.values.request), ledger: probe.store.requestStatus(probe.activity, args.values.request) }); }
+    finally { probe.close(); }
+    return;
+  }
   if (requestCommands.includes(command)) {
     const probe = openProbe(sandbox, budget, undefined, undefined, command === 'request-resume'
       ? { relatedRunId: args.values.request!, acceptDuplicateRisk: args.values['accept-duplicate-risk'] } : undefined, true);
