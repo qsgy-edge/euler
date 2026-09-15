@@ -85,4 +85,5 @@ Used by `/wayfinder`. The **map** is a single issue labelled `wayfinder:map`, ho
 - When the reviewed specification baseline changes, update the human-readable `Spec references` baseline in every affected open generated ticket before implementation starts. Preserve the `euler-to-tickets:` marker; it records ticket provenance.
 - Treat GitHub native issue dependencies as the blocker source of truth. If a body `Blocked by` fallback is present, remove closed blockers and retain open ones after each dependency changes state.
 - After an implementation PR merges, compare its recorded evidence gaps with downstream ticket scope. Add a gap only when the downstream ticket already owns that behavior; create or route new scope separately.
+- After a PR is merged, remove its local and remote feature branches only after verifying that no worktree or unique patch remains. For squash- or rebase-merged branches, check patch equivalence before deletion; keep `main` and active feature branches.
 <!-- agents-md-author:end ticket-synchronization -->
