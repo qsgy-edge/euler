@@ -200,7 +200,7 @@ test('steer is consumed only after the settled batch; follow-up creates a linked
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
-test('escaped near-limit tool results are truncated to the archive byte limit', async () => {
+test('escaped near-limit tool results are marked failed when archive encoding requires truncation', async () => {
   const sandbox = createSandbox();
   const limits = { ...budget, contextLimit: 100000, maxTotalTokens: 200000 };
   const probe = openProbe(sandbox, limits, undefined, undefined, undefined, true);
@@ -215,7 +215,8 @@ test('escaped near-limit tool results are truncated to the archive byte limit', 
     run.finishTool(tool.id, String.fromCharCode(34, 92).repeat(16384));
     const result = run.status().tools[0]!.result!;
     const archived = probe.archive.read(result.source).text;
-    assert.equal(result.outcome, 'success');
+    assert.equal(result.outcome, 'failure');
+    assert.equal(result.errorClass, 'tool-result-truncated');
     assert.ok(Buffer.byteLength(archived) <= 65536);
     assert.ok(JSON.parse(archived).modelResult.length < 32768);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
