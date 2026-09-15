@@ -260,9 +260,19 @@ export class AgentRun {
     const tool = state.tools.find(tool => tool.callId === callId);
     check(tool && !tool.result, 'tool-already-settled');
     check(Buffer.byteLength(modelResult) <= 32768, 'tool-result-too-large');
-    const rawResult = modelResult;
-    const projection = Array.from(modelResult).slice(0, 256).join('');
-    const source = this.#host.source.append(randomUUID(), JSON.stringify({ callId, outcome, modelResult: projection, rawResult }), 'tool');
+    const encode = (value: string) => JSON.stringify({ callId, outcome, modelResult: value });
+    let archivedResult = modelResult;
+    if (Buffer.byteLength(encode(archivedResult)) > 65535) {
+      let low = 0, high = Array.from(modelResult).length;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        const candidate = Array.from(modelResult).slice(0, middle).join('');
+        if (Buffer.byteLength(encode(candidate)) <= 65535) low = middle;
+        else high = middle - 1;
+      }
+      archivedResult = Array.from(modelResult).slice(0, low).join('');
+    }
+    const source = this.#host.source.append(randomUUID(), encode(archivedResult), 'tool');
     this.#event({ kind: 'tool-result', result: { callId, executionState: tool.started ? 'started' : 'not_started',
       outcome, argumentsHash: tool.argumentsHash, errorClass, source } });
   }
