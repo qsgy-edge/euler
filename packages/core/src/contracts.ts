@@ -46,7 +46,7 @@ export interface HostAdapter {
   };
   transport: {
     kind: 'local-counting@1';
-    send(payload: string): { hash: string; byteLength: number; count: number };
+    send(payload: string, attempt?: { attemptId: string; runId: string; payloadHash: string; byteLength: number }): { hash: string; byteLength: number; count: number };
   };
 }
 

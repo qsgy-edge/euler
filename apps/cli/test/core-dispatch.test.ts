@@ -24,7 +24,7 @@ test('failed final gate sends zero; an unchanged successful payload is received 
     const receipt = probe.session.dispatch(turn);
     assert.equal(receipt.count, 1);
     assert.deepEqual(probe.transport.payloads, [turn.payload]);
-    assert.equal(receipt.formalLedger, false);
+    assert.equal(receipt.formalLedger, true);
     assert.throws(() => probe.session.dispatch(turn), /attempt-settled-or-unknown/);
     assert.equal(probe.transport.count, 1);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }

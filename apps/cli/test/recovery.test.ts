@@ -48,7 +48,10 @@ test('torn or changed source blocks dependent intent and transport; missing boun
     assert.equal(probe.transport.count, 0);
     rmSync(path);
     assert.throws(() => openSandbox(sandbox.root), /ENOENT/);
-  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+  } finally {
+    try { assert.throws(() => probe.close(), /ENOENT/); }
+    finally { rmSync(sandbox.root, { recursive: true, force: true }); }
+  }
 });
 
 test('stored inputs with invalid size or rewritten event bytes cannot receive a new ack', () => {
