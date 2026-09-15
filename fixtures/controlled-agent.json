@@ -1,0 +1,7 @@
+{
+  "schema": "controlled-agent-fixture@1",
+  "plain": "Synthetic test only. Reply with the word READY. Do not call a tool.",
+  "tool": "Synthetic test only. Call controlled.echo once with text EULER-T07, then report its result. Do not use any other tool.",
+  "steer": "Keep the same synthetic task. Include the word STEERED in the final reply.",
+  "followUp": "Synthetic follow-up: reply FOLLOWED without tools."
+}

@@ -29,6 +29,7 @@ export class CountingTransport {
     return { bytes, records };
   }
   query(attempt: RequestAttempt): RequestReconciliation {
+    check(attempt.adapterVersion === API_VERSION, 'reconciliation-reader-unavailable');
     const { bytes, records } = this.#readReceiver();
     check(records.every(record => record.attemptId !== null), 'receiver-unbound-observation');
     const hits = records.filter(record => record.attemptId === attempt.attemptId);

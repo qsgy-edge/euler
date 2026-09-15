@@ -1,3 +1,5 @@
+import { replayAgent } from '../context/agent-state.ts';
+import type { AgentEvent, AgentStatus } from '../context/agent-state.ts';
 import { randomUUID } from 'node:crypto';
 import { lstatSync, readdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -127,7 +129,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=8), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=9), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -218,7 +220,7 @@ CREATE TABLE request_runs (
 CREATE TABLE request_events (
   event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES request_runs(run_id),
   seq INTEGER NOT NULL CHECK(seq>0),
-  kind TEXT NOT NULL CHECK(kind IN ('run-authorized','run-revoked','run-sealed','run-recovery-gap','model/request-attempt-reconciled@v1','context/assembly@v1','model/request-attempt-started@v1','model/request-attempt-finished@v1')),
+  kind TEXT NOT NULL CHECK(kind IN ('agent/event@v1','run-authorized','run-revoked','run-sealed','run-recovery-gap','model/request-attempt-reconciled@v1','context/assembly@v1','model/request-attempt-started@v1','model/request-attempt-finished@v1')),
   attempt_id TEXT REFERENCES request_attempts(attempt_id), activity_id TEXT NOT NULL REFERENCES owner_activities(id),
   created_at TEXT NOT NULL, payload TEXT NOT NULL, hash TEXT NOT NULL, UNIQUE(run_id,seq)
 ) STRICT;
@@ -447,7 +449,7 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=8;
+PRAGMA user_version=9;
 ` + ['workspaces','workspace_projects','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
@@ -503,15 +505,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,8,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,9,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 8, 'unsupported-probe-schema');
+        check(version === 9, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 8 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 9 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -772,7 +774,10 @@ export class ProbeStore {
       JOIN execution_streams s ON s.stream_id=r.stream_id
       WHERE s.project_id=? AND s.principal_id=? AND r.run_id!=?
       AND (EXISTS(SELECT 1 FROM request_attempts a WHERE a.run_id=r.run_id AND a.outcome='unknown-sent')
-        OR EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='run-recovery-gap'))
+        OR EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='run-recovery-gap')
+        OR (EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='agent/event@v1')
+          AND (NOT EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='agent/event@v1' AND json_extract(e.payload,'$.event.kind')='terminal')
+            OR EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='agent/event@v1' AND json_extract(e.payload,'$.event.result.outcome')='unknown'))))
       AND NOT EXISTS(SELECT 1 FROM request_runs child WHERE child.related_run_id=r.run_id)`)
       .all(stream.projectId, stream.principalId, currentRunId ?? '');
     check(blockers.every(row => row.run_id === relatedRunId), 'request-recovery-required');
@@ -787,9 +792,14 @@ export class ProbeStore {
         const previous = this.requestStatus(activity, input.relatedRunId);
         check(previous.sealed, 'recovery-run-not-sealed');
         check(!this.#db.prepare('SELECT 1 FROM request_runs WHERE related_run_id=?').get(input.relatedRunId), 'recovery-already-authorized');
-        const unresolved = previous.attempts.some(attempt => attempt.outcome === 'received' || (attempt.outcome === 'unknown-sent'
+        const runtimeEvents = previous.events.filter(event => event.kind === 'agent/event@v1').map(event => JSON.parse(event.payload).event as AgentEvent);
+        const runtime = runtimeEvents.length ? replayAgent(runtimeEvents, previous.attempts.length) : null;
+        const settledRuntime = runtime?.terminal && runtime.tools.every(tool => tool.result && tool.result.outcome !== 'unknown')
+          && previous.attempts.every(attempt => attempt.outcome !== 'unknown-sent');
+        const unresolved = !settledRuntime && (Boolean(runtime && (!runtime.terminal || runtime.tools.some(tool => !tool.result || tool.result.outcome === 'unknown')))
+          || previous.attempts.some(attempt => attempt.outcome === 'received' || (attempt.outcome === 'unknown-sent'
           && !previous.events.some(event => event.attemptId === attempt.attemptId && event.kind === 'model/request-attempt-reconciled@v1'
-            && (JSON.parse(event.payload) as { evidence: { outcome: string } }).evidence.outcome === 'not-received')));
+            && (JSON.parse(event.payload) as { evidence: { outcome: string } }).evidence.outcome === 'not-received'))));
         check((!unresolved && !previous.events.some(event => event.kind === 'run-recovery-gap'))
           || input.acceptDuplicateRisk === true, 'duplicate-risk-approval-required');
         this.#verifyRequestSources(previous.assemblies);
@@ -945,10 +955,16 @@ export class ProbeStore {
     });
   }
 
-  finishRequestAttempt(activity: Activity, input: { attemptId: string; outcome: 'received' | 'cancelled-before-send'; usage?: { count: number } | null }): RequestAttempt {
+  finishRequestAttempt(activity: Activity, input: { attemptId: string; outcome: 'received' | 'cancelled-before-send'; usage?: { count: number; inputTokens?: number; outputTokens?: number; modelHash?: string; finishReason?: string } | null }): RequestAttempt {
     return this.withActivity(activity, () => {
       uuid(input.attemptId);
       check(input.outcome === 'received' || input.outcome === 'cancelled-before-send', 'invalid-attempt-outcome');
+      if (input.usage) {
+        check(Number.isSafeInteger(input.usage.count) && input.usage.count > 0, 'invalid-usage');
+        for (const value of [input.usage.inputTokens, input.usage.outputTokens]) check(value === undefined || (Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000), 'invalid-usage');
+        check(input.usage.modelHash === undefined || /^[0-9a-f]{64}$/.test(input.usage.modelHash), 'invalid-model-hash');
+        check(input.usage.finishReason === undefined || ['end', 'tools', 'length', 'error'].includes(input.usage.finishReason), 'invalid-finish-reason');
+      }
       const row = this.#db.prepare('SELECT * FROM request_attempts WHERE attempt_id=?').get(input.attemptId);
       check(row, 'unknown-attempt');
       const run = this.#requestRun(activity, String(row.run_id));
@@ -1092,6 +1108,36 @@ export class ProbeStore {
       };
     });
   }
+  appendAgentEvent(activity: Activity, runId: string, event: AgentEvent): AgentStatus {
+    return this.withActivity(activity, () => {
+      const ledger = this.requestStatus(activity, runId);
+      check(ledger.run.activityId === activity.id, 'agent-owner-mismatch');
+      if (event.kind === 'tool-started') {
+        check(ledger.run.state === 'authorized', 'run-not-admissible');
+        this.#requestRecoveryGate(activity, ledger.run.relatedRunId, runId);
+        this.#verifyRequestSources(ledger.assemblies);
+        const assembly = ledger.assemblies.at(-1);
+        const intent = this.readIntent(activity);
+        check(assembly && intent?.status === 'active' && intent.eventId === assembly.intent?.eventId && intent.hash === assembly.intent.hash, 'intent-stale');
+        check(Date.now() - Date.parse(ledger.run.authorizedAt) < ledger.run.budget.wallClockMs, 'run-deadline');
+      }
+      const events = ledger.events.filter(item => item.kind === 'agent/event@v1')
+        .map(item => JSON.parse(item.payload).event as AgentEvent);
+      const result = replayAgent([...events, event], ledger.attempts.length);
+      if ('source' in event) this.#validateSource(event.source);
+      if (event.kind === 'tool-result') this.#validateSource(event.result.source);
+      if (event.kind === 'response') check(ledger.attempts.some(attempt => attempt.attemptId === event.attemptId && attempt.outcome === 'received'), 'response-not-received');
+      this.#requestEvent(runId, 'agent/event@v1', null, JSON.stringify({ runId, event }), activity.id);
+      return result;
+    });
+  }
+
+  agentStatus(activity: Activity, runId: string): AgentStatus {
+    const ledger = this.requestStatus(activity, runId);
+    return replayAgent(ledger.events.filter(item => item.kind === 'agent/event@v1')
+      .map(item => JSON.parse(item.payload).event as AgentEvent), ledger.attempts.length);
+  }
+
   bindAttempt(activity: Activity, runId: string): AttemptOwnership {
     return this.withActivity(activity, () => {
       uuid(runId);
