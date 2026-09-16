@@ -72,7 +72,21 @@ test('write-only ACL permits an approved write without granting a read', windows
     const identity = fileIdentity(path);
     sid = execFileSync(join(system32, 'whoami.exe'), ['/user', '/fo', 'csv', '/nh'], { encoding: 'utf8' }).match(/S-1-[\d-]+/)![0];
     execFileSync(join(system32, 'icacls.exe'), [path, '/deny', `*${sid}:(RD)`], { stdio: 'pipe' }); denied = true;
-    assert.throws(() => readFileSync(path), /EACCES|EPERM/);
+    const kernel = koffi.load('kernel32.dll');
+    const open = kernel.func('void * __stdcall CreateFileW(str16 path, uint32 access, uint32 share, void *security, uint32 disposition, uint32 flags, void *templateFile)');
+    const close = kernel.func('int __stdcall CloseHandle(void *handle)');
+    const lastError = kernel.func('uint32 __stdcall GetLastError()');
+    const assertReadDenied = () => {
+      // libuv opens with BACKUP_SEMANTICS, which can bypass a DACL on a
+      // privileged runner. Probe normal content-read access independently.
+      const handle = open(path, 1, 7, null, 3, 0x80, null) as bigint;
+      const error = lastError();
+      const invalid = !handle || handle === -1n || handle === 0xffffffffffffffffn;
+      if (!invalid) close(handle);
+      assert.equal(invalid, true, 'normal content read must be denied');
+      assert.equal(error, 5, 'ERROR_ACCESS_DENIED');
+    };
+    assertReadDenied();
     let approvals = 0;
     const status = await pumpAgent(f.run, { ...model([
       { id: 'read', name: 'file.read', arguments: { path: 'write-only.txt' } },
@@ -81,7 +95,7 @@ test('write-only ACL permits an approved write without granting a read', windows
     assert.deepEqual(status.tools.map(tool => tool.result?.outcome), ['unavailable', 'success']);
     assert.equal(approvals, 1);
     assert.deepEqual(status.tools[1]!.result!.file!.identity, identity);
-    assert.throws(() => readFileSync(path), /EACCES|EPERM/);
+    assertReadDenied();
     execFileSync(join(system32, 'icacls.exe'), [path, '/remove:d', `*${sid}`], { stdio: 'pipe' }); denied = false;
     assert.equal(readFileSync(path, 'utf8'), 'AFTER');
   } finally {
