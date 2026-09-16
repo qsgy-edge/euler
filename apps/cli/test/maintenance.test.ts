@@ -136,8 +136,20 @@ test('racing startup and closing never leave an admitted unregistered process', 
         assert.equal(typeof rows[0]?.incarnation, 'string');
         assert.ok(rows[0]!.epoch < Number((status.fence as { epoch: number }).epoch));
       }
-      if (worker.child.exitCode === null && worker.child.signalCode === null) worker.command('stop');
+      let stopDelivery: Promise<Error | null> = Promise.resolve(null);
+      if (worker.child.exitCode === null && worker.child.signalCode === null) {
+        // Admission refusal can close stdin before the exit notification.
+        // Observe the stream error and verify that same write's callback below.
+        worker.child.stdin.once('error', () => {});
+        stopDelivery = new Promise(resolve => worker.child.stdin.write('stop\n', error => resolve(error ?? null)));
+      }
       const result = await worker.exit;
+      const stopError = await stopDelivery;
+      if (stopError) {
+        assert.equal((stopError as NodeJS.ErrnoException).code, 'EPIPE');
+        assert.equal(result.code, 1);
+        assert.match(JSON.stringify(worker.observations), /admission-closed/);
+      }
       assert.ok(result.code === 0 || result.code === 1);
       if (result.code === 0) assert.equal(rows.length, 1);
       else assert.match(JSON.stringify(worker.observations), /admission-closed/);
