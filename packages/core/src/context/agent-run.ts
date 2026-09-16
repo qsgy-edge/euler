@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { REQUEST_POLICY_HASH } from '../store/request-ledger.ts';
 import { API_VERSION, check, sha256, validateBudget } from '../contracts.ts';
 import type { Binding, HostAdapter, ProbeBudget, SourceAck } from '../contracts.ts';
@@ -72,10 +73,15 @@ export class AgentRun {
     this.#store = store; this.#activity = activity; this.#host = { ...host, binding: structuredClone(host.binding), ...(host.files ? { files: structuredClone(host.files) } : {}) };
     if (host.files) {
       validateFileCapability(host.files, host.binding);
-      const distance = relative(activity.root.path, host.files.root.path);
-      const inverse = relative(host.files.root.path, activity.root.path);
-      check(distance !== '' && (distance === '..' || distance.startsWith(`..${sep}`) || isAbsolute(distance))
-        && inverse !== '' && (inverse === '..' || inverse.startsWith(`..${sep}`) || isAbsolute(inverse)), 'file-product-root-overlap');
+      // The protected store can be bound through a Windows 8.3 spelling.
+      // Compare its native canonical path with the canonical project root;
+      // the Host independently rejects noncanonical project-root aliases.
+      for (const protectedRoot of [activity.root.path, realpathSync.native(activity.root.path)]) {
+        const distance = relative(protectedRoot, host.files.root.path);
+        const inverse = relative(host.files.root.path, protectedRoot);
+        check(distance !== '' && (distance === '..' || distance.startsWith(`..${sep}`) || isAbsolute(distance))
+          && inverse !== '' && (inverse === '..' || inverse.startsWith(`..${sep}`) || isAbsolute(inverse)), 'file-product-root-overlap');
+      }
       host.source.read(host.files.source);
     }
     this.#route = structuredClone(route); this.#budget = { ...budget };

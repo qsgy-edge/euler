@@ -68,7 +68,7 @@ export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: P
     : { provider: 'fake', model: 'controlled', route: 'fixture', authNamespace: 'synthetic' };
   let files: FileCapability | undefined;
   if (scenario === 'files' && process.platform === 'win32') {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), 'euler-file-project-')));
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'euler-file-project-')));
     files = { schema: 'file-capability@1', grantId: randomUUID(), binding: bindingOf(sandbox), root: { path: root, identity: fileIdentity(root) },
       source: probe.archive.append(randomUUID(), JSON.stringify({ kind: 'synthetic-file-root-binding', root, command: 'agent --scenario files', input: filesFixture.input }), 'user') };
     emit('file-project-bound', { root: files.root, ownerId: files.binding.ownerId, projectId: files.binding.projectId, syntheticOnly: true, cleanupOwner: 'host-project-resource' });

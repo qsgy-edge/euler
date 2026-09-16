@@ -61,7 +61,7 @@ function openAt(parent: bigint, name: string, directory: boolean, write: boolean
   check(name.length > 0 && !/[\\/:\0]/.test(name) && name !== '.' && name !== '..', 'file-invalid-component');
   const a = native();
   const handle: (bigint | null)[] = [null];
-  const status = a.openAt(handle, SYNCHRONIZE | FILE_READ_ATTRIBUTES | (directory ? FILE_TRAVERSE | READ_CONTROL : write ? FILE_READ_DATA | FILE_WRITE_DATA : FILE_READ_DATA),
+  const status = a.openAt(handle, SYNCHRONIZE | FILE_READ_ATTRIBUTES | (directory ? FILE_TRAVERSE | READ_CONTROL : write ? FILE_WRITE_DATA : FILE_READ_DATA),
     { Length: a.attributeSize, RootDirectory: parent, ObjectName: { Length: name.length * 2, MaximumLength: name.length * 2, Buffer: name },
       Attributes: OBJ_CASE_INSENSITIVE, SecurityDescriptor: null, SecurityQualityOfService: null }, {}, null, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
     create ? FILE_CREATE : FILE_OPEN, FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT

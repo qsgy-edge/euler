@@ -12,7 +12,7 @@ import { openProbe } from '../src/probe.ts';
 
 test('a native create that leaves a file but returns denied keeps unknown and cleanup responsibility', { skip: process.platform !== 'win32' }, () => {
   const sandbox = createSandbox();
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'euler-file-filter-')));
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'euler-file-filter-')));
   try {
     const worker = fileURLToPath(new URL('./file-crash-worker.ts', import.meta.url));
     const processResult = spawnSync(process.execPath, [worker, sandbox.root, root, 'filter-denial'], { encoding: 'utf8', timeout: 20000 });
@@ -37,7 +37,7 @@ test('a native create that leaves a file but returns denied keeps unknown and cl
 for (const phase of ['before-io', 'after-flush']) test(`file process death at ${phase} retains unknown cleanup evidence without retrying`,
   { skip: process.platform !== 'win32', timeout: 30000 }, async t => {
     const sandbox = createSandbox();
-    const root = realpathSync(mkdtempSync(join(tmpdir(), 'euler-file-crash-')));
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'euler-file-crash-')));
     const worker = fileURLToPath(new URL('./file-crash-worker.ts', import.meta.url));
     const child = spawn(process.execPath, [worker, sandbox.root, root, phase], { stdio: ['pipe', 'pipe', 'pipe'] });
     let output = '', errors = '';

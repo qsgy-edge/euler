@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, realpathSync, mkdirSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import koffi from 'koffi';
 import { AgentRun, DEFAULT_BUDGET, fileIdentity } from '@euler/core';
 import type { FileCapability, FileDecision, FilePresentation, ToolCall } from '@euler/core';
 import { createFileToolHost } from '../src/file-tools.ts';
@@ -15,7 +16,7 @@ import type { AgentPump } from '../src/agent-pump.ts';
 
 function fixture() {
   const sandbox = createSandbox();
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'euler-file-project-')));
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'euler-file-project-')));
   const budget = { ...DEFAULT_BUDGET, contextLimit: 32000, maxTotalTokens: 128000, maxToolCalls: 8, maxModelAttempts: 3, toolTimeoutMs: 2000, wallClockMs: 30000 };
   const probe = openProbe(sandbox, budget);
   const binding = bindingOf(sandbox);
@@ -58,6 +59,59 @@ test('permission revoked during approval is a known no-effect failure and siblin
   } finally {
     if (denied) execFileSync(join(system32, 'icacls.exe'), [f.root, '/remove:d', `*${sid}`], { stdio: 'pipe' });
     f.close();
+  }
+});
+
+test('write-only ACL permits an approved write without granting a read', windows, async () => {
+  const f = fixture();
+  const path = join(f.root, 'write-only.txt');
+  const system32 = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32');
+  let sid = '', denied = false;
+  try {
+    writeFileSync(path, 'BEFORE');
+    const identity = fileIdentity(path);
+    sid = execFileSync(join(system32, 'whoami.exe'), ['/user', '/fo', 'csv', '/nh'], { encoding: 'utf8' }).match(/S-1-[\d-]+/)![0];
+    execFileSync(join(system32, 'icacls.exe'), [path, '/deny', `*${sid}:(RD)`], { stdio: 'pipe' }); denied = true;
+    assert.throws(() => readFileSync(path), /EACCES|EPERM/);
+    let approvals = 0;
+    const status = await pumpAgent(f.run, { ...model([
+      { id: 'read', name: 'file.read', arguments: { path: 'write-only.txt' } },
+      { id: 'write', name: 'file.write', arguments: { path: 'write-only.txt', content: 'AFTER' } },
+    ]), ...createFileToolHost(async () => { approvals++; return 'approved'; }) });
+    assert.deepEqual(status.tools.map(tool => tool.result?.outcome), ['unavailable', 'success']);
+    assert.equal(approvals, 1);
+    assert.deepEqual(status.tools[1]!.result!.file!.identity, identity);
+    assert.throws(() => readFileSync(path), /EACCES|EPERM/);
+    execFileSync(join(system32, 'icacls.exe'), [path, '/remove:d', `*${sid}`], { stdio: 'pipe' }); denied = false;
+    assert.equal(readFileSync(path, 'utf8'), 'AFTER');
+  } finally {
+    if (denied) execFileSync(join(system32, 'icacls.exe'), [path, '/remove:d', `*${sid}`], { stdio: 'pipe' });
+    f.close();
+  }
+});
+
+test('native spelling of a short-path data root cannot become a project capability', windows, t => {
+  const parent = mkdtempSync(join(tmpdir(), 'euler-short-protected-'));
+  const previous = process.env.TEMP;
+  let f: ReturnType<typeof fixture> | undefined;
+  try {
+    const shortPath = koffi.load('kernel32.dll').func('uint32 __stdcall GetShortPathNameW(str16 path, void *buffer, uint32 size)');
+    const buffer = Buffer.alloc(8192);
+    const length = shortPath(parent, buffer, 4096) as number;
+    assert.ok(length > 0 && length < 4096);
+    const short = buffer.toString('utf16le', 0, length * 2);
+    if (short.toLowerCase() === realpathSync.native(parent).toLowerCase()) { t.skip('8.3 names unavailable on this volume'); return; }
+    process.env.TEMP = short;
+    f = fixture();
+    const protectedPath = realpathSync.native(f.sandbox.root);
+    f.run.stop('cancelled');
+    assert.notEqual(f.probe.activity.root.path.toLowerCase(), protectedPath.toLowerCase());
+    assert.throws(() => new AgentRun(f!.probe.store, f!.probe.activity, { binding: bindingOf(f!.sandbox), source: f!.probe.archive,
+      files: { ...f!.capability, root: { path: protectedPath, identity: fileIdentity(protectedPath) } } },
+      { provider: 'fake', model: 'test', route: 'fixture', authNamespace: 'none' }, f!.budget), /file-product-root-overlap/);
+  } finally {
+    if (previous === undefined) delete process.env.TEMP; else process.env.TEMP = previous;
+    f?.close(); rmSync(parent, { recursive: true, force: true });
   }
 });
 

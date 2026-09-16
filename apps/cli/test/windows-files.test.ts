@@ -8,7 +8,7 @@ import { WindowsFileRoot } from '../src/windows-files.ts';
 
 const windows = { skip: process.platform !== 'win32' };
 test('Windows file operations use the approved handle and prevent replacement until it closes', windows, async () => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'euler-t08-handles-')));
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'euler-t08-handles-')));
   const path = join(root, 'approved.txt');
   writeFileSync(path, 'ORIGINAL');
   const files = new WindowsFileRoot({ path: root, identity: fileIdentity(root) });

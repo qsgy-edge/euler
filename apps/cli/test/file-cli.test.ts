@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, renameSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
-import { release } from 'node:os';
+import { readFileSync, renameSync, rmSync, writeFileSync, mkdirSync, mkdtempSync, realpathSync } from 'node:fs';
+import { release, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import koffi from 'koffi';
 import { ProbeStore } from '@euler/core';
 import type { AgentStatus } from '@euler/core';
 import { bindingOf, createSandbox, resourcesOf } from '../src/sandbox.ts';
@@ -78,6 +79,47 @@ test('CLI accepts a separately presented owner decision and maintenance observes
       t.diagnostic(`T08 Windows receipts: ${artifact}`);
     } finally { clearTimeout(timeout); child.kill(); if (root) rmSync(root, { recursive: true, force: true }); rmSync(sandbox.root, { recursive: true, force: true }); }
   });
+
+test('CLI binds a canonical resource root when TEMP uses an 8.3 spelling', { skip: process.platform !== 'win32', timeout: 30000 }, async t => {
+  const parent = mkdtempSync(join(tmpdir(), 'euler-short-cli-'));
+  let child: ReturnType<typeof spawn> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let root: string | undefined;
+  try {
+    const shortPath = koffi.load('kernel32.dll').func('uint32 __stdcall GetShortPathNameW(str16 path, void *buffer, uint32 size)');
+    const buffer = Buffer.alloc(8192);
+    const length = shortPath(parent, buffer, 4096) as number;
+    assert.ok(length > 0 && length < 4096);
+    const short = buffer.toString('utf16le', 0, length * 2);
+    if (short.toLowerCase() === realpathSync.native(parent).toLowerCase()) { t.skip('8.3 names unavailable on this volume'); return; }
+    child = spawn(process.execPath, [main, 'agent', '--scenario', 'files', '--interactive'],
+      { env: { ...process.env, TEMP: short, TMP: short }, stdio: ['pipe', 'pipe', 'pipe'] });
+    let pending = '', errors = '';
+    const events: Record<string, any>[] = [];
+    child.stderr!.setEncoding('utf8'); child.stderr!.on('data', data => { errors += data; });
+    child.stdout!.setEncoding('utf8'); child.stdout!.on('data', data => {
+      pending += data;
+      for (;;) {
+        const end = pending.indexOf('\n');
+        if (end < 0) break;
+        const event = JSON.parse(pending.slice(0, end)); pending = pending.slice(end + 1); events.push(event);
+        if (event.event === 'file-project-bound') root = event.root.path;
+        if (event.event === 'file-approval') child!.stdin!.write(event.command + '\n');
+      }
+    });
+    timer = setTimeout(() => child!.kill(), 20000);
+    const code = await new Promise<number | null>((resolve, reject) => { child!.once('error', reject); child!.once('close', resolve); });
+    assert.equal(code, 0, errors);
+    assert.equal(events.filter(event => event.event === 'file-approval').length, 1,
+      JSON.stringify(events.filter(event => event.event === 'agent-result').map(event => event.status.tools.map((tool: AgentStatus['tools'][number]) => tool.result?.outcome))));
+    assert.ok(root);
+    assert.equal(root.toLowerCase(), realpathSync.native(root).toLowerCase());
+    assert.equal(readFileSync(join(root, 'result.txt'), 'utf8'), 'EULER-T08');
+    const result = events.find(event => event.event === 'agent-result');
+    assert.equal(result?.status.terminal, 'completed');
+    assert.ok(result?.status.tools.every((tool: AgentStatus['tools'][number]) => tool.result?.outcome === 'success'));
+  } finally { clearTimeout(timer); child?.kill(); if (root) rmSync(root, { recursive: true, force: true }); rmSync(parent, { recursive: true, force: true }); }
+});
 
 test('CLI reports file capability unavailable on unsupported operating systems', { skip: process.platform === 'win32' }, () => {
   const sandbox = createSandbox();
