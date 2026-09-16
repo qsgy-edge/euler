@@ -13,7 +13,8 @@
     "evidence": "node scripts/evidence.ts",
     "evidence:memory": "node scripts/evidence-memory.ts",
     "evidence:maintenance": "node scripts/evidence-maintenance.ts",
-    "evidence:persistence": "node scripts/evidence-persistence.ts"
+    "evidence:persistence": "node scripts/evidence-persistence.ts",
+    "evidence:guidance": "node scripts/evidence-guidance.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

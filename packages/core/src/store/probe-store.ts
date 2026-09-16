@@ -548,6 +548,20 @@ export class ProbeStore {
     this.withActivity(activity, () => this.#insertSession(binding, source));
   }
 
+  guidanceMembership(activity: Activity, projectIds: string[]): { ownerId: string; projects: { projectId: string; workspaceId: string | null }[] } {
+    return this.withActivity(activity, () => {
+      check(projectIds.length <= 32 && new Set(projectIds).size === projectIds.length, 'guidance-scope-unresolved');
+      return { ownerId: this.#binding.ownerId, projects: projectIds.map(projectId => {
+        const row = this.#db.prepare(`SELECT p.owner_id,w.workspace_id,w.owner_id AS workspace_owner
+          FROM projects p LEFT JOIN workspace_projects m ON m.project_id=p.project_id
+          LEFT JOIN workspaces w ON w.workspace_id=m.workspace_id WHERE p.project_id=?`).get(projectId);
+        check(row?.owner_id === this.#binding.ownerId
+          && (row.workspace_id === null || row.workspace_owner === this.#binding.ownerId), 'guidance-scope-unresolved');
+        return { projectId, workspaceId: row.workspace_id === null ? null : String(row.workspace_id) };
+      }) };
+    });
+  }
+
   bindWorkspace(activity: Activity, workspaceId: string, projectIds: string[]): void {
     this.withActivity(activity, () => {
       uuid(workspaceId);

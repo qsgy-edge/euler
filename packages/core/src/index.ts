@@ -1,3 +1,7 @@
+export { GuidanceSession } from './context/guidance-session.ts';
+export type { GuidanceConfig, GuidanceTarget, GuidanceAssembly, InstructionSnapshot, GuidanceBlock, GuidanceScope, SkillReference } from './context/guidance-session.ts';
+export type { SkillRef, SkillEntry, SkillCatalog, SkillActivation } from './context/skill-catalog.ts';
+export type { GuidanceOperation, RecognizedConstraint, OwnerDirective, GuidanceResolution, GuidanceConflict, GuidanceExecution, SyntheticPermissions } from './context/guidance-conflicts.ts';
 export * from './contracts.ts';
 export { AgentRun } from './context/agent-run.ts';
 export type { AgentHost, ModelRequest, NeutralRequest } from './context/agent-run.ts';

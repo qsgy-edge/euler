@@ -37,6 +37,9 @@ jobs:
       - name: Record persistence transaction and recovery observations
         if: always()
         run: npm run evidence:persistence
+      - name: Record controlled guidance observations
+        if: always()
+        run: npm run evidence:guidance
       - uses: actions/upload-artifact@v4
         if: always()
         with:
