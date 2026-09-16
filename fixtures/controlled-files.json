@@ -1,0 +1,6 @@
+{
+  "schema": "controlled-files-fixture@1",
+  "input": "In this disposable synthetic project, write EULER-T08 to result.txt after independent owner approval, then read it back. Do not access any other resources.",
+  "content": "EULER-T08",
+  "path": "result.txt"
+}

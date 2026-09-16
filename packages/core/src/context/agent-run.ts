@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { REQUEST_POLICY_HASH } from '../store/request-ledger.ts';
 import { API_VERSION, check, sha256, validateBudget } from '../contracts.ts';
 import type { Binding, HostAdapter, ProbeBudget, SourceAck } from '../contracts.ts';
@@ -6,12 +7,16 @@ import type { Activity, ProbeStore } from '../store/probe-store.ts';
 import type { RequestAttempt, RequestRecovery } from '../store/request-ledger.ts';
 import { coreToolSchemas, controlledToolSchema } from './tool-schemas.ts';
 import type { ToolSchema } from './tool-schemas.ts';
+import { fileToolSchemas, parseFileCall, validateFileCapability } from './file-contract.ts';
+import type { FileCapability, FileTarget, FilePresentation, FileDecision, FileReceipt, FileFailureReason } from './file-contract.ts';
+import { isAbsolute, join, relative, sep } from 'node:path';
 import type { AgentEvent, AgentStatus, ModelReply, ModelRoute, RunTerminal, ToolCall, ToolResult } from './agent-state.ts';
 
 export interface AgentHost {
   binding: Binding;
   encode?: (request: NeutralRequest) => string;
   source: HostAdapter['source'] & { append(eventId: string, text: string, role?: 'user' | 'assistant' | 'tool'): SourceAck };
+  files?: FileCapability;
 }
 export interface NeutralRequest extends ModelRoute {
   schema: 'euler-model@1';
@@ -65,7 +70,20 @@ export class AgentRun {
   constructor(store: ProbeStore, activity: Activity, host: AgentHost, route: ModelRoute, budget: ProbeBudget,
     options: { executionMode?: 'parallel-safe' | 'sequential'; recovery?: RequestRecovery } = {}) {
     validateBudget(budget);
-    this.#store = store; this.#activity = activity; this.#host = host;
+    this.#store = store; this.#activity = activity; this.#host = { ...host, binding: structuredClone(host.binding), ...(host.files ? { files: structuredClone(host.files) } : {}) };
+    if (host.files) {
+      validateFileCapability(host.files, host.binding);
+      // The protected store can be bound through a Windows 8.3 spelling.
+      // Compare its native canonical path with the canonical project root;
+      // the Host independently rejects noncanonical project-root aliases.
+      for (const protectedRoot of [activity.root.path, realpathSync.native(activity.root.path)]) {
+        const distance = relative(protectedRoot, host.files.root.path);
+        const inverse = relative(host.files.root.path, protectedRoot);
+        check(distance !== '' && (distance === '..' || distance.startsWith(`..${sep}`) || isAbsolute(distance))
+          && inverse !== '' && (inverse === '..' || inverse.startsWith(`..${sep}`) || isAbsolute(inverse)), 'file-product-root-overlap');
+      }
+      host.source.read(host.files.source);
+    }
     this.#route = structuredClone(route); this.#budget = { ...budget };
     this.#executionMode = options.executionMode ?? 'sequential';
     check(Object.keys(route).sort().join(',') === 'authNamespace,model,provider,route', 'invalid-route');
@@ -73,7 +91,7 @@ export class AgentRun {
     store.withActivity(activity, () => {
       store.authorizeRequestRun(activity, this.runId, { budget, intent: null,
         relatedRunId: options.recovery?.relatedRunId ?? null, acceptDuplicateRisk: options.recovery?.acceptDuplicateRisk ?? false });
-      this.#event({ kind: 'opened', route: this.#route });
+      this.#event({ kind: 'opened', route: this.#route, ...(this.#host.files ? { files: structuredClone(this.#host.files) } : {}) });
     });
   }
   #event(event: AgentEvent): AgentStatus { return this.#store.appendAgentEvent(this.#activity, this.runId, event); }
@@ -101,7 +119,8 @@ export class AgentRun {
     check(intent.status === 'active', 'intent-not-active');
     this.#event({ kind: 'admitted', eventIds: pending.map(input => input.source.eventId) });
     const sources = state.inputs.filter(input => input.mode === 'steer').map(input => input.source);
-    const p0 = { policy: POLICY, tools: [...coreToolSchemas(), controlledToolSchema()] };
+    const p0 = { policy: POLICY + (this.#host.files ? ` File capability snapshot: ${sha256(JSON.stringify(this.#host.files))}.` : ''),
+      tools: [...coreToolSchemas(), controlledToolSchema(), ...(this.#host.files ? fileToolSchemas() : [])] };
     const ledger = this.#store.requestStatus(this.#activity, this.runId);
     const priorInputs = new Set<string>();
     const p2 = state.responses.map(response => {
@@ -134,7 +153,7 @@ export class AgentRun {
       this.stop(reserved > this.#budget.contextLimit ? 'needs-input' : 'budget-exhausted'); return null;
     }
     const assembly = this.#store.appendRequestAssembly(this.#activity, { runId: this.runId, epoch: this.#activity.epoch,
-      route: JSON.stringify(this.#route), model: this.#route.model, policyHash: REQUEST_POLICY_HASH, estimator: 'utf8-bytes-upper-bound@1',
+      route: JSON.stringify(this.#route), model: this.#route.model, policyHash: this.#host.files ? sha256(JSON.stringify(p0)) : REQUEST_POLICY_HASH, estimator: 'utf8-bytes-upper-bound@1',
       sources, intent: { eventId: intent.eventId, hash: intent.hash }, payload, payloadHash: sha256(payload), byteLength,
       estimatedTokens: byteLength, budget: this.#budget, zones: { p0: Buffer.byteLength(JSON.stringify(p0)), p1: 0, p2: 0, p3: byteLength - Buffer.byteLength(JSON.stringify(p0)) },
       selection: sources.map((source, ordinal) => ({ ordinal, hash: source.hash, reason: 'mandatory-source' })), degradation: 'none' });
@@ -242,19 +261,94 @@ export class AgentRun {
     const call = this.#calls.get(callId);
     check(call, 'unknown-tool-call');
     if (call.name !== 'controlled.echo') {
-      this.#result(callId, 'unavailable', 'Tool unavailable', 'capability-unavailable'); return null;
+      const file = state.files.find(item => item.admission.callId === callId);
+      if (!this.#host.files || !file || (call.name === 'file.write' && !file.approved)) {
+        this.#result(callId, 'unavailable', 'Tool unavailable or approval missing', 'capability-unavailable'); return null;
+      }
+      this.fileContext(callId);
+      this.#host.source.read(file.admission.source);
+      if (file.approvalSource) this.#host.source.read(file.approvalSource);
+      check(file.admission.capabilityHash === sha256(JSON.stringify(this.#host.files)), 'file-capability-stale');
+      const intent = this.#store.readIntent(this.#activity);
+      check(intent?.eventId === file.admission.intentEventId && intent.hash === file.admission.intentHash, 'file-intent-stale');
     }
-    if (Object.keys(call.arguments).length !== 1 || typeof call.arguments.text !== 'string' || call.arguments.text.length > 1024) {
-      this.#result(callId, 'failure', 'Invalid tool arguments', 'invalid-arguments'); return null;
+    if (call.name === 'controlled.echo') {
+      if (Object.keys(call.arguments).length !== 1 || typeof call.arguments.text !== 'string' || call.arguments.text.length > 1024) {
+        this.#result(callId, 'failure', 'Invalid tool arguments', 'invalid-arguments'); return null;
+      }
     }
     this.#event({ kind: 'tool-started', callId });
+    this.#store.assertDispatchBoundary();
     return structuredClone(call);
+  }
+  fileContext(callId: string): { capability: FileCapability; call: ToolCall; parts: string[] } {
+    check(this.#active() && this.#host.files, 'file-capability-unavailable');
+    const call = this.#calls.get(callId);
+    const tool = this.status().tools.find(tool => tool.callId === callId);
+    check(call && tool && !tool.started && !tool.result, 'file-not-admissible');
+    this.#store.assertToolAdmission(this.#activity, this.runId);
+    const parsed = parseFileCall(call);
+    validateFileCapability(this.#host.files, this.#host.binding);
+    this.#host.source.read(this.#host.files.source);
+    const stream = this.#store.readStream(this.#activity, this.#activity.streamId);
+    check(stream.principalId === this.#host.binding.ownerId && stream.projectId === this.#host.binding.projectId
+      && stream.originHostId === this.#host.binding.hostId, 'file-resource-owner-mismatch');
+    return structuredClone({ capability: this.#host.files, call, parts: parsed.parts });
+  }
+  presentFile(callId: string, target: FileTarget): FilePresentation | null {
+    const { capability, call, parts } = this.fileContext(callId);
+    check(target.path === join(capability.root.path, ...parts)
+      && target.parent.path === join(capability.root.path, ...parts.slice(0, -1)), 'file-target-mismatch');
+    const intent = this.#store.readIntent(this.#activity)!;
+    const token = randomUUID();
+    const presentation = { token, callId, path: target.path, existingIdentity: target.identity, content: String(call.arguments.content ?? '') };
+    const source = this.#host.source.append(randomUUID(), JSON.stringify({ kind: 'file-presentation', ...presentation }), 'tool');
+    this.#event({ kind: 'file-prepared', admission: { callId, presentationId: token, capabilityHash: sha256(JSON.stringify(capability)),
+      intentEventId: intent.eventId, intentHash: intent.hash, epoch: this.#activity.epoch,
+      operation: call.name as 'file.read' | 'file.write', rawPath: String(call.arguments.path), parts,
+      root: capability.root, target: structuredClone(target), cleanup: 'host-project-resource', source } });
+    return call.name === 'file.write' ? presentation : null;
+  }
+  decideFile(presentation: FilePresentation, decision: FileDecision): void {
+    this.fileContext(presentation.callId);
+    const file = this.status().files.find(file => file.admission.callId === presentation.callId);
+    check(file && file.admission.presentationId === presentation.token
+      && this.#host.source.read(file.admission.source).text === JSON.stringify({ kind: 'file-presentation', ...presentation }), 'file-approval-mismatch');
+    check(['approved', 'rejected', 'unavailable'].includes(decision), 'file-approval-invalid');
+    if (decision !== 'approved') { this.rejectFile(presentation.callId, `file-approval-${decision}`); return; }
+    const source = this.#host.source.append(randomUUID(), JSON.stringify({ kind: 'file-owner-approval', token: presentation.token,
+      callId: presentation.callId, ownerId: this.#host.binding.ownerId, decision }), 'user');
+    this.#event({ kind: 'file-approved', callId: presentation.callId, presentationId: presentation.token, source });
+  }
+  rejectFile(callId: string, reason: string): void {
+    if (!this.status().terminal) this.#result(callId, 'unavailable', reason, 'file-admission-denied');
+  }
+  failFile(callId: string): void {
+    if (!this.status().terminal) { this.#result(callId, 'unknown', 'File completion unknown; inspect the registered project resource before retrying.', 'file-io-unknown'); this.stop('blocked-unknown'); }
+  }
+  finishFileFailure(callId: string, reason: FileFailureReason): void {
+    check(['file-output-too-large', 'file-invalid-utf8', 'file-create-conflict', 'file-create-denied'].includes(reason), 'file-failure-evidence-invalid');
+    if (this.status().terminal) {
+      const source = this.#host.source.append(randomUUID(), JSON.stringify({ callId, failureReason: reason }), 'tool');
+      this.#event({ kind: 'file-reconciled', callId, source, failureReason: reason });
+    } else this.#result(callId, 'failure', reason, reason);
+  }
+  finishFile(callId: string, receipt: FileReceipt): void {
+    const file = this.status().files.find(file => file.admission.callId === callId);
+    check(file && Number.isSafeInteger(receipt.byteLength) && receipt.byteLength >= 0 && receipt.byteLength <= 4096
+      && /^\d+$/.test(receipt.identity.dev) && /^\d+$/.test(receipt.identity.ino)
+      && (!file.admission.target.identity || JSON.stringify(file.admission.target.identity) === JSON.stringify(receipt.identity)), 'file-receipt-mismatch');
+    const text = JSON.stringify(receipt);
+    if (this.status().terminal) {
+      const source = this.#host.source.append(randomUUID(), text, 'tool');
+      this.#event({ kind: 'file-reconciled', callId, source, receipt: structuredClone(receipt) });
+    } else this.#result(callId, 'success', text, null, receipt);
   }
   finishTool(callId: string, modelResult: string, outcome: 'success' | 'failure' = 'success'): void {
     check(typeof modelResult === 'string', 'invalid-tool-result');
     this.#result(callId, outcome, modelResult, outcome === 'failure' ? 'tool-error' : null);
   }
-  #result(callId: string, outcome: ToolResult['outcome'], modelResult: string, errorClass: string | null): void {
+  #result(callId: string, outcome: ToolResult['outcome'], modelResult: string, errorClass: string | null, file?: FileReceipt): void {
     const state = this.status();
     check(!state.terminal, 'late-tool-result');
     const tool = state.tools.find(tool => tool.callId === callId);
@@ -271,7 +365,7 @@ export class AgentRun {
     }
     const source = this.#host.source.append(randomUUID(), encode(archivedResult, archivedOutcome), 'tool');
     this.#event({ kind: 'tool-result', result: { callId, executionState: tool.started ? 'started' : 'not_started',
-      outcome: archivedOutcome, argumentsHash: tool.argumentsHash, errorClass: archivedErrorClass, source } });
+      outcome: archivedOutcome, argumentsHash: tool.argumentsHash, errorClass: archivedErrorClass, source, ...(file ? { file: structuredClone(file) } : {}) } });
   }
   #terminal(terminal: RunTerminal): void {
     this.#store.withActivity(this.#activity, () => {

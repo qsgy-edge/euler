@@ -1108,23 +1108,29 @@ export class ProbeStore {
       };
     });
   }
+  assertToolAdmission(activity: Activity, runId: string): void {
+    this.withActivity(activity, () => {
+      const ledger = this.requestStatus(activity, runId);
+      check(ledger.run.activityId === activity.id && ledger.run.state === 'authorized', 'run-not-admissible');
+      this.#requestRecoveryGate(activity, ledger.run.relatedRunId, runId);
+      this.#verifyRequestSources(ledger.assemblies);
+      const assembly = ledger.assemblies.at(-1);
+      const intent = this.readIntent(activity);
+      check(assembly && intent?.status === 'active' && intent.eventId === assembly.intent?.eventId && intent.hash === assembly.intent.hash, 'intent-stale');
+      check(Date.now() - Date.parse(ledger.run.authorizedAt) < ledger.run.budget.wallClockMs, 'run-deadline');
+    });
+  }
   appendAgentEvent(activity: Activity, runId: string, event: AgentEvent): AgentStatus {
     return this.withActivity(activity, () => {
       const ledger = this.requestStatus(activity, runId);
       check(ledger.run.activityId === activity.id, 'agent-owner-mismatch');
-      if (event.kind === 'tool-started') {
-        check(ledger.run.state === 'authorized', 'run-not-admissible');
-        this.#requestRecoveryGate(activity, ledger.run.relatedRunId, runId);
-        this.#verifyRequestSources(ledger.assemblies);
-        const assembly = ledger.assemblies.at(-1);
-        const intent = this.readIntent(activity);
-        check(assembly && intent?.status === 'active' && intent.eventId === assembly.intent?.eventId && intent.hash === assembly.intent.hash, 'intent-stale');
-        check(Date.now() - Date.parse(ledger.run.authorizedAt) < ledger.run.budget.wallClockMs, 'run-deadline');
-      }
+      if (event.kind === 'tool-started' || event.kind === 'file-prepared' || event.kind === 'file-approved') this.assertToolAdmission(activity, runId);
       const events = ledger.events.filter(item => item.kind === 'agent/event@v1')
         .map(item => JSON.parse(item.payload).event as AgentEvent);
       const result = replayAgent([...events, event], ledger.attempts.length);
       if ('source' in event) this.#validateSource(event.source);
+      if (event.kind === 'opened' && event.files) this.#validateSource(event.files.source);
+      if (event.kind === 'file-prepared') this.#validateSource(event.admission.source);
       if (event.kind === 'tool-result') this.#validateSource(event.result.source);
       if (event.kind === 'response') check(ledger.attempts.some(attempt => attempt.attemptId === event.attemptId && attempt.outcome === 'received'), 'response-not-received');
       this.#requestEvent(runId, 'agent/event@v1', null, JSON.stringify({ runId, event }), activity.id);
@@ -2357,6 +2363,31 @@ export class ProbeStore {
     });
   }
 
+  #controlledFiles() {
+    const rows = this.#db.prepare(`SELECT e.run_id,e.payload,e.hash,s.principal_id,s.project_id FROM request_events e
+      JOIN request_runs r ON r.run_id=e.run_id JOIN execution_streams s ON s.stream_id=r.stream_id
+      WHERE s.store_id=? AND e.kind='agent/event@v1' ORDER BY e.run_id,e.seq`).all(this.#storeId);
+    const runs = new Map<string, { events: AgentEvent[]; ownerId: string; projectId: string }>();
+    for (const row of rows) {
+      check(sha256(String(row.payload)) === row.hash, 'file-cleanup-evidence-gap');
+      const runId = String(row.run_id);
+      const run = runs.get(runId) ?? { events: [], ownerId: String(row.principal_id), projectId: String(row.project_id) };
+      run.events.push(JSON.parse(String(row.payload)).event as AgentEvent); runs.set(runId, run);
+    }
+    return [...runs].flatMap(([runId, run]) => {
+      const state = replayAgent(run.events, 0);
+      return state.files.filter(file => file.admission.operation === 'file.write').map(file => {
+        const tool = state.tools.find(tool => tool.callId === file.admission.callId)!;
+        const receipt = file.reconciled ?? tool.result?.file;
+        return { runId, callId: tool.callId, ownerId: run.ownerId, projectId: run.projectId,
+          root: file.admission.root, parent: file.admission.target.parent, path: file.admission.target.path,
+          identity: receipt?.identity ?? file.admission.target.identity, source: file.admission.source,
+          responsibility: file.admission.cleanup, started: tool.started,
+          state: receipt ? 'recorded' : ['file-create-conflict', 'file-create-denied'].includes(file.failureReason ?? tool.result?.errorClass ?? '') ? 'no_effect'
+            : tool.started ? 'unknown' : 'not_started' };
+      });
+    });
+  }
   #scanResiduals() {
     const observedAt = new Date().toISOString();
     const entries: { path: string; state: 'expected' | 'unexpected' | 'unknown'; observedAt: string; dev: string | null; ino: string | null; reason: string }[] = [];
@@ -2385,10 +2416,25 @@ export class ProbeStore {
     } catch {
       entries.push({ path: '.', state: 'unknown', observedAt, dev: null, ino: null, reason: 'residual-enumeration-evidence-gap' });
     }
+    for (const file of this.#controlledFiles().filter(file => file.started && file.state !== 'no_effect')) {
+      try {
+        sameFile(file.root.path, file.root.identity);
+        sameFile(file.parent.path, file.parent.identity);
+        check(file.state === 'recorded' && file.identity, 'file-cleanup-evidence-gap');
+        sameFile(file.path, file.identity);
+        entries.push({ path: file.path, state: 'expected', observedAt, dev: file.identity.dev, ino: file.identity.ino,
+          reason: 'registered-project-copy:host-project-resource' });
+      } catch {
+        entries.push({ path: file.path, state: 'unknown', observedAt, dev: file.identity?.dev ?? null, ino: file.identity?.ino ?? null,
+          reason: 'project-copy-reconciliation-required' });
+      }
+    }
+    const unique = new Map<string, (typeof entries)[number]>();
+    for (const entry of entries) if (!unique.has(entry.path) || entry.state !== 'expected') unique.set(entry.path, entry);
     this.#db.prepare('DELETE FROM maintenance_residuals WHERE store_id=?').run(this.#storeId);
     const insert = this.#db.prepare('INSERT INTO maintenance_residuals VALUES (?,?,?,?,?,?,?)');
-    for (const entry of entries) insert.run(this.#storeId, entry.path, entry.state, observedAt, entry.dev, entry.ino, entry.reason);
-    return entries;
+    for (const entry of unique.values()) insert.run(this.#storeId, entry.path, entry.state, observedAt, entry.dev, entry.ino, entry.reason);
+    return [...unique.values()];
   }
 
   releaseMaintenance(coordinator: string): Fence {
@@ -2420,6 +2466,7 @@ export class ProbeStore {
   maintenanceStatus() {
     return this.#transaction(() => ({
       fence: this.fence(),
+      controlledFiles: this.#controlledFiles(),
       coordinatorStream: this.fence().coordinator_stream ? this.#readStream(this.fence().coordinator_stream!) : null,
       streams: this.#db.prepare('SELECT stream_id FROM execution_streams WHERE store_id=? ORDER BY rowid').all(this.#storeId)
         .map(row => this.#readStream(String(row.stream_id))),
