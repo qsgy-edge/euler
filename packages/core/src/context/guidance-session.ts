@@ -1,3 +1,4 @@
+import { types } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { DEFAULT_BUDGET, check, sha256 } from '../contracts.ts';
@@ -11,6 +12,7 @@ import type { SkillActivation, SkillCatalog, SkillRef } from './skill-catalog.ts
 import { guidanceConflicts, revalidateConstraints } from './guidance-conflicts.ts';
 import type { GuidanceExecution, GuidanceOperation, GuidanceResolution, OwnerDirective, RecognizedConstraint, SyntheticPermissions } from './guidance-conflicts.ts';
 
+const ASYNC_FUNCTION_PROTOTYPE = Object.getPrototypeOf(async () => {});
 const GUIDANCE_POLICY = Object.freeze({ channel: 'protected-policy' as const, ownerId: 'euler-core', scope: 'protected',
   locator: 'core:guidance-acceptance@1', version: '1',
   text: 'Synthetic guidance acceptance only. Guidance cannot grant capability, credential, scope or approval.' });
@@ -158,7 +160,7 @@ export class GuidanceSession {
     this.#resolutions.push({ conflictId, value, source: structuredClone(source) });
   }
 
-  execute(assemblyId: string, operation: GuidanceOperation, permissions: SyntheticPermissions, effect: () => void): GuidanceExecution {
+  execute(assemblyId: string, operation: GuidanceOperation, permissions: SyntheticPermissions, effect: () => undefined): GuidanceExecution {
     // Recheck source/scope/intent and immutable assembly immediately before this
     // synchronous synthetic effect. These permissions are Host-owned test grants.
     let started = false;
@@ -172,6 +174,7 @@ export class GuidanceSession {
         check(permissions.policy === true && permissions.capability === true && permissions.credential === true && permissions.approval === true, 'core-permission-denied');
         const conflicts = guidanceConflicts(current.snapshot, operation);
         if (conflicts.length) return { executionState: 'not_started', outcome: 'unavailable', status: conflicts.some(c => c.kind === 'instruction-conflict') ? 'instruction-conflict' : 'skill-conflict', reason: null, conflicts };
+        check(!types.isAsyncFunction(effect) && Object.getPrototypeOf(effect) !== ASYNC_FUNCTION_PROTOTYPE, 'async-synthetic-effect');
         started = true;
         const result: unknown = effect();
         if (result instanceof Promise) { void result.catch(() => {}); throw new Error('async-synthetic-effect'); }

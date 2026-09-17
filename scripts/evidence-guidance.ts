@@ -43,7 +43,7 @@ try {
     quote: i === 0 ? 'Use npm.' : 'Use pnpm.', operation: operation.name, target: target.path, key: 'package-manager', value: i === 0 ? 'npm' : 'pnpm' })));
   const snapshots = [core.prepare([target])];
   let effects = 0;
-  const effect = () => { writeFileSync(target.path, 'synthetic effect'); effects++; };
+  const effect = (): undefined => { writeFileSync(target.path, 'synthetic effect'); effects++; };
   const conflict = core.execute(snapshots[0]!.assemblyId, operation, permissions, effect);
   assert.equal(conflict.status, 'skill-conflict'); assert.equal(effects, 0);
   const resolution = probe.archive.append(randomUUID(), `Resolve ${conflict.conflicts[0]!.id}: npm`);

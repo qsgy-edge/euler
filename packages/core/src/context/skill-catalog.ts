@@ -53,7 +53,10 @@ export function skillSources(config: GuidanceConfig, membership: Membership, pro
       let path: string;
       try { path = realpathSync.native(source.path); check(statSync(path).isDirectory(), 'skill-directory-unavailable'); }
       catch (error) { if (!source.required && (error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
-      if (!source.required) targetChain(source.scope.kind === 'project' ? binding.root : config.dataRoot, source.path);
+      if (!source.required) {
+        const bound = source.scope.kind === 'project' ? binding.root : config.dataRoot;
+        targetChain({ ...bound, path: verifyRoot(bound) }, source.path);
+      }
       const key = JSON.stringify([membership.ownerId, source.scope.kind, source.scope.id, path]);
       if (seen.has(key)) continue;
       seen.add(key); result.push({ ...source, path });
@@ -101,6 +104,6 @@ export function catalogPage(entries: SkillEntry[], query: string, limit: number,
     check(hash === catalogHash && Number.isSafeInteger(offset) && offset >= 0 && offset <= matches.length, 'skill-cursor-stale');
   }
   const page = matches.slice(offset, offset + limit);
-  return { status: 'available', reason: null, entries: page, complete: offset === 0 && page.length === entries.length,
-    total: entries.length, catalogHash, nextCursor: offset + page.length < matches.length ? `${catalogHash}:${offset + page.length}` : null };
+  return { status: 'available', reason: null, entries: page, complete: offset === 0 && page.length === matches.length,
+    total: matches.length, catalogHash, nextCursor: offset + page.length < matches.length ? `${catalogHash}:${offset + page.length}` : null };
 }

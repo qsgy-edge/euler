@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { GuidanceSession, fileIdentity, sha256 } from '@euler/core';
@@ -24,8 +25,10 @@ function fixture() {
   };
   const core = new GuidanceSession(probe.store, probe.activity, probe.archive, config);
   const target = { projectId: sandbox.fixture.projectId, path: join(root, 'src', 'example.ts') };
-  return { sandbox, probe, root, workspaceId, config, core, target, intent,
-    close() { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); } };
+  let closed = false;
+  const closeProbe = () => { if (!closed) { probe.close(); closed = true; } };
+  return { sandbox, probe, root, workspaceId, config, core, target, intent, closeProbe,
+    close() { closeProbe(); rmSync(sandbox.root, { recursive: true, force: true }); } };
 }
 
 function skill(root: string, name: string, text = 'Follow the complete instructions.\n') {
@@ -49,10 +52,10 @@ test('Skill discovery is bounded, resolves default scopes and preserves explicit
     const next = f.core.search(f.target.projectId, '', 10, catalog.nextCursor!);
     assert.equal(next.entries.length, 2);
     const chosen = f.core.select('review', f.target.projectId);
-    assert.equal(chosen.selected.entryLocator, join(local.directory, 'SKILL.md'));
+    assert.equal(chosen.selected.entryLocator, realpathSync.native(join(local.directory, 'SKILL.md')));
     assert.equal(chosen.shadowed.length, 1);
     const all = f.core.search(f.target.projectId);
-    const explicit = all.entries.find(e => e.ref.entryLocator === join(global.directory, 'SKILL.md'))!.ref;
+    const explicit = all.entries.find(e => e.ref.entryLocator === realpathSync.native(join(global.directory, 'SKILL.md')))!.ref;
     f.core.activate(explicit, f.target.projectId, 'owner-explicit');
     const prepared = f.core.prepare([f.target]);
     assert.equal(prepared.snapshot.guidance.find(g => g.kind === 'skill')!.text, global.body);
@@ -67,6 +70,55 @@ test('Skill discovery is bounded, resolves default scopes and preserves explicit
     assert.equal(f.core.inspect(prepared.assemblyId).snapshot.guidance.find(g => g.kind === 'skill')!.text, global.body);
   } finally { f.close(); }
 });
+test('filtered Skill pages report matching totals and completeness, including an empty result', () => {
+  const f = fixture();
+  try {
+    for (const name of ['alpha', 'beta', 'betamax']) skill(join(f.root, '.agents', 'skills'), name);
+    const single = f.core.search(f.target.projectId, 'alpha');
+    assert.equal(single.total, 1);
+    assert.equal(single.complete, true);
+    assert.equal(single.nextCursor, null);
+    assert.deepEqual(single.entries.map(e => e.name), ['alpha']);
+    const empty = f.core.search(f.target.projectId, 'absent');
+    assert.equal(empty.status, 'available');
+    assert.equal(empty.total, 0);
+    assert.equal(empty.complete, true);
+    assert.equal(empty.nextCursor, null);
+    const first = f.core.search(f.target.projectId, 'beta', 1);
+    assert.equal(first.total, 2);
+    assert.equal(first.complete, false);
+    const next = f.core.search(f.target.projectId, 'beta', 1, first.nextCursor!);
+    assert.equal(next.total, 2);
+    assert.equal(next.complete, false); // One continuation page is not the entire matching set.
+    assert.equal(next.nextCursor, null);
+    assert.deepEqual([...first.entries, ...next.entries].map(e => e.name), ['beta', 'betamax']);
+  } finally { f.close(); }
+});
+
+test('Windows short bound roots load canonical default Skill directories without weakening containment', { skip: process.platform !== 'win32' }, t => {
+  const f = fixture();
+  try {
+    const shortPath = (path: string) => {
+      const result = spawnSync('cmd.exe', ['/d', '/c', `for %I in ("${path}") do @echo %~sI`], { encoding: 'utf8', windowsVerbatimArguments: true });
+      assert.equal(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    const shortData = shortPath(f.sandbox.root);
+    const shortProject = shortPath(f.root);
+    if (shortData === f.sandbox.root && shortProject === f.root) { t.skip('8.3 short names unavailable on fixture volume'); return; }
+    skill(join(f.root, '.agents', 'skills'), 'review');
+    f.core.configure({ ...f.config, dataRoot: { path: shortData, identity: f.config.dataRoot.identity },
+      projects: [{ projectId: f.target.projectId, root: { path: shortProject, identity: fileIdentity(f.root) } }] });
+    const catalog = f.core.search(f.target.projectId);
+    assert.equal(catalog.status, 'available', catalog.reason ?? 'expected available catalog');
+    assert.equal(catalog.entries.length, 1);
+    f.core.activate(catalog.entries[0]!.ref, f.target.projectId, 'owner-explicit');
+    const target = { ...f.target, path: join(shortProject, 'src', 'example.ts') };
+    assert.equal(f.core.prepare([target]).status, 'ready');
+    assert.throws(() => f.core.prepare([{ ...target, path: join(shortData, 'outside.ts') }]), /owner-unresolved|outside-project/);
+  } finally { f.close(); }
+});
+
 test('source gates and exact Skill identity do not depend on object property order', () => {
   const f = fixture();
   try {
@@ -151,14 +203,14 @@ test('Core stops actual synthetic effects for direct Skill conflicts, preserves 
     for (const name of ['first', 'second']) f.core.activate(f.core.select(name, f.target.projectId).selected, f.target.projectId, 'owner-explicit');
     const operation = { name: 'synthetic.write' as const, targets: [f.target.path] };
     f.core.recognize([
-      { locator: join(first.directory, 'SKILL.md'), hash: sha256(first.body), quote: 'Use npm for this operation.', operation: operation.name, target: f.target.path, key: 'package-manager', value: 'npm' },
-      { locator: join(second.directory, 'SKILL.md'), hash: sha256(second.body), quote: 'Use pnpm for this operation.', operation: operation.name, target: f.target.path, key: 'package-manager', value: 'pnpm' },
+      { locator: realpathSync.native(join(first.directory, 'SKILL.md')), hash: sha256(first.body), quote: 'Use npm for this operation.', operation: operation.name, target: f.target.path, key: 'package-manager', value: 'npm' },
+      { locator: realpathSync.native(join(second.directory, 'SKILL.md')), hash: sha256(second.body), quote: 'Use pnpm for this operation.', operation: operation.name, target: f.target.path, key: 'package-manager', value: 'pnpm' },
     ]);
     const assembly = f.core.prepare([f.target]);
     const allowed = { policy: true, capability: true, credential: true, approval: true };
     const output = join(f.root, 'result.txt');
     let effects = 0;
-    const effect = () => { writeFileSync(output, 'synthetic effect'); effects++; };
+    const effect = (): undefined => { writeFileSync(output, 'synthetic effect'); effects++; };
     const blocked = f.core.execute(assembly.assemblyId, operation, allowed, effect);
     assert.equal(blocked.status, 'skill-conflict');
     assert.equal(effects, 0);
@@ -189,33 +241,33 @@ test('AGENTS scope precedence, compatible Skills and different operations avoid 
     writeFileSync(globalPath, 'Use npm. Keep evidence.');
     writeFileSync(projectPath, 'Use pnpm.');
     const operation = { name: 'synthetic.write' as const, targets: [f.target.path] };
-    const rule = (locator: string, quote: string, key: string, value: string) => ({ locator, hash: sha256(readFileSync(locator)), quote,
+    const rule = (locator: string, quote: string, key: string, value: string) => ({ locator: realpathSync.native(locator), hash: sha256(readFileSync(locator)), quote,
       operation: operation.name, target: f.target.path, key, value });
     f.core.recognize([rule(globalPath, 'Use npm.', 'manager', 'npm'), rule(globalPath, 'Keep evidence.', 'evidence', 'keep'), rule(projectPath, 'Use pnpm.', 'manager', 'pnpm')]);
     let effects = 0;
     const allowed = { policy: true, capability: true, credential: true, approval: true };
     let prepared = f.core.prepare([f.target]);
-    assert.equal(f.core.execute(prepared.assemblyId, operation, allowed, () => effects++).status, 'completed');
+    assert.equal(f.core.execute(prepared.assemblyId, operation, allowed, () => { effects++; }).status, 'completed');
     const compatible = skill(join(f.root, '.agents', 'skills'), 'compatible', 'Use pnpm.');
     const ref = f.core.select('compatible', f.target.projectId).selected;
     f.core.activate(ref, f.target.projectId, 'catalog-selection');
     f.core.recognize([rule(join(compatible.directory, 'SKILL.md'), 'Use pnpm.', 'manager', 'pnpm')]);
     prepared = f.core.prepare([f.target]);
-    assert.equal(f.core.execute(prepared.assemblyId, operation, allowed, () => effects++).status, 'completed');
+    assert.equal(f.core.execute(prepared.assemblyId, operation, allowed, () => { effects++; }).status, 'completed');
     const conflicting = skill(join(f.root, '.agents', 'skills'), 'conflicting', 'Use yarn.');
     f.core.activate(f.core.select('conflicting', f.target.projectId).selected, f.target.projectId, 'owner-explicit');
     f.core.recognize([rule(join(conflicting.directory, 'SKILL.md'), 'Use yarn.', 'manager', 'yarn')]);
     prepared = f.core.prepare([f.target]);
-    assert.equal(f.core.execute(prepared.assemblyId, operation, allowed, () => effects++).status, 'instruction-conflict');
+    assert.equal(f.core.execute(prepared.assemblyId, operation, allowed, () => { effects++; }).status, 'instruction-conflict');
     f.core.recognize([]); // A recognizer cannot retract a conflict to grant permission.
     prepared = f.core.prepare([f.target]);
-    assert.equal(f.core.execute(prepared.assemblyId, operation, allowed, () => effects++).status, 'instruction-conflict');
+    assert.equal(f.core.execute(prepared.assemblyId, operation, allowed, () => { effects++; }).status, 'instruction-conflict');
     const input = f.probe.archive.append(randomUUID(), 'For this operation use bun.');
     f.core.direct([{ source: input, quote: 'use bun', operation: operation.name, target: f.target.path, key: 'manager', value: 'bun' }]);
     prepared = f.core.prepare([f.target]);
-    assert.equal(f.core.execute(prepared.assemblyId, operation, allowed, () => effects++).status, 'completed');
+    assert.equal(f.core.execute(prepared.assemblyId, operation, allowed, () => { effects++; }).status, 'completed');
     for (const gate of ['policy', 'capability', 'credential', 'approval']) {
-      assert.equal(f.core.execute(prepared.assemblyId, operation, { ...allowed, [gate]: false }, () => effects++).status, 'unavailable');
+      assert.equal(f.core.execute(prepared.assemblyId, operation, { ...allowed, [gate]: false }, () => { effects++; }).status, 'unavailable');
     }
     assert.equal(effects, 3);
   } finally { f.close(); }
@@ -229,28 +281,28 @@ test('a multi-target operation obeys each target independently and still blocks 
     const second = skill(join(f.root, '.agents', 'skills'), 'second', 'Use pnpm.');
     for (const name of ['first', 'second']) f.core.activate(f.core.select(name, f.target.projectId).selected, f.target.projectId, 'owner-explicit');
     const operation = { name: 'synthetic.write' as const, targets: [f.target.path, other.path] };
-    const rule = (source: typeof first, target: string, value: string) => ({ locator: join(source.directory, 'SKILL.md'), hash: sha256(source.body),
+    const rule = (source: typeof first, target: string, value: string) => ({ locator: realpathSync.native(join(source.directory, 'SKILL.md')), hash: sha256(source.body),
       quote: `Use ${value}.`, operation: operation.name, target, key: 'manager', value });
     f.core.recognize([rule(first, f.target.path, 'npm'), rule(second, other.path, 'pnpm')]);
     const allowed = { policy: true, capability: true, credential: true, approval: true };
     const prepared = f.core.prepare([f.target, other]);
     let effects = 0;
-    assert.equal(f.core.execute(prepared.assemblyId, operation, allowed, () => effects++).status, 'completed');
+    assert.equal(f.core.execute(prepared.assemblyId, operation, allowed, () => { effects++; }).status, 'completed');
     f.core.recognize([rule(second, f.target.path, 'pnpm')]);
     const conflicting = f.core.prepare([f.target, other]);
-    const blocked = f.core.execute(conflicting.assemblyId, operation, allowed, () => effects++);
+    const blocked = f.core.execute(conflicting.assemblyId, operation, allowed, () => { effects++; });
     assert.equal(blocked.status, 'skill-conflict');
     assert.equal(blocked.conflicts.length, 1);
     assert.ok(blocked.conflicts[0]!.evidence.every(e => e.target === f.target.path));
     assert.equal(effects, 1);
-    assert.equal(f.core.execute(conflicting.assemblyId, { ...operation, targets: [other.path] }, allowed, () => effects++).status, 'completed');
+    assert.equal(f.core.execute(conflicting.assemblyId, { ...operation, targets: [other.path] }, allowed, () => { effects++; }).status, 'completed');
     const input = f.probe.archive.append(randomUUID(), 'Use npm here and pnpm there.');
     f.core.direct([
       { source: input, quote: 'npm here', operation: operation.name, target: f.target.path, key: 'manager', value: 'npm' },
       { source: input, quote: 'pnpm there', operation: operation.name, target: other.path, key: 'manager', value: 'pnpm' },
     ]);
     const resolved = f.core.prepare([f.target, other]);
-    assert.equal(f.core.execute(resolved.assemblyId, operation, allowed, () => effects++).status, 'completed');
+    assert.equal(f.core.execute(resolved.assemblyId, operation, allowed, () => { effects++; }).status, 'completed');
     assert.equal(effects, 3);
   } finally { f.close(); }
 });
@@ -263,38 +315,38 @@ test('changed guidance replaces stale constraints only after current-source reco
     const selected = skill(join(f.root, '.agents', 'skills'), 'review', 'Use pnpm.');
     f.core.activate(f.core.select('review', f.target.projectId).selected, f.target.projectId, 'owner-explicit');
     const operation = { name: 'synthetic.write' as const, targets: [f.target.path] };
-    const rule = (locator: string, body: string, value: string) => ({ locator, hash: sha256(body), quote: `Use ${value}.`,
+    const rule = (locator: string, body: string, value: string) => ({ locator: realpathSync.native(locator), hash: sha256(body), quote: `Use ${value}.`,
       operation: operation.name, target: f.target.path, key: 'manager', value });
     const oldRule = rule(agents, 'Use npm.', 'npm');
     f.core.recognize([oldRule, rule(join(selected.directory, 'SKILL.md'), selected.body, 'pnpm')]);
     const original = f.core.prepare([f.target]);
     const allowed = { policy: true, capability: true, credential: true, approval: true };
     let effects = 0;
-    assert.equal(f.core.execute(original.assemblyId, operation, allowed, () => effects++).status, 'instruction-conflict');
+    assert.equal(f.core.execute(original.assemblyId, operation, allowed, () => { effects++; }).status, 'instruction-conflict');
     writeFileSync(agents, 'Use pnpm.');
     const changed = f.core.prepare([f.target]);
-    assert.equal(f.core.execute(changed.assemblyId, operation, allowed, () => effects++).reason, 'guidance-constraint-stale');
+    assert.equal(f.core.execute(changed.assemblyId, operation, allowed, () => { effects++; }).reason, 'guidance-constraint-stale');
     f.core.recognize([{ ...oldRule, hash: sha256('Use pnpm.') }]); // Actual new hash, but quote is no longer present.
     const forged = f.core.prepare([f.target]);
-    assert.equal(f.core.execute(forged.assemblyId, operation, allowed, () => effects++).reason, 'guidance-constraint-stale');
+    assert.equal(f.core.execute(forged.assemblyId, operation, allowed, () => { effects++; }).reason, 'guidance-constraint-stale');
     f.core.recognize([rule(agents, 'Use pnpm.', 'pnpm')]);
     const refreshed = f.core.prepare([f.target]);
-    assert.equal(f.core.execute(refreshed.assemblyId, operation, allowed, () => effects++).status, 'completed');
+    assert.equal(f.core.execute(refreshed.assemblyId, operation, allowed, () => { effects++; }).status, 'completed');
     assert.equal(f.core.inspect(original.assemblyId).snapshotHash, original.snapshotHash);
     assert.deepEqual(f.core.inspect(original.assemblyId).snapshot.constraints[0], oldRule);
     writeFileSync(agents, 'Use yarn.');
     const input = f.probe.archive.append(randomUUID(), 'Use bun for this operation.');
     f.core.direct([{ source: input, quote: 'Use bun', operation: operation.name, target: f.target.path, key: 'manager', value: 'bun' }]);
     const directed = f.core.prepare([f.target]);
-    assert.equal(f.core.execute(directed.assemblyId, operation, allowed, () => effects++).status, 'completed');
+    assert.equal(f.core.execute(directed.assemblyId, operation, allowed, () => { effects++; }).status, 'completed');
     assert.equal(effects, 2);
     f.core.direct([]);
     const stillStale = f.core.prepare([f.target]);
-    assert.equal(f.core.execute(stillStale.assemblyId, operation, allowed, () => effects++).reason, 'guidance-constraint-stale');
+    assert.equal(f.core.execute(stillStale.assemblyId, operation, allowed, () => { effects++; }).reason, 'guidance-constraint-stale');
     const resumed = new GuidanceSession(f.probe.store, f.probe.activity, f.probe.archive, f.config, f.core.runId);
     resumed.recognize([rule(agents, 'Use yarn.', 'yarn')]);
     const again = resumed.prepare([f.target]);
-    assert.equal(resumed.execute(again.assemblyId, operation, allowed, () => effects++).status, 'instruction-conflict');
+    assert.equal(resumed.execute(again.assemblyId, operation, allowed, () => { effects++; }).status, 'instruction-conflict');
     assert.equal(effects, 2);
   } finally { f.close(); }
 });
@@ -357,7 +409,7 @@ test('same-task moves retain Skill bytes, restart revalidates full sources, and 
     const first = f.core.prepare([f.target]);
     const moved = f.core.prepare([{ ...f.target, path: join(f.root, 'src', 'other.ts') }]);
     assert.equal(moved.snapshot.guidance.find(g => g.kind === 'skill')!.text, selected.body);
-    f.probe.close();
+    f.closeProbe();
     const reopened = openProbe(f.sandbox);
     try {
       const recovered = new GuidanceSession(reopened.store, reopened.activity, reopened.archive, f.config, f.core.runId);
@@ -370,7 +422,26 @@ test('same-task moves retain Skill bytes, restart revalidates full sources, and 
       assert.equal(completed.snapshot.guidance.some(g => g.kind === 'skill'), false);
       assert.ok(completed.snapshot.cacheEpoch > moved.snapshot.cacheEpoch);
     } finally { reopened.close(); }
-  } finally { rmSync(f.sandbox.root, { recursive: true, force: true }); }
+  } finally { f.close(); }
+});
+
+test('synthetic execution rejects async and bound-async effects before any callback code runs', async () => {
+  const f = fixture();
+  try {
+    const prepared = f.core.prepare([f.target]);
+    const operation = { name: 'synthetic.write' as const, targets: [f.target.path] };
+    const allowed = { policy: true, capability: true, credential: true, approval: true };
+    let effects = 0;
+    const effect = async () => { effects++; await Promise.resolve(); effects++; };
+    for (const callback of [effect, effect.bind(null)]) {
+      // @ts-expect-error Async returns are forbidden statically; exercise the runtime gate too.
+      const result = f.core.execute(prepared.assemblyId, operation, allowed, callback);
+      await Promise.resolve();
+      assert.equal(effects, 0);
+      assert.equal(result.executionState, 'not_started');
+      assert.equal(result.reason, 'async-synthetic-effect');
+    }
+  } finally { f.close(); }
 });
 
 test('optional empty AGENTS is exact, unreadable guidance is unavailable, and revoked runs cannot execute', () => {
@@ -394,7 +465,7 @@ test('optional empty AGENTS is exact, unreadable guidance is unavailable, and re
     assert.equal(unknown.executionState, 'started');
     assert.equal(unknown.outcome, 'unknown');
     f.probe.store.revokeRequestRun(f.probe.activity, f.core.runId);
-    const stopped = f.core.execute(ready.assemblyId, operation, allowed, () => effects++);
+    const stopped = f.core.execute(ready.assemblyId, operation, allowed, () => { effects++; });
     assert.equal(stopped.executionState, 'not_started');
     assert.equal(stopped.reason, 'run-not-admissible');
     assert.equal(effects, 1);
