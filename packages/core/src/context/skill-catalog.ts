@@ -15,6 +15,13 @@ export interface SkillActivation { ref: SkillRef; projectId: string; task: strin
   selectionReason: 'exact-qualified-ref'; shadowed: SkillRef[] }
 type Membership = ReturnType<ProbeStore['guidanceMembership']>;
 
+export function sameGuidanceScope(a: GuidanceScope, b: GuidanceScope): boolean {
+  return a.kind === b.kind && a.id === b.id;
+}
+export function skillRefKey(ref: SkillRef): string {
+  return JSON.stringify([ref.ownerId, ref.scope.kind, ref.scope.id, ref.sourceLocator, ref.entryLocator, ref.hash]);
+}
+
 export function skillSources(config: GuidanceConfig, membership: Membership, projectId: string): { scope: GuidanceScope; path: string; required: boolean }[] {
   const project = membership.projects.find(p => p.projectId === projectId);
   check(project, 'skill-scope-unresolved');
@@ -40,14 +47,14 @@ export function skillSources(config: GuidanceConfig, membership: Membership, pro
   for (const kind of ['project', 'workspace', 'global']) {
     for (const source of [...defaults.filter(s => s.scope.kind === kind), ...applicable.filter(s => s.scope.kind === kind)
       .map(s => ({ scope: s.scope, path: s.root.path, required: true }))]) {
-      const matching = overrides.filter(s => s.canonical === identity(source.path) && JSON.stringify(s.scope) === JSON.stringify(source.scope));
+      const matching = overrides.filter(s => s.canonical === identity(source.path) && sameGuidanceScope(s.scope, source.scope));
       if (matching.some(s => !s.enabled || !s.trusted)) continue;
       for (const override of matching) verifyRoot(override.root);
       let path: string;
       try { path = realpathSync.native(source.path); check(statSync(path).isDirectory(), 'skill-directory-unavailable'); }
       catch (error) { if (!source.required && (error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
       if (!source.required) targetChain(source.scope.kind === 'project' ? binding.root : config.dataRoot, source.path);
-      const key = JSON.stringify([membership.ownerId, source.scope, path]);
+      const key = JSON.stringify([membership.ownerId, source.scope.kind, source.scope.id, path]);
       if (seen.has(key)) continue;
       seen.add(key); result.push({ ...source, path });
     }

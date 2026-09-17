@@ -6,9 +6,9 @@ import type { Activity, BoundFile, ProbeStore } from '../store/probe-store.ts';
 import { freezeRequestPayload } from '../store/request-ledger.ts';
 import { LocalGuidanceFiles, targetChain, verifyRoot, within } from './local-guidance.ts';
 import type { GuidanceFile } from './local-guidance.ts';
-import { catalogPage, discoverSkills, skillMetadata, skillSources } from './skill-catalog.ts';
+import { catalogPage, discoverSkills, sameGuidanceScope, skillMetadata, skillRefKey, skillSources } from './skill-catalog.ts';
 import type { SkillActivation, SkillCatalog, SkillRef } from './skill-catalog.ts';
-import { guidanceConflicts } from './guidance-conflicts.ts';
+import { guidanceConflicts, revalidateConstraints } from './guidance-conflicts.ts';
 import type { GuidanceExecution, GuidanceOperation, GuidanceResolution, OwnerDirective, RecognizedConstraint, SyntheticPermissions } from './guidance-conflicts.ts';
 
 const GUIDANCE_POLICY = Object.freeze({ channel: 'protected-policy' as const, ownerId: 'euler-core', scope: 'protected',
@@ -82,7 +82,7 @@ export class GuidanceSession {
   configure(config: GuidanceConfig): void { this.#config = structuredClone(config); this.#files.clear(); }
 
   loadReference(ref: SkillRef, projectId: string, relativePath: string, hash: string): void {
-    check(this.#activations.some(a => a.projectId === projectId && JSON.stringify(a.ref) === JSON.stringify(ref)), 'skill-not-active');
+    check(this.#activations.some(a => a.projectId === projectId && skillRefKey(a.ref) === skillRefKey(ref)), 'skill-not-active');
     this.#skill(ref, projectId);
     const root = dirname(ref.entryLocator);
     const path = resolve(root, relativePath);
@@ -108,7 +108,7 @@ export class GuidanceSession {
     const entries = discoverSkills(this.#config, membership, projectId, this.#files).filter(e => e.name === name);
     check(entries.length, 'skill-unavailable');
     const selection = { selected: entries[0]!.ref, shadowed: entries.slice(1).map(e => e.ref) };
-    this.#selections.set(JSON.stringify([projectId, selection.selected]), structuredClone(selection));
+    this.#selections.set(JSON.stringify([projectId, skillRefKey(selection.selected)]), structuredClone(selection));
     return selection;
   }
 
@@ -116,7 +116,7 @@ export class GuidanceSession {
     const membership = this.#store.guidanceMembership(this.#activity, [projectId]);
     check(ref.ownerId === membership.ownerId, 'skill-owner-mismatch');
     const sources = skillSources(this.#config, membership, projectId);
-    check(sources.some(s => s.path === ref.sourceLocator && JSON.stringify(s.scope) === JSON.stringify(ref.scope)), 'skill-source-ineligible');
+    check(sources.some(s => s.path === ref.sourceLocator && sameGuidanceScope(s.scope, ref.scope)), 'skill-source-ineligible');
     const file = this.#files.read(ref.entryLocator, ref.sourceLocator);
     check(file && file.locator === ref.entryLocator && file.hash === ref.hash, 'skill-ref-stale');
     skillMetadata(file);
@@ -128,14 +128,14 @@ export class GuidanceSession {
     const intent = this.#store.recoverIntent(this.#activity);
     check(intent?.status === 'active', 'intent-not-active');
     this.#skill(ref, projectId);
-    if (!this.#activations.some(a => a.projectId === projectId && JSON.stringify(a.ref) === JSON.stringify(ref))) {
+    if (!this.#activations.some(a => a.projectId === projectId && skillRefKey(a.ref) === skillRefKey(ref))) {
       this.#activations.push({ ref: structuredClone(ref), projectId, task: intent.intentId, reason,
-        selectionReason: 'exact-qualified-ref', shadowed: this.#selections.get(JSON.stringify([projectId, ref]))?.shadowed ?? [] });
+        selectionReason: 'exact-qualified-ref', shadowed: this.#selections.get(JSON.stringify([projectId, skillRefKey(ref)]))?.shadowed ?? [] });
     }
   }
 
   deactivate(ref: SkillRef, projectId: string): void {
-    this.#activations = this.#activations.filter(a => a.projectId !== projectId || JSON.stringify(a.ref) !== JSON.stringify(ref));
+    this.#activations = this.#activations.filter(a => a.projectId !== projectId || skillRefKey(a.ref) !== skillRefKey(ref));
   }
 
   recognize(constraints: RecognizedConstraint[]): void {
@@ -233,7 +233,7 @@ export class GuidanceSession {
             targets: targets.filter(t => t.projectId === activation.projectId).map(t => t.path), depth: 0 });
         } catch (error) { problems.push(`skill-unavailable:${error instanceof Error ? error.message : 'read-failed'}`); }
       }
-      this.#references = this.#references.filter(r => this.#activations.some(a => a.projectId === r.projectId && JSON.stringify(a.ref) === JSON.stringify(r.ref)));
+      this.#references = this.#references.filter(r => this.#activations.some(a => a.projectId === r.projectId && skillRefKey(a.ref) === skillRefKey(r.ref)));
       for (const reference of this.#references) {
         try {
           this.#skill(reference.ref, reference.projectId);
@@ -246,6 +246,7 @@ export class GuidanceSession {
       if (intent.status === 'completed' || previous && previous.snapshot.task !== intent.intentId) {
         this.#constraints = []; this.#directives = []; this.#resolutions = [];
       }
+      this.#constraints = revalidateConstraints(this.#constraints, guidance);
       for (const resolution of this.#resolutions) this.#archive.read(resolution.source);
       for (const directive of this.#directives) this.#archive.read(directive.source);
       const body = {
