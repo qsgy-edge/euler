@@ -143,6 +143,46 @@ test('an oversized first candidate cannot block a later fitting fact', () => {
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('numeric terms gate near neighbors before normal result admission', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const ids = ['RFC 42 route', 'RFC 43 route'].map(content => {
+      const source = probe.archive.append(randomUUID(), `Evidence ${content}`);
+      const captured = probe.store.captureMemory(probe.activity, source, content, {
+        type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+      }).record;
+      const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
+      return probe.store.activateMemory(probe.activity, verified.recordId, verified).record.recordId;
+    });
+    probe.store.drainSearchProjection(probe.activity);
+    assert.deepEqual(probe.store.searchMemories(probe.activity, { query: 'RFC 42 route' }).results.map(hit => hit.unitId), [ids[0]]);
+    assert.deepEqual(probe.store.searchMemories(probe.activity, { query: 'RFC 99 route' }).results, []);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('overlapping current validity windows share one claim result slot', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const ids = ['Atlas setting alpha', 'Atlas setting beta'].map((content, index) => {
+      const source = probe.archive.append(randomUUID(), `Evidence ${content}`);
+      const captured = probe.store.captureMemory(probe.activity, source, content, {
+        type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [], claimKey: 'Atlas setting',
+        validFrom: new Date(Date.now() - (index + 1) * 60_000).toISOString(),
+        validUntil: new Date(Date.now() + (index + 1) * 60_000).toISOString(),
+      }).record;
+      const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
+      return probe.store.activateMemory(probe.activity, verified.recordId, verified).record.recordId;
+    });
+    probe.store.drainSearchProjection(probe.activity);
+    const page = probe.store.searchMemories(probe.activity, { query: 'Atlas' });
+    assert.equal(page.status, 'ready');
+    assert.equal(page.results.length, 1);
+    assert.ok(ids.includes(page.results[0]!.unitId));
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('S02: equivalent current claims in one project occupy one result slot', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);
@@ -263,14 +303,13 @@ test('X01/X02/X05/X09: only an owner-bound task grant can discover another regis
     first.store.revokeMemoryDiscovery(first.activity, grant.grantId);
     assert.throws(() => first.store.searchMemories(first.activity, { query: 'Atlas', grantId: grant.grantId, cursor: firstPage.nextCursor! }), /discovery-not-authorized/);
     const nextConsent = approveDiscovery(first, [secondBinding.projectId], 2);
-    const nextGrant = first.store.authorizeMemoryDiscovery(first.activity, nextConsent, [secondBinding.projectId], 2);
+    assert.throws(() => first.store.authorizeMemoryDiscovery(first.activity, nextConsent, [secondBinding.projectId], 2), /discovery-already-authorized/);
     const end = first.archive.append(randomUUID(), 'Finish synthetic analysis');
     const current = first.store.readIntent(first.activity)!;
     const completed = first.store.transitionIntent(first.activity, current.eventId, end, { status: 'completed', step: 'done' });
-    assert.throws(() => first.store.searchMemories(first.activity, { query: 'Atlas', grantId: nextGrant.grantId }), /discovery-not-authorized/);
     const resumedInput = first.archive.append(randomUUID(), 'Continue after completion');
     first.store.transitionIntent(first.activity, completed.eventId, resumedInput, { status: 'active', step: 'new-analysis' });
-    assert.throws(() => first.store.searchMemories(first.activity, { query: 'Atlas', grantId: nextGrant.grantId }), /discovery-not-authorized/);
+    assert.throws(() => first.store.authorizeMemoryDiscovery(first.activity, nextConsent, [secondBinding.projectId], 2), /discovery-consent-required/);
   } finally { second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
@@ -293,6 +332,56 @@ test('cross-project discovery charges empty queries to a durable per-grant query
     assert.equal(exhausted.status, 'unavailable');
     assert.equal(exhausted.coverage.reason, 'task-query-budget-exhausted');
     assert.deepEqual(exhausted.coverage.unavailableProjects, [sandbox.fixture.projectId]);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('one owner decision cannot mint fresh budget or revive discovery after task completion', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const source = probe.archive.append(randomUUID(), 'Atlas evidence');
+    const captured = probe.store.captureMemory(probe.activity, source, 'Atlas route', {
+      type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+    }).record;
+    const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
+    probe.store.activateMemory(probe.activity, verified.recordId, verified);
+    probe.store.drainSearchProjection(probe.activity);
+    const text = 'Authorize one Atlas result';
+    const input = probe.archive.append(randomUUID(), text);
+    probe.store.transitionIntent(probe.activity, null, input, { status: 'active', step: 'analysis' }, text);
+    const approval = approveDiscovery(probe, [sandbox.fixture.projectId], 1);
+    const grant = probe.store.authorizeMemoryDiscovery(probe.activity, approval, [sandbox.fixture.projectId], 1);
+    assert.equal(probe.store.searchMemories(probe.activity, { query: 'Atlas', grantId: grant.grantId }).results.length, 1);
+    assert.deepEqual(probe.store.authorizeMemoryDiscovery(probe.activity, approval, [sandbox.fixture.projectId], 1), grant);
+    assert.equal(probe.store.searchMemories(probe.activity, { query: 'Atlas', grantId: grant.grantId }).coverage.reason, 'task-budget-exhausted');
+    const secondApproval = approveDiscovery(probe, [sandbox.fixture.projectId], 1);
+    assert.throws(() => probe.store.authorizeMemoryDiscovery(probe.activity, secondApproval, [sandbox.fixture.projectId], 1), /discovery-already-authorized/);
+    const done = probe.archive.append(randomUUID(), 'Finish task');
+    const active = probe.store.readIntent(probe.activity)!;
+    const completed = probe.store.transitionIntent(probe.activity, active.eventId, done, { status: 'completed', step: 'done' });
+    const restart = probe.archive.append(randomUUID(), 'Reactivate same intent');
+    probe.store.transitionIntent(probe.activity, completed.eventId, restart, { status: 'active', step: 'resumed' });
+    assert.throws(() => probe.store.authorizeMemoryDiscovery(probe.activity, approval, [sandbox.fixture.projectId], 1), /discovery-consent-required/);
+    assert.throws(() => probe.store.authorizeMemoryDiscovery(probe.activity, secondApproval, [sandbox.fixture.projectId], 1), /discovery-consent-required/);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('an owner can revoke a grant while the intent is paused', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const text = 'Authorize bounded analysis';
+    const input = probe.archive.append(randomUUID(), text);
+    probe.store.transitionIntent(probe.activity, null, input, { status: 'active', step: 'analysis' }, text);
+    const approval = approveDiscovery(probe, [sandbox.fixture.projectId], 1);
+    const { grantId } = probe.store.authorizeMemoryDiscovery(probe.activity, approval, [sandbox.fixture.projectId], 1);
+    const pauseInput = probe.archive.append(randomUUID(), 'Pause task');
+    const current = probe.store.readIntent(probe.activity)!;
+    const paused = probe.store.transitionIntent(probe.activity, current.eventId, pauseInput, { status: 'paused', step: 'waiting' });
+    probe.store.revokeMemoryDiscovery(probe.activity, grantId);
+    const resumeInput = probe.archive.append(randomUUID(), 'Resume task');
+    probe.store.transitionIntent(probe.activity, paused.eventId, resumeInput, { status: 'active', step: 'analysis' });
+    assert.throws(() => probe.store.searchMemories(probe.activity, { query: 'Atlas', grantId }), /discovery-not-authorized/);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
@@ -323,12 +412,31 @@ test('a cross-project grant cannot reveal a shared-scope record sourced from an 
   } finally { second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('malformed applies-to conditions fail at capture instead of granting normal applicability', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const source = probe.archive.append(randomUUID(), 'restriction evidence');
+    for (const condition of ['agent:cli:restricted', 'unknown:cli', 'platform:', 'agent:cli restricted']) {
+      assert.throws(() => probe.store.captureMemory(probe.activity, source, 'Restricted route', {
+        type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [condition],
+      }), /invalid-memory-scope/, condition);
+    }
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('X03/X04: cross-project applies-to uses the target environment, not the querying host', () => {
   const sandbox = createSandbox();
   const other = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
   createSandboxSession(sandbox, other);
   const first = openProbe(sandbox);
   const second = openProbe(sandbox, undefined, undefined, other);
+  const unknownBinding = { ...bindingOf(sandbox), sessionId: randomUUID(), branchId: randomUUID() };
+  const wrongBinding = { ...bindingOf(sandbox), sessionId: randomUUID(), branchId: randomUUID() };
+  createSandboxSession(sandbox, unknownBinding);
+  createSandboxSession(sandbox, wrongBinding);
+  const unknownHost = openProbe(sandbox, undefined, undefined, unknownBinding);
+  const wrongHost = openProbe(sandbox, undefined, undefined, wrongBinding);
   try {
     const platform = process.platform === 'linux' ? 'win32' : 'linux';
     const source = second.archive.append(randomUUID(), 'target environment evidence');
@@ -351,9 +459,12 @@ test('X03/X04: cross-project applies-to uses the target environment, not the que
     const knownHit = known.results[0];
     assert.equal(knownHit?.kind, 'memory');
     if (knownHit?.kind === 'memory') assert.equal(knownHit.applicability, 'applicable');
-    const unknownConsent = approveDiscovery(first, [other.projectId], 8);
-    const unknownGrant = first.store.authorizeMemoryDiscovery(first.activity, unknownConsent, [other.projectId], 8);
-    const unknown = first.store.searchMemories(first.activity, { query: 'socket', grantId: unknownGrant.grantId });
+    const unknownText = 'Analyze with unknown target';
+    const unknownInput = unknownHost.archive.append(randomUUID(), unknownText);
+    unknownHost.store.transitionIntent(unknownHost.activity, null, unknownInput, { status: 'active', step: 'analysis' }, unknownText);
+    const unknownApproval = approveDiscovery(unknownHost, [other.projectId], 8);
+    const unknownGrant = unknownHost.store.authorizeMemoryDiscovery(unknownHost.activity, unknownApproval, [other.projectId], 8);
+    const unknown = unknownHost.store.searchMemories(unknownHost.activity, { query: 'socket', grantId: unknownGrant.grantId });
     const unknownHit = unknown.results[0];
     assert.equal(unknownHit?.kind, 'memory');
     if (unknownHit?.kind === 'memory') {
@@ -361,13 +472,16 @@ test('X03/X04: cross-project applies-to uses the target environment, not the que
       assert.equal(unknownHit.exposureMode, 'reference_only');
     }
     const wrongTarget = { [other.projectId]: { platform: process.platform } };
-    const wrongConsent = approveDiscovery(first, [other.projectId], 8, wrongTarget);
-    const wrongGrant = first.store.authorizeMemoryDiscovery(first.activity, wrongConsent, [other.projectId], 8, wrongTarget);
-    assert.equal(first.store.searchMemories(first.activity, { query: 'socket', grantId: wrongGrant.grantId }).results.length, 0);
-    assert.throws(() => first.store.searchMemories(first.activity, {
+    const wrongText = 'Analyze wrong target';
+    const wrongInput = wrongHost.archive.append(randomUUID(), wrongText);
+    wrongHost.store.transitionIntent(wrongHost.activity, null, wrongInput, { status: 'active', step: 'analysis' }, wrongText);
+    const wrongConsent = approveDiscovery(wrongHost, [other.projectId], 8, wrongTarget);
+    const wrongGrant = wrongHost.store.authorizeMemoryDiscovery(wrongHost.activity, wrongConsent, [other.projectId], 8, wrongTarget);
+    assert.equal(wrongHost.store.searchMemories(wrongHost.activity, { query: 'socket', grantId: wrongGrant.grantId }).results.length, 0);
+    assert.throws(() => unknownHost.store.searchMemories(unknownHost.activity, {
       query: 'socket', grantId: unknownGrant.grantId, target: { platform },
     }), /invalid-search-target/);
-  } finally { second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+  } finally { wrongHost.close(); unknownHost.close(); second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
 test('expired memory is only an annotated status, never an injected fact', t => {

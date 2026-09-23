@@ -101,22 +101,6 @@ try {
   { cross: crossHits.map(hit => ({ id: hit.unitId, projectId: hit.projectId, exposureMode: hit.exposureMode })),
     allowed: crossFirst.coverage.allowedProjects, inspected: crossFirst.coverage.inspectedProjects,
     candidateCount: crossFirst.coverage.candidateCount, pages: 2 });
-  let completedDenied = false, reactivatedDenied = false;
-  const laterApproval = first.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
-    intentId: intent.intentId, goalEventId: intent.goalInput.eventId,
-    projectIds: [other.projectId], targets: {}, maxResults: 1, maxBytes: 131072 }));
-  const laterGrant = first.store.authorizeMemoryDiscovery(first.activity, laterApproval, [other.projectId], 1).grantId;
-  const completeInput = first.archive.append(randomUUID(), 'Complete analysis');
-  const completed = first.store.transitionIntent(first.activity, first.store.readIntent(first.activity)!.eventId,
-    completeInput, { status: 'completed', step: 'done' });
-  try { first.store.searchMemories(first.activity, { query: 'Atlas', grantId: laterGrant }); }
-  catch (error) { completedDenied = error instanceof Error && error.message === 'discovery-not-authorized'; }
-  const resumeInput = first.archive.append(randomUUID(), 'Resume after completion');
-  first.store.transitionIntent(first.activity, completed.eventId, resumeInput, { status: 'active', step: 'new-analysis' });
-  try { first.store.searchMemories(first.activity, { query: 'Atlas', grantId: laterGrant }); }
-  catch (error) { reactivatedDenied = error instanceof Error && error.message === 'discovery-not-authorized'; }
-  judgeDiscovery('X05', revoked && completedDenied && reactivatedDenied ? 'old-grant-and-cursor-denied' : 'mismatch',
-    { revoked, completedDenied, reactivatedDenied, cursor: Boolean(crossFirst.nextCursor) });
   const unknown = randomUUID();
   const unknownApproval = first.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
     intentId: intent.intentId, goalEventId: intent.goalInput.eventId,
@@ -126,6 +110,30 @@ try {
   catch (error) { denied = error instanceof Error ? error.message : String(error); }
   judgeDiscovery('X09', denied === 'discovery-project-unavailable' && !denied.includes(unknown)
     ? 'no-name-or-content-disclosed' : 'mismatch', { error: denied, undisclosed: !denied?.includes(unknown) });
+  const endSandbox = createSandbox();
+  const endHost = openProbe(endSandbox);
+  let completedDenied = false, reactivatedDenied = false, reissueDenied = false;
+  try {
+    const endGoal = 'Analyze registered project';
+    const endInput = endHost.archive.append(randomUUID(), endGoal);
+    const endIntent = endHost.store.transitionIntent(endHost.activity, null, endInput, { status: 'active', step: 'analysis' }, endGoal);
+    const approval = endHost.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
+      intentId: endIntent.intentId, goalEventId: endIntent.goalInput.eventId,
+      projectIds: [endSandbox.fixture.projectId], targets: {}, maxResults: 1, maxBytes: 131072 }));
+    const endGrant = endHost.store.authorizeMemoryDiscovery(endHost.activity, approval, [endSandbox.fixture.projectId], 1).grantId;
+    const completeInput = endHost.archive.append(randomUUID(), 'Complete analysis');
+    const completed = endHost.store.transitionIntent(endHost.activity, endIntent.eventId, completeInput, { status: 'completed', step: 'done' });
+    try { endHost.store.searchMemories(endHost.activity, { query: 'Atlas', grantId: endGrant }); }
+    catch (error) { completedDenied = error instanceof Error && error.message === 'discovery-not-authorized'; }
+    const resumeInput = endHost.archive.append(randomUUID(), 'Resume after completion');
+    endHost.store.transitionIntent(endHost.activity, completed.eventId, resumeInput, { status: 'active', step: 'new-analysis' });
+    try { endHost.store.searchMemories(endHost.activity, { query: 'Atlas', grantId: endGrant }); }
+    catch (error) { reactivatedDenied = error instanceof Error && error.message === 'discovery-not-authorized'; }
+    try { endHost.store.authorizeMemoryDiscovery(endHost.activity, approval, [endSandbox.fixture.projectId], 1); }
+    catch (error) { reissueDenied = error instanceof Error && error.message === 'discovery-consent-required'; }
+  } finally { endHost.close(); rmSync(endSandbox.root, { recursive: true, force: true }); }
+  judgeDiscovery('X05', revoked && completedDenied && reactivatedDenied && reissueDenied ? 'old-grant-and-cursor-denied' : 'mismatch',
+    { revoked, completedDenied, reactivatedDenied, reissueDenied, cursor: Boolean(crossFirst.nextCursor) });
 } finally { second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 
 const targetSandbox = createSandbox();
@@ -133,6 +141,9 @@ const targetBinding = { ...bindingOf(targetSandbox), projectId: randomUUID(), se
 createSandboxSession(targetSandbox, targetBinding);
 const targetHost = openProbe(targetSandbox);
 const targetSource = openProbe(targetSandbox, undefined, undefined, targetBinding);
+const unknownBinding = { ...bindingOf(targetSandbox), sessionId: randomUUID(), branchId: randomUUID() };
+createSandboxSession(targetSandbox, unknownBinding);
+const unknownHost = openProbe(targetSandbox, undefined, undefined, unknownBinding);
 try {
   const platform = process.platform === 'linux' ? 'win32' : 'linux';
   const source = targetSource.archive.append(randomUUID(), 'target evidence');
@@ -142,18 +153,18 @@ try {
   const verified = targetSource.store.verifyMemory(targetSource.activity, captured.recordId, captured, 'pass', [source]).record;
   targetSource.store.activateMemory(targetSource.activity, verified.recordId, verified);
   targetSource.store.drainSearchProjection(targetSource.activity);
-  const goal = 'Analyze target environment';
-  const goalInput = targetHost.archive.append(randomUUID(), goal);
-  const intent = targetHost.store.transitionIntent(targetHost.activity, null, goalInput, { status: 'active', step: 'analysis' }, goal);
-  const knownTarget = { [targetBinding.projectId]: { agent: 'cli', platform } };
-  const makeGrant = (targets: typeof knownTarget | Record<string, never>) => {
-    const approval = targetHost.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
+  const makeGrant = (host: ReturnType<typeof openProbe>, targets: Record<string, { agent?: string; platform?: string; component?: string }>) => {
+    const goal = 'Analyze target environment';
+    const goalInput = host.archive.append(randomUUID(), goal);
+    const intent = host.store.transitionIntent(host.activity, null, goalInput, { status: 'active', step: 'analysis' }, goal);
+    const approval = host.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
       intentId: intent.intentId, goalEventId: intent.goalInput.eventId,
       projectIds: [targetBinding.projectId], targets, maxResults: 2, maxBytes: 131072 }));
-    return targetHost.store.authorizeMemoryDiscovery(targetHost.activity, approval, [targetBinding.projectId], 2, targets).grantId;
+    return host.store.authorizeMemoryDiscovery(host.activity, approval, [targetBinding.projectId], 2, targets).grantId;
   };
-  const known = targetHost.store.searchMemories(targetHost.activity, { query: 'socket', grantId: makeGrant(knownTarget) });
-  const unknown = targetHost.store.searchMemories(targetHost.activity, { query: 'socket', grantId: makeGrant({}) });
+  const knownTarget = { [targetBinding.projectId]: { agent: 'cli', platform } };
+  const known = targetHost.store.searchMemories(targetHost.activity, { query: 'socket', grantId: makeGrant(targetHost, knownTarget) });
+  const unknown = unknownHost.store.searchMemories(unknownHost.activity, { query: 'socket', grantId: makeGrant(unknownHost, {}) });
   const knownHit = known.results[0], unknownHit = unknown.results[0];
   judgeDiscovery('X03', known.status === 'ready' && knownHit?.kind === 'memory'
     && knownHit.projectId === targetBinding.projectId && knownHit.applicability === 'applicable'
@@ -162,7 +173,7 @@ try {
     && unknownHit.applicability === 'needs-verification' && unknownHit.exposureMode === 'reference_only'
     ? 'reference-needs-verification' : 'mismatch',
   { status: unknown.status, kind: unknownHit?.kind, exposureMode: unknownHit?.exposureMode });
-} finally { targetSource.close(); targetHost.close(); rmSync(targetSandbox.root, { recursive: true, force: true }); }
+} finally { unknownHost.close(); targetSource.close(); targetHost.close(); rmSync(targetSandbox.root, { recursive: true, force: true }); }
 
 const projectionSandbox = createSandbox();
 const projection = openProbe(projectionSandbox);

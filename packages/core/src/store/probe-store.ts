@@ -273,7 +273,8 @@ CREATE TABLE memory_discovery_grants (
   max_bytes INTEGER NOT NULL CHECK(max_bytes>0 AND max_bytes<=1000000),
   used_bytes INTEGER NOT NULL DEFAULT 0 CHECK(used_bytes>=0 AND used_bytes<=max_bytes),
   max_queries INTEGER NOT NULL CHECK(max_queries>0 AND max_queries<=128),
-  used_queries INTEGER NOT NULL DEFAULT 0 CHECK(used_queries>=0 AND used_queries<=max_queries)
+  used_queries INTEGER NOT NULL DEFAULT 0 CHECK(used_queries>=0 AND used_queries<=max_queries),
+  UNIQUE(session_id,intent_id)
 ) STRICT;
 CREATE TABLE memory_discovery_projects (
   grant_id TEXT NOT NULL REFERENCES memory_discovery_grants(grant_id), project_id TEXT NOT NULL REFERENCES projects(project_id),
@@ -616,7 +617,7 @@ export class ProbeStore {
     targets: Record<string, SearchTarget> = {}, maxBytes = 131072): { grantId: string } {
     return this.withActivity(activity, () => {
       const intent = this.readIntent(activity);
-      check(intent?.status === 'active', 'discovery-consent-required');
+      check(intent?.status === 'active' && !this.#discoveryTaskCompleted(intent.intentId), 'discovery-consent-required');
       const approval = this.#readDiscoveryApproval(consent, intent);
       check(JSON.stringify(approval.projectIds) === JSON.stringify(projectIds) && approval.maxResults === maxResults
         && approval.maxBytes === maxBytes && JSON.stringify(approval.targets) === JSON.stringify(targets), 'discovery-consent-required');
@@ -630,8 +631,14 @@ export class ProbeStore {
           .get(projectId, this.#binding.ownerId), 'discovery-project-unavailable');
       }
       check(validDiscoveryTargets(targets, projectIds), 'invalid-discovery-target');
-      const grantId = randomUUID();
       const payload = JSON.stringify(consent);
+      const previous = this.#db.prepare('SELECT grant_id,consent_hash,state FROM memory_discovery_grants WHERE session_id=? AND intent_id=?')
+        .get(this.#binding.sessionId, intent.intentId);
+      if (previous) {
+        check(previous.consent_hash === sha256(payload) && previous.state === 'active', 'discovery-already-authorized');
+        return { grantId: String(previous.grant_id) };
+      }
+      const grantId = randomUUID();
       this.#db.prepare(`INSERT INTO memory_discovery_grants
         (grant_id,owner_id,session_id,intent_id,consent,consent_hash,state,max_results,max_bytes,max_queries)
         VALUES (?,?,?,?,?,?,'active',?,?,?)`)
@@ -669,9 +676,18 @@ export class ProbeStore {
 
   revokeMemoryDiscovery(activity: Activity, grantId: string): void {
     this.withActivity(activity, () => {
-      this.#discoveryProjects(activity, grantId);
-      this.#db.prepare("UPDATE memory_discovery_grants SET state='revoked' WHERE grant_id=?").run(grantId);
+      uuid(grantId);
+      const changed = this.#db.prepare(`UPDATE memory_discovery_grants SET state='revoked'
+        WHERE grant_id=? AND owner_id=? AND session_id=? AND state='active'`)
+        .run(grantId, this.#binding.ownerId, this.#binding.sessionId);
+      check(changed.changes === 1, 'discovery-not-authorized');
     });
+  }
+
+  #discoveryTaskCompleted(intentId: string): boolean {
+    return Boolean(this.#db.prepare(`SELECT 1 FROM intent_events
+      WHERE session_id=? AND branch_id=? AND intent_id=? AND status='completed' LIMIT 1`)
+      .get(this.#binding.sessionId, this.#binding.branchId, intentId));
   }
 
   #discoveryProjects(activity: Activity, grantId: string): { projects: string[]; remaining: number; remainingBytes: number;
@@ -682,6 +698,7 @@ export class ProbeStore {
     check(row?.state === 'active', 'discovery-not-authorized');
     const intent = this.readIntent(activity);
     check(intent?.status === 'active' && intent.intentId === row.intent_id
+      && !this.#discoveryTaskCompleted(intent.intentId)
       && sha256(String(row.consent)) === row.consent_hash, 'discovery-not-authorized');
     const consent = JSON.parse(String(row.consent)) as SourceAck;
     const approval = this.#readDiscoveryApproval(consent, intent);
@@ -1890,7 +1907,9 @@ export class ProbeStore {
         coverage: unavailableCoverage('candidate-limit'), truncated: true, nextCursor: null };
       const candidates: SearchResult[] = [];
       const lanes = groups.map(() => [] as SearchResult[]);
+      const numericGroups = groups.filter(group => /\p{N}/u.test(group.text));
       const seen = new Set<string>();
+      const now = Date.now();
       for (const row of rows) {
         let record: MemoryRecord;
         try {
@@ -1908,7 +1927,8 @@ export class ProbeStore {
           return { status: 'unavailable', results: [], coverage: unavailableCoverage(reason), truncated: true, nextCursor: null };
         }
         const words = normalizeSearchText(record.content).split(' ');
-        if (!groups.some(group => words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text))) continue;
+        if (numericGroups.some(group => !words.includes(group.text))
+          || !groups.some(group => words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text))) continue;
         const projectId = record.source.binding.projectId;
         const target = grant ? (grant.targets.get(projectId) ?? {}) : (request.target ?? { agent: 'cli', platform: process.platform });
         let applicability = memoryApplicability(record.appliesTo, target);
@@ -1916,11 +1936,12 @@ export class ProbeStore {
         if (!grant && request.target && (request.target.agent !== undefined && request.target.agent !== 'cli'
           || request.target.platform !== undefined && request.target.platform !== process.platform)) applicability = 'needs-verification';
         if (applicability === 'inapplicable') continue;
+        const temporal = memoryTemporalStatus(record, now);
         const key = record.conflictSetId ? `conflict:${projectId}:${record.conflictSetId}`
-          : JSON.stringify([projectId, record.scope.kind, record.scope.id, record.claimKey, record.appliesTo, record.validFrom, record.validUntil]);
+          : JSON.stringify([projectId, record.scope.kind, record.scope.id, record.claimKey, record.appliesTo,
+            temporal ?? 'current', record.verification]);
         if (seen.has(key)) continue;
         seen.add(key);
-        const temporal = memoryTemporalStatus(record, Date.now());
         if (record.verification !== 'verified' || record.conflictSetId || temporal) {
           const reason = temporal ?? (record.verification === 'stale' ? 'stale' : 'conflicted');
           candidates.push({ kind: 'status', unitId: record.recordId, claimRef: sha256(record.claimKey),
@@ -2065,7 +2086,7 @@ export class ProbeStore {
         AND ${this.#visibleScopeSql('memory_heads')} ORDER BY rowid`)
         .all(...this.#scopeParameters()).map(row => this.#readMemoryUnsafe(String(row.record_id)))
         .filter(record => !record.conflictSetId && !memoryTemporalStatus(record, Date.now())
-          && record.appliesTo.every(condition => ['cli', process.platform].includes(condition)));
+          && memoryApplicability(record.appliesTo, { agent: 'cli', platform: process.platform }) === 'applicable');
       for (const record of records) {
         this.#db.prepare('INSERT INTO feedback_events VALUES (?,?,?,?,?)')
           .run(randomUUID(), record.recordId, record.headEventId, record.revisionId, 'retrieved');
@@ -2442,7 +2463,8 @@ export class ProbeStore {
     return structuredClone(scope);
   }
   #normalizeAppliesTo(value: string[]): string[] {
-    check(Array.isArray(value) && value.every(item => typeof item === 'string' && item.length > 0 && Buffer.byteLength(item) <= 256), 'invalid-memory-scope');
+    check(Array.isArray(value) && value.every(item => typeof item === 'string' && item.length > 0
+      && Buffer.byteLength(item) <= 256 && parseMemoryCondition(item) !== null), 'invalid-memory-scope');
     const normalized = [...value].sort();
     check(new Set(normalized).size === normalized.length, 'invalid-memory-scope');
     return normalized;
@@ -2860,16 +2882,25 @@ function validDiscoveryTargets(targets: Record<string, SearchTarget>, projectIds
     && Object.entries(targets).every(([projectId, target]) => projectIds.includes(projectId) && validSearchTarget(target, true)));
 }
 
+function parseMemoryCondition(condition: string): { kind: keyof SearchTarget; value: string } | null {
+  const parts = condition.split(':');
+  if (parts.length === 1 && /^[^:\s]+$/u.test(condition)) {
+    return { kind: ['win32','linux','darwin'].includes(condition) ? 'platform' : 'agent', value: condition };
+  }
+  if (parts.length === 2 && ['agent','platform','component'].includes(parts[0]!)
+    && /^[^:\s]+$/u.test(parts[1]!)) return { kind: parts[0] as keyof SearchTarget, value: parts[1]! };
+  return null;
+}
+
 function memoryApplicability(conditions: readonly string[], target: SearchTarget):
   'applicable' | 'needs-verification' | 'inapplicable' {
   let unknown = false;
   for (const condition of conditions) {
-    const [kind, value] = condition.includes(':') ? condition.split(':', 2)
-      : ['win32','linux','darwin'].includes(condition) ? ['platform', condition] : ['agent', condition];
-    if ((kind !== 'agent' && kind !== 'platform' && kind !== 'component') || !value) return 'inapplicable';
-    const actual = target[kind];
+    const parsed = parseMemoryCondition(condition);
+    if (!parsed) return 'inapplicable';
+    const actual = target[parsed.kind];
     if (actual === undefined) unknown = true;
-    else if (actual !== value) return 'inapplicable';
+    else if (actual !== parsed.value) return 'inapplicable';
   }
   return unknown ? 'needs-verification' : 'applicable';
 }
