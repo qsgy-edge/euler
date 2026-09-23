@@ -51,11 +51,13 @@ export type MemoryLifecycle = 'candidate' | 'active' | 'superseded' | 'rejected'
 export type MemoryVerification = 'unverified' | 'verified' | 'conflicted' | 'stale';
 export type MemoryScopeKind = 'project' | 'workspace' | 'personal' | 'session';
 export interface MemoryScope { kind: MemoryScopeKind; id: string; resolved: boolean }
-export interface MemoryCaptureOptions { type: MemoryType; scope: MemoryScope; appliesTo: string[]; claimKey?: string }
+export interface MemoryCaptureOptions { type: MemoryType; scope: MemoryScope; appliesTo: string[]; claimKey?: string;
+  validFrom?: string; validUntil?: string }
 export interface MemoryRecord {
   schema: 'memory-record@1'; recordId: string; revisionId: string; revision: number; claimKey: string;
   content: string; contentHash: string; type: MemoryType; lifecycle: MemoryLifecycle;
   verification: MemoryVerification; scope: MemoryScope; appliesTo: string[]; source: SourceAck;
+  validFrom: string | null; validUntil: string | null;
   conflictSetId: string | null; verificationRunId: string | null; headEventId: string; hash: string;
 }
 export type MemoryChange = { kind: 'correct'; input: SourceAck; content: string }
@@ -82,7 +84,16 @@ export interface ActivationBatch {
   payload: string; digest: string;
 }
 export interface MemoryOperation { status: 'committed' | 'no_op'; record: MemoryRecord; eventId: string | null }
-export interface SearchResult { unitId: string; record: MemoryRecord; exposureMode: 'normal' | 'status_only'; rank: number }
+export interface SearchRequest { query: string; limit?: number; byteBudget?: number; cursor?: string; grantId?: string;
+  noActiveProject?: true; target?: { agent?: string; platform?: string; component?: string } }
+export type SearchResult = { kind: 'memory'; unitId: string; record: MemoryRecord; exposureMode: 'normal' | 'reference_only'; rank: number;
+  projectId: string; target: { agent?: string; platform?: string; component?: string }; applicability: 'applicable' | 'needs-verification' }
+  | { kind: 'status'; unitId: string; claimRef: string; verification: MemoryVerification;
+    reason: 'stale' | 'conflicted' | 'expired' | 'not-yet-valid'; conflictSetId: string | null;
+    projectId: string; target: { agent?: string; platform?: string; component?: string }; exposureMode: 'status_only'; rank: number };
+export interface SearchPage { status: 'ready' | 'dirty' | 'unavailable'; results: SearchResult[];
+  coverage: { allowedProjects: string[]; inspectedProjects: string[]; unavailableProjects: string[]; complete: false; reason: string | null };
+  truncated: boolean; nextCursor: string | null }
 export interface SearchProjectionReceipt { jobId: string; eventId: string; status: 'done' | 'failed'; generation: number; reason: string | null }
 export interface ConflictOperation { status: 'committed' | 'no_op'; left: MemoryOperation; right: MemoryOperation; conflictSetId: string | null }
 export interface EvolutionProposalInput {
@@ -129,7 +140,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=9), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=10), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -247,6 +258,35 @@ CREATE TABLE project_resources (
   project_id TEXT NOT NULL REFERENCES projects(project_id), path TEXT NOT NULL, dev TEXT NOT NULL, ino TEXT NOT NULL,
   PRIMARY KEY(project_id,path)
 ) STRICT;
+CREATE TABLE memory_discovery_grants (
+  grant_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, session_id TEXT NOT NULL REFERENCES sessions(session_id),
+  intent_id TEXT NOT NULL, consent TEXT NOT NULL, consent_hash TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('active','revoked')),
+  max_results INTEGER NOT NULL CHECK(max_results>0 AND max_results<=128),
+  used_results INTEGER NOT NULL DEFAULT 0 CHECK(used_results>=0 AND used_results<=max_results),
+  max_bytes INTEGER NOT NULL CHECK(max_bytes>0 AND max_bytes<=1000000),
+  used_bytes INTEGER NOT NULL DEFAULT 0 CHECK(used_bytes>=0 AND used_bytes<=max_bytes)
+) STRICT;
+CREATE TABLE memory_discovery_projects (
+  grant_id TEXT NOT NULL REFERENCES memory_discovery_grants(grant_id), project_id TEXT NOT NULL REFERENCES projects(project_id),
+  PRIMARY KEY(grant_id,project_id)
+) STRICT;
+CREATE TABLE memory_discovery_targets (
+  grant_id TEXT NOT NULL, project_id TEXT NOT NULL, agent TEXT, platform TEXT, component TEXT,
+  CHECK(agent IS NOT NULL OR platform IS NOT NULL OR component IS NOT NULL),
+  PRIMARY KEY(grant_id,project_id),
+  FOREIGN KEY(grant_id,project_id) REFERENCES memory_discovery_projects(grant_id,project_id)
+) STRICT;
+CREATE TRIGGER immutable_discovery_targets_update BEFORE UPDATE ON memory_discovery_targets BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_discovery_targets_delete BEFORE DELETE ON memory_discovery_targets BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_discovery_grant BEFORE UPDATE ON memory_discovery_grants
+WHEN NEW.grant_id!=OLD.grant_id OR NEW.owner_id!=OLD.owner_id OR NEW.session_id!=OLD.session_id
+  OR NEW.intent_id!=OLD.intent_id OR NEW.consent!=OLD.consent OR NEW.consent_hash!=OLD.consent_hash
+  OR NEW.max_results!=OLD.max_results OR NEW.max_bytes!=OLD.max_bytes OR (OLD.state='revoked' AND NEW.state!='revoked')
+  OR NEW.used_results<OLD.used_results OR NEW.used_bytes<OLD.used_bytes
+BEGIN SELECT RAISE(ABORT,'discovery-grant-immutable'); END;
+CREATE TRIGGER immutable_discovery_projects_update BEFORE UPDATE ON memory_discovery_projects BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_discovery_projects_delete BEFORE DELETE ON memory_discovery_projects BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TABLE workspaces (workspace_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL) STRICT;
 CREATE TABLE workspace_projects (
   workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id), project_id TEXT NOT NULL UNIQUE REFERENCES projects(project_id),
@@ -268,6 +308,7 @@ CREATE TABLE memory_records (
 CREATE TABLE memory_revisions (
   revision_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), revision INTEGER NOT NULL CHECK(revision > 0),
   content TEXT NOT NULL, content_hash TEXT NOT NULL, type TEXT NOT NULL CHECK(type IN ('fact','preference','decision','insight','episode')),
+  valid_from TEXT, valid_until TEXT, source_project_id TEXT NOT NULL REFERENCES projects(project_id),
   scope_kind TEXT NOT NULL CHECK(scope_kind IN ('project','workspace','personal','session')), scope_id TEXT NOT NULL,
   scope_resolved INTEGER NOT NULL CHECK(scope_resolved IN (0,1)), source_json TEXT NOT NULL,
   source_event_id TEXT NOT NULL, source_hash TEXT NOT NULL, source_content_hash TEXT NOT NULL, source_locator TEXT NOT NULL,
@@ -449,15 +490,15 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=9;
-` + ['workspaces','workspace_projects','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events'].map(table => `
+PRAGMA user_version=10;
+` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 `).join('') + ['memory_heads','intent_heads','owner_fences','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
-  'verification_runs','verification_evidence','proposal_evidence','projection_jobs','feedback_events','search_projection_jobs','conflict_sets','conflict_members','evolution_proposals'].map(table => `
+  'verification_runs','verification_evidence','proposal_evidence','projection_jobs','feedback_events','search_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
-`).join('') + ['memory_heads','intent_heads','owner_fences','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
+`).join('') + ['memory_heads','intent_heads','owner_fences','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
 CREATE TRIGGER owned_${table}_${operation.toLowerCase()} BEFORE ${operation} ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
 `)).join('') + `
@@ -505,15 +546,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,9,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,10,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 9, 'unsupported-probe-schema');
+        check(version === 10, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 9 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 10 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -560,6 +601,76 @@ export class ProbeStore {
         return { projectId, workspaceId: row.workspace_id === null ? null : String(row.workspace_id) };
       }) };
     });
+  }
+
+  // Host-only synthetic owner decision; a search request or model text cannot create this grant.
+  authorizeMemoryDiscovery(activity: Activity, consent: SourceAck, projectIds: string[], maxResults: number,
+    targets: Record<string, { agent?: string; platform?: string; component?: string }> = {}, maxBytes = 131072): { grantId: string } {
+    return this.withActivity(activity, () => {
+      const intent = this.readIntent(activity);
+      check(intent?.status === 'active' && sameBinding(consent.binding, this.#binding)
+        && JSON.stringify(consent) === JSON.stringify(intent.goalInput), 'discovery-consent-required');
+      this.#validateSource(consent);
+      check(Array.isArray(projectIds) && projectIds.length > 0 && projectIds.length <= 32
+        && new Set(projectIds).size === projectIds.length && Number.isSafeInteger(maxResults)
+        && maxResults > 0 && maxResults <= 128 && Number.isSafeInteger(maxBytes)
+        && maxBytes > 0 && maxBytes <= 1000000, 'invalid-discovery-grant');
+      for (const projectId of projectIds) {
+        uuid(projectId);
+        check(this.#db.prepare('SELECT 1 FROM projects WHERE project_id=? AND owner_id=?')
+          .get(projectId, this.#binding.ownerId), 'discovery-project-unavailable');
+      }
+      check(targets && typeof targets === 'object' && !Array.isArray(targets)
+        && Object.entries(targets).every(([projectId, target]) => projectIds.includes(projectId) && target
+          && typeof target === 'object' && !Array.isArray(target) && Object.keys(target).length > 0
+          && Object.keys(target).every(key => ['agent','platform','component'].includes(key))
+          && Object.values(target).every(value => typeof value === 'string' && value.length > 0 && Buffer.byteLength(value) <= 128)),
+      'invalid-discovery-target');
+      const grantId = randomUUID();
+      const payload = JSON.stringify(consent);
+      this.#db.prepare('INSERT INTO memory_discovery_grants VALUES (?,?,?,?,?,?,?, ?,0,?,0)')
+        .run(grantId, this.#binding.ownerId, this.#binding.sessionId, intent.intentId, payload, sha256(payload), 'active', maxResults, maxBytes);
+      for (const projectId of projectIds) this.#db.prepare('INSERT INTO memory_discovery_projects VALUES (?,?)').run(grantId, projectId);
+      for (const [projectId, target] of Object.entries(targets)) this.#db.prepare('INSERT INTO memory_discovery_targets VALUES (?,?,?,?,?)')
+        .run(grantId, projectId, target.agent ?? null, target.platform ?? null, target.component ?? null);
+      return { grantId };
+    });
+  }
+
+  revokeMemoryDiscovery(activity: Activity, grantId: string): void {
+    this.withActivity(activity, () => {
+      this.#discoveryProjects(activity, grantId);
+      this.#db.prepare("UPDATE memory_discovery_grants SET state='revoked' WHERE grant_id=?").run(grantId);
+    });
+  }
+
+  #discoveryProjects(activity: Activity, grantId: string): { projects: string[]; remaining: number; remainingBytes: number;
+    targets: Map<string, { agent?: string; platform?: string; component?: string }> } {
+    uuid(grantId);
+    const row = this.#db.prepare('SELECT * FROM memory_discovery_grants WHERE grant_id=? AND owner_id=? AND session_id=?')
+      .get(grantId, this.#binding.ownerId, this.#binding.sessionId);
+    check(row?.state === 'active', 'discovery-not-authorized');
+    const intent = this.readIntent(activity);
+    check(intent?.status === 'active' && intent.intentId === row.intent_id
+      && sha256(String(row.consent)) === row.consent_hash, 'discovery-not-authorized');
+    const consent = JSON.parse(String(row.consent)) as SourceAck;
+    check(JSON.stringify(consent) === JSON.stringify(intent.goalInput), 'discovery-not-authorized');
+    this.#validateSource(consent);
+    const projects = this.#db.prepare(`SELECT m.project_id FROM memory_discovery_projects m
+      JOIN projects p ON p.project_id=m.project_id AND p.owner_id=? WHERE m.grant_id=? ORDER BY m.project_id`)
+      .all(this.#binding.ownerId, grantId).map(project => String(project.project_id));
+    check(projects.length > 0 && projects.length <= 32, 'discovery-not-authorized');
+    const targets = new Map<string, { agent?: string; platform?: string; component?: string }>();
+    for (const item of this.#db.prepare('SELECT * FROM memory_discovery_targets WHERE grant_id=?').all(grantId)) {
+      check(projects.includes(String(item.project_id)), 'discovery-not-authorized');
+      targets.set(String(item.project_id), {
+        ...(item.agent === null ? {} : { agent: String(item.agent) }),
+        ...(item.platform === null ? {} : { platform: String(item.platform) }),
+        ...(item.component === null ? {} : { component: String(item.component) }),
+      });
+    }
+    return { projects, targets, remaining: Number(row.max_results) - Number(row.used_results),
+      remainingBytes: Number(row.max_bytes) - Number(row.used_bytes) };
   }
 
   bindWorkspace(activity: Activity, workspaceId: string, projectIds: string[]): void {
@@ -1299,9 +1410,15 @@ export class ProbeStore {
 
   captureMemory(activity: Activity, input: SourceAck, content: string, options: MemoryCaptureOptions): MemoryOperation {
     return this.withActivity(activity, () => {
-      check(Object.keys(options).every(key => ['type','scope','appliesTo','claimKey'].includes(key)), 'invalid-memory-options');
+      check(Object.keys(options).every(key => ['type','scope','appliesTo','claimKey','validFrom','validUntil'].includes(key)), 'invalid-memory-options');
       const scope = this.#validateScope(options.scope);
       this.#validateSource(input, content, scope);
+      const validFrom = options.validFrom ?? null, validUntil = options.validUntil ?? null;
+      for (const value of [validFrom, validUntil]) if (value !== null) {
+        check(typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value)
+          && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString() === value, 'invalid-memory-validity');
+      }
+      check(!validFrom || !validUntil || validFrom < validUntil, 'invalid-memory-validity');
       const appliesTo = this.#normalizeAppliesTo(options.appliesTo);
       const claimKey = options.claimKey ?? content.trim().normalize('NFC');
       check(typeof claimKey === 'string' && claimKey.length > 0 && Buffer.byteLength(claimKey) <= 65536, 'invalid-claim-key');
@@ -1316,6 +1433,7 @@ export class ProbeStore {
         const same = existing.content === content && existing.type === options.type && existing.scope_kind === scope.kind
           && existing.scope_id === scope.id && Number(existing.scope_resolved) === (scope.resolved ? 1 : 0)
           && JSON.stringify(this.#readAppliesTo(String(existing.revision_id))) === JSON.stringify(appliesTo)
+          && existing.valid_from === validFrom && existing.valid_until === validUntil
           && existing.source_json === JSON.stringify(input);
         check(same, 'identity-conflict');
         const record = this.#readMemoryUnsafe(String(existing.record_id));
@@ -1329,7 +1447,8 @@ export class ProbeStore {
       const eventId = randomUUID();
       const base = { schema: 'memory-record@1' as const, recordId, revisionId, revision: 1, claimKey,
         content, contentHash: sha256(content), type: options.type, lifecycle: 'candidate' as const,
-        verification: 'unverified' as const, scope, appliesTo, source: structuredClone(input), conflictSetId: null, verificationRunId: null, headEventId: eventId };
+        verification: 'unverified' as const, scope, appliesTo, source: structuredClone(input), validFrom, validUntil,
+        conflictSetId: null, verificationRunId: null, headEventId: eventId };
       const record = this.#withMemoryHash(base);
       this.#db.prepare('INSERT INTO memory_records VALUES (?, ?, ?, ?, ?)')
         .run(recordId, this.#binding.ownerId, claimKey, input.binding.sessionId, new Date().toISOString());
@@ -1338,7 +1457,7 @@ export class ProbeStore {
       this.#db.prepare('INSERT INTO capture_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
         .run(randomUUID(), input.eventId, recordId, 'complete', capturePayload, sha256(capturePayload), new Date().toISOString(), input.binding.sessionId);
       this.#appendMemoryEvent(null, record, 'capture', input.eventId, { automatic: true },
-        this.#requestDigest('capture', null, { input, content, scope, type: options.type, appliesTo, claimKey }));
+        this.#requestDigest('capture', null, { input, content, scope, type: options.type, appliesTo, claimKey, validFrom, validUntil }));
       return { status: 'committed', record, eventId };
     });
   }
@@ -1615,8 +1734,9 @@ export class ProbeStore {
         check(event.eventId === job.event_id && typeof event.recordId === 'string', 'outbox-evidence-gap');
         const record = this.#readMemoryUnsafe(event.recordId);
         const generation = Number(job.projection_rowid);
-        const eligible = record.lifecycle === 'active' && record.verification === 'verified' && record.scope.resolved
-          && !record.conflictSetId && record.appliesTo.every(condition => ['cli', process.platform].includes(condition));
+        const eligible = record.lifecycle === 'active' && record.scope.resolved
+          && ['verified','stale','conflicted'].includes(record.verification);
+        const exposure = record.verification === 'verified' && !record.conflictSetId ? 'normal' : 'status_only';
         const old = this.#db.prepare('SELECT rowid FROM search_documents WHERE unit_id=?').get(record.recordId);
         if (old) this.#db.prepare('DELETE FROM search_fts WHERE rowid=?').run(Number(old.rowid));
         this.#db.prepare('DELETE FROM search_documents WHERE unit_id=?').run(record.recordId);
@@ -1624,8 +1744,8 @@ export class ProbeStore {
           const indexed = `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim();
           this.#db.prepare(`INSERT INTO search_documents
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(record.recordId, this.#binding.ownerId, record.recordId, record.revisionId,
-            this.#binding.projectId, record.scope.kind, record.scope.id, record.lifecycle, record.verification, 'normal', indexed,
-            record.contentHash, record.revision, 'cjk-2gram@1', generation);
+            record.source.binding.projectId, record.scope.kind, record.scope.id, record.lifecycle, record.verification, exposure, indexed,
+            record.contentHash, record.revision, 'latin-cjk@2', generation);
           const row = this.#db.prepare('SELECT rowid FROM search_documents WHERE unit_id=?').get(record.recordId);
           this.#db.prepare('INSERT INTO search_fts(rowid,content) VALUES (?,?)').run(Number(row!.rowid), indexed);
         }
@@ -1646,14 +1766,15 @@ export class ProbeStore {
       const receipts: SearchProjectionReceipt[] = [];
       for (const row of canonical) {
         const record = this.#readMemoryUnsafe(String(row.record_id));
-        const eligible = record.lifecycle === 'active' && record.verification === 'verified' && record.scope.resolved
-          && !record.conflictSetId && record.appliesTo.every(condition => ['cli', process.platform].includes(condition));
+        const eligible = record.lifecycle === 'active' && record.scope.resolved
+          && ['verified','stale','conflicted'].includes(record.verification);
         if (!eligible) continue;
+        const exposure = record.verification === 'verified' && !record.conflictSetId ? 'normal' : 'status_only';
         const indexed = `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim();
         const generation = record.revision;
         this.#db.prepare(`INSERT INTO search_documents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(record.recordId, this.#binding.ownerId,
-          record.recordId, record.revisionId, this.#binding.projectId, record.scope.kind, record.scope.id, record.lifecycle,
-          record.verification, 'normal', indexed, record.contentHash, record.revision, 'cjk-2gram@1', generation);
+          record.recordId, record.revisionId, record.source.binding.projectId, record.scope.kind, record.scope.id, record.lifecycle,
+          record.verification, exposure, indexed, record.contentHash, record.revision, 'latin-cjk@2', generation);
         receipts.push({ jobId: '', eventId: record.headEventId, status: 'done', generation, reason: 'rebuild' });
       }
       this.#db.exec(`DROP TABLE search_fts;
@@ -1663,23 +1784,162 @@ export class ProbeStore {
     });
   }
 
-  searchMemories(activity: Activity, query: string, limit = 10): SearchResult[] {
+  searchMemories(activity: Activity, request: SearchRequest): SearchPage {
     return this.withActivity(activity, () => {
+      check(request && typeof request === 'object' && Object.keys(request).every(key =>
+        ['query','limit','byteBudget','cursor','grantId','target','noActiveProject'].includes(key)), 'invalid-search-request');
+      check(request.noActiveProject === undefined || request.noActiveProject === true, 'invalid-search-request');
+      const limit = request.limit ?? 10;
+      const byteBudget = request.byteBudget ?? 8192;
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= 32, 'invalid-search-limit');
-      const indexed = `${normalizeSearchText(query)} ${cjkBigrams(query)}`.trim();
-      const rows = this.#db.prepare(`SELECT d.*, bm25(search_fts) AS rank FROM search_fts
-        JOIN search_documents d ON d.rowid=search_fts.rowid
-        WHERE search_fts MATCH ? AND d.owner_id=? AND ${this.#visibleScopeSql('d')} ORDER BY rank LIMIT ?`).all(
-        indexed, this.#binding.ownerId, ...this.#scopeParameters(), limit);
-      return rows.map(row => {
-        const record = this.#readMemoryUnsafe(String(row.record_id));
-        const eligible = record.lifecycle === 'active' && record.verification === 'verified' && record.scope.resolved
-          && !record.conflictSetId && record.appliesTo.every(condition => ['cli', process.platform].includes(condition));
-        check(eligible && String(row.content_hash) === record.contentHash
-          && String(row.content) === `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim(), 'search-evidence-gap');
-        this.#validateScope(record.scope);
-        return { unitId: String(row.unit_id), record, exposureMode: String(row.exposure_mode) as 'normal' | 'status_only', rank: Number(row.rank) };
-      });
+      check(Number.isSafeInteger(byteBudget) && byteBudget > 0 && byteBudget <= 65536, 'invalid-search-budget');
+      check(typeof request.query === 'string' && Buffer.byteLength(request.query) <= 4096, 'invalid-search-query');
+      check(request.target === undefined || (request.target !== null && typeof request.target === 'object'
+        && Object.keys(request.target).every(key => ['agent','platform','component'].includes(key))
+        && Object.values(request.target).every(value => typeof value === 'string' && value.length > 0 && Buffer.byteLength(value) <= 128)), 'invalid-search-target');
+      const terms = searchTerms(request.query);
+      const groups = searchGroups(request.query);
+      const grant = request.grantId ? this.#discoveryProjects(activity, request.grantId) : null;
+      check(!grant || request.target === undefined, 'invalid-search-target');
+      const projects = grant?.projects ?? [this.#binding.projectId];
+      const coverage = { allowedProjects: projects, inspectedProjects: projects, unavailableProjects: [], complete: false as const, reason: null as string | null };
+      if (!grant && request.noActiveProject) return { status: 'ready', results: [],
+        coverage: { ...coverage, allowedProjects: [], inspectedProjects: [], reason: 'no-active-project' },
+        truncated: false, nextCursor: null };
+      const scopeSql = this.#searchScopeSql('h', projects);
+      const scopeArgs = this.#searchScopeArgs(projects);
+      const sourceSql = grant ? ` AND v.source_project_id IN (${projects.map(() => '?').join(',')})` : '';
+      const projectedSourceSql = grant ? ` AND d.project_id IN (${projects.map(() => '?').join(',')})` : '';
+      const missing = this.#db.prepare(`SELECT 1 FROM memory_heads h JOIN memory_records r ON r.record_id=h.record_id
+        JOIN memory_revisions v ON v.revision_id=h.revision_id
+        LEFT JOIN search_documents d ON d.record_id=h.record_id
+        WHERE r.owner_id=? AND ${scopeSql}${sourceSql} AND h.lifecycle='active' AND h.scope_resolved=1
+          AND h.verification IN ('verified','stale','conflicted')
+          AND (d.unit_id IS NULL OR d.owner_id!=r.owner_id OR d.project_id!=v.source_project_id
+            OR d.scope_kind!=h.scope_kind OR d.scope_id!=h.scope_id OR d.content_hash!=v.content_hash
+            OR d.tokenizer_version!='latin-cjk@2' OR d.source_seq!=v.revision
+            OR d.exposure_mode!=CASE WHEN h.verification='verified' AND h.conflict_set_id IS NULL THEN 'normal' ELSE 'status_only' END
+            OR d.revision_id!=h.revision_id OR d.lifecycle!=h.lifecycle OR d.verification!=h.verification)
+        LIMIT 1`).get(this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
+      const extra = this.#db.prepare(`SELECT 1 FROM search_documents d JOIN memory_heads h ON h.record_id=d.record_id
+        WHERE d.owner_id=? AND ${this.#searchScopeSql('d', projects)}${projectedSourceSql}
+          AND (h.lifecycle!='active' OR h.scope_resolved!=1 OR d.revision_id!=h.revision_id
+            OR d.lifecycle!=h.lifecycle OR d.verification!=h.verification) LIMIT 1`)
+        .get(this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
+      if (missing || extra) return { status: 'dirty', results: [], coverage: { ...coverage, reason: 'index-lag' }, truncated: false, nextCursor: null };
+      if (!terms.length) return { status: 'ready', results: [], coverage: { ...coverage, reason: 'unsupported-query' }, truncated: false, nextCursor: null };
+      if (terms.length > 16) return { status: 'unavailable', results: [],
+        coverage: { ...coverage, reason: 'query-term-limit' }, truncated: true, nextCursor: null };
+      if (grant && (grant.remaining === 0 || grant.remainingBytes === 0)) return { status: 'unavailable', results: [],
+        coverage: { ...coverage, reason: 'task-budget-exhausted' }, truncated: true, nextCursor: null };
+      const match = terms.map(term => `"${term.replaceAll('"', '""')}"`).join(' OR ');
+      let rows: Record<string, unknown>[];
+      try {
+        rows = this.#db.prepare(`SELECT d.*, bm25(search_fts) AS rank FROM search_fts
+          JOIN search_documents d ON d.rowid=search_fts.rowid
+          JOIN memory_records r ON r.record_id=d.record_id
+          WHERE search_fts MATCH ? AND d.owner_id=? AND ${this.#searchScopeSql('d', projects)}${projectedSourceSql}
+          ORDER BY rank, r.rowid LIMIT 257`).all(
+          match, this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
+      } catch { return { status: 'unavailable', results: [], coverage: { ...coverage, reason: 'index-unavailable' }, truncated: true, nextCursor: null }; }
+      if (rows.length > 256) return { status: 'unavailable', results: [],
+        coverage: { ...coverage, reason: 'candidate-limit' }, truncated: true, nextCursor: null };
+      const candidates: SearchResult[] = [];
+      const lanes = groups.map(() => [] as SearchResult[]);
+      const seen = new Set<string>();
+      for (const row of rows) {
+        let record: MemoryRecord;
+        try {
+          record = this.#readMemoryUnsafe(String(row.record_id), projects);
+          check(record.lifecycle === 'active' && record.scope.resolved && ['verified','stale','conflicted'].includes(record.verification)
+            && row.unit_id === record.recordId && row.revision_id === record.revisionId
+            && row.scope_kind === record.scope.kind && row.scope_id === record.scope.id
+            && row.project_id === record.source.binding.projectId
+            && row.tokenizer_version === 'latin-cjk@2'
+            && row.exposure_mode === (record.verification === 'verified' && !record.conflictSetId ? 'normal' : 'status_only')
+            && String(row.content_hash) === record.contentHash
+            && String(row.content) === `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim(), 'search-evidence-gap');
+        } catch (error) {
+          const reason = error instanceof Error && error.message === 'search-evidence-gap' ? 'search-evidence-gap' : 'canonical-evidence-gap';
+          return { status: 'unavailable', results: [], coverage: { ...coverage, reason }, truncated: true, nextCursor: null };
+        }
+        const words = normalizeSearchText(record.content).split(' ');
+        if (!groups.some(group => words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text))) continue;
+        const projectId = record.source.binding.projectId;
+        const target = grant ? (grant.targets.get(projectId) ?? {}) : (request.target ?? { agent: 'cli', platform: process.platform });
+        let applicability = memoryApplicability(record.appliesTo, target);
+        if (!grant && request.target && (request.target.agent !== undefined && request.target.agent !== 'cli'
+          || request.target.platform !== undefined && request.target.platform !== process.platform)) applicability = 'needs-verification';
+        if (applicability === 'inapplicable') continue;
+        const key = record.conflictSetId ? `conflict:${record.conflictSetId}`
+          : JSON.stringify([projectId, record.scope.kind, record.scope.id, record.claimKey, record.appliesTo, record.validFrom, record.validUntil]);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const now = Date.now();
+        const temporal = record.validFrom && now < Date.parse(record.validFrom) ? 'not-yet-valid'
+          : record.validUntil && now >= Date.parse(record.validUntil) ? 'expired' : null;
+        if (record.verification !== 'verified' || record.conflictSetId || temporal) {
+          const reason = temporal ?? (record.verification === 'stale' ? 'stale' : 'conflicted');
+          candidates.push({ kind: 'status', unitId: record.recordId, claimRef: sha256(record.claimKey),
+            verification: record.verification, reason, conflictSetId: record.conflictSetId,
+            projectId, target, exposureMode: 'status_only', rank: Number(row.rank) });
+        } else candidates.push({ kind: 'memory', unitId: record.recordId, record, projectId, target,
+          applicability, exposureMode: applicability === 'needs-verification' ? 'reference_only' : 'normal', rank: Number(row.rank) });
+        const hit = candidates[candidates.length - 1]!;
+        groups.forEach((group, index) => {
+          if (words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text)) lanes[index]!.push(hit);
+        });
+      }
+      const fused: SearchResult[] = [];
+      const selected = new Set<string>();
+      while (fused.length < candidates.length) {
+        let advanced = false;
+        for (const lane of lanes) {
+          const next = lane.find(hit => !selected.has(hit.unitId));
+          if (!next) continue;
+          fused.push(next);
+          selected.add(next.unitId);
+          advanced = true;
+        }
+        if (!advanced) break;
+      }
+      candidates.splice(0, candidates.length, ...fused);
+      const fingerprint = sha256(JSON.stringify(candidates.map(hit => [hit.unitId, hit.kind === 'memory' ? hit.record.headEventId : hit.reason])));
+      const cursorScope = sha256(JSON.stringify([this.#binding.sessionId, request.grantId ?? null, request.query, request.target ?? null, projects]));
+      let offset = 0;
+      if (request.cursor !== undefined) {
+        check(typeof request.cursor === 'string' && request.cursor.length <= 2048, 'invalid-search-cursor');
+        let cursor: { schema?: string; scope?: string; fingerprint?: string; offset?: number };
+        try { cursor = JSON.parse(Buffer.from(request.cursor, 'base64url').toString('utf8')); }
+        catch { throw new Error('invalid-search-cursor'); }
+        check(cursor.schema === 'memory-search-cursor@1' && cursor.scope === cursorScope
+          && cursor.fingerprint === fingerprint && Number.isSafeInteger(cursor.offset)
+          && cursor.offset! > 0 && cursor.offset! <= candidates.length, 'invalid-search-cursor');
+        offset = cursor.offset!;
+      }
+      const results: SearchResult[] = [];
+      let bytes = 0;
+      const remaining = grant?.remaining ?? limit;
+      const remainingBytes = grant?.remainingBytes ?? byteBudget;
+      for (const candidate of candidates.slice(offset)) {
+        const size = Buffer.byteLength(JSON.stringify(candidate));
+        if (results.length >= Math.min(limit, remaining) || bytes + size > Math.min(byteBudget, remainingBytes)) break;
+        results.push(candidate);
+        bytes += size;
+      }
+      if (!results.length && candidates.length > offset) return { status: 'unavailable', results: [],
+        coverage: { ...coverage, reason: 'result-over-budget' }, truncated: true, nextCursor: null };
+      if (grant && results.length) this.#db.prepare(`UPDATE memory_discovery_grants
+        SET used_results=used_results+?, used_bytes=used_bytes+? WHERE grant_id=? AND state='active'
+          AND used_results+?<=max_results AND used_bytes+?<=max_bytes`)
+        .run(results.length, bytes, request.grantId!, results.length, bytes);
+      const end = offset + results.length;
+      const truncated = end < candidates.length;
+      const exhausted = grant && (results.length >= grant.remaining || bytes >= grant.remainingBytes);
+      const nextCursor = truncated && !exhausted
+        ? Buffer.from(JSON.stringify({ schema: 'memory-search-cursor@1', scope: cursorScope, fingerprint, offset: end })).toString('base64url') : null;
+      return { status: 'ready', results, coverage: truncated && exhausted ? { ...coverage, reason: 'task-budget-exhausted' } : coverage,
+        truncated, nextCursor };
     });
   }
 
@@ -1719,7 +1979,19 @@ export class ProbeStore {
     });
   }
 
-  #visibleScopeSql(alias: 'projection_jobs' | 'memory_heads' | 'v' | 'd' | 'j' | 'search_documents'): string {
+  #searchScopeSql(alias: 'd' | 'h', projects: readonly string[]): string {
+    const ids = projects.map(() => '?').join(',');
+    return `((${alias}.scope_kind='project' AND ${alias}.scope_id IN (${ids}))
+      OR (${alias}.scope_kind='personal' AND ${alias}.scope_id=?)
+      OR (${alias}.scope_kind='workspace' AND EXISTS
+        (SELECT 1 FROM workspace_projects w WHERE w.workspace_id=${alias}.scope_id AND w.project_id IN (${ids}))))`;
+  }
+
+  #searchScopeArgs(projects: readonly string[]): string[] {
+    return [...projects, this.#binding.ownerId, ...projects];
+  }
+
+  #visibleScopeSql(alias: 'projection_jobs' | 'memory_heads' | 'v' | 'd' | 'j' | 'search_documents' | 'h'): string {
     return `((${alias}.scope_kind='project' AND ${alias}.scope_id=?) OR (${alias}.scope_kind='personal' AND ${alias}.scope_id=?)
       OR (${alias}.scope_kind='session' AND ${alias}.scope_id=?) OR (${alias}.scope_kind='workspace' AND EXISTS
         (SELECT 1 FROM workspace_projects w WHERE w.workspace_id=${alias}.scope_id AND w.project_id=?)))`;
@@ -2079,10 +2351,10 @@ export class ProbeStore {
     return null;
   }
   #validateSource(input: SourceAck, content?: string,
-    targetScope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true }): void {
+    targetScope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true }, projects: readonly string[] = [this.#binding.projectId]): void {
     check(input?.schema === 'cli-source-ack@1' && input.status === 'durable'
       && input.binding.ownerId === this.#binding.ownerId && input.binding.hostId === this.#binding.hostId, 'source-scope-mismatch');
-    this.#validateScope(targetScope);
+    this.#validateScope(targetScope, projects);
     check(this.#sourceAllowedForScope(input.binding, targetScope), 'source-scope-mismatch');
     const source = this.sessionSource(input.binding);
     sameFile(source.path, source.identity);
@@ -2103,16 +2375,17 @@ export class ProbeStore {
       WHERE m.workspace_id=? AND m.project_id=? AND w.owner_id=?`).get(scope.id, binding.projectId, this.#binding.ownerId));
   }
 
-  #validateScope(scope: MemoryScope): MemoryScope {
+  #validateScope(scope: MemoryScope, projects: readonly string[] = [this.#binding.projectId]): MemoryScope {
     check(scope && ['project', 'workspace', 'personal', 'session'].includes(scope.kind) && typeof scope.id === 'string', 'invalid-memory-scope');
     uuid(scope.id);
     check(Object.keys(scope).every(key => ['kind','id','resolved'].includes(key)) && typeof scope.resolved === 'boolean', 'invalid-memory-scope');
-    if (scope.kind === 'project') check(scope.id === this.#binding.projectId && scope.resolved, 'invalid-memory-scope');
+    if (scope.kind === 'project') check(projects.includes(scope.id) && scope.resolved, 'invalid-memory-scope');
     if (scope.kind === 'personal') check(scope.id === this.#binding.ownerId && scope.resolved, 'invalid-memory-scope');
     if (scope.kind === 'session') check(scope.id === this.#binding.sessionId && !scope.resolved, 'invalid-memory-scope');
     if (scope.kind === 'workspace') {
       check(scope.resolved && this.#db.prepare(`SELECT 1 FROM workspace_projects m JOIN workspaces w ON w.workspace_id=m.workspace_id
-        WHERE m.workspace_id=? AND m.project_id=? AND w.owner_id=?`).get(scope.id, this.#binding.projectId, this.#binding.ownerId), 'workspace-unavailable');
+        WHERE m.workspace_id=? AND m.project_id IN (${projects.map(() => '?').join(',')}) AND w.owner_id=?`)
+        .get(scope.id, ...projects, this.#binding.ownerId), 'workspace-unavailable');
     }
     return structuredClone(scope);
   }
@@ -2128,10 +2401,12 @@ export class ProbeStore {
   }
   #eligible(record: MemoryRecord): void {
     check(record.scope.resolved && record.verification === 'verified' && !record.conflictSetId, 'memory-not-eligible');
+    check((!record.validFrom || Date.now() >= Date.parse(record.validFrom))
+      && (!record.validUntil || Date.now() < Date.parse(record.validUntil)), 'memory-not-current');
     this.#validateSource(record.source, undefined, record.scope);
     this.#checkVerification(record, true);
   }
-  #checkVerification(record: MemoryRecord, readSources = false): void {
+  #checkVerification(record: MemoryRecord, readSources = false, projects: readonly string[] = [this.#binding.projectId]): void {
     if (!record.verificationRunId) { check(record.verification !== 'verified', 'verification-evidence-gap'); return; }
     const row = this.#db.prepare('SELECT * FROM verification_runs WHERE run_id=?').get(record.verificationRunId);
     check(row && row.record_id === record.recordId && row.revision_id === record.revisionId
@@ -2139,7 +2414,7 @@ export class ProbeStore {
       && (record.verification !== 'verified' || row.result === 'pass'), 'verification-evidence-gap');
     const evidence = JSON.parse(String(row.evidence_json)) as SourceAck[];
     this.#checkEvidenceRows('verification_evidence', 'run_id', record.verificationRunId, evidence);
-    if (readSources) for (const ref of evidence) this.#validateSource(ref, undefined, record.scope);
+    if (readSources) for (const ref of evidence) this.#validateSource(ref, undefined, record.scope, projects);
   }
   #withMemoryHash(record: Omit<MemoryRecord, 'hash'> & { hash?: string }): MemoryRecord {
     const { hash: _hash, ...snapshot } = record;
@@ -2158,14 +2433,15 @@ export class ProbeStore {
     const revision = this.#db.prepare('SELECT * FROM memory_revisions WHERE revision_id=?').get(record.revisionId);
     check(revision && revision.record_id === record.recordId && revision.revision === record.revision
       && revision.content === record.content && revision.content_hash === record.contentHash
-      && revision.type === record.type && revision.scope_kind === record.scope.kind && revision.scope_id === record.scope.id
+      && revision.type === record.type && revision.valid_from === record.validFrom && revision.valid_until === record.validUntil
+      && revision.source_project_id === record.source.binding.projectId && revision.scope_kind === record.scope.kind && revision.scope_id === record.scope.id
       && Number(revision.scope_resolved) === (record.scope.resolved ? 1 : 0)
       && JSON.stringify(this.#readAppliesTo(record.revisionId)) === JSON.stringify(record.appliesTo)
       && revision.source_json === JSON.stringify(record.source) && revision.source_event_id === record.source.eventId
       && revision.source_hash === record.source.hash && revision.source_content_hash === record.source.contentHash
       && revision.source_locator === record.source.locator && sha256(record.content) === record.contentHash, 'memory-evidence-gap');
   }
-  #replayMemory(recordId: string): MemoryRecord {
+  #replayMemory(recordId: string, projects: readonly string[] = [this.#binding.projectId]): MemoryRecord {
     const owner = this.#db.prepare('SELECT owner_id,claim_key,source_lineage FROM memory_records WHERE record_id=?').get(recordId);
     check(owner?.owner_id === this.#binding.ownerId, 'memory-not-found');
     const events = this.#db.prepare('SELECT * FROM memory_events WHERE record_id=? ORDER BY seq').all(recordId);
@@ -2198,19 +2474,19 @@ export class ProbeStore {
     check(current, 'memory-evidence-gap');
     return current;
   }
-  #readMemoryUnsafe(recordId: string): MemoryRecord {
+  #readMemoryUnsafe(recordId: string, projects: readonly string[] = [this.#binding.projectId]): MemoryRecord {
     const row = this.#db.prepare('SELECT * FROM memory_heads WHERE record_id=?').get(recordId);
     check(row, 'memory-evidence-gap');
-    const record = this.#replayMemory(recordId);
+    const record = this.#replayMemory(recordId, projects);
     check(this.#snapshotBytes(record) === row.snapshot && record.hash === row.snapshot_hash
       && record.revisionId === row.revision_id && record.lifecycle === row.lifecycle
       && record.verification === row.verification && record.scope.kind === row.scope_kind && record.scope.id === row.scope_id
       && record.scope.resolved === Boolean(row.scope_resolved) && record.conflictSetId === row.conflict_set_id
       && record.verificationRunId === row.verification_run_id
       && record.headEventId === row.head_event_id, 'memory-evidence-gap');
-    this.#validateScope(record.scope);
-    this.#validateSource(record.source, undefined, record.scope);
-    this.#checkVerification(record, true);
+    this.#validateScope(record.scope, projects);
+    this.#validateSource(record.source, undefined, record.scope, projects);
+    this.#checkVerification(record, true, projects);
     return record;
   }
   #assertMemoryExpected(recordId: string, expected: MemoryRecord): MemoryRecord {
@@ -2228,8 +2504,9 @@ export class ProbeStore {
       .map(row => String(row.value));
   }
   #insertRevision(record: MemoryRecord): void {
-    this.#db.prepare('INSERT INTO memory_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    this.#db.prepare('INSERT INTO memory_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(record.revisionId, record.recordId, record.revision, record.content, record.contentHash, record.type,
+        record.validFrom, record.validUntil, record.source.binding.projectId,
         record.scope.kind, record.scope.id, record.scope.resolved ? 1 : 0, JSON.stringify(record.source),
         record.source.eventId, record.source.hash, record.source.contentHash, record.source.locator);
     for (const [ordinal, value] of record.appliesTo.entries()) {
@@ -2509,11 +2786,36 @@ export class ProbeStore {
   close(): void { this.#db.close(); }
 }
 
+function memoryApplicability(conditions: readonly string[], target: { agent?: string; platform?: string; component?: string }):
+  'applicable' | 'needs-verification' | 'inapplicable' {
+  let unknown = false;
+  for (const condition of conditions) {
+    const [kind, value] = condition.includes(':') ? condition.split(':', 2)
+      : ['win32','linux','darwin'].includes(condition) ? ['platform', condition] : ['agent', condition];
+    if ((kind !== 'agent' && kind !== 'platform' && kind !== 'component') || !value) return 'inapplicable';
+    const actual = target[kind];
+    if (actual === undefined) unknown = true;
+    else if (actual !== value) return 'inapplicable';
+  }
+  return unknown ? 'needs-verification' : 'applicable';
+}
+
+function searchGroups(value: string): { text: string; kind: 'han' | 'latin' }[] {
+  return (value.normalize('NFKC').toLowerCase().match(/[\p{Script=Han}]+|[\p{L}\p{N}]+/gu) ?? [])
+    .filter(run => Array.from(run).length >= 2)
+    .map(run => ({ text: run, kind: /^[\p{Script=Han}]+$/u.test(run) ? 'han' as const : 'latin' as const }));
+}
+
+function searchTerms(value: string): string[] {
+  return [...new Set(searchGroups(value).flatMap(group => group.kind === 'han'
+    ? Array.from(group.text).slice(0, -1).map((char, index) => char + Array.from(group.text)[index + 1]) : [group.text]))];
+}
+
 function normalizeSearchText(value: string): string {
-  return value.normalize('NFC').toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  return value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 }
 function cjkBigrams(value: string): string {
-  return value.normalize('NFC').match(/[\p{Script=Han}]+/gu)?.flatMap(run => {
+  return value.normalize('NFKC').match(/[\p{Script=Han}]+/gu)?.flatMap(run => {
     const chars = Array.from(run);
     return chars.slice(0, -1).map((char, index) => `${char}${chars[index + 1]}`);
   }).join(' ') ?? '';

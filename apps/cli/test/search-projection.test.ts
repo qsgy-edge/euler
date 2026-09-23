@@ -15,12 +15,12 @@ test('search projection drains outbox and applies canonical eligibility', () => 
     const captured = probe.store.captureMemory(probe.activity, source, '本地路由优先', options);
     const verified = probe.store.verifyMemory(probe.activity, captured.record.recordId, captured.record, 'pass', [source]);
     const active = probe.store.activateMemory(probe.activity, captured.record.recordId, verified.record);
-    assert.equal(probe.store.searchMemories(probe.activity, '路由').length, 0);
+    assert.equal(probe.store.searchMemories(probe.activity, { query: '路由' }).results.length, 0);
     assert.equal(probe.store.drainSearchProjection(probe.activity).length, 3);
-    assert.equal(probe.store.searchMemories(probe.activity, '路由')[0]!.record.recordId, active.record.recordId);
+    assert.equal(probe.store.searchMemories(probe.activity, { query: '路由' }).results[0]?.unitId, active.record.recordId);
     probe.store.forgetMemory(probe.activity, active.record.recordId, active.record);
     probe.store.drainSearchProjection(probe.activity);
-    assert.deepEqual(probe.store.searchMemories(probe.activity, '路由'), []);
+    assert.deepEqual(probe.store.searchMemories(probe.activity, { query: '路由' }).results, []);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
@@ -39,9 +39,12 @@ test('search projection rebuilds canonical content after document corruption', (
     const revised = probe.store.reviseMemory(probe.activity, active.record.recordId, active.record, changedSource, '新内容', [changedSource]);
     probe.store.drainSearchProjection(probe.activity);
     db.prepare("UPDATE search_documents SET content='伪造内容', content_hash=? WHERE record_id=?").run('0'.repeat(64), active.record.recordId);
-    assert.throws(() => probe.store.searchMemories(probe.activity, '新内容'), /search-evidence-gap/);
+    const corrupted = probe.store.searchMemories(probe.activity, { query: '新内容' });
+    assert.equal(corrupted.status, 'dirty');
+    assert.deepEqual(corrupted.results, []);
+    assert.equal(corrupted.coverage.reason, 'index-lag');
     probe.store.rebuildSearchProjection(probe.activity);
-    assert.equal(probe.store.searchMemories(probe.activity, '新内容')[0]!.record.revisionId, revised.record.revisionId);
+    assert.equal(probe.store.searchMemories(probe.activity, { query: '新内容' }).results[0]?.unitId, revised.record.recordId);
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
@@ -58,10 +61,29 @@ test('rebuilding one project preserves another project search slice', () => {
     const verified = second.store.verifyMemory(second.activity, captured.record.recordId, captured.record, 'pass', [source]);
     second.store.activateMemory(second.activity, captured.record.recordId, verified.record);
     second.store.drainSearchProjection(second.activity);
-    assert.equal(second.store.searchMemories(second.activity, '项目')[0]!.record.recordId, captured.record.recordId);
+    assert.equal(second.store.searchMemories(second.activity, { query: '项目' }).results[0]?.unitId, captured.record.recordId);
     first.store.rebuildSearchProjection(first.activity);
-    assert.equal(second.store.searchMemories(second.activity, '项目')[0]!.record.recordId, captured.record.recordId);
+    assert.equal(second.store.searchMemories(second.activity, { query: '项目' }).results[0]?.unitId, captured.record.recordId);
   } finally { second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('a projected owner change cannot make an eligible fact disappear as an empty result', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
+  try {
+    const source = probe.archive.append(randomUUID(), 'owner-bound source');
+    const captured = probe.store.captureMemory(probe.activity, source, 'Atlas ownership', {
+      type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+    }).record;
+    const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
+    probe.store.activateMemory(probe.activity, verified.recordId, verified);
+    probe.store.drainSearchProjection(probe.activity);
+    db.prepare('UPDATE search_documents SET owner_id=? WHERE record_id=?').run(randomUUID(), captured.recordId);
+    const page = probe.store.searchMemories(probe.activity, { query: 'Atlas' });
+    assert.equal(page.status, 'dirty');
+    assert.deepEqual(page.results, []);
+  } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
 test('CJK bigrams do not cross punctuation boundaries', () => {
@@ -74,6 +96,6 @@ test('CJK bigrams do not cross punctuation boundaries', () => {
     const verified = probe.store.verifyMemory(probe.activity, captured.record.recordId, captured.record, 'pass', [source]);
     probe.store.activateMemory(probe.activity, captured.record.recordId, verified.record);
     probe.store.drainSearchProjection(probe.activity);
-    assert.equal(probe.store.searchMemories(probe.activity, '地路').length, 0);
+    assert.equal(probe.store.searchMemories(probe.activity, { query: '地路' }).results.length, 0);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });

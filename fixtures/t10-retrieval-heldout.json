@@ -1,0 +1,11 @@
+{
+  "schema": "t10-retrieval-corpus@1",
+  "set": "held-out",
+  "cases": [
+    { "id": "H01", "content": "API v7 checks the gateway", "query": "ＡＰＩ Ｖ７", "gold": "hit" },
+    { "id": "H02", "content": "跨域会话恢复流程", "query": "会话恢复", "gold": "hit" },
+    { "id": "H03", "content": "山,川边界", "query": "山川", "gold": "empty" },
+    { "id": "H04", "content": "蓝色发布计划", "query": "绿色上线方案", "gold": "empty" },
+    { "id": "H05", "content": "重建检索索引", "query": "索", "gold": "empty" }
+  ]
+}
