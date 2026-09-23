@@ -86,6 +86,42 @@ test('a projected owner change cannot make an eligible fact disappear as an empt
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('project spoofing in a shared projection cannot reveal term presence from an ungranted source', () => {
+  const sandbox = createSandbox();
+  const other = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
+  createSandboxSession(sandbox, other);
+  const first = openProbe(sandbox);
+  const second = openProbe(sandbox, undefined, undefined, other);
+  const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
+  try {
+    const source = second.archive.append(randomUUID(), 'private personal evidence');
+    const captured = second.store.captureMemory(second.activity, source, 'HiddenCanary', {
+      type: 'fact', scope: { kind: 'personal', id: other.ownerId, resolved: true }, appliesTo: [],
+    }).record;
+    const verified = second.store.verifyMemory(second.activity, captured.recordId, captured, 'pass', [source]).record;
+    second.store.activateMemory(second.activity, verified.recordId, verified);
+    second.store.drainSearchProjection(second.activity);
+    const goal = 'Analyze only the registered local project';
+    const input = first.archive.append(randomUUID(), goal);
+    const intent = first.store.transitionIntent(first.activity, null, input, { status: 'active', step: 'analysis' }, goal);
+    const approval = first.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
+      intentId: intent.intentId, goalEventId: intent.goalInput.eventId,
+      projectIds: [sandbox.fixture.projectId], targets: {}, maxResults: 2, maxBytes: 131072 }));
+    const { grantId } = first.store.authorizeMemoryDiscovery(first.activity, approval, [sandbox.fixture.projectId], 2);
+    db.prepare('UPDATE search_documents SET project_id=? WHERE record_id=?').run(sandbox.fixture.projectId, captured.recordId);
+    const absent = first.store.searchMemories(first.activity, { query: 'AbsentCanary', grantId });
+    const present = first.store.searchMemories(first.activity, { query: 'HiddenCanary', grantId });
+    assert.equal(absent.status, 'dirty');
+    assert.equal(present.status, 'dirty');
+    assert.equal(absent.coverage.reason, 'index-lag');
+    assert.equal(present.coverage.reason, 'index-lag');
+    assert.deepEqual(absent.results, []);
+    assert.deepEqual(present.results, []);
+    assert.equal(JSON.stringify(absent).includes(other.projectId), false);
+    assert.equal(JSON.stringify(present).includes(other.projectId), false);
+  } finally { db.close(); second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('missing FTS posting reports a dirty projection instead of an empty answer', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);

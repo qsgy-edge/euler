@@ -1880,9 +1880,17 @@ export class ProbeStore {
             OR d.exposure_mode!=CASE WHEN h.verification='verified' AND h.conflict_set_id IS NULL THEN 'normal' ELSE 'status_only' END
             OR d.revision_id!=h.revision_id OR d.lifecycle!=h.lifecycle OR d.verification!=h.verification)
         LIMIT 1`).get(this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
-      const extra = this.#db.prepare(`SELECT 1 FROM search_documents d JOIN memory_heads h ON h.record_id=d.record_id
+      const extra = this.#db.prepare(`SELECT 1 FROM search_documents d
+        LEFT JOIN memory_heads h ON h.record_id=d.record_id
+        LEFT JOIN memory_records r ON r.record_id=d.record_id
+        LEFT JOIN memory_revisions v ON v.revision_id=h.revision_id
         WHERE d.owner_id=? AND ${this.#searchScopeSql('d', projects)}${projectedSourceSql}
-          AND (h.lifecycle!='active' OR h.scope_resolved!=1 OR d.revision_id!=h.revision_id
+          AND (h.record_id IS NULL OR r.record_id IS NULL OR v.revision_id IS NULL
+            OR r.owner_id!=d.owner_id OR d.unit_id!=d.record_id OR d.project_id!=v.source_project_id
+            OR d.scope_kind!=h.scope_kind OR d.scope_id!=h.scope_id OR d.content_hash!=v.content_hash
+            OR d.tokenizer_version!='latin-cjk@3' OR d.source_seq!=v.revision
+            OR d.exposure_mode!=CASE WHEN h.verification='verified' AND h.conflict_set_id IS NULL THEN 'normal' ELSE 'status_only' END
+            OR h.lifecycle!='active' OR h.scope_resolved!=1 OR d.revision_id!=h.revision_id
             OR d.lifecycle!=h.lifecycle OR d.verification!=h.verification) LIMIT 1`)
         .get(this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
       if (missing || extra) return { status: 'dirty', results: [], coverage: unavailableCoverage('index-lag'), truncated: true, nextCursor: null };
