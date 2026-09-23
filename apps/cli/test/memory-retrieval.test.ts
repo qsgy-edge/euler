@@ -147,7 +147,7 @@ test('numeric terms gate near neighbors before normal result admission', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);
   try {
-    const ids = ['RFC 42 route', 'RFC 43 route'].map(content => {
+    const ids = ['RFC 42 route', 'RFC 43 route', 'RFC 43 route; phase 42 approved'].map(content => {
       const source = probe.archive.append(randomUUID(), `Evidence ${content}`);
       const captured = probe.store.captureMemory(probe.activity, source, content, {
         type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
@@ -180,6 +180,106 @@ test('overlapping current validity windows share one claim result slot', () => {
     assert.equal(page.status, 'ready');
     assert.equal(page.results.length, 1);
     assert.ok(ids.includes(page.results[0]!.unitId));
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('workspace memory is evaluated for each approved target while retaining its source project', () => {
+  const sandbox = createSandbox();
+  const targetBinding = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
+  createSandboxSession(sandbox, targetBinding);
+  const probe = openProbe(sandbox);
+  const target = openProbe(sandbox, undefined, undefined, targetBinding);
+  try {
+    const workspaceId = randomUUID();
+    probe.store.bindWorkspace(probe.activity, workspaceId, [sandbox.fixture.projectId, targetBinding.projectId]);
+    const targetPlatform = process.platform === 'linux' ? 'win32' : 'linux';
+    const source = probe.archive.append(randomUUID(), 'Shared socket evidence');
+    const captured = probe.store.captureMemory(probe.activity, source, 'Socket target mode', {
+      type: 'fact', scope: { kind: 'workspace', id: workspaceId, resolved: true }, appliesTo: [`platform:${targetPlatform}`],
+    }).record;
+    const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
+    probe.store.activateMemory(probe.activity, verified.recordId, verified);
+    probe.store.drainSearchProjection(probe.activity);
+    const goal = 'Analyze both workspace members';
+    const input = probe.archive.append(randomUUID(), goal);
+    probe.store.transitionIntent(probe.activity, null, input, { status: 'active', step: 'analysis' }, goal);
+    const targets = {
+      [sandbox.fixture.projectId]: { agent: 'cli', platform: process.platform },
+      [targetBinding.projectId]: { agent: 'cli', platform: targetPlatform },
+    };
+    const approval = approveDiscovery(probe, [sandbox.fixture.projectId, targetBinding.projectId], 4, targets);
+    const { grantId } = probe.store.authorizeMemoryDiscovery(probe.activity, approval,
+      [sandbox.fixture.projectId, targetBinding.projectId], 4, targets);
+    const page = probe.store.searchMemories(probe.activity, { query: 'Socket', grantId });
+    assert.equal(page.status, 'ready');
+    assert.equal(page.results.length, 1);
+    const hit = page.results[0];
+    assert.equal(hit?.kind, 'memory');
+    assert.equal(hit?.projectId, sandbox.fixture.projectId);
+    assert.equal(hit?.targetProjectId, targetBinding.projectId);
+    if (hit?.kind === 'memory') assert.equal(hit.applicability, 'applicable');
+  } finally { target.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('one shared fact can occupy separate target pages without losing source provenance', () => {
+  const sandbox = createSandbox();
+  const other = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
+  createSandboxSession(sandbox, other);
+  const sourceHost = openProbe(sandbox);
+  const targetHost = openProbe(sandbox, undefined, undefined, other);
+  try {
+    const workspaceId = randomUUID();
+    sourceHost.store.bindWorkspace(sourceHost.activity, workspaceId, [sandbox.fixture.projectId, other.projectId]);
+    const source = sourceHost.archive.append(randomUUID(), 'Shared workspace evidence');
+    const captured = sourceHost.store.captureMemory(sourceHost.activity, source, 'Socket shared mode', {
+      type: 'fact', scope: { kind: 'workspace', id: workspaceId, resolved: true }, appliesTo: [],
+    }).record;
+    const verified = sourceHost.store.verifyMemory(sourceHost.activity, captured.recordId, captured, 'pass', [source]).record;
+    sourceHost.store.activateMemory(sourceHost.activity, verified.recordId, verified);
+    sourceHost.store.drainSearchProjection(sourceHost.activity);
+    const local = targetHost.store.searchMemories(targetHost.activity, { query: 'Socket' });
+    assert.equal(local.results[0]?.projectId, sandbox.fixture.projectId);
+    assert.equal(local.results[0]?.targetProjectId, other.projectId);
+    const goal = 'Analyze both members';
+    const input = sourceHost.archive.append(randomUUID(), goal);
+    sourceHost.store.transitionIntent(sourceHost.activity, null, input, { status: 'active', step: 'analysis' }, goal);
+    const targets = {
+      [sandbox.fixture.projectId]: { agent: 'cli', platform: process.platform },
+      [other.projectId]: { agent: 'cli', platform: process.platform },
+    };
+    const approval = approveDiscovery(sourceHost, [sandbox.fixture.projectId, other.projectId], 2, targets);
+    const { grantId } = sourceHost.store.authorizeMemoryDiscovery(sourceHost.activity, approval,
+      [sandbox.fixture.projectId, other.projectId], 2, targets);
+    const first = sourceHost.store.searchMemories(sourceHost.activity, { query: 'Socket', grantId, limit: 1 });
+    assert.equal(first.results.length, 1);
+    assert.ok(first.nextCursor);
+    const second = sourceHost.store.searchMemories(sourceHost.activity, { query: 'Socket', grantId, limit: 1, cursor: first.nextCursor! });
+    assert.equal(second.results.length, 1);
+    assert.equal(second.nextCursor, null);
+    assert.equal(first.results[0]?.unitId, second.results[0]?.unitId);
+    assert.deepEqual(new Set([first.results[0]?.targetProjectId, second.results[0]?.targetProjectId]),
+      new Set([sandbox.fixture.projectId, other.projectId]));
+    assert.ok([...first.results, ...second.results].every(hit => hit.projectId === sandbox.fixture.projectId));
+  } finally { targetHost.close(); sourceHost.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('equivalent applicability syntax deduplicates the same current claim and target', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    for (const [index, condition] of ['linux', 'platform:linux'].entries()) {
+      const source = probe.archive.append(randomUUID(), `Evidence for ${condition}`);
+      const captured = probe.store.captureMemory(probe.activity, source, `Socket setting ${index}`, {
+        type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true },
+        appliesTo: [condition], claimKey: 'Socket setting',
+      }).record;
+      const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
+      probe.store.activateMemory(probe.activity, verified.recordId, verified);
+    }
+    probe.store.drainSearchProjection(probe.activity);
+    const page = probe.store.searchMemories(probe.activity, { query: 'Socket', target: { agent: 'cli', platform: 'linux' } });
+    assert.equal(page.status, 'ready');
+    assert.equal(page.results.length, 1);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 

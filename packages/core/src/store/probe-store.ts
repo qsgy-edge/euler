@@ -92,10 +92,10 @@ export interface MemoryDiscoveryApproval {
 export interface SearchRequest { query: string; limit?: number; byteBudget?: number; cursor?: string; grantId?: string;
   noActiveProject?: true; target?: SearchTarget }
 export type SearchResult = { kind: 'memory'; unitId: string; record: MemoryRecord; exposureMode: 'normal' | 'reference_only'; rank: number;
-  projectId: string; target: SearchTarget; applicability: 'applicable' | 'needs-verification' }
+  projectId: string; targetProjectId: string; target: SearchTarget; applicability: 'applicable' | 'needs-verification' }
   | { kind: 'status'; unitId: string; claimRef: string; verification: MemoryVerification;
     reason: 'stale' | 'conflicted' | 'expired' | 'not-yet-valid'; conflictSetId: string | null;
-    projectId: string; target: SearchTarget; exposureMode: 'status_only'; rank: number };
+    projectId: string; targetProjectId: string; target: SearchTarget; exposureMode: 'status_only'; rank: number };
 export interface SearchPage { status: 'ready' | 'dirty' | 'unavailable'; results: SearchResult[];
   coverage: { allowedProjects: string[]; inspectedProjects: string[]; unavailableProjects: string[];
     candidateCount: number | null; complete: false; reason: string | null };
@@ -1907,7 +1907,6 @@ export class ProbeStore {
         coverage: unavailableCoverage('candidate-limit'), truncated: true, nextCursor: null };
       const candidates: SearchResult[] = [];
       const lanes = groups.map(() => [] as SearchResult[]);
-      const numericGroups = groups.filter(group => /\p{N}/u.test(group.text));
       const seen = new Set<string>();
       const now = Date.now();
       for (const row of rows) {
@@ -1927,42 +1926,54 @@ export class ProbeStore {
           return { status: 'unavailable', results: [], coverage: unavailableCoverage(reason), truncated: true, nextCursor: null };
         }
         const words = normalizeSearchText(record.content).split(' ');
-        if (numericGroups.some(group => !words.includes(group.text))
+        if (!numericContextMatches(groups, words)
           || !groups.some(group => words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text))) continue;
         const projectId = record.source.binding.projectId;
-        const target = grant ? (grant.targets.get(projectId) ?? {}) : (request.target ?? { agent: 'cli', platform: process.platform });
-        let applicability = memoryApplicability(record.appliesTo, target);
-        if (grant && applicability === 'applicable' && (!target.agent || !target.platform)) applicability = 'needs-verification';
-        if (!grant && request.target && (request.target.agent !== undefined && request.target.agent !== 'cli'
-          || request.target.platform !== undefined && request.target.platform !== process.platform)) applicability = 'needs-verification';
-        if (applicability === 'inapplicable') continue;
+        const targetProjects = record.scope.kind === 'project' ? [record.scope.id]
+          : record.scope.kind === 'personal' ? projects
+          : record.scope.kind === 'workspace' ? this.#db.prepare(`SELECT project_id FROM workspace_projects
+            WHERE workspace_id=? AND project_id IN (${projects.map(() => '?').join(',')}) ORDER BY project_id`)
+              .all(record.scope.id, ...projects).map(row => String(row.project_id)) : [];
         const temporal = memoryTemporalStatus(record, now);
-        const key = record.conflictSetId ? `conflict:${projectId}:${record.conflictSetId}`
-          : JSON.stringify([projectId, record.scope.kind, record.scope.id, record.claimKey, record.appliesTo,
-            temporal ?? 'current', record.verification]);
-        if (seen.has(key)) continue;
-        seen.add(key);
-        if (record.verification !== 'verified' || record.conflictSetId || temporal) {
-          const reason = temporal ?? (record.verification === 'stale' ? 'stale' : 'conflicted');
-          candidates.push({ kind: 'status', unitId: record.recordId, claimRef: sha256(record.claimKey),
-            verification: record.verification, reason, conflictSetId: record.conflictSetId,
-            projectId, target, exposureMode: 'status_only', rank: Number(row.rank) });
-        } else candidates.push({ kind: 'memory', unitId: record.recordId, record, projectId, target,
-          applicability, exposureMode: applicability === 'needs-verification' ? 'reference_only' : 'normal', rank: Number(row.rank) });
-        const hit = candidates[candidates.length - 1]!;
-        groups.forEach((group, index) => {
-          if (words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text)) lanes[index]!.push(hit);
-        });
+        const parsedConditions = record.appliesTo.map(parseMemoryCondition);
+        if (parsedConditions.some(condition => !condition)) continue;
+        const applicabilityKey = [...new Set(parsedConditions.map(condition => `${condition!.kind}:${condition!.value}`))].sort();
+        for (const targetProjectId of targetProjects) {
+          const target = grant ? (grant.targets.get(targetProjectId) ?? {}) : (request.target ?? { agent: 'cli', platform: process.platform });
+          let applicability = memoryApplicability(record.appliesTo, target);
+          if (grant && applicability === 'applicable' && (!target.agent || !target.platform)) applicability = 'needs-verification';
+          if (!grant && request.target && (request.target.agent !== undefined && request.target.agent !== 'cli'
+            || request.target.platform !== undefined && request.target.platform !== process.platform)) applicability = 'needs-verification';
+          if (applicability === 'inapplicable') continue;
+          const key = record.conflictSetId ? `conflict:${projectId}:${targetProjectId}:${record.conflictSetId}`
+            : JSON.stringify([projectId, targetProjectId, record.scope.kind, record.scope.id, record.claimKey,
+              applicabilityKey, temporal ?? 'current', record.verification]);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          if (record.verification !== 'verified' || record.conflictSetId || temporal) {
+            const reason = temporal ?? (record.verification === 'stale' ? 'stale' : 'conflicted');
+            candidates.push({ kind: 'status', unitId: record.recordId, claimRef: sha256(record.claimKey),
+              verification: record.verification, reason, conflictSetId: record.conflictSetId,
+              projectId, targetProjectId, target, exposureMode: 'status_only', rank: Number(row.rank) });
+          } else candidates.push({ kind: 'memory', unitId: record.recordId, record, projectId, targetProjectId, target,
+            applicability, exposureMode: applicability === 'needs-verification' ? 'reference_only' : 'normal', rank: Number(row.rank) });
+          if (candidates.length > 256) return { status: 'unavailable', results: [],
+            coverage: unavailableCoverage('candidate-limit'), truncated: true, nextCursor: null };
+          const hit = candidates[candidates.length - 1]!;
+          groups.forEach((group, index) => {
+            if (words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text)) lanes[index]!.push(hit);
+          });
+        }
       }
       const fused: SearchResult[] = [];
-      const selected = new Set<string>();
+      const selected = new Set<SearchResult>();
       while (fused.length < candidates.length) {
         let advanced = false;
         for (const lane of lanes) {
-          const next = lane.find(hit => !selected.has(hit.unitId));
+          const next = lane.find(hit => !selected.has(hit));
           if (!next) continue;
           fused.push(next);
-          selected.add(next.unitId);
+          selected.add(next);
           advanced = true;
         }
         if (!advanced) break;
@@ -1970,7 +1981,8 @@ export class ProbeStore {
       candidates.splice(0, candidates.length, ...fused);
       coverage.inspectedProjects = projects;
       coverage.candidateCount = candidates.length;
-      const fingerprint = sha256(JSON.stringify(candidates.map(hit => [hit.unitId, hit.kind === 'memory' ? hit.record.headEventId : hit.reason])));
+      const fingerprint = sha256(JSON.stringify(candidates.map(hit => [hit.unitId, hit.projectId, hit.targetProjectId,
+        hit.kind === 'memory' ? hit.record.headEventId : hit.reason])));
       const cursorScope = sha256(JSON.stringify([this.#binding.sessionId, request.grantId ?? null, request.query, request.target ?? null, projects]));
       let offset = 0;
       if (request.cursor !== undefined) {
@@ -2926,6 +2938,22 @@ function searchGroups(value: string): { text: string; kind: 'han' | 'latin' }[] 
 function searchTerms(value: string): string[] {
   return [...new Set(searchGroups(value).flatMap(group => group.kind === 'han'
     ? Array.from(group.text).slice(0, -1).map((char, index) => char + Array.from(group.text)[index + 1]) : [group.text]))];
+}
+
+function numericContextMatches(groups: { text: string; kind: 'han' | 'latin' }[], words: string[]): boolean {
+  return groups.every((group, index) => {
+    if (!/\p{N}/u.test(group.text)) return true;
+    if (!words.includes(group.text)) return false;
+    const previous = groups[index - 1];
+    const next = groups[index + 1];
+    if (previous?.kind === 'latin' && !/\p{N}/u.test(previous.text)) {
+      return words.some((word, position) => word === previous.text && words[position + 1] === group.text);
+    }
+    if (next?.kind === 'latin' && !/\p{N}/u.test(next.text)) {
+      return words.some((word, position) => word === group.text && words[position + 1] === next.text);
+    }
+    return true;
+  });
 }
 
 function normalizeSearchText(value: string): string {
