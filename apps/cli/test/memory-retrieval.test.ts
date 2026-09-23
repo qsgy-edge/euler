@@ -12,6 +12,14 @@ assert.equal(createHash('sha256').update(readFileSync(new URL('../../../fixtures
 assert.equal(createHash('sha256').update(readFileSync(new URL('../../../fixtures/t10-retrieval-supplement.json', import.meta.url))).digest('hex'),
   'd0d63c08714250d356435dad9bf9fae6a0c4eef249991ea2f803dbf94c26240a');
 
+function approveDiscovery(probe: ReturnType<typeof openProbe>, projectIds: string[], maxResults: number,
+  targets: Record<string, { agent?: string; platform?: string; component?: string }> = {}, maxBytes = 131072) {
+  const intent = probe.store.readIntent(probe.activity)!;
+  return probe.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
+    intentId: intent.intentId, goalEventId: intent.goalInput.eventId, projectIds, targets, maxResults, maxBytes }));
+}
+
+
 
 test('D02: a CJK substring reaches its current canonical memory', () => {
   const sandbox = createSandbox();
@@ -49,6 +57,25 @@ test('D01/D03/D04/D05: frozen exact, boundary, synonym and single-Han judgments'
       assert.deepEqual(page.results.map(result => result.unitId), entry.gold === 'hit' ? [captured.recordId] : [], entry.id);
     } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
   }
+});
+
+test('Latin script boundaries and one-digit exact terms remain searchable beside Han', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const source = probe.archive.append(randomUUID(), 'mixed-script evidence');
+    const captured = probe.store.captureMemory(probe.activity, source, '缓存API 7', {
+      type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+    }).record;
+    const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
+    probe.store.activateMemory(probe.activity, verified.recordId, verified);
+    probe.store.drainSearchProjection(probe.activity);
+    for (const query of ['API', '7', '缓存']) {
+      const page = probe.store.searchMemories(probe.activity, { query });
+      assert.equal(page.status, 'ready');
+      assert.deepEqual(page.results.map(item => item.unitId), [captured.recordId], query);
+    }
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
 test('S01: lexical lanes cover two different task questions', () => {
@@ -91,6 +118,28 @@ test('a tight result budget covers separate lexical questions before near duplic
     assert.equal(page.truncated, true);
     assert.ok(page.results.some(item => item.kind === 'memory' && item.record.content.startsWith('Cache')));
     assert.ok(page.results.some(item => item.kind === 'memory' && item.record.content.startsWith('Socket')));
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('an oversized first candidate cannot block a later fitting fact', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const ids = [ 'Atlas ' + 'noise '.repeat(500), 'Atlas small' ].map(content => {
+      const source = probe.archive.append(randomUUID(), `Evidence: ${content.slice(0, 20)}`);
+      const captured = probe.store.captureMemory(probe.activity, source, content, {
+        type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+      }).record;
+      const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
+      return probe.store.activateMemory(probe.activity, verified.recordId, verified).record.recordId;
+    });
+    probe.store.drainSearchProjection(probe.activity);
+    const page = probe.store.searchMemories(probe.activity, { query: 'Atlas', byteBudget: 1800 });
+    assert.equal(page.status, 'ready');
+    assert.deepEqual(page.results.map(item => item.unitId), [ids[1]]);
+    assert.equal(page.truncated, true);
+    assert.equal(page.coverage.reason, 'oversized-candidate-skipped');
+    assert.equal(page.nextCursor, null);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
@@ -154,7 +203,7 @@ test('S05: an undersized page budget never emits a partial fact', () => {
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
-test('X01/X02: only an owner-bound task grant can discover another registered project', () => {
+test('X01/X02/X05/X09: only an owner-bound task grant can discover another registered project', () => {
   const sandbox = createSandbox();
   const secondBinding = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
   createSandboxSession(sandbox, secondBinding);
@@ -182,15 +231,24 @@ test('X01/X02: only an owner-bound task grant can discover another registered pr
     const text = 'Owner authorizes read-only analysis of two registered synthetic projects';
     const instruction = first.archive.append(randomUUID(), text);
     first.store.transitionIntent(first.activity, null, instruction, { status: 'active', step: 'analysis' }, text);
-    const grant = first.store.authorizeMemoryDiscovery(first.activity, instruction, [sandbox.fixture.projectId, secondBinding.projectId], 4);
+    assert.throws(() => first.store.authorizeMemoryDiscovery(first.activity, instruction, [secondBinding.projectId], 1), /discovery-consent-required/);
+    const consent = approveDiscovery(first, [sandbox.fixture.projectId, secondBinding.projectId], 4);
+    const grant = first.store.authorizeMemoryDiscovery(first.activity, consent, [sandbox.fixture.projectId, secondBinding.projectId], 4);
     const page = first.store.searchMemories(first.activity, { query: 'Atlas', grantId: grant.grantId, noActiveProject: true });
     assert.equal(page.status, 'ready');
     assert.deepEqual(new Set(page.results.map(item => item.projectId)), new Set([sandbox.fixture.projectId, secondBinding.projectId]));
     assert.deepEqual(new Set(page.results.map(item => item.unitId)), new Set([a.recordId, b.recordId]));
-    assert.throws(() => first.store.authorizeMemoryDiscovery(first.activity, instruction, [randomUUID()], 1), /discovery-project-unavailable/);
+    assert.ok(page.results.every(item => item.kind === 'memory' && item.applicability === 'needs-verification'
+      && item.exposureMode === 'reference_only'));
+    const unknownProject = randomUUID();
+    const unavailable = approveDiscovery(first, [unknownProject], 1);
+    assert.throws(() => first.store.authorizeMemoryDiscovery(first.activity, unavailable, [unknownProject], 1), /discovery-project-unavailable/);
+    assert.throws(() => first.store.authorizeMemoryDiscovery(first.activity, consent, [secondBinding.projectId], 4), /discovery-consent-required/);
     const firstPage = first.store.searchMemories(first.activity, { query: 'Atlas', grantId: grant.grantId, limit: 1 });
     assert.equal(firstPage.results.length, 1);
     assert.equal(firstPage.truncated, true);
+    assert.deepEqual(new Set(firstPage.coverage.inspectedProjects), new Set([sandbox.fixture.projectId, secondBinding.projectId]));
+    assert.equal(firstPage.coverage.candidateCount, 2);
     assert.ok(firstPage.nextCursor);
     const secondPage = first.store.searchMemories(first.activity, { query: 'Atlas', grantId: grant.grantId, limit: 1, cursor: firstPage.nextCursor });
     assert.equal(secondPage.results.length, 1);
@@ -199,7 +257,8 @@ test('X01/X02: only an owner-bound task grant can discover another registered pr
     assert.equal(first.store.searchMemories(first.activity, { query: 'Atlas', grantId: grant.grantId }).coverage.reason, 'task-budget-exhausted');
     first.store.revokeMemoryDiscovery(first.activity, grant.grantId);
     assert.throws(() => first.store.searchMemories(first.activity, { query: 'Atlas', grantId: grant.grantId, cursor: firstPage.nextCursor! }), /discovery-not-authorized/);
-    const nextGrant = first.store.authorizeMemoryDiscovery(first.activity, instruction, [secondBinding.projectId], 2);
+    const nextConsent = approveDiscovery(first, [secondBinding.projectId], 2);
+    const nextGrant = first.store.authorizeMemoryDiscovery(first.activity, nextConsent, [secondBinding.projectId], 2);
     const end = first.archive.append(randomUUID(), 'Finish synthetic analysis');
     const current = first.store.readIntent(first.activity)!;
     first.store.transitionIntent(first.activity, current.eventId, end, { status: 'completed', step: 'done' });
@@ -224,7 +283,8 @@ test('a cross-project grant cannot reveal a shared-scope record sourced from an 
     const text = 'Analyze only this registered project';
     const input = first.archive.append(randomUUID(), text);
     first.store.transitionIntent(first.activity, null, input, { status: 'active', step: 'analysis' }, text);
-    const { grantId } = first.store.authorizeMemoryDiscovery(first.activity, input, [sandbox.fixture.projectId], 2);
+    const consent = approveDiscovery(first, [sandbox.fixture.projectId], 2);
+    const { grantId } = first.store.authorizeMemoryDiscovery(first.activity, consent, [sandbox.fixture.projectId], 2);
     const page = first.store.searchMemories(first.activity, { query: 'Atlas', grantId });
     assert.equal(page.status, 'ready');
     assert.deepEqual(page.results, []);
@@ -251,14 +311,18 @@ test('X03/X04: cross-project applies-to uses the target environment, not the que
     const text = 'Explicitly read the registered target project';
     const input = first.archive.append(randomUUID(), text);
     first.store.transitionIntent(first.activity, null, input, { status: 'active', step: 'analysis' }, text);
-    const knownGrant = first.store.authorizeMemoryDiscovery(first.activity, input, [other.projectId], 8,
-      { [other.projectId]: { platform, agent: 'cli' } });
+    const knownTarget = { [other.projectId]: { platform, agent: 'cli' } };
+    const knownConsent = approveDiscovery(first, [other.projectId], 8, knownTarget);
+    const knownGrant = first.store.authorizeMemoryDiscovery(first.activity, knownConsent, [other.projectId], 8, knownTarget);
+    assert.throws(() => first.store.authorizeMemoryDiscovery(first.activity, knownConsent, [other.projectId], 8,
+      { [other.projectId]: { platform: process.platform } }), /discovery-consent-required/);
     const known = first.store.searchMemories(first.activity, { query: 'socket', grantId: knownGrant.grantId });
     assert.equal(known.status, 'ready');
     const knownHit = known.results[0];
     assert.equal(knownHit?.kind, 'memory');
     if (knownHit?.kind === 'memory') assert.equal(knownHit.applicability, 'applicable');
-    const unknownGrant = first.store.authorizeMemoryDiscovery(first.activity, input, [other.projectId], 8);
+    const unknownConsent = approveDiscovery(first, [other.projectId], 8);
+    const unknownGrant = first.store.authorizeMemoryDiscovery(first.activity, unknownConsent, [other.projectId], 8);
     const unknown = first.store.searchMemories(first.activity, { query: 'socket', grantId: unknownGrant.grantId });
     const unknownHit = unknown.results[0];
     assert.equal(unknownHit?.kind, 'memory');
@@ -266,8 +330,9 @@ test('X03/X04: cross-project applies-to uses the target environment, not the que
       assert.equal(unknownHit.applicability, 'needs-verification');
       assert.equal(unknownHit.exposureMode, 'reference_only');
     }
-    const wrongGrant = first.store.authorizeMemoryDiscovery(first.activity, input, [other.projectId], 8,
-      { [other.projectId]: { platform: process.platform } });
+    const wrongTarget = { [other.projectId]: { platform: process.platform } };
+    const wrongConsent = approveDiscovery(first, [other.projectId], 8, wrongTarget);
+    const wrongGrant = first.store.authorizeMemoryDiscovery(first.activity, wrongConsent, [other.projectId], 8, wrongTarget);
     assert.equal(first.store.searchMemories(first.activity, { query: 'socket', grantId: wrongGrant.grantId }).results.length, 0);
     assert.throws(() => first.store.searchMemories(first.activity, {
       query: 'socket', grantId: unknownGrant.grantId, target: { platform },
@@ -333,6 +398,8 @@ test('X06/X07: pending projection is not an authoritative empty answer, and rebu
     const pending = probe.store.searchMemories(probe.activity, { query: 'Atlas' });
     assert.equal(pending.status, 'dirty');
     assert.deepEqual(pending.results, []);
+    assert.deepEqual(pending.coverage.inspectedProjects, []);
+    assert.deepEqual(pending.coverage.unavailableProjects, [sandbox.fixture.projectId]);
     probe.store.rebuildSearchProjection(probe.activity);
     const rebuilt = probe.store.searchMemories(probe.activity, { query: 'Atlas' });
     assert.equal(rebuilt.status, 'ready');

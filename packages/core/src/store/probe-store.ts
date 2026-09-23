@@ -84,15 +84,21 @@ export interface ActivationBatch {
   payload: string; digest: string;
 }
 export interface MemoryOperation { status: 'committed' | 'no_op'; record: MemoryRecord; eventId: string | null }
+export interface SearchTarget { agent?: string; platform?: string; component?: string }
+export interface MemoryDiscoveryApproval {
+  schema: 'memory-discovery-approval@1'; intentId: string; goalEventId: string;
+  projectIds: string[]; targets: Record<string, SearchTarget>; maxResults: number; maxBytes: number;
+}
 export interface SearchRequest { query: string; limit?: number; byteBudget?: number; cursor?: string; grantId?: string;
-  noActiveProject?: true; target?: { agent?: string; platform?: string; component?: string } }
+  noActiveProject?: true; target?: SearchTarget }
 export type SearchResult = { kind: 'memory'; unitId: string; record: MemoryRecord; exposureMode: 'normal' | 'reference_only'; rank: number;
-  projectId: string; target: { agent?: string; platform?: string; component?: string }; applicability: 'applicable' | 'needs-verification' }
+  projectId: string; target: SearchTarget; applicability: 'applicable' | 'needs-verification' }
   | { kind: 'status'; unitId: string; claimRef: string; verification: MemoryVerification;
     reason: 'stale' | 'conflicted' | 'expired' | 'not-yet-valid'; conflictSetId: string | null;
-    projectId: string; target: { agent?: string; platform?: string; component?: string }; exposureMode: 'status_only'; rank: number };
+    projectId: string; target: SearchTarget; exposureMode: 'status_only'; rank: number };
 export interface SearchPage { status: 'ready' | 'dirty' | 'unavailable'; results: SearchResult[];
-  coverage: { allowedProjects: string[]; inspectedProjects: string[]; unavailableProjects: string[]; complete: false; reason: string | null };
+  coverage: { allowedProjects: string[]; inspectedProjects: string[]; unavailableProjects: string[];
+    candidateCount: number | null; complete: false; reason: string | null };
   truncated: boolean; nextCursor: string | null }
 export interface SearchProjectionReceipt { jobId: string; eventId: string; status: 'done' | 'failed'; generation: number; reason: string | null }
 export interface ConflictOperation { status: 'committed' | 'no_op'; left: MemoryOperation; right: MemoryOperation; conflictSetId: string | null }
@@ -605,12 +611,13 @@ export class ProbeStore {
 
   // Host-only synthetic owner decision; a search request or model text cannot create this grant.
   authorizeMemoryDiscovery(activity: Activity, consent: SourceAck, projectIds: string[], maxResults: number,
-    targets: Record<string, { agent?: string; platform?: string; component?: string }> = {}, maxBytes = 131072): { grantId: string } {
+    targets: Record<string, SearchTarget> = {}, maxBytes = 131072): { grantId: string } {
     return this.withActivity(activity, () => {
       const intent = this.readIntent(activity);
-      check(intent?.status === 'active' && sameBinding(consent.binding, this.#binding)
-        && JSON.stringify(consent) === JSON.stringify(intent.goalInput), 'discovery-consent-required');
-      this.#validateSource(consent);
+      check(intent?.status === 'active', 'discovery-consent-required');
+      const approval = this.#readDiscoveryApproval(consent, intent);
+      check(JSON.stringify(approval.projectIds) === JSON.stringify(projectIds) && approval.maxResults === maxResults
+        && approval.maxBytes === maxBytes && JSON.stringify(approval.targets) === JSON.stringify(targets), 'discovery-consent-required');
       check(Array.isArray(projectIds) && projectIds.length > 0 && projectIds.length <= 32
         && new Set(projectIds).size === projectIds.length && Number.isSafeInteger(maxResults)
         && maxResults > 0 && maxResults <= 128 && Number.isSafeInteger(maxBytes)
@@ -620,12 +627,7 @@ export class ProbeStore {
         check(this.#db.prepare('SELECT 1 FROM projects WHERE project_id=? AND owner_id=?')
           .get(projectId, this.#binding.ownerId), 'discovery-project-unavailable');
       }
-      check(targets && typeof targets === 'object' && !Array.isArray(targets)
-        && Object.entries(targets).every(([projectId, target]) => projectIds.includes(projectId) && target
-          && typeof target === 'object' && !Array.isArray(target) && Object.keys(target).length > 0
-          && Object.keys(target).every(key => ['agent','platform','component'].includes(key))
-          && Object.values(target).every(value => typeof value === 'string' && value.length > 0 && Buffer.byteLength(value) <= 128)),
-      'invalid-discovery-target');
+      check(validDiscoveryTargets(targets, projectIds), 'invalid-discovery-target');
       const grantId = randomUUID();
       const payload = JSON.stringify(consent);
       this.#db.prepare('INSERT INTO memory_discovery_grants VALUES (?,?,?,?,?,?,?, ?,0,?,0)')
@@ -637,6 +639,27 @@ export class ProbeStore {
     });
   }
 
+  #readDiscoveryApproval(consent: SourceAck, intent: Intent): MemoryDiscoveryApproval {
+    check(sameBinding(consent?.binding, this.#binding) && consent.eventId !== intent.goalInput.eventId, 'discovery-consent-required');
+    this.#validateSource(consent);
+    const text = this.#readSource!(consent).text;
+    check(Buffer.byteLength(text) <= 8192, 'discovery-consent-required');
+    let approval: MemoryDiscoveryApproval;
+    try { approval = JSON.parse(text) as MemoryDiscoveryApproval; }
+    catch { throw new Error('discovery-consent-required'); }
+    check(approval?.schema === 'memory-discovery-approval@1' && approval.intentId === intent.intentId
+      && approval.goalEventId === intent.goalInput.eventId && Array.isArray(approval.projectIds)
+      && approval.projectIds.length > 0 && approval.projectIds.length <= 32
+      && new Set(approval.projectIds).size === approval.projectIds.length
+      && approval.projectIds.every(id => typeof id === 'string' && /^[0-9a-f-]{36}$/i.test(id))
+      && Number.isSafeInteger(approval.maxResults) && approval.maxResults > 0 && approval.maxResults <= 128
+      && Number.isSafeInteger(approval.maxBytes) && approval.maxBytes > 0 && approval.maxBytes <= 1000000
+      && validDiscoveryTargets(approval.targets, approval.projectIds)
+      && Object.keys(approval).sort().join(',') === ['schema','intentId','goalEventId','projectIds','targets','maxResults','maxBytes'].sort().join(','),
+    'discovery-consent-required');
+    return approval;
+  }
+
   revokeMemoryDiscovery(activity: Activity, grantId: string): void {
     this.withActivity(activity, () => {
       this.#discoveryProjects(activity, grantId);
@@ -645,7 +668,7 @@ export class ProbeStore {
   }
 
   #discoveryProjects(activity: Activity, grantId: string): { projects: string[]; remaining: number; remainingBytes: number;
-    targets: Map<string, { agent?: string; platform?: string; component?: string }> } {
+    targets: Map<string, SearchTarget> } {
     uuid(grantId);
     const row = this.#db.prepare('SELECT * FROM memory_discovery_grants WHERE grant_id=? AND owner_id=? AND session_id=?')
       .get(grantId, this.#binding.ownerId, this.#binding.sessionId);
@@ -654,13 +677,14 @@ export class ProbeStore {
     check(intent?.status === 'active' && intent.intentId === row.intent_id
       && sha256(String(row.consent)) === row.consent_hash, 'discovery-not-authorized');
     const consent = JSON.parse(String(row.consent)) as SourceAck;
-    check(JSON.stringify(consent) === JSON.stringify(intent.goalInput), 'discovery-not-authorized');
-    this.#validateSource(consent);
+    const approval = this.#readDiscoveryApproval(consent, intent);
     const projects = this.#db.prepare(`SELECT m.project_id FROM memory_discovery_projects m
       JOIN projects p ON p.project_id=m.project_id AND p.owner_id=? WHERE m.grant_id=? ORDER BY m.project_id`)
       .all(this.#binding.ownerId, grantId).map(project => String(project.project_id));
-    check(projects.length > 0 && projects.length <= 32, 'discovery-not-authorized');
-    const targets = new Map<string, { agent?: string; platform?: string; component?: string }>();
+    check(projects.length > 0 && projects.length <= 32
+      && JSON.stringify([...approval.projectIds].sort()) === JSON.stringify(projects)
+      && approval.maxResults === row.max_results && approval.maxBytes === row.max_bytes, 'discovery-not-authorized');
+    const targets = new Map<string, SearchTarget>();
     for (const item of this.#db.prepare('SELECT * FROM memory_discovery_targets WHERE grant_id=?').all(grantId)) {
       check(projects.includes(String(item.project_id)), 'discovery-not-authorized');
       targets.set(String(item.project_id), {
@@ -668,6 +692,9 @@ export class ProbeStore {
         ...(item.platform === null ? {} : { platform: String(item.platform) }),
         ...(item.component === null ? {} : { component: String(item.component) }),
       });
+    }
+    for (const projectId of projects) for (const key of ['agent','platform','component'] as const) {
+      check((targets.get(projectId)?.[key] ?? null) === (approval.targets[projectId]?.[key] ?? null), 'discovery-not-authorized');
     }
     return { projects, targets, remaining: Number(row.max_results) - Number(row.used_results),
       remainingBytes: Number(row.max_bytes) - Number(row.used_bytes) };
@@ -1734,18 +1761,16 @@ export class ProbeStore {
         check(event.eventId === job.event_id && typeof event.recordId === 'string', 'outbox-evidence-gap');
         const record = this.#readMemoryUnsafe(event.recordId);
         const generation = Number(job.projection_rowid);
-        const eligible = record.lifecycle === 'active' && record.scope.resolved
-          && ['verified','stale','conflicted'].includes(record.verification);
-        const exposure = record.verification === 'verified' && !record.conflictSetId ? 'normal' : 'status_only';
+        const exposure = memoryProjectionExposure(record);
         const old = this.#db.prepare('SELECT rowid FROM search_documents WHERE unit_id=?').get(record.recordId);
         if (old) this.#db.prepare('DELETE FROM search_fts WHERE rowid=?').run(Number(old.rowid));
         this.#db.prepare('DELETE FROM search_documents WHERE unit_id=?').run(record.recordId);
-        if (eligible) {
+        if (exposure) {
           const indexed = `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim();
           this.#db.prepare(`INSERT INTO search_documents
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(record.recordId, this.#binding.ownerId, record.recordId, record.revisionId,
             record.source.binding.projectId, record.scope.kind, record.scope.id, record.lifecycle, record.verification, exposure, indexed,
-            record.contentHash, record.revision, 'latin-cjk@2', generation);
+            record.contentHash, record.revision, 'latin-cjk@3', generation);
           const row = this.#db.prepare('SELECT rowid FROM search_documents WHERE unit_id=?').get(record.recordId);
           this.#db.prepare('INSERT INTO search_fts(rowid,content) VALUES (?,?)').run(Number(row!.rowid), indexed);
         }
@@ -1766,15 +1791,13 @@ export class ProbeStore {
       const receipts: SearchProjectionReceipt[] = [];
       for (const row of canonical) {
         const record = this.#readMemoryUnsafe(String(row.record_id));
-        const eligible = record.lifecycle === 'active' && record.scope.resolved
-          && ['verified','stale','conflicted'].includes(record.verification);
-        if (!eligible) continue;
-        const exposure = record.verification === 'verified' && !record.conflictSetId ? 'normal' : 'status_only';
+        const exposure = memoryProjectionExposure(record);
+        if (!exposure) continue;
         const indexed = `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim();
         const generation = record.revision;
         this.#db.prepare(`INSERT INTO search_documents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(record.recordId, this.#binding.ownerId,
           record.recordId, record.revisionId, record.source.binding.projectId, record.scope.kind, record.scope.id, record.lifecycle,
-          record.verification, exposure, indexed, record.contentHash, record.revision, 'latin-cjk@2', generation);
+          record.verification, exposure, indexed, record.contentHash, record.revision, 'latin-cjk@3', generation);
         receipts.push({ jobId: '', eventId: record.headEventId, status: 'done', generation, reason: 'rebuild' });
       }
       this.#db.exec(`DROP TABLE search_fts;
@@ -1794,15 +1817,16 @@ export class ProbeStore {
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= 32, 'invalid-search-limit');
       check(Number.isSafeInteger(byteBudget) && byteBudget > 0 && byteBudget <= 65536, 'invalid-search-budget');
       check(typeof request.query === 'string' && Buffer.byteLength(request.query) <= 4096, 'invalid-search-query');
-      check(request.target === undefined || (request.target !== null && typeof request.target === 'object'
-        && Object.keys(request.target).every(key => ['agent','platform','component'].includes(key))
-        && Object.values(request.target).every(value => typeof value === 'string' && value.length > 0 && Buffer.byteLength(value) <= 128)), 'invalid-search-target');
+      check(request.target === undefined || validSearchTarget(request.target), 'invalid-search-target');
       const terms = searchTerms(request.query);
       const groups = searchGroups(request.query);
       const grant = request.grantId ? this.#discoveryProjects(activity, request.grantId) : null;
       check(!grant || request.target === undefined, 'invalid-search-target');
       const projects = grant?.projects ?? [this.#binding.projectId];
-      const coverage = { allowedProjects: projects, inspectedProjects: projects, unavailableProjects: [], complete: false as const, reason: null as string | null };
+      const coverage: SearchPage['coverage'] = { allowedProjects: projects, inspectedProjects: [], unavailableProjects: [],
+        candidateCount: null, complete: false, reason: null };
+      const unavailableCoverage = (reason: string): SearchPage['coverage'] =>
+        ({ ...coverage, unavailableProjects: projects, reason });
       if (!grant && request.noActiveProject) return { status: 'ready', results: [],
         coverage: { ...coverage, allowedProjects: [], inspectedProjects: [], reason: 'no-active-project' },
         truncated: false, nextCursor: null };
@@ -1817,7 +1841,7 @@ export class ProbeStore {
           AND h.verification IN ('verified','stale','conflicted')
           AND (d.unit_id IS NULL OR d.owner_id!=r.owner_id OR d.project_id!=v.source_project_id
             OR d.scope_kind!=h.scope_kind OR d.scope_id!=h.scope_id OR d.content_hash!=v.content_hash
-            OR d.tokenizer_version!='latin-cjk@2' OR d.source_seq!=v.revision
+            OR d.tokenizer_version!='latin-cjk@3' OR d.source_seq!=v.revision
             OR d.exposure_mode!=CASE WHEN h.verification='verified' AND h.conflict_set_id IS NULL THEN 'normal' ELSE 'status_only' END
             OR d.revision_id!=h.revision_id OR d.lifecycle!=h.lifecycle OR d.verification!=h.verification)
         LIMIT 1`).get(this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
@@ -1826,12 +1850,14 @@ export class ProbeStore {
           AND (h.lifecycle!='active' OR h.scope_resolved!=1 OR d.revision_id!=h.revision_id
             OR d.lifecycle!=h.lifecycle OR d.verification!=h.verification) LIMIT 1`)
         .get(this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
-      if (missing || extra) return { status: 'dirty', results: [], coverage: { ...coverage, reason: 'index-lag' }, truncated: false, nextCursor: null };
+      if (missing || extra) return { status: 'dirty', results: [], coverage: unavailableCoverage('index-lag'), truncated: true, nextCursor: null };
+      try { this.#db.exec("INSERT INTO search_fts(search_fts,rank) VALUES ('integrity-check',1)"); }
+      catch { return { status: 'dirty', results: [], coverage: unavailableCoverage('fts-integrity-gap'), truncated: true, nextCursor: null }; }
       if (!terms.length) return { status: 'ready', results: [], coverage: { ...coverage, reason: 'unsupported-query' }, truncated: false, nextCursor: null };
       if (terms.length > 16) return { status: 'unavailable', results: [],
-        coverage: { ...coverage, reason: 'query-term-limit' }, truncated: true, nextCursor: null };
+        coverage: unavailableCoverage('query-term-limit'), truncated: true, nextCursor: null };
       if (grant && (grant.remaining === 0 || grant.remainingBytes === 0)) return { status: 'unavailable', results: [],
-        coverage: { ...coverage, reason: 'task-budget-exhausted' }, truncated: true, nextCursor: null };
+        coverage: unavailableCoverage('task-budget-exhausted'), truncated: true, nextCursor: null };
       const match = terms.map(term => `"${term.replaceAll('"', '""')}"`).join(' OR ');
       let rows: Record<string, unknown>[];
       try {
@@ -1841,9 +1867,9 @@ export class ProbeStore {
           WHERE search_fts MATCH ? AND d.owner_id=? AND ${this.#searchScopeSql('d', projects)}${projectedSourceSql}
           ORDER BY rank, r.rowid LIMIT 257`).all(
           match, this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
-      } catch { return { status: 'unavailable', results: [], coverage: { ...coverage, reason: 'index-unavailable' }, truncated: true, nextCursor: null }; }
+      } catch { return { status: 'unavailable', results: [], coverage: unavailableCoverage('index-unavailable'), truncated: true, nextCursor: null }; }
       if (rows.length > 256) return { status: 'unavailable', results: [],
-        coverage: { ...coverage, reason: 'candidate-limit' }, truncated: true, nextCursor: null };
+        coverage: unavailableCoverage('candidate-limit'), truncated: true, nextCursor: null };
       const candidates: SearchResult[] = [];
       const lanes = groups.map(() => [] as SearchResult[]);
       const seen = new Set<string>();
@@ -1851,23 +1877,24 @@ export class ProbeStore {
         let record: MemoryRecord;
         try {
           record = this.#readMemoryUnsafe(String(row.record_id), projects);
-          check(record.lifecycle === 'active' && record.scope.resolved && ['verified','stale','conflicted'].includes(record.verification)
-            && row.unit_id === record.recordId && row.revision_id === record.revisionId
+          const exposure = memoryProjectionExposure(record);
+          check(exposure && row.unit_id === record.recordId && row.revision_id === record.revisionId
             && row.scope_kind === record.scope.kind && row.scope_id === record.scope.id
             && row.project_id === record.source.binding.projectId
-            && row.tokenizer_version === 'latin-cjk@2'
-            && row.exposure_mode === (record.verification === 'verified' && !record.conflictSetId ? 'normal' : 'status_only')
+            && row.tokenizer_version === 'latin-cjk@3'
+            && row.exposure_mode === exposure
             && String(row.content_hash) === record.contentHash
             && String(row.content) === `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim(), 'search-evidence-gap');
         } catch (error) {
           const reason = error instanceof Error && error.message === 'search-evidence-gap' ? 'search-evidence-gap' : 'canonical-evidence-gap';
-          return { status: 'unavailable', results: [], coverage: { ...coverage, reason }, truncated: true, nextCursor: null };
+          return { status: 'unavailable', results: [], coverage: unavailableCoverage(reason), truncated: true, nextCursor: null };
         }
         const words = normalizeSearchText(record.content).split(' ');
         if (!groups.some(group => words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text))) continue;
         const projectId = record.source.binding.projectId;
         const target = grant ? (grant.targets.get(projectId) ?? {}) : (request.target ?? { agent: 'cli', platform: process.platform });
         let applicability = memoryApplicability(record.appliesTo, target);
+        if (grant && applicability === 'applicable' && (!target.agent || !target.platform)) applicability = 'needs-verification';
         if (!grant && request.target && (request.target.agent !== undefined && request.target.agent !== 'cli'
           || request.target.platform !== undefined && request.target.platform !== process.platform)) applicability = 'needs-verification';
         if (applicability === 'inapplicable') continue;
@@ -1904,6 +1931,8 @@ export class ProbeStore {
         if (!advanced) break;
       }
       candidates.splice(0, candidates.length, ...fused);
+      coverage.inspectedProjects = projects;
+      coverage.candidateCount = candidates.length;
       const fingerprint = sha256(JSON.stringify(candidates.map(hit => [hit.unitId, hit.kind === 'memory' ? hit.record.headEventId : hit.reason])));
       const cursorScope = sha256(JSON.stringify([this.#binding.sessionId, request.grantId ?? null, request.query, request.target ?? null, projects]));
       let offset = 0;
@@ -1918,28 +1947,33 @@ export class ProbeStore {
         offset = cursor.offset!;
       }
       const results: SearchResult[] = [];
-      let bytes = 0;
+      let bytes = 0, end = offset, skipped = 0;
       const remaining = grant?.remaining ?? limit;
       const remainingBytes = grant?.remainingBytes ?? byteBudget;
-      for (const candidate of candidates.slice(offset)) {
+      const pageBytes = Math.min(byteBudget, remainingBytes);
+      for (; end < candidates.length && results.length < Math.min(limit, remaining); end++) {
+        const candidate = candidates[end]!;
         const size = Buffer.byteLength(JSON.stringify(candidate));
-        if (results.length >= Math.min(limit, remaining) || bytes + size > Math.min(byteBudget, remainingBytes)) break;
+        if (size > pageBytes) { skipped++; continue; }
+        if (bytes + size > pageBytes) break;
         results.push(candidate);
         bytes += size;
       }
       if (!results.length && candidates.length > offset) return { status: 'unavailable', results: [],
-        coverage: { ...coverage, reason: 'result-over-budget' }, truncated: true, nextCursor: null };
-      if (grant && results.length) this.#db.prepare(`UPDATE memory_discovery_grants
-        SET used_results=used_results+?, used_bytes=used_bytes+? WHERE grant_id=? AND state='active'
-          AND used_results+?<=max_results AND used_bytes+?<=max_bytes`)
-        .run(results.length, bytes, request.grantId!, results.length, bytes);
-      const end = offset + results.length;
-      const truncated = end < candidates.length;
+        coverage: { ...coverage, unavailableProjects: projects, reason: 'result-over-budget' }, truncated: true, nextCursor: null };
+      if (grant && results.length) {
+        const updated = this.#db.prepare(`UPDATE memory_discovery_grants
+          SET used_results=used_results+?, used_bytes=used_bytes+? WHERE grant_id=? AND state='active'
+            AND used_results+?<=max_results AND used_bytes+?<=max_bytes`)
+          .run(results.length, bytes, request.grantId!, results.length, bytes);
+        check(updated.changes === 1, 'discovery-budget-stale');
+      }
+      const truncated = end < candidates.length || skipped > 0;
       const exhausted = grant && (results.length >= grant.remaining || bytes >= grant.remainingBytes);
-      const nextCursor = truncated && !exhausted
+      const nextCursor = end < candidates.length && !exhausted
         ? Buffer.from(JSON.stringify({ schema: 'memory-search-cursor@1', scope: cursorScope, fingerprint, offset: end })).toString('base64url') : null;
-      return { status: 'ready', results, coverage: truncated && exhausted ? { ...coverage, reason: 'task-budget-exhausted' } : coverage,
-        truncated, nextCursor };
+      const reason = skipped ? 'oversized-candidate-skipped' : truncated && exhausted ? 'task-budget-exhausted' : null;
+      return { status: 'ready', results, coverage: { ...coverage, reason }, truncated, nextCursor };
     });
   }
 
@@ -2786,7 +2820,25 @@ export class ProbeStore {
   close(): void { this.#db.close(); }
 }
 
-function memoryApplicability(conditions: readonly string[], target: { agent?: string; platform?: string; component?: string }):
+function memoryProjectionExposure(record: MemoryRecord): 'normal' | 'status_only' | null {
+  if (record.lifecycle !== 'active' || !record.scope.resolved
+    || !['verified','stale','conflicted'].includes(record.verification)) return null;
+  return record.verification === 'verified' && !record.conflictSetId ? 'normal' : 'status_only';
+}
+
+function validSearchTarget(value: unknown, required = false): value is SearchTarget {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value)
+    && (!required || Object.keys(value).length > 0)
+    && Object.keys(value).every(key => ['agent','platform','component'].includes(key))
+    && Object.values(value).every(item => typeof item === 'string' && item.length > 0 && Buffer.byteLength(item) <= 128));
+}
+
+function validDiscoveryTargets(targets: Record<string, SearchTarget>, projectIds: readonly string[]): boolean {
+  return Boolean(targets && typeof targets === 'object' && !Array.isArray(targets)
+    && Object.entries(targets).every(([projectId, target]) => projectIds.includes(projectId) && validSearchTarget(target, true)));
+}
+
+function memoryApplicability(conditions: readonly string[], target: SearchTarget):
   'applicable' | 'needs-verification' | 'inapplicable' {
   let unknown = false;
   for (const condition of conditions) {
@@ -2800,10 +2852,22 @@ function memoryApplicability(conditions: readonly string[], target: { agent?: st
   return unknown ? 'needs-verification' : 'applicable';
 }
 
+function searchRuns(value: string): { text: string; kind: 'han' | 'latin' }[] {
+  const runs: { text: string; kind: 'han' | 'latin' }[] = [];
+  let previousKind: 'han' | 'latin' | null = null;
+  for (const char of value.normalize('NFKC').toLowerCase()) {
+    const kind = /\p{Script=Han}/u.test(char) ? 'han' : /[\p{L}\p{N}]/u.test(char) ? 'latin' : null;
+    if (!kind) { previousKind = null; continue; }
+    const previous = runs[runs.length - 1];
+    if (previous && previousKind === kind) previous.text += char;
+    else runs.push({ text: char, kind });
+    previousKind = kind;
+  }
+  return runs;
+}
+
 function searchGroups(value: string): { text: string; kind: 'han' | 'latin' }[] {
-  return (value.normalize('NFKC').toLowerCase().match(/[\p{Script=Han}]+|[\p{L}\p{N}]+/gu) ?? [])
-    .filter(run => Array.from(run).length >= 2)
-    .map(run => ({ text: run, kind: /^[\p{Script=Han}]+$/u.test(run) ? 'han' as const : 'latin' as const }));
+  return searchRuns(value).filter(run => Array.from(run.text).length >= 2 || /^\p{N}$/u.test(run.text));
 }
 
 function searchTerms(value: string): string[] {
@@ -2812,13 +2876,13 @@ function searchTerms(value: string): string[] {
 }
 
 function normalizeSearchText(value: string): string {
-  return value.normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  return searchRuns(value).map(run => run.text).join(' ');
 }
 function cjkBigrams(value: string): string {
-  return value.normalize('NFKC').match(/[\p{Script=Han}]+/gu)?.flatMap(run => {
-    const chars = Array.from(run);
+  return searchRuns(value).filter(run => run.kind === 'han').flatMap(run => {
+    const chars = Array.from(run.text);
     return chars.slice(0, -1).map((char, index) => `${char}${chars[index + 1]}`);
-  }).join(' ') ?? '';
+  }).join(' ');
 }
 
 function processAbsent(pid: number): boolean {

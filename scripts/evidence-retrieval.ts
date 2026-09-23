@@ -68,31 +68,58 @@ try {
   const local = first.store.searchMemories(first.activity, { query: 'Atlas' });
   const text = 'Explicit synthetic owner grant for cross-project read-only analysis';
   const input = first.archive.append(randomUUID(), text);
-  first.store.transitionIntent(first.activity, null, input, { status: 'active', step: 'analysis' }, text);
-  const { grantId } = first.store.authorizeMemoryDiscovery(first.activity, input, [sandbox.fixture.projectId, other.projectId], 2);
-  const cross = first.store.searchMemories(first.activity, { query: 'Atlas', grantId, limit: 1 });
+  const intent = first.store.transitionIntent(first.activity, null, input, { status: 'active', step: 'analysis' }, text);
+  const approved = first.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
+    intentId: intent.intentId, goalEventId: intent.goalInput.eventId,
+    projectIds: [sandbox.fixture.projectId, other.projectId], targets: {}, maxResults: 4, maxBytes: 131072 }));
+  const { grantId } = first.store.authorizeMemoryDiscovery(first.activity, approved, [sandbox.fixture.projectId, other.projectId], 4);
+  const crossFirst = first.store.searchMemories(first.activity, { query: 'Atlas', grantId, limit: 1 });
+  const crossSecond = crossFirst.nextCursor
+    ? first.store.searchMemories(first.activity, { query: 'Atlas', grantId, limit: 1, cursor: crossFirst.nextCursor }) : null;
+  const crossHits = [...crossFirst.results, ...(crossSecond?.results ?? [])];
   first.store.revokeMemoryDiscovery(first.activity, grantId);
   let revoked = false;
-  try { first.store.searchMemories(first.activity, { query: 'Atlas', grantId, cursor: cross.nextCursor! }); }
+  try { first.store.searchMemories(first.activity, { query: 'Atlas', grantId, cursor: crossFirst.nextCursor! }); }
   catch (error) { revoked = error instanceof Error && error.message === 'discovery-not-authorized'; }
   const passed = local.status === 'ready' && local.results.length === 1
-    && local.results[0]?.projectId === sandbox.fixture.projectId && cross.status === 'ready'
-    && cross.results.length === 1 && cross.truncated && cross.nextCursor !== null && revoked;
+    && local.results[0]?.projectId === sandbox.fixture.projectId && crossFirst.status === 'ready'
+    && crossSecond?.status === 'ready' && crossFirst.truncated && crossSecond.nextCursor === null
+    && crossHits.length === 2 && new Set(crossHits.map(hit => hit.projectId)).size === 2
+    && crossHits.some(hit => hit.projectId === other.projectId) && revoked;
   observations.push({ caseId: 'X01/X02/X05', local: local.results.map(hit => ({ id: hit.unitId, projectId: hit.projectId })),
-    cross: cross.results.map(hit => ({ id: hit.unitId, projectId: hit.projectId })),
-    allowed: cross.coverage.allowedProjects, truncated: cross.truncated, revoked, passed });
+    cross: crossHits.map(hit => ({ id: hit.unitId, projectId: hit.projectId, exposureMode: hit.exposureMode })),
+    allowed: crossFirst.coverage.allowedProjects, inspected: crossFirst.coverage.inspectedProjects,
+    candidateCount: crossFirst.coverage.candidateCount, pages: 2, truncated: crossFirst.truncated, revoked, passed });
 } finally { second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+
+const discovery = JSON.parse(discoveryBytes.toString('utf8')) as { schema: string; cases: { id: string; gold: string }[] };
+assert.equal(discovery.schema, 't10-discovery-cases@1');
+let focusedRaw = '', focusedPass = true;
+try {
+  focusedRaw = execFileSync(process.execPath,
+    ['--test', 'apps/cli/test/memory-retrieval.test.ts', 'apps/cli/test/search-projection.test.ts'],
+    { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+} catch (error) {
+  focusedPass = false;
+  focusedRaw = String((error as { stdout?: string }).stdout ?? error);
+}
+const testLines = focusedRaw.split('\n');
+for (const entry of discovery.cases) {
+  const line = testLines.find(value => value.startsWith('✔ ') && value.includes(entry.id));
+  observations.push({ caseId: entry.id, gold: entry.gold, testLine: line ?? null, passed: focusedPass && Boolean(line) });
+}
 
 const passed = observations.every(item => (item as { passed: boolean }).passed);
 const output = {
   schema: 't10-retrieval-evidence@1', at: new Date().toISOString(),
   commit: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
   worktreeStatus: execFileSync('git', ['status', '--short'], { encoding: 'utf8' }).trim().split('\n').filter(Boolean),
-  environment, fixtureDigest, corpusDigests: digests, observations, passed,
+  environment, fixtureDigest, corpusDigests: digests, observations, focusedPass, passed,
 };
 const directory = join('artifacts', `t10-${Date.now()}`);
 mkdirSync(directory, { recursive: true });
 const path = join(directory, 'summary.json');
 writeFileSync(path, JSON.stringify(output, null, 2) + '\n', { flag: 'wx' });
+writeFileSync(join(directory, 'focused-test.txt'), focusedRaw, { flag: 'wx' });
 console.log(JSON.stringify({ path, passed, cases: observations.length, corpusDigests: digests }));
 if (!passed) process.exitCode = 1;

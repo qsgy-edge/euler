@@ -86,6 +86,28 @@ test('a projected owner change cannot make an eligible fact disappear as an empt
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('missing FTS posting reports a dirty projection instead of an empty answer', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
+  try {
+    const source = probe.archive.append(randomUUID(), 'posting evidence');
+    const captured = probe.store.captureMemory(probe.activity, source, 'Atlas posting', {
+      type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+    }).record;
+    const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
+    probe.store.activateMemory(probe.activity, verified.recordId, verified);
+    probe.store.drainSearchProjection(probe.activity);
+    const row = db.prepare('SELECT rowid,content FROM search_documents WHERE record_id=?').get(captured.recordId)!;
+    db.prepare("INSERT INTO search_fts(search_fts,rowid,content) VALUES ('delete',?,?)").run(row.rowid!, row.content!);
+    const missing = probe.store.searchMemories(probe.activity, { query: 'Atlas' });
+    assert.equal(missing.status, 'dirty');
+    assert.deepEqual(missing.results, []);
+    probe.store.rebuildSearchProjection(probe.activity);
+    assert.equal(probe.store.searchMemories(probe.activity, { query: 'Atlas' }).results[0]?.unitId, captured.recordId);
+  } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('CJK bigrams do not cross punctuation boundaries', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);
