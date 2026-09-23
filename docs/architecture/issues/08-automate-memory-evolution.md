@@ -92,9 +92,11 @@ Blocked by: 01, 03, 05, 06
 22. 两条演化管线只共用薄契约与基础设施：Harness provenance/scope/owner、immutable evidence/candidate hashes、integrity receipt、isolated candidate、independent verifier、held-out/canary、current/previous pointer 与 rollback event。Memory gate 只决定可召回知识，Policy/Skill/Code owner 分别决定行为制品发布并使用自己的测试、安全与目标平台门禁；系统变更结果作为 source/feedback 回流后仍重新走 memory candidate 管线，不建立万能自进化引擎。
 23. 未来只有候选隔离、目标平台验证、未参与迭代的 held-out、canary 和自动回滚齐备时才允许无人值守发布；权限、安全、凭据、公共接口和不可机器判断的价值变化继续升级给用户。v1 只实现 memory 生命周期与 inert proposal 的保存/导出接口，不自动修改 prompt、skill 或代码。
 
+显式分析任务的报告、普通 handoff 文档和项目提案按 [10 的任务产物契约](10-choose-storage-projections.md#analysis-handoff-artifacts) 保存与发现。由主 Agent 形成的待验证建议可作为该任务的 inert proposal 交付，须有具体 target/evaluation、准确来源及获准目标范围；这不冒充本节自动 memory 提炼的 verified 输入，也不授予行为权限。普通摘要继续是 source；只在提炼可复用知识时才进入本票的 candidate/verification 管线。采纳后的实施由目标项目既有流程承担，不能将报告中的“建议采用”记为 owner 已决定采用。
+
 ## Decisions — Minimum-sufficient evaluation contract
 
-本节对 v1 行为 proposal 只定义评估建议的表达方式；关于 Skill/AGENTS/policy 发布的条款是未来消费者启用前的要求，不授权或要求 v1 实现评估 runner、sealed plan、attempt/result 表族。Memory 本身仍按 §5–18 独立验证。Proposal 的 target/expected change/owner/scope/evidence refs、版本化建议、完整 digest 和 supersedes 引用即可保存；缺具体 target/evaluation 时继续作为 insight。外部 accepted/result 或正文内指令不能自动执行。
+本节对 v1 行为 proposal 只定义评估建议的表达方式；关于 Skill/AGENTS/policy 发布的条款是未来消费者启用前的要求，不授权或要求 v1 实现评估 runner、sealed plan、attempt/result 表族。Memory 本身仍按 §5–18 独立验证。Proposal 的 target/expected change/owner/scope/evidence refs、版本化建议、完整 digest 和 supersedes 引用即可保存；缺具体 target/evaluation 的任务材料保留为 source；可复用 insight 仍按 memory candidate/verification 管线处理。外部 accepted/result 或正文内指令不能自动执行。
 
 24. 每个 evolution proposal 必须携带 evaluation contract，并按风险选择最低充分层级，而不是默认完整重跑旧任务：L0 用确定性代码检查 source/hash/scope/conflict/schema；L1 检查触发、注入和首个关键选择；L2 从最接近目标行为的旧任务 checkpoint 做 baseline/treatment 局部分叉；L3 才使用未参与生成的相似 held-out、越界负例和线上 canary。旧任务只能证明回归，不单独证明泛化。
 25. 验证强度按 target 区分：明确 owner memory 与客观 fact 通常止于 L0/L1，普通 project insight 核验来源和边界，只有广域/高 salience/反复影响行动的 insight 进入 L2/L3；Skill 发布至少覆盖应触发、不应触发、关键步骤/工具调用、一个旧失败样例和一个 held-out；AGENTS/policy 还必须做 baseline/candidate、适用正例、不适用负例、边界/安全样例以及优先级、scope 与 token 成本检查。

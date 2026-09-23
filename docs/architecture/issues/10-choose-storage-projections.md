@@ -52,7 +52,7 @@ Resolution scope: 2026-09-09 收敛首次切片：canonical/owner/search 不变�
 ## Decisions — Unified search projection
 
 12. v1 使用一份非权威、可重建的 `search_documents` 统一搜索投影及一份 external-content FTS5 `search_fts`，而不是多个孤立索引或万能 canonical 表。每个 search document 至少携带 `owner_kind`、用于整体验证/清除的 `owner_id`、独立可检索单元 `unit_id`、current `revision_id`、logical project/scope、lifecycle/verification 提示、`exposure_mode`、content、content hash、source seq、tokenizer version 与 projection generation；`(owner_kind, unit_id)` 唯一。Memory 通常一条 record 对应一个 unit，session/source/repo owner 可发布多个有界 chunk unit。
-13. 所有 eligible memory 以及 owner adapter 明确发布的有界 session/source/repo chunk unit 可进入同一物理索引，但不得为此默认复制完整 session、source 或仓库；查询按 owner kind/任务子项分 lane 取候选，再由 Orchestrator 做 RRF，避免大量 session 文本淹没 durable memory。投影中的 scope/state 只作预过滤提示；每个命中必须回到 canonical owner 重验 project/scope/applies-to/lifecycle/verification/validity/integrity，索引行无权授予资格。
+13. 所有 eligible memory 以及 owner adapter 明确发布的有界 session/source/repo chunk unit 可进入同一物理索引，但不得为此默认复制完整 session、source 或仓库；查询按 owner kind/任务子项分 lane 取候选，再由 Orchestrator 做 RRF，避免大量 session 文本淹没 durable memory。投影中的 scope/state 只作预过滤提示；每个命中必须回到 canonical owner 重验 project/scope/applies-to/lifecycle/verification/validity/integrity，索引行无权授予资格。显式跨项目查询复用该索引并按 09 的任务级只读范围筛选，不改变记录 scope；报告/交接文档及 proposal 由所属 source/proposal owner 发布有界发现单元，以 `source.search/expand` 返回带种类和状态的任务资料，不混入 `memory.search` 的已验证事实。
 14. canonical 转换与搜索投影的同步契约如下：active/verified current head 创建或更新 search document；正文 revision、rollback、scope/project/applies-to/validity 变化更新同一 unit 行；stale/conflicted 保留可匹配文本但改为 `status_only`，只能产生有界状态标记；superseded/rejected/tombstoned 删除索引行；bundle 导入先作为 candidate，通过门禁后才进入索引；retrieved/seen 等统计变化不重建 FTS。冲突成员以 `conflict_set_id` 聚合为一个状态提示。
 15. canonical 事务只同步追加 projection job/outbox，不等待 FTS；未来 artifact/embedding 文件投影同样不进入 mutation 关键路径。worker 处理 search/FTS job 时必须重新读取当前 head，以 current revision/hash/seq 条件化幂等 upsert/delete，旧 job 不能覆盖新 revision。每个 eligible memory head 或 owner-published unit 必须有当前 search document，每个 search document 必须指向当前有效 owner/unit/revision；watermark 与双向完整性检查发现不一致即标 degraded 并重建。
 16. 快速通道新记忆在索引追上前由下一轮 pinned delta 暴露；小规模 backlog 可用有界 canonical scan 补漏。backlog 超限、hash 不符或索引损坏时停用该投影并显示 `dirty/rebuilding/failed`，不能静默返回旧结果，也不能因投影失败阻止 canonical 写入。
@@ -79,6 +79,19 @@ Resolution scope: 2026-09-09 收敛首次切片：canonical/owner/search 不变�
 
 19. insight 本体是 SQLite durable memory；scope_overview 是独立后续切片的 SQLite 有界派生正文。Wiki、insight 页面与架构图文件继续 deferred；只有确有文件消费者时才决定输出格式、外部发布、purge 与恢复协议，不能把历史文件方案变成首次 schema 的空表或 gate。真实数据冻结后新增持久能力必须前进迁移。
 20. v1 不建立统一 Wiki/知识仓库。机器生成的 project memory 只在个人 DB 中按 logical project ID 管理；用户明确批准的 ADR、AGENTS/policy、manifest 或项目文档进入其所属的现有项目仓库。需要分享时显式导出带输入 hash 和“生成快照、非权威”标记的文件；人工批准为 ADR 时创建独立权威 ADR，不能把 Wiki 文件原地升格。
+
+<a id="analysis-handoff-artifacts"></a>
+
+### Analysis reports and project handoff
+
+本契约复用既有 source/archive、`evolution_proposals` 和可重建搜索投影，提供不依赖特定 Skill 的持久交接。它不启用 scope-overview/Wiki、全历史 backfill、跨宿主 bundle 或通用任务/制品管理系统。
+
+1. **完整报告：** 分析任务的完整结果由原任务 source/archive owner 归档，绑定稳定 identity、不可变版本/正文 hash、真实任务与来源。内容覆盖目标、实际覆盖项目、事实/推断/建议、证据与未决问题；修订追加新版本并引用旧版。保存在 Euler 管理的归档载体，不跟随任意启动目录写入某个项目仓库；完成声明须已有 durable ack，崩溃/重复保存沿既有 identity 对账。目录布局由现有 source carrier 决定，不另建 report 数据库或文件发布系统。
+2. **项目提案：** 有明确 target、预期改动、范围/非目标和验收方法的建议，复用版本化 inert proposal，按目标项目保存；可在预期改动/评估建议中表达收益、风险和未决项，不新增万能 proposal 类型。正文包含接手者所需的项目相关背景，并引用准确报告版本/区段和证据；保存事实不证明建议已验证、已采纳或已实施。普通交接摘要、缺 target/evaluation 的想法保留为 source 文档；可复用知识另走 memory candidate/verification，不能为获得搜索入口直接晋升。
+3. **跨项目来源与可见性：** 原始来源保留真实 owner/project；Host 根据已批准交付目标绑定报告区段和提案，不能伪造 source binding 或将整份混合报告改 scope 为 personal/目标项目；含跨项目内容的报告或归档事件也不能因 originating session 绑定某项目就自动向该项目全部开放。只读分析授权允许其正常任务归档，不自动授予向其他项目发布资料的权利；项目可见交接材料须处于已批准的保存/交付范围。项目会话仅能发现和展开该范围内的相关区段/提案，每条引用仍单独重验读取权限；target 标签或报告链接不开放其他项目正文、名称或摘要。必要时生成带 derived-from 的获准项目摘录，不能仅挂一个不可读总报告链接冒充可交接。
+4. **发现与接续：** 归档/proposal durable 后由既有投影入口提供有界、带类型/版本/项目/来源状态的发现单元，索引损坏可重建。新会话可按项目和任务问题搜索，再按需展开，入口不依赖手工维护关系表或安装某个 Skill。进入实施前重验相关代码/来源版本、适用条件及当前授权；旧报告只证明当时分析，不能成为恢复跨项目读取或执行权限的凭据。
+5. **导出与任务交接：** owner 可显式导出 Markdown 快照，或批准将选定项目提案送入该项目既有 Issue/计划系统；一次批准可覆盖明确的一批目标。输出保留版本、来源与“分析/待验证建议”状态，提供足够的获准项目上下文，使不访问 Euler 私有 DB 的接手者仍能理解目标与验收；不可达引用明确报缺。外部发布、仓库写入和实施分别受当前授权约束，不内置任务系统集成、自动创建 Issue 或另行维护实施进度；发布后进度以目标项目已有系统为准。Markdown 交接是已选资料的受控输出，不是 X-15 的整库/event bundle 导出。
+6. **保留与清除：** 报告正文、历史版本、项目摘录、proposal payload、发现单元、输入/输出 refs/hash 与实际受控导出副本均复用原 owner 的备份、恢复与 purge 闭包。来源撤销/删除时不能凭缓存或旧交接副本绕过当前权限；受影响摘录/提案及索引按依赖失效或清除。外部 Issue/远端仓库等无法控制的副本按既有规则列残留，不能承诺跨资源原子发布或全域清除。
 
 ## Decisions — Retention, forgetting, privacy and capacity
 

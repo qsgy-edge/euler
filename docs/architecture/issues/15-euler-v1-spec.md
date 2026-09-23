@@ -75,6 +75,8 @@ Source map: course-source:map; see ../migration-manifest.json
 46. 作为 owner，我希望从原始来源重建而不是兼容旧 MC 派生状态，以便新系统不背负错误身份、旧摘要或双真值。
 47. 作为 owner，我希望达到门槛后彻底退出 MC 运行时依赖，以便线上只有一套 context owner。
 48. 作为实现者，我希望总规格、原始契约、验收与阶段映射可追溯，以便跨会话实现不会靠猜测补齐规则或把课程结果当生产 PASS。
+49. 作为 owner，我希望在任意目录发起明确的跨项目分析，并只读取该任务获准的项目，以便发现新能力的适用机会而不污染日常局部上下文。
+50. 作为 owner，我希望完整分析及项目提案可持久保存、发现和导出，以便换项目或换会话仍能继续落地，且不依赖指定 handoff Skill。
 
 ## Implementation Decisions
 
@@ -91,6 +93,8 @@ v1 聚焦 memory lifecycle 和 context 协作。AGENTS、Skill、Core tool 与 M
 首次可用切片沿用 14 的自研 CLI 首接方向：Windows、自研 CLI 的交互模式、一个显式绑定 project/session、一条经验证并固定配置的 provider/model 路径。闭环包含 durable source、最小 intent、低风险 memory 验证与检索、预算/换窗/恢复、实际请求 ledger、inspect/correct/forget/restore/自动更新 rollback、持久 Info，以及维护模式 purge、backup 和故障恢复。无强命中允许空；少量 owner-confirmed bootstrap 即可，不要求全历史重建。额外模型/provider、自动跨 scope 晋升不作为该切片前置。
 
 Pi regular、RPC/JSON/print、MCP、scope overview/raw backfill、bundle 和其他平台生产支持按独立能力切片后续启用；双宿主仍共享同一 Core 和语义，但不要求同步交付。未启用的入口必须实际 unavailable，不能默认直通；不得借切片名义跳过已经启用的数据路径所需的 approval、durability、purge、恢复或 D7 门禁。小型本地 AGENTS/Skill 与固定 Host 工具先满足当前任务，目录规模优化留到出现需求后。各切片的直接依赖和 X-card 子项见 D8，不新建 capability registry。
+
+2026-09-23 owner 批准在该路线内补齐任务级跨项目只读发现及持久交接：普通操作仍绑定 primary project，显式分析可从已登记且获准读取的目标建立任务，不依赖启动目录；不扩大首次 canary 的单一 project/session，也不授权多项目操作或 live 数据访问。完整报告复用 source/archive，明确改动建议复用项目 inert proposal；T10/T11/T13 分别实现检索、来源恢复与交接，T18 验真实会话接续，T20/T22a/T22b/T24 覆盖对应备份、清除及组合验收。具体 Skill、Issue 平台与工作流由用户选择，核心能力可独立使用。新增路径仍先用合成数据验收，不以此启用 overview/backfill、通用产物系统或技能发布。
 
 ### I02. 运行时与依赖
 
@@ -124,6 +128,8 @@ scope 为 logical project、可选扁平 workspace、personal；每 project 最�
 
 Proposer/Historian 推荐标准级，Historian 还需长上下文和忠实压缩；Verifier 按风险选能力，低风险允许同模型隔离上下文，高影响/跨 scope/安全候选增加不同模型、真实工具/平台、held-out/canary 或人工。Provider/model 可配置，无型号白名单；低于所需能力只能停留 candidate/evidence-gap。模型能力、reasoning effort 与编排拓扑不等同。行为制品只保存版本化 inert proposal：target/type、expected change、owner/scope、evidence refs、risk 和建议的 evaluation contract；正文与完整 digest 不可原地改写，修订创建新 proposal 引用旧版，引用进入 purge 闭包。评估建议可描述 L0–L3、assertions、baseline/held-out 和成本限制，但它不是执行许可或已完成的结果。v1 不建 sealed plan、evaluation attempt/result 表族、不执行行为评估或自动发布；外部附带的 accepted/result 也不能激活行为。未来有评估/发布消费者时再定义执行、独立验收和迁移，memory 自身的 verification_runs 不受此收敛影响。
 
+完整分析报告和普通 handoff 是任务 source 产物；具体目标/验收明确的项目建议可作为待验证的 inert proposal 保存。按 [10 的任务产物契约](10-choose-storage-projections.md#analysis-handoff-artifacts) 保留正文版本、覆盖、来源与项目可见范围，提供有界发现及显式 Markdown 导出。它们不自动成为 verified memory 或 owner 已采纳决定；发布到项目仓库/Issue 及实施仍由当前授权和项目既有流程决定。
+
 Primary/fallback 只处理暂时不可用、超时、限流、协议或结构化输出失败，不覆盖 integrity FAIL、语义 block 或 evidence-gap。每个实际调用记录 requested/actual provider/model、role/job、版本可得性、fallback ordinal、配置/输入/输出/schema/hash、起止、usage/cache 与终态；未知字段明确 unknown，不记录秘密正文。
 
 Worker 在启动、canonical 写入后、agent_end/空闲和显式 maintenance 时 cooperative drain，短租约、有界 batch/deadline、按 owner revision/input hash/generation 幂等。重启可接管过期 lease，但不得重复 mutation/receipt；未知 attempt 先查询，不盲目重复。明确否定只能在 source 变化或显式维护后重新验证；重复失败有 blocked 原因。后台不阻塞普通响应关键路径。
@@ -146,11 +152,13 @@ retrieved、injected、source revalidated、task outcome、owner feedback 与 ca
 
 ### I07. Retrieval 与可重建投影
 
-先硬过滤 logical scope、active project set、applies-to、lifecycle/verification、时间有效性及 integrity，再按当前请求/intent 检索、简单可复算融合与 claim/environment/time 去重，在预算内覆盖任务子项。不用可信度/相似度/时效总分抵消资格失败，不为固定 top-k 注入弱命中。
+正常自动检索先硬过滤 logical scope、active project set、applies-to、lifecycle/verification、时间有效性及 integrity，再按当前请求/intent 检索、简单可复算融合与 claim/environment/time 去重，在预算内覆盖任务子项。不用可信度/相似度/时效总分抵消资格失败，不为固定 top-k 注入弱命中。
+
+显式跨项目分析按 [09 的只读发现契约](09-assemble-context-safely.md#cross-project-discovery) 建立绑定当前 intent/task 的获准读取集合，任务内复用，结束/换任务/撤销后失效。该集合不扩大操作/guidance 的 `active_project_set`，不授予发布、写入或跨 scope 晋升。适用条件按被分析项目及目标环境判断；环境未知的有界参考须标待核验，不成为当前项目事实。结果保留项目、环境、版本/时间及来源，说明实际覆盖、未覆盖/不可用和截断，不能将少量命中冒充全历史分析。
 
 v1 使用一份非权威 search-documents + external-content FTS5，版本化 Latin/数字规范化和 CJK overlapping 2-gram；canonical 正文不改写，不建 embedding 表。单字 fallback 由 held-out 决定，纯同义无强 lexical 证据可返回空/慢路径。未来向量或图只有真实漏召回/多跳需求与实验胜出后再考虑。
 
-Memory 与 owner 明确发布的有界 session/source/repo units 分 lane；不默认复制全库/整仓库。每个命中回 canonical owner 重验。active verified current 有正常搜索投影；stale/conflicted 仅 status-only，superseded/rejected/tombstoned 不正常召回。canonical 事务只追加 outbox，worker 重新读 current head 并按 revision/hash/seq/generation 条件更新；旧 job 不覆盖新 revision，重复 delivery 幂等。
+Memory 与 owner 明确发布的有界 session/source/repo units 分 lane；不默认复制全库/整仓库。报告、普通 handoff 与项目 proposal 通过 source/proposal owner 发布任务资料发现单元，以 `source.search/expand` 按需读取，不混入 `memory.search` 的已验证事实。每个命中回 canonical owner 重验。active verified current 有正常搜索投影；stale/conflicted 仅 status-only，superseded/rejected/tombstoned 不正常召回。canonical 事务只追加 outbox，worker 重新读 current head 并按 revision/hash/seq/generation 条件更新；旧 job 不覆盖新 revision，重复 delivery 幂等。
 
 跨会话的 `scope_overview` 是可选的有界 baseline，不替代 canonical retrieval。只有用户要求项目全貌/规划、当前请求需要跨主题关系，或 retrieval 暴露 evidence-gap 时才读取适用 overview；它必须带 input generation、source/memory refs digest 和 content hash。overview 过期、冲突、purge、cursor gap 或 verifier 未完成时只返回状态标记或触发局部 review/source recovery，不把旧摘要当事实注入。
 
@@ -223,6 +231,8 @@ Core policy 是受保护 channel，AGENTS 为独立 P0 guidance，带 owner/scop
 绑定复用既有 task/intent 与 instruction snapshot；同任务、同 scope/hash 不反复读正文，暂未调用或仍适用的换文件不释放。任务结束、明确停用、scope/权限/信任失效才从下一 assembly 移除；换窗重新校验并装入准确正文，不靠“已加载”状态恢复。v1 无 Skill 专用版本表、包历史、市场、自动安装/升级/回滚管理器；必要状态复用 P3，不建设完整状态栏。
 
 多个已选且合格的不同 Skill 对同一副作用提出已明确识别、无法同时满足的直接约束时，必须暴露 `skill-conflict` 并停止相关副作用；不按加载顺序静默择一或停用另一份，不增加额外 LLM 裁决器或通用自然语言冲突解析器。相容约束及适用于不同操作的对照不得被误判为此冲突；owner 明确解除冲突后，经新 instruction snapshot/assembly 和原 Core gate 重验，合法操作可恢复。X-05 明确验证冲突终态、相关副作用为 0 及正常对照，X-10 复验真实 adapter；仅证明两份正文加载成功不算该项验收。
+
+Euler 的持久交接不依赖某个 Skill。用户可选 handoff 工作流生成材料，Core 只通过已有受控 source 接口归档明确选中的正文并提供项目发现/读取；临时文件必须保存正文和 hash，不能只存路径。`suggested skills` 不自动激活技能，显式调用限制仍适用；没有该技能时普通 Markdown 交接可完成。不修改第三方技能正文、不新增专属 importer 或工作流引擎，详细分工见 [13](13-select-target-v1-migration.md#optional-handoff-workflows)。
 
 ### I14. Core/Host tools 与 MCP
 
@@ -325,12 +335,12 @@ Windows-first；共享 Core/portable/可自动化 OS 用 Windows/macOS/Linux CI 
 | ID | 阶段 | 必须观察的结果与完整 PASS 边界 |
 |---|---|---|
 | X-01 | P1 | 首次路径的 app-id/数据根、schema/FK/CAS/seq/head/intent、pending、Info/outbox、stream owner/fence 与 inert proposal 完整 digest；不预建可选 artifact 或行为评估表，portable/Host 分列。 |
-| X-02 | P2 | eligibility、FTS/CJK、current 去重与本地冻结需求语料/held-out；历史 60 用例取得后追加，不是开跑硬前置，不伪称复用。 |
+| X-02 | P2 | eligibility、FTS/CJK、current 去重、任务级只读发现/目标环境/覆盖说明与本地冻结需求语料/held-out；历史 60 用例取得后追加，不是开跑硬前置，不伪称复用。 |
 | X-03 | P1 | 实际 search worker 的乱序/重复/崩溃/lease、FTS 损坏重建与双向完整性；overview 后续子项验 SQLite body/refs/cursor 原子性、历史证据与新版本重建。 |
 | X-04 | P2，P3 接线复验 | bootstrap、硬上下文及累计 run 预算、取消、四级降级、完整 ReAct、source ack/recovery、单主调用快路径和失败后正常继续；补充验证 `received → admitted-to-loop → bound-to-assembly`、默认 steer 的完整批次边界、follow-up/queue/cancel 分流、局部工具错误隔离和严格终态；fake provider/受控工具仅用于状态机反馈回路，仍须在合成数据上用真实 provider 完成接线证据。 |
 | X-05 | P2，P3 补齐 | 按 12 通用组验 project/scope、本地 AGENTS/Skill/provider metadata 与 Core gate；MCP 和 Pi loading 分别为后续追加组。共享隔离失败与能力专属失败分开处理，未启用能力不阻塞首次 CLI。 |
 | X-06 | P1，P3 接线复验 | 两道 barrier、started 与撤销的并发线性化、payload/网络计数、unknown-sent 对账/封存与 recovery gap；有正常发送及继续路径，stub 不替代真实接线；补充验证 Core 结果信封、未启动/已启动/unknown 区分、普通错误的兄弟调用继续、`executionMode` 批次顺序、权威事件 durable-before-terminal-presentation 和迟到结果不触发新调用；自研 CLI 须验证同一响应中已出现完整 tool call、但响应尚未结束时，工具执行次数为 0；完整响应结束并 durable 归档后，通过 gate 的调用正常执行。 |
-| X-07 | P2 | capture/独立取源、08 状态转换表、时间/冲突/回滚/抑制/Info、retrieved/injected 和 inert proposal 无行为权限；scope review/backfill 是后续子项，无行为 evaluation runner。 |
+| X-07 | P2 | capture/独立取源、08 状态转换表、时间/冲突/回滚/抑制/Info、retrieved/injected 和 inert proposal 无行为权限；含任务报告/项目提案的保存、导出与 source 发现，普通 handoff 不强制转 proposal；scope review/backfill 是后续子项，无行为 evaluation runner。 |
 | X-08 | 独立课程票 | owner 预封存 pre-image/held-out、重签篡改、known-bad、负迁移及正向严格改善/其他零回归；不替代 P2 runtime 安全门禁。 |
 | X-09 | P2 Core，P3 Host | actual-used inspect、correct/forget/restore/rollback、完整 batch CAS、结构化 cycle-safe purge 和真实模型 tool-call 后 Host 重验；物理副本归 X-12。 |
 | X-10 | P3 | 按 12 卡内“首次 CLI 必测”和“后续模式启用前追加”分组验呈现/批准/终态及 receipt 两面；与同模式 X-11 联合验收，只读模式不授予写权限。 |
@@ -344,6 +354,7 @@ P1 为 `X-01 → (X-03/search 与 X-06/ledger)`，两条可以并行；P3 按每
 
 ### 增量验收闭包
 
+- 任务级跨项目发现：X-02/X-05 验默认局部、显式只读范围、权限撤销、任务结束、目标环境和覆盖说明；X-04/X-07 验报告/项目提案的 durable 保存、跨会话发现、原文恢复、Markdown 交接与无特定 Skill 对照。X-12 覆盖新增实际载体及引用的备份、恢复和清除；这些子项不授权真实项目数据或自动实施。
 - D1 primary/fallback、实际模型/版本与 attempt receipt 对账：X-07；否定结论不被 fallback 覆盖。
 - D4/D5 archive ack/job 恢复、raw-only compartment、window identity/lifecycle 与 baseline：X-04/X-14；Pi 未 flush 和 unknown source 不冒充 durable。
 - D6 Core isolation：本地 AGENTS scope/conflict、Skill 发现/同名/准确正文/换窗、多已选 Skill 的 skill-conflict，以及 provider metadata、Core/Host schema 与未启用工具拒绝，归 X-04/X-05/X-10 通用组；包含拒绝、相容和解除冲突后正常对照，不要求通用自然语言冲突解析器或先实现 MCP/Pi。
@@ -370,7 +381,7 @@ P1 为 `X-01 → (X-03/search 与 X-06/ledger)`，两条可以并行；P3 按每
 
 - 多人协作、云 SaaS、自动跨设备同步、音视频记忆、共享/云盘 SQLite。
 - 把源材料、intent、活动指令、Wiki 或索引当作一种 canonical memory；L0/L1/L2 多套 store、统一主题 taxonomy、通用图、向量数据库或默认 embedding。
-- 生成 Wiki/insight/diagram 文件、空 artifact metadata 表及通用 artifact worker；首个真实消费者获批后另走契约与前进迁移。
+- 生成 Wiki/insight/diagram 文件、空 artifact metadata 表及通用 artifact worker；首个真实消费者获批后另走契约与前进迁移。任务报告归档与显式 Markdown 交接按 10 执行，不启用这些后置生成设施。
 - 自动发布或热加载 policy/AGENTS/Skill/tool/code/Harness 修改、通用插件注册、MCP server 市场/自动安装更新、Skill 包版本/更新系统。
 - 行为自进化的 sealed-plan/attempt/result 执行系统、overview 外部文件发布/pin/GC/同 hash repair，以及在线细粒度 UI/cache purge quiesce；不得通过为未来预留空表重新加入首次 P0/P1。
 - 额外 RAG/router Agent、通用 task 框架、完整状态栏、Trajectory UI、分布式 trace、全量 prompt diff。
@@ -398,9 +409,22 @@ P1 为 `X-01 → (X-03/search 与 X-06/ledger)`，两条可以并行；P3 按每
 
 [01 课程检查点](../migration-manifest.json)、[02 课程检查点](../migration-manifest.json)、[03 课程检查点](../migration-manifest.json) 和原始 research 只解释历史来源及反例，不是 Euler 的生产 receipt。[Q6 对照](../research/2026-08-29-pi-vs-dsh-q6.md) 的 Pi runtime 选择后来已由 14/13 限定为 Pi adapter，自研 CLI 仍只复用 pi-ai；不能把历史表述重新扩大。MC migration head、行计数与 Pi 0.84.3/0.84.4/0.85.1 版本引用均是各自观察时点的事实，迁移/接线必须绑定 UTC observation timestamp、host/install identity、source/installation receipt 和具体 bytes；不能把不同时间点的观察互相当作当前环境保证。
 
+### Owner-approved discovery and handoff delivery (2026-09-23)
+
+本轮为纯规格/任务记录修改，交付路径为直接提交 `main`，不开实现 PR；后续代码、持久化和运行时接线仍走各实现票的 feature 分支 + PR。该设计已获 owner 确认，不宣称独立终审或 runtime PASS。复用现有契约和任务票，不创建第二份 map 或新全局记忆库；历史 course-source map/migration manifest 保持原样。
+
+| 实施票 | 本轮补齐的责任 | 验收边界 |
+|---|---|---|
+| [T10 / #10](https://github.com/qsgy-edge/euler/issues/10) | 默认局部及显式任务级跨项目只读检索、目标环境、覆盖说明 | 合成库独立检索；不要求真实模型或报告生成 |
+| [T11 / #11](https://github.com/qsgy-edge/euler/issues/11) | 获准来源/任务资料的发现与准确版本展开，重验引用权限 | 合成 source carrier；不冒充分析交付或真实 loop |
+| [T13 / #13](https://github.com/qsgy-edge/euler/issues/13) | 报告/普通 handoff 归档、项目 proposal、可独立理解的 Markdown 交接及可发现性 | 复用 source/proposal；依赖 T10/T11，无特定 Skill 依赖，无自动发布/实施 |
+| [T18 / #18](https://github.com/qsgy-edge/euler/issues/18) | 真实模型合成任务中的发现→分析→保存，以及换项目/新会话后的接续 | 依赖 T13 产物；旧分析授权不自动转移，不把换窗等同新会话 |
+| [T20 / #20](https://github.com/qsgy-edge/euler/issues/20)、[T22a / #22](https://github.com/qsgy-edge/euler/issues/22)、[T22b / #23](https://github.com/qsgy-edge/euler/issues/23) | 按实际启用路径覆盖报告/提案/摘录/发现引用及受控输出的备份、恢复、清除 | 延用 owner/fence/闭包，不新增产物管理框架 |
+| [T24 / #25](https://github.com/qsgy-edge/euler/issues/25) | 汇合上述实际组合证据 | 不承担遗漏实现，不以组件存在或文档定案签 PASS |
+
 ### 已定路径与迁移清单
 
-本节保留已完成迁移的历史清单和当时的四处 rewrite 规则，不是后续文档维护的限制。`migration-manifest.json` 的 target/README hashes 对应 Euler 检查点 `ef58c8ca39fe9ec2d95c215387afe162d40fda08`，应对该 commit 的 Git blob 校验，不与当前修订后的工作树比同。后续规范直接在 Euler 中同步修改相关 owner contract/验收，并用 Git diff/新提交追踪；不重签历史 manifest、不回写课程源，也不重新要求“只许四处转换”。本次修改仍是未提交的设计修订，不构成独立复验或 runtime PASS。
+本节保留已完成迁移的历史清单和当时的四处 rewrite 规则，不是后续文档维护的限制。`migration-manifest.json` 的 target/README hashes 对应 Euler 检查点 `ef58c8ca39fe9ec2d95c215387afe162d40fda08`，应对该 commit 的 Git blob 校验，不与当前修订后的工作树比同。后续规范直接在 Euler 中同步修改相关 owner contract/验收，并用 Git diff/新提交追踪；不重签历史 manifest、不回写课程源，也不重新要求“只许四处转换”。后续设计修订以各自 Git 提交定位，提交本身不构成独立复验或 runtime PASS。
 
 产品仓库为独立 private `qsgy-edge/euler`；Windows 主开发副本 `D:\GithubRepositories\Agent\euler`。生成本规格时，课程仓库无 remote，不能编造可访问的 GitHub blob URL 或在本次授权之外发布整个课程仓库；原始完整轨迹留在当前本地 Git 检查点。
 

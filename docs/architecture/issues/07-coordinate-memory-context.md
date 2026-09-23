@@ -35,7 +35,7 @@ Blocked by: 02, 04, 05, 06
 
 首次切片由自研 CLI 的真实 Host 输入建立本机 owner/store identity，显式创建或选择 logical project，再绑定经过实际资源检查的 root；路径只是绑定资源，不自动产生 project/workspace。选择 provider route 和凭据引用后先做合成探针，未通过真实数据门禁前使用 disposable store。持久保存原始用户输入后，Core 才建立最小 intent；不增加 onboarding 服务或通用任务框架。
 
-没有 project 绑定时允许不读取项目的 session-local 问答、绑定操作及诊断；不读取其他 project memory、不把 unresolved candidate 晋升到 durable scope。Host 应展示缺少的具体输入和绑定入口，而不是无限返回 needs-input。用户改目标时保存真实输入并 CAS transition；目标/约束文本是有来源的工作状态，不是可以由代码证明所有自然语言行动对齐的权限系统。权限由显式 scope/capability/approval 字段约束，语义歧义只暂停受影响操作，允许澄清。P0 提供空库→绑定→intent 的正常 fixture，P2/P3 验真实闭环。
+没有 project 绑定且没有有效任务级只读发现授权时，允许不读取项目的 session-local 问答、绑定操作及诊断，不读取其他 project memory；显式跨项目分析可按 [09 的只读发现契约](09-assemble-context-safely.md#cross-project-discovery) 从已登记且获准读取的目标建立任务，不依赖 cwd，也不授予资源操作权限。两种路径都不把 unresolved candidate 晋升到 durable scope。Host 应展示缺少的具体输入和绑定入口，而不是无限返回 needs-input。用户改目标时保存真实输入并 CAS transition；目标/约束文本是有来源的工作状态，不是可以由代码证明所有自然语言行动对齐的权限系统。权限由显式 scope/capability/approval 字段约束，语义歧义只暂停受影响操作，允许澄清。P0 提供空库→绑定→intent 的正常 fixture，P2/P3 验真实闭环。
 
 ## Decisions — Budget, compaction and writeback
 
@@ -55,7 +55,7 @@ Blocked by: 02, 04, 05, 06
 
 11. Memory Retriever 保持为本地、确定性、可单独测试的 retrieval primitive：先按 logical project/workspace/personal、`applies_to`、lifecycle 与 verification 做硬过滤，v1 再对当前请求 + active intent 执行 FTS/BM25 lexical 召回与分 lane 的简单融合、claim 去重和 token-budget admission。Dense semantic 是有可复现漏召回并实验胜出后的扩展，不是 v1 必做项；scope 更窄、类型固定或时间更新都不构成万能排序优先级。
 12. 快路径不调用额外 LLM，也不为凑固定 `top-k` 注入弱相关内容；`candidate/stale/conflicted` 默认不得作为事实进入正常 prompt，只有显式研究/核验流程才能带状态标签返回。最小 v1 可先落 metadata filter + FTS/BM25，在出现可复现的语义漏召回后接入向量检索；接口从一开始允许融合多路候选，但不预设向量数据库、固定融合公式或 LLM reranker。
-13. Agentic RAG 属主 Agent 的按需慢路径，不是另建 RAG Agent：首轮无强相关命中、证据冲突/过期、多跳关系、跨 scope、需要原话/版本/出处，或主 Agent 在正常调用中判断证据不足时，才通过 `memory.search`、provenance traversal、`source.expand` 等工具改写查询并迭代检索。这样智能体化能力复用现有主 Agent ReAct 循环，同时维持单一 Orchestrator、一次普通快路径调用和可审计的检索底座。
+13. Agentic RAG 属主 Agent 的按需慢路径，不是另建 RAG Agent：首轮无强相关命中、证据冲突/过期、多跳关系、跨 scope、需要原话/版本/出处，或主 Agent 在正常调用中判断证据不足时，才通过 `memory.search`、provenance traversal、`source.expand` 等工具改写查询并迭代检索。这样智能体化能力复用现有主 Agent ReAct 循环，同时维持单一 Orchestrator、一次普通快路径调用和可审计的检索底座。证据不足本身不授权全局查询；跨项目只读范围必须由 09 的显式任务授权建立，并在任务内复用、结束或撤销后失效。报告/提案属于按需读取的任务产物，其归档与交接按 10，不由 Retriever 自动转成 durable memory。
 
 ## Decisions — Source Recovery
 

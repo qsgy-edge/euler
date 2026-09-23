@@ -14,16 +14,26 @@ Resolution scope: Status: resolved 仅表示设计裁决已定案；11/12/13 定
 1. 不把相关性、权威、时效与可信度压成一个可互相补偿的万能加权分数。Memory Retriever 先以 logical scope、`applies_to`、lifecycle/verification、temporal validity 和 source integrity 做硬准入；未通过权威或验证门禁的对象不能靠高语义相似度进入正常上下文。
 2. Eligible set 内以当前用户请求 + active intent 做 v1 FTS/BM25 lexical 召回，并在确有多 lane 时用 RRF 等简单、可复算方法融合排名；不建 embedding/dense semantic 路径，后续只有可复现漏召回和实验胜出才增加。融合分只表示检索相关性，不获得真值或指令权威。随后按规范 claim、subject/resource、适用环境和有效时间归一去重，只保留该语义单元的 current eligible version。
 3. 最终选择在 Orchestrator 的动态 token 预算内优先覆盖当前任务的不同问题子项，避免近重复结果占满窗口；不为“多样性”维护万能 MMR 权重，不设固定 top-k，也不注入弱相关内容。没有强相关 eligible memory 时返回空，由主 Agent 决定是否进入 Agentic RAG 慢路径。
-4. 多项目会话每轮维护由 active intent/task、实际 resource owner、manifest 与工具路径共同验证的 `active_project_set`；默认只含 `primary_project`，workspace/personal 中适用对象正常参与。`affected_project_ids` 只记录本会话曾触碰的项目，不自动扩大本轮检索。明确跨项目任务才加入所需项目，返回结果保留 project 标签且不跨项目折叠 claim；项目身份仍未确定时只使用 session-local context。
+4. 多项目会话每轮维护由 active intent/task、实际 resource owner、manifest 与工具路径共同验证的 `active_project_set`；默认只含 `primary_project`，workspace/personal 中适用对象正常参与。`affected_project_ids` 只记录本会话曾触碰的项目，不自动扩大本轮检索。明确跨项目操作任务才加入所需项目，返回结果保留 project 标签且不跨项目折叠 claim；项目身份仍未确定且没有下述有效只读发现授权时，只使用 session-local context。
+
+<a id="cross-project-discovery"></a>
+
+### Task-scoped cross-project discovery
+
+- 默认自动检索保持当前 active project 及适用 workspace/personal 的边界。用户明确要求跨项目分析时，Core 从已登记项目与本任务获准读取集合的交集解析只读发现范围；启动目录不决定该集合，也不要求用户维护项目关联表。没有当前目录的 project 绑定时，仍可凭真实 owner 输入和已登记目标建立此分析任务；未解析的目标不参与查询。未授权项目的名称、摘要和正文均不得通过搜索泄露。
+- 只读范围绑定既有 intent/task 的版本与授权来源，任务内允许连续查询和证据展开，不逐次重新批准。每次检索、展开与后续装配重验权限；撤销、任务结束或切换到另一任务后恢复局部范围，旧 cursor/ref 不延续授权。重启或换窗只有在同一任务及授权仍可核验时才能继续，不能从报告或历史批准文字重建权限。只读发现使用的读取集合不扩大 `active_project_set`，不会加载其他项目 guidance；文件修改、发布、外部分享及跨 scope memory 晋升仍须各自的有效授权。
+- 适用条件按被分析项目和目标 agent/platform/component 判断，不能用发起查询的宿主平台替代目标环境。环境未明确时，可返回带“适用性待核验”标签的有界参考；这不改变 memory 的 lifecycle/verification，不作为当前项目事实自动注入。已知不适用的对象不作为该目标的可用结论；owner、来源完整性、隐私与验证门禁仍不可放宽。
+- 复用主 Agent 的正常工具循环和本地检索：按能力/需求改写查询，先返回有界候选与来源，再按需展开。保留 project、环境、版本/时间及证据标签，不跨项目合并同名 claim；没有强相关结果允许空，不新建全局记忆库、常驻分析 Agent、额外 router/reranker 或默认向量索引。检索命中和分析建议均不自动写入 active memory。
+- 返回本次允许披露的查询范围、实际覆盖、未覆盖/不可用部分和截断/继续入口；“这些项目已查询”不等于“其全部历史已分析”。超预算、索引缺口或访问失败必须可见，分页/继续仍受同一任务累计预算和当前权限限制。报告/提案的保存及项目交接按 [10 的任务产物契约](10-choose-storage-projections.md#analysis-handoff-artifacts)，不以扩大 memory 资格代替产物发现。
 
 ## Decisions — Scope overview as a derived projection
 
 本节是独立后续 scope-review 切片启用时的语义，不要求首次切片生成 overview。正文在 SQLite 派生投影表中与 refs/generation/cursor 事务提交；物理协议以 10 的 Scope-review projection contract 为准，不再使用文件发布/pin/同 hash repair。未启用时 canonical retrieval 与 source recovery 正常可用。
 
-4a. 跨会话整体分析按 logical scope 运行，不把所有项目合成一个全局检索池。`scope_overview` 只作为 Context Orchestrator 可选的有界 baseline/projection：它记录当前 scope 的 verified/active 决策、适用约束、重大变化、未决问题和 evidence-gap，并携带覆盖 input watermark、逐条 input identity、claim→source/memory ref、content hash 与可重建状态；它没有 memory、instruction、policy、权限或批准权威。project→workspace/personal 只允许通过显式 membership/`derived_from`，不按相似 claim 或模型自报 scope 扩大。
+4a. 后台跨会话 scope review 按 logical scope 运行，不把所有项目合成一个默认全局检索池；上节的显式任务级只读发现不依赖该后续设施。`scope_overview` 只作为 Context Orchestrator 可选的有界 baseline/projection：它记录当前 scope 的 verified/active 决策、适用约束、重大变化、未决问题和 evidence-gap，并携带覆盖 input watermark、逐条 input identity、claim→source/memory ref、content hash 与可重建状态；它没有 memory、instruction、policy、权限或批准权威。project→workspace/personal 只允许通过显式 membership/`derived_from`，不按相似 claim 或模型自报 scope 扩大。
 4b. project/source/head/关系变化或 membership/权限撤回时，Core 通过类型化 artifact-input 反向依赖使直接及更宽 scope 的 overview stale；Orchestrator 注入前重验当前 head、scope、lifecycle、verification、source version 和覆盖水位。当前请求仍先走 canonical retrieval，只有项目全貌/规划、跨主题关系或局部 evidence-gap 需要时才读取适用 overview；任何依赖闭包、purge、cursor gap 或 verifier 状态无法证明时，只返回状态标记或触发局部 review/source recovery，不把旧 overview 当事实注入。
 
-5. Candidate/rejected/tombstoned 对象不进入正常上下文；superseded 历史仅在明确历史查询中返回。Relevant claim 若 stale/conflicted，不把任何一方正文当事实注入，但在它确实影响当前请求时加入有界 `memory_status` marker，包含规范 claim key、状态、conflict/source reference 与建议的复验动作，避免模型把“被安全过滤”误解为“没有相关知识”。主 Agent 可据此进入慢路径；研究模式才展开带状态标签的双方/旧版本。安全或权限冲突由 Control Plane 直接阻断，不能只靠 marker 提醒模型。
+5. Memory candidate/rejected/tombstoned 对象不进入正常上下文；superseded 历史仅在明确历史查询中返回。Relevant claim 若 stale/conflicted，不把任何一方正文当事实注入，但在它确实影响当前请求时加入有界 `memory_status` marker，包含规范 claim key、状态、conflict/source reference 与建议的复验动作，避免模型把“被安全过滤”误解为“没有相关知识”。主 Agent 可据此进入慢路径；研究模式才展开带状态标签的双方/旧版本。安全或权限冲突由 Control Plane 直接阻断，不能只靠 marker 提醒模型。
 6. Memory/source 的安全边界是语义隔离加模型外能力门禁，而不是字符串过滤或 XML/Markdown 本身。P0 固定 policy 声明这些块只是数据；active policy artifact 只从独立 instruction channel 加载。Memory 用结构化 envelope 携带 type/scope/state/provenance，raw source excerpt 明确标为 untrusted 并附 immutable locator/hash；不得通过关键词删除或改写原文，否则既破坏证据完整性也防不住注入变体。
 7. Preference/decision memory 只表示 owner 曾表达的偏好或决定，可以为推理提供数据，但不能授予权限、扩大 scope、改写 tool schema、路径/网络/凭据能力或审批状态；需要强制执行时必须另行发布 policy artifact。所有副作用由 Harness 在模型外重新检查当前 user intent、active policy、capability 与目标资源，记忆文本和 source 内容均无权绕过。
 8. 远端模型供应商响应中的正文和元数据全部按不可信 source data 处理；返回的 system/developer/tool 等字段不映射为 Harness 指令，只保留协议白名单字段、执行长度上限与内容 hash/调用链核验。Provider adapter 可以选择最低非指令数据表示，但不能因 API 角色限制把 retrieval 内容提升为 policy 权威。

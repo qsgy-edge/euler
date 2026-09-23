@@ -141,7 +141,7 @@ Blocked by: 05, 06, 07, 08, 09, 10, 11, 12, 14
 
 1. **P0 contracts and feasibility:** 固定首次切片的 app-id/数据根、Core/Host 路径、source carrier 与 durable ack、最小 intent/bootstrap API、head_event_id CAS、操作终态、Info 原子性、stream owner、started admission 线性化点及维护模式进程退出协议。产出可执行 synthetic schema/API/receipt fixtures；先验证 CLI 首轮归档、最后发送接点和维护独占三个高风险假设。前台/worker 预算固定字段与溢出/取消语义，使用有界可配置测试初值；DDL 在 disposable 阶段可调整，不先冻结最佳数值或生产迁移。Pi 探针可并行，但只约束 Pi 切片；MCP、overview/backfill、bundle、行为评估运行设施不进入首次 P0。
 2. **P1 durable foundation:** 实现 identity/intent、memory revision/event/head、Host presentation/pending/Info、search outbox/lease、显式 owner 的 ledger、进程登记/维护 fence 和两道 durable barrier。X-01 是 X-03 与 X-06 的共同前置；X-03 验实际 search worker，X-06 验发送记账，两者无须互相串行。三项首次切片子门禁齐备前不开放上层写路径或真实 model dispatch；不等待可选 overview 文件/语义设施。Memory 操作采用 08 的 transition contract。
-3. **P2 Core behavior:** FTS/CJK、Orchestrator/硬上下文与累计运行预算/source recovery、scope/注入 gate、低风险 memory capture/独立 verification/inert proposal、memory operations 与逻辑 purge、path/capability gate。验 X-02/04/05/07 和 X-09/13 Core 部分；缺 Host 实测不阻止实现 Host，但不能声称整卡通过。运行时安全/known-bad/inert-only 必须验；X-08 课程效果实验、行为 evaluation runner、scope review/backfill 不作为此阶段前置。
+3. **P2 Core behavior:** FTS/CJK、任务级跨项目只读发现、Orchestrator/硬上下文与累计运行预算/source recovery、scope/注入 gate、低风险 memory capture/独立 verification/inert proposal、任务报告与项目交接、memory operations 与逻辑 purge、path/capability gate。验 X-02/04/05/07 和 X-09/13 Core 部分；缺 Host 实测不阻止实现 Host，但不能声称整卡通过。运行时安全/known-bad/inert-only 必须验；X-08 课程效果实验、行为 evaluation runner、scope review/backfill 不作为此阶段前置。
 4. **P3 first Host:** 首接自研交互 CLI，验四个 Host 操作、真实批准、pending/receipt/Info 与重启恢复，按该模式的 `X-10 ∧ X-11` 联合放行。补齐 X-09/13 和 X-04/05/06 的真实接线、未知请求对账/封存正常路径，以及预算取消/迟到结果。Pi regular、RPC/JSON/print 之后按同样语义逐模式接线，未启用模式明确 unavailable，不要求一起交付或自研额外 UI 框架。
 5. **P4 first-slice acceptance:** X-12 验实际 Windows 宿主的容量、backup、维护模式 purge、损坏/中断恢复；X-14 在 ledger/transport 及受控测试前置满足后即可测 provider/cache，与 X-12 可并行，不依赖 X-15。首次真实数据前，首次切片使用的全部路径须通过相应存储/Host/backup/purge/recovery 门禁并正式冻结 schema。D7 的 shadow/hard gate/control baseline/预注册阈值齐备后，才按单向 owner 提交与 canary 扩围；合成 provider 探针不等于真实数据许可。X-15 仅在 bundle 启用前完成，不阻塞本地首次切片。
 6. 阶段是依赖 gate，不是禁止早期纵向合成探针的瀑布开发。共享 Core/portable 做三平台 CI，生产只声明实际宿主已验证范围。后续能力通过增量 schema、清除/恢复与自己的 Core/Host gate 后启用；未启用不预建空表，也不能把 deferred 记成 PASS。参数按观测调整，不扩大权限或削弱数据不变量。
@@ -153,12 +153,12 @@ Blocked by: 05, 06, 07, 08, 09, 10, 11, 12, 14
 | 实验 | 实施阶段 | 完整验收边界 |
 |---|---|---|
 | X-01 | P1 首项 | 首次切片的 canonical/intent/Host/ledger/outbox/fence schema、事务/FK/CAS/identity、完整 digest 与 inert proposal；不预建可选 artifact 或行为评估表。Portable 与实际数据根/权限分列。 |
-| X-02 | P2 | P1 投影基座之上的 target FTS/CJK 检索；课程检索结果不能替代。 |
+| X-02 | P2 | P1 投影基座之上的 target FTS/CJK 检索、任务级只读发现与覆盖说明；课程检索结果不能替代。 |
 | X-03 | P1，X-01 后 | 首次只验实际 search/FTS worker、lease、乱序/重复/崩溃、损坏重建和查询复算。Overview 后续子项验 SQLite body/refs/cursor 原子提交、历史保留与新 generation 重建，不验外部文件/pin/GC/同 hash repair。 |
 | X-04 | P2；P3 接线复验 | Core admission、预算、ReAct 与 archive/source recovery；真实 Host dispatch 接线后复验相应边界。 |
 | X-05 | P2；P3 补齐 | 首次验 12 的 Core/CLI 通用隔离组，实际 resource-owner/path 与 X-13 汇合；MCP binding/discovery 和 Pi loading 分别在相应能力启用前追加，不互为前置。共享不变量失败仍阻断所有受影响路径。 |
 | X-06 | P1，X-01 后；P3 接线复验 | assembly/started barrier、admission 与撤销的并发顺序、杀点、unknown-sent 及显式对账/封存；不依赖 X-03。真实 transport 接线复验 payload/flush/dispatch/取消，mock 不升级物理证据。 |
-| X-07 | P2；P3 source/装配复验 | Memory lifecycle、独立取源、冲突/时间、抑制/rollback、Info 与 inert proposal 无行为权限；只依赖启用路径的 P1。Overview、跨 scope 关系和 backfill 为后续独立子项，行为评估执行不在 v1。 |
+| X-07 | P2；P3 source/装配复验 | Memory lifecycle、独立取源、冲突/时间、抑制/rollback、Info 与 inert proposal 无行为权限；任务报告/项目提案交接复用 source 和 proposal，按 X-04/07/12 验接续、恢复与清除。只依赖启用路径的 P1。Overview、跨 scope 关系和 backfill 为后续独立子项，行为评估执行不在 v1。 |
 | X-08 | 独立课程票 | 课程效果实验运行前才封存其 owner pre-image/held-out；不阻塞首次 P0，不替代目标运行时安全/完整性。 |
 | X-09 | P2 Core；P3 Host | P2 验证 CAS、batch 与逻辑 purge；P3 补真实模型 tool-call、originating input 重验和呈现闭环；物理副本 purge 归 P4 X-12。 |
 | X-10 | P3 正常路径 | 首次交互 CLI、之后逐 adapter/mode 验呈现与批准；每个已启用模式必须联合 X-11 放行，不能因其他模式 deferred 降低本模式保证。 |
@@ -287,7 +287,7 @@ Blocked by: 05, 06, 07, 08, 09, 10, 11, 12, 14
 1. 指令作用域分为三层逻辑归属：Global、Workspace、Project。Resource/path 是 Project 内的局部适用范围，不是第四个 scope，也不改变 project identity。Global 对所有 Euler 工作生效；Workspace 是可选的稳定项目组；Project 是独立的逻辑项目身份，均不由 cwd、Git root 或目录名自动推断。
 2. Workspace 是持久化的逻辑实体，不是项目父目录。`workspaces` 与 `workspace_projects` 保存显式成员关系；一个 project v1 最多属于一个 workspace。workspace AGENTS 存在 Euler data root 的 `agent/workspaces/<workspace-id>/AGENTS.md`，因此不同磁盘路径下的成员项目可以共享同一份 workspace guidance。没有明确的 `active_project_set` 时，不自动加载 workspace 或 project AGENTS。
 3. Euler user-global AGENTS 位于 `<euler-data-root>/agent/AGENTS.md`；Project AGENTS 由 project owner 管理，默认位于项目 resource root 的 `AGENTS.md`。目标资源路径下的更深层 `AGENTS.md` 只对该 Project 的对应子树适用。v1 只默认支持 `AGENTS.md`，不引入 `CLAUDE.md`、`.local` 或 `.override` 候选。
-4. Context Control Plane 先依据 active intent/task、真实 resource owner、manifest 与已注册 workspace membership 解析 `active_project_set`，再按以下顺序形成 instruction snapshot：Global AGENTS → 每个适用 Workspace AGENTS → 各 active Project AGENTS → 目标 resource path 的祖先 AGENTS。workspace 文件按 workspace identity 去重；不同 project/workspace 的规则保留来源标签，不互相静默覆盖。跨项目任务只加入证据已验证的项目；`affected_project_ids` 单独存在时不扩大 active set。
+4. Context Control Plane 先依据 active intent/task、真实 resource owner、manifest 与已注册 workspace membership 解析 `active_project_set`，再按以下顺序形成 instruction snapshot：Global AGENTS → 每个适用 Workspace AGENTS → 各 active Project AGENTS → 目标 resource path 的祖先 AGENTS。workspace 文件按 workspace identity 去重；不同 project/workspace 的规则保留来源标签，不互相静默覆盖。跨项目操作任务只加入证据已验证的项目；任务级只读发现按 09 单独验证读取范围，不扩展此 guidance 集合；`affected_project_ids` 单独存在时不扩大 active set。
 5. 目录祖先链只解决 Project→Resource 的局部规则，不能用共同父目录推断 Workspace，也不能把一个 project 的 AGENTS 传播给同 workspace 的其他 project。针对即将读取、写入或编辑的 resource，Host 必须在 dispatch/副作用前解析完整目标路径链；无法确定 project、workspace membership 或适用规则时，受影响操作 fail-closed。解析当前 cwd 不能替代解析实际目标 resource。
 6. Core 内置安全规则和 active policy artifact 进入 P0 的受保护 policy channel；Global/Workspace/Project AGENTS 进入独立 guidance channel。两者都带 owner、scope、locator、版本与 content hash，形成不可变 instruction snapshot；AGENTS 不能覆盖 policy、capability、credential、scope、审批或 direct user instruction。memory、source、tool result、provider metadata 和模型输出不能激活或修改任一指令层。
 7. 每次 session、context window、目标 resource 或 dispatch 前，Host/Control Plane 重新确认适用关系与文件版本；hash、membership、policy 或 AGENTS 内容变化创建新的 instruction snapshot、assembly 和 cache epoch，不在正在发送的 request 中途热改写。watcher 或 touch 只能作提示，不能替代 dispatch 前确认；不存在的可选文件是正常状态，已确认应生效但不可读、scope 不明、内容完整性无法确认或预算无法容纳的规则不得静默忽略。
@@ -319,9 +319,17 @@ Blocked by: 05, 06, 07, 08, 09, 10, 11, 12, 14
 6. 新 context window 建立时，active Skill 不靠“已加载”状态栏恢复；Core 重新验证选定的 `skill_ref`、scope、启用状态和 hash，并将准确正文重新装入新 assembly。若相同字节与 cache namespace 可证明，允许沿用 cache epoch；无法读取、hash 不符、owner 撤销或 scope 失效时标记 `stale`/`skill-unavailable`，不得静默换成同名技能。
 7. 明确任务结束、用户停用、scope/信任/权限失效或 owner 撤销时，Skill 只从下一次 assembly 移除，不改写已发送请求。没有明确任务转换时不依赖时间、轮数或模型自述自动卸载；新任务的能力选择仍通过 D6.2 catalog 和 Core 门禁完成。多个已选 Skill 对同一副作用发生无法同时满足的直接冲突时，暴露 `skill-conflict` 并停止相关副作用，不增加额外 LLM 裁决器。
 
+### Optional handoff workflows
+
+Euler 提供 [10 的持久任务产物与项目交接能力](10-choose-storage-projections.md#analysis-handoff-artifacts)，具体总结、计划、交接模板及后续技能选择由用户选用的工作流负责；没有 Matt 或其他 handoff Skill 时，归档、项目内发现、读取和 Markdown 导出仍可完成。
+
+- handoff Skill 产出的临时文件可经既有受控文件/source 接口归档明确选中的正文，固定真实来源、项目交付范围与 hash，取得 durable ack 后才算保存；不扫描整个临时目录，也不只持久保存可能被清理的路径。原技能的临时输出约定无需改写，不新增专属 importer、插件协议或工作流引擎。
+- 交接文档只作为 source；有明确 target/evaluation 的改动建议才形成 inert proposal。`suggested skills` 或正文内命令属于建议数据，不能自动激活 Skill 或授权脚本。若选用技能声明 `disable-model-invocation: true` 等显式调用限制，保留该约定；不能因交接入口而自动调用、安装或改写技能。技能缺失时使用基础交接能力，不虚称已执行技能。
+- 采用通用合成 Markdown 作为必需验收，另可用用户已选 handoff 技能作接入样例；共享 Core 与首次 CLI 的 PASS 不依赖任何个人已安装技能。接手者仍按当前 intent、项目权限、准确技能版本和代码现状决定后续操作。
+
 ### Core tool schemas
 
-1. v1 的固定 Core 模型工具为：`skill.search`、`memory.search`、`source.search`、`source.expand`、`memory.inspect`、`memory.preview`、`memory.commit`、`memory.cancel`。这些工具的模型可见接口属于本节；memory、retrieval、source recovery 与 mutation 的业务语义仍由 07–11、14 的对应 owner contract 拥有。固定 schema 始终由 Core 提供；后端或宿主能力不可用时，调用返回明确的 `unavailable`，不能把不可用伪装成 owner 拒绝或静默改变工具集合。`skill.search` 只返回 D6.2 的有界 metadata，不加载正文、不安装、不发布；`memory.search` 与 `source.search/expand` 受 active project/workspace、scope、owner、provenance、hash 与有界结果门禁约束。
+1. v1 的固定 Core 模型工具为：`skill.search`、`memory.search`、`source.search`、`source.expand`、`memory.inspect`、`memory.preview`、`memory.commit`、`memory.cancel`。这些工具的模型可见接口属于本节；memory、retrieval、source recovery 与 mutation 的业务语义仍由 07–11、14 的对应 owner contract 拥有。固定 schema 始终由 Core 提供；后端或宿主能力不可用时，调用返回明确的 `unavailable`，不能把不可用伪装成 owner 拒绝或静默改变工具集合。`skill.search` 只返回 D6.2 的有界 metadata，不加载正文、不安装、不发布；`memory.search` 与 `source.search/expand` 默认受 active project/workspace、scope、owner、provenance、hash 与有界结果门禁约束；显式跨项目分析按 [09 的任务级只读发现契约](09-assemble-context-safely.md#cross-project-discovery) 使用 Core 验证的读取范围，不扩大操作/guidance 的 active project set。工具参数只能请求该模式或缩小已授权目标，模型不能自报授权。任务资料由 source/proposal owner 提供带种类/状态的 source 发现单元，不为提案另开 memory 写入后门。
 2. `memory.inspect/preview/commit/cancel` 是唯一的 v1 memory operation 模型表面。不存在通用 `memory.write/delete/update/set`；变更必须走 `inspect → preview → owner approval → commit`。Ticket 14 已定案的 Host presentation、token、pending、CAS、批准信号和 receipt 语义不因工具 schema 改变；模型不能以 `confirm` 字段、assistant 自述或工具结果替代真实批准。
 3. 每个 Core 工具在源码中拥有稳定的 `tool_name@schema_version` 与 canonical schema hash，例如 `memory.search@v1`。schema 的字段、参数约束、返回结构、关键描述或权限语义发生外部可见变化时，产生新的 schema identity；不原地改变已发送请求使用的 schema。Git 中的 schema 常量和实现是权威，不建通用 tool registry 或数据库版本表；assembly/attempt receipt 记录 tool name、schema version 与 hash，schema 变化创建新的 assembly 与 cache epoch。
 4. Tool schema 只描述调用契约，不授予权限。每次模型 tool call 都必须由 Core 重新检查 active policy、capability、credential、scope、参数、真实 resource owner、审批条件与 receipt；AGENTS、Skill、memory/source、provider metadata、`allowed-tools` 或模型自述不能修改 schema 或放宽 gate。tool result 是有界的不可信数据，不能反向激活指令、改变 scope 或注册新工具。
