@@ -161,6 +161,23 @@ test('numeric terms gate near neighbors before normal result admission', () => {
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('a number bound to identifiers on both sides rejects an interrupted phrase', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const ids = ['foo 2026 bar', 'foo 2026 unrelated bar', 'foo unrelated 2026 bar'].map(content => {
+      const source = probe.archive.append(randomUUID(), `Evidence: ${content}`);
+      const captured = probe.store.captureMemory(probe.activity, source, content, {
+        type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+      }).record;
+      const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
+      return probe.store.activateMemory(probe.activity, verified.recordId, verified).record.recordId;
+    });
+    probe.store.drainSearchProjection(probe.activity);
+    assert.deepEqual(probe.store.searchMemories(probe.activity, { query: 'foo 2026 bar' }).results.map(hit => hit.unitId), [ids[0]]);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('overlapping current validity windows share one claim result slot', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);
@@ -280,6 +297,25 @@ test('equivalent applicability syntax deduplicates the same current claim and ta
     const page = probe.store.searchMemories(probe.activity, { query: 'Socket', target: { agent: 'cli', platform: 'linux' } });
     assert.equal(page.status, 'ready');
     assert.equal(page.results.length, 1);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('numeric identifiers require both neighboring query terms', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const entries = ['foo 2026 unrelated bar', 'foo 2026 bar', 'foo unrelated 2026 bar'];
+    const ids = entries.map(content => {
+      const source = probe.archive.append(randomUUID(), `Evidence: ${content}`);
+      const captured = probe.store.captureMemory(probe.activity, source, content, {
+        type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+      }).record;
+      const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
+      return probe.store.activateMemory(probe.activity, verified.recordId, verified).record.recordId;
+    });
+    probe.store.drainSearchProjection(probe.activity);
+    const page = probe.store.searchMemories(probe.activity, { query: 'foo 2026 bar' });
+    assert.deepEqual(page.results.map(item => item.unitId), [ids[1]]);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 

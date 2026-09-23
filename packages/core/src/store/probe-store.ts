@@ -2957,11 +2957,11 @@ function numericContextMatches(groups: { text: string; kind: 'han' | 'latin' }[]
     if (!words.includes(group.text)) return false;
     const previous = groups[index - 1];
     const next = groups[index + 1];
-    if (previous?.kind === 'latin' && !/\p{N}/u.test(previous.text)) {
-      return words.some((word, position) => word === previous.text && words[position + 1] === group.text);
-    }
-    if (next?.kind === 'latin' && !/\p{N}/u.test(next.text)) {
-      return words.some((word, position) => word === group.text && words[position + 1] === next.text);
+    const left = previous?.kind === 'latin' && !/\p{N}/u.test(previous.text) ? previous.text : null;
+    const right = next?.kind === 'latin' && !/\p{N}/u.test(next.text) ? next.text : null;
+    if (left || right) {
+      return words.some((word, position) => word === group.text
+        && (!left || words[position - 1] === left) && (!right || words[position + 1] === right));
     }
     return true;
   });
