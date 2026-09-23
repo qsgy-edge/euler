@@ -41,7 +41,7 @@ export interface HostAdapter {
   source: {
     append(eventId: string, text: string): SourceAck;
     lookup(eventId: string): SourceAck | null;
-    read(ref: SourceAck): { text: string };
+    read(ref: SourceAck): { text: string; role?: 'user' | 'assistant' | 'tool' };
     expand(ref: SourceAck, offset: number, limit: number): SourceExcerpt;
   };
   transport: {

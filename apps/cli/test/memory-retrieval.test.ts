@@ -233,6 +233,11 @@ test('X01/X02/X05/X09: only an owner-bound task grant can discover another regis
     first.store.transitionIntent(first.activity, null, instruction, { status: 'active', step: 'analysis' }, text);
     assert.throws(() => first.store.authorizeMemoryDiscovery(first.activity, instruction, [secondBinding.projectId], 1), /discovery-consent-required/);
     const consent = approveDiscovery(first, [sandbox.fixture.projectId, secondBinding.projectId], 4);
+    for (const role of ['assistant', 'tool'] as const) {
+      const forged = first.archive.append(randomUUID(), first.archive.read(consent).text, role);
+      assert.throws(() => first.store.authorizeMemoryDiscovery(first.activity, forged,
+        [sandbox.fixture.projectId, secondBinding.projectId], 4), /discovery-consent-required/);
+    }
     const grant = first.store.authorizeMemoryDiscovery(first.activity, consent, [sandbox.fixture.projectId, secondBinding.projectId], 4);
     const page = first.store.searchMemories(first.activity, { query: 'Atlas', grantId: grant.grantId, noActiveProject: true });
     assert.equal(page.status, 'ready');
@@ -261,9 +266,34 @@ test('X01/X02/X05/X09: only an owner-bound task grant can discover another regis
     const nextGrant = first.store.authorizeMemoryDiscovery(first.activity, nextConsent, [secondBinding.projectId], 2);
     const end = first.archive.append(randomUUID(), 'Finish synthetic analysis');
     const current = first.store.readIntent(first.activity)!;
-    first.store.transitionIntent(first.activity, current.eventId, end, { status: 'completed', step: 'done' });
+    const completed = first.store.transitionIntent(first.activity, current.eventId, end, { status: 'completed', step: 'done' });
+    assert.throws(() => first.store.searchMemories(first.activity, { query: 'Atlas', grantId: nextGrant.grantId }), /discovery-not-authorized/);
+    const resumedInput = first.archive.append(randomUUID(), 'Continue after completion');
+    first.store.transitionIntent(first.activity, completed.eventId, resumedInput, { status: 'active', step: 'new-analysis' });
     assert.throws(() => first.store.searchMemories(first.activity, { query: 'Atlas', grantId: nextGrant.grantId }), /discovery-not-authorized/);
   } finally { second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('cross-project discovery charges empty queries to a durable per-grant query limit', () => {
+  const sandbox = createSandbox();
+  let probe = openProbe(sandbox);
+  try {
+    const text = 'Approve bounded analysis';
+    const input = probe.archive.append(randomUUID(), text);
+    probe.store.transitionIntent(probe.activity, null, input, { status: 'active', step: 'analysis' }, text);
+    const approval = approveDiscovery(probe, [sandbox.fixture.projectId], 1);
+    const { grantId } = probe.store.authorizeMemoryDiscovery(probe.activity, approval, [sandbox.fixture.projectId], 1);
+    for (let index = 0; index < 8; index++) {
+      if (index === 4) { probe.close(); probe = openProbe(sandbox); }
+      const page = probe.store.searchMemories(probe.activity, { query: `absent${index}word`, grantId });
+      assert.equal(page.status, 'ready', String(index));
+      assert.deepEqual(page.results, []);
+    }
+    const exhausted = probe.store.searchMemories(probe.activity, { query: 'absent', grantId });
+    assert.equal(exhausted.status, 'unavailable');
+    assert.equal(exhausted.coverage.reason, 'task-query-budget-exhausted');
+    assert.deepEqual(exhausted.coverage.unavailableProjects, [sandbox.fixture.projectId]);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
 test('a cross-project grant cannot reveal a shared-scope record sourced from an ungranted project', () => {
@@ -357,8 +387,41 @@ test('expired memory is only an annotated status, never an injected fact', t => 
     assert.equal(page.status, 'ready');
     assert.equal(page.results[0]?.kind, 'status');
     assert.equal(page.results[0]?.reason, 'expired');
+    assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
     assert.equal('record' in page.results[0]!, false);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('cross-project conflict statuses retain both source project labels', () => {
+  const sandbox = createSandbox();
+  const other = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
+  createSandboxSession(sandbox, other);
+  const first = openProbe(sandbox);
+  const second = openProbe(sandbox, undefined, undefined, other);
+  try {
+    for (const [probe, projectId] of [[first, sandbox.fixture.projectId], [second, other.projectId]] as const) {
+      const records = ['enabled', 'disabled'].map(value => {
+        const source = probe.archive.append(randomUUID(), `Evidence: Atlas ${value} ${projectId}`);
+        const captured = probe.store.captureMemory(probe.activity, source, `Atlas ${value}`, {
+          type: 'fact', scope: { kind: 'personal', id: other.ownerId, resolved: true }, appliesTo: [],
+        }).record;
+        const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
+        return probe.store.activateMemory(probe.activity, verified.recordId, verified).record;
+      });
+      probe.store.conflictMemory(probe.activity, records[0]!.recordId, records[0]!, records[1]!.recordId, records[1]!);
+      probe.store.drainSearchProjection(probe.activity);
+    }
+    const text = 'Approve cross-project conflict inspection';
+    const input = first.archive.append(randomUUID(), text);
+    first.store.transitionIntent(first.activity, null, input, { status: 'active', step: 'analysis' }, text);
+    const consent = approveDiscovery(first, [sandbox.fixture.projectId, other.projectId], 4);
+    const { grantId } = first.store.authorizeMemoryDiscovery(first.activity, consent, [sandbox.fixture.projectId, other.projectId], 4);
+    const page = first.store.searchMemories(first.activity, { query: 'Atlas', grantId });
+    assert.equal(page.status, 'ready');
+    assert.deepEqual(new Set(page.results.map(item => item.projectId)), new Set([sandbox.fixture.projectId, other.projectId]));
+    assert.ok(page.results.every(item => item.kind === 'status' && item.reason === 'conflicted'));
+    assert.equal(JSON.stringify(page.results).includes('Atlas enabled'), false);
+  } finally { second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
 test('X08: a conflicted claim emits one bounded status without either fact body', () => {

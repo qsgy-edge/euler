@@ -95,12 +95,12 @@ export class CliArchive {
     });
   }
 
-  read(ref: SourceAck): { text: string } {
+  read(ref: SourceAck): { text: string; role: RawEvent['role'] } {
     return this.#gate(() => {
       check(sameBinding(ref.binding, bindingOf(this.#sandbox)), 'source-scope-mismatch');
       const result = this.#scan().find(item => item.event.eventId === ref.eventId);
       check(result && JSON.stringify(result.ack) === JSON.stringify(ref), 'source-evidence-gap');
-      return { text: result.event.text };
+      return { text: result.event.text, role: result.event.role };
     });
   }
 

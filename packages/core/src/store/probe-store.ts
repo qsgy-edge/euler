@@ -271,7 +271,9 @@ CREATE TABLE memory_discovery_grants (
   max_results INTEGER NOT NULL CHECK(max_results>0 AND max_results<=128),
   used_results INTEGER NOT NULL DEFAULT 0 CHECK(used_results>=0 AND used_results<=max_results),
   max_bytes INTEGER NOT NULL CHECK(max_bytes>0 AND max_bytes<=1000000),
-  used_bytes INTEGER NOT NULL DEFAULT 0 CHECK(used_bytes>=0 AND used_bytes<=max_bytes)
+  used_bytes INTEGER NOT NULL DEFAULT 0 CHECK(used_bytes>=0 AND used_bytes<=max_bytes),
+  max_queries INTEGER NOT NULL CHECK(max_queries>0 AND max_queries<=128),
+  used_queries INTEGER NOT NULL DEFAULT 0 CHECK(used_queries>=0 AND used_queries<=max_queries)
 ) STRICT;
 CREATE TABLE memory_discovery_projects (
   grant_id TEXT NOT NULL REFERENCES memory_discovery_grants(grant_id), project_id TEXT NOT NULL REFERENCES projects(project_id),
@@ -524,12 +526,12 @@ export class ProbeStore {
   readonly #binding: Binding;
   readonly #resources: StoreResources;
   readonly #queryRequest: ((attempt: RequestAttempt) => RequestReconciliation) | undefined;
-  readonly #readSource: ((input: SourceAck) => { text: string }) | undefined;
+  readonly #readSource: ((input: SourceAck) => { text: string; role?: 'user' | 'assistant' | 'tool' }) | undefined;
   #depth = 0;
   #committingOperation: string | null = null;
 
   constructor(resources: StoreResources, storeId: string, binding: Binding, initialize = false,
-    readSource?: (input: SourceAck) => { text: string }, appId = 'euler', queryRequest?: (attempt: RequestAttempt) => RequestReconciliation) {
+    readSource?: (input: SourceAck) => { text: string; role?: 'user' | 'assistant' | 'tool' }, appId = 'euler', queryRequest?: (attempt: RequestAttempt) => RequestReconciliation) {
     this.#queryRequest = queryRequest;
     this.#readSource = readSource;
     this.#storeId = storeId;
@@ -630,8 +632,11 @@ export class ProbeStore {
       check(validDiscoveryTargets(targets, projectIds), 'invalid-discovery-target');
       const grantId = randomUUID();
       const payload = JSON.stringify(consent);
-      this.#db.prepare('INSERT INTO memory_discovery_grants VALUES (?,?,?,?,?,?,?, ?,0,?,0)')
-        .run(grantId, this.#binding.ownerId, this.#binding.sessionId, intent.intentId, payload, sha256(payload), 'active', maxResults, maxBytes);
+      this.#db.prepare(`INSERT INTO memory_discovery_grants
+        (grant_id,owner_id,session_id,intent_id,consent,consent_hash,state,max_results,max_bytes,max_queries)
+        VALUES (?,?,?,?,?,?,'active',?,?,?)`)
+        .run(grantId, this.#binding.ownerId, this.#binding.sessionId, intent.intentId, payload, sha256(payload),
+          maxResults, maxBytes, Math.min(128, Math.max(8, maxResults * 4)));
       for (const projectId of projectIds) this.#db.prepare('INSERT INTO memory_discovery_projects VALUES (?,?)').run(grantId, projectId);
       for (const [projectId, target] of Object.entries(targets)) this.#db.prepare('INSERT INTO memory_discovery_targets VALUES (?,?,?,?,?)')
         .run(grantId, projectId, target.agent ?? null, target.platform ?? null, target.component ?? null);
@@ -642,7 +647,9 @@ export class ProbeStore {
   #readDiscoveryApproval(consent: SourceAck, intent: Intent): MemoryDiscoveryApproval {
     check(sameBinding(consent?.binding, this.#binding) && consent.eventId !== intent.goalInput.eventId, 'discovery-consent-required');
     this.#validateSource(consent);
-    const text = this.#readSource!(consent).text;
+    const source = this.#readSource!(consent);
+    check(source.role === 'user', 'discovery-consent-required');
+    const text = source.text;
     check(Buffer.byteLength(text) <= 8192, 'discovery-consent-required');
     let approval: MemoryDiscoveryApproval;
     try { approval = JSON.parse(text) as MemoryDiscoveryApproval; }
@@ -668,7 +675,7 @@ export class ProbeStore {
   }
 
   #discoveryProjects(activity: Activity, grantId: string): { projects: string[]; remaining: number; remainingBytes: number;
-    targets: Map<string, SearchTarget> } {
+    remainingQueries: number; targets: Map<string, SearchTarget> } {
     uuid(grantId);
     const row = this.#db.prepare('SELECT * FROM memory_discovery_grants WHERE grant_id=? AND owner_id=? AND session_id=?')
       .get(grantId, this.#binding.ownerId, this.#binding.sessionId);
@@ -683,7 +690,8 @@ export class ProbeStore {
       .all(this.#binding.ownerId, grantId).map(project => String(project.project_id));
     check(projects.length > 0 && projects.length <= 32
       && JSON.stringify([...approval.projectIds].sort()) === JSON.stringify(projects)
-      && approval.maxResults === row.max_results && approval.maxBytes === row.max_bytes, 'discovery-not-authorized');
+      && approval.maxResults === row.max_results && approval.maxBytes === row.max_bytes
+      && row.max_queries === Math.min(128, Math.max(8, approval.maxResults * 4)), 'discovery-not-authorized');
     const targets = new Map<string, SearchTarget>();
     for (const item of this.#db.prepare('SELECT * FROM memory_discovery_targets WHERE grant_id=?').all(grantId)) {
       check(projects.includes(String(item.project_id)), 'discovery-not-authorized');
@@ -697,7 +705,8 @@ export class ProbeStore {
       check((targets.get(projectId)?.[key] ?? null) === (approval.targets[projectId]?.[key] ?? null), 'discovery-not-authorized');
     }
     return { projects, targets, remaining: Number(row.max_results) - Number(row.used_results),
-      remainingBytes: Number(row.max_bytes) - Number(row.used_bytes) };
+      remainingBytes: Number(row.max_bytes) - Number(row.used_bytes),
+      remainingQueries: Number(row.max_queries) - Number(row.used_queries) };
   }
 
   bindWorkspace(activity: Activity, workspaceId: string, projectIds: string[]): void {
@@ -1431,6 +1440,8 @@ export class ProbeStore {
           transitionHash, bytes, hash);
       this.#db.prepare(`INSERT INTO intent_heads VALUES (?, ?, ?) ON CONFLICT(session_id,branch_id) DO UPDATE SET event_id=excluded.event_id`)
         .run(this.#binding.sessionId, this.#binding.branchId, snapshot.eventId);
+      if (snapshot.status === 'completed') this.#db.prepare(`UPDATE memory_discovery_grants SET state='revoked'
+        WHERE session_id=? AND intent_id=? AND state='active'`).run(this.#binding.sessionId, snapshot.intentId);
       return { ...snapshot, hash };
     });
   }
@@ -1830,6 +1841,13 @@ export class ProbeStore {
       if (!grant && request.noActiveProject) return { status: 'ready', results: [],
         coverage: { ...coverage, allowedProjects: [], inspectedProjects: [], reason: 'no-active-project' },
         truncated: false, nextCursor: null };
+      if (grant) {
+        if (grant.remainingQueries === 0) return { status: 'unavailable', results: [],
+          coverage: unavailableCoverage('task-query-budget-exhausted'), truncated: true, nextCursor: null };
+        const charged = this.#db.prepare(`UPDATE memory_discovery_grants SET used_queries=used_queries+1
+          WHERE grant_id=? AND state='active' AND used_queries<max_queries`).run(request.grantId!);
+        check(charged.changes === 1, 'discovery-budget-stale');
+      }
       const scopeSql = this.#searchScopeSql('h', projects);
       const scopeArgs = this.#searchScopeArgs(projects);
       const sourceSql = grant ? ` AND v.source_project_id IN (${projects.map(() => '?').join(',')})` : '';
@@ -1898,13 +1916,11 @@ export class ProbeStore {
         if (!grant && request.target && (request.target.agent !== undefined && request.target.agent !== 'cli'
           || request.target.platform !== undefined && request.target.platform !== process.platform)) applicability = 'needs-verification';
         if (applicability === 'inapplicable') continue;
-        const key = record.conflictSetId ? `conflict:${record.conflictSetId}`
+        const key = record.conflictSetId ? `conflict:${projectId}:${record.conflictSetId}`
           : JSON.stringify([projectId, record.scope.kind, record.scope.id, record.claimKey, record.appliesTo, record.validFrom, record.validUntil]);
         if (seen.has(key)) continue;
         seen.add(key);
-        const now = Date.now();
-        const temporal = record.validFrom && now < Date.parse(record.validFrom) ? 'not-yet-valid'
-          : record.validUntil && now >= Date.parse(record.validUntil) ? 'expired' : null;
+        const temporal = memoryTemporalStatus(record, Date.now());
         if (record.verification !== 'verified' || record.conflictSetId || temporal) {
           const reason = temporal ?? (record.verification === 'stale' ? 'stale' : 'conflicted');
           candidates.push({ kind: 'status', unitId: record.recordId, claimRef: sha256(record.claimKey),
@@ -1969,10 +1985,11 @@ export class ProbeStore {
         check(updated.changes === 1, 'discovery-budget-stale');
       }
       const truncated = end < candidates.length || skipped > 0;
-      const exhausted = grant && (results.length >= grant.remaining || bytes >= grant.remainingBytes);
+      const exhausted = grant && (results.length >= grant.remaining || bytes >= grant.remainingBytes || grant.remainingQueries === 1);
       const nextCursor = end < candidates.length && !exhausted
         ? Buffer.from(JSON.stringify({ schema: 'memory-search-cursor@1', scope: cursorScope, fingerprint, offset: end })).toString('base64url') : null;
-      const reason = skipped ? 'oversized-candidate-skipped' : truncated && exhausted ? 'task-budget-exhausted' : null;
+      const reason = skipped ? 'oversized-candidate-skipped'
+        : truncated && exhausted ? grant?.remainingQueries === 1 ? 'task-query-budget-exhausted' : 'task-budget-exhausted' : null;
       return { status: 'ready', results, coverage: { ...coverage, reason }, truncated, nextCursor };
     });
   }
@@ -2047,7 +2064,8 @@ export class ProbeStore {
         WHERE lifecycle='active' AND verification='verified' AND scope_resolved=1
         AND ${this.#visibleScopeSql('memory_heads')} ORDER BY rowid`)
         .all(...this.#scopeParameters()).map(row => this.#readMemoryUnsafe(String(row.record_id)))
-        .filter(record => !record.conflictSetId && record.appliesTo.every(condition => ['cli', process.platform].includes(condition)));
+        .filter(record => !record.conflictSetId && !memoryTemporalStatus(record, Date.now())
+          && record.appliesTo.every(condition => ['cli', process.platform].includes(condition)));
       for (const record of records) {
         this.#db.prepare('INSERT INTO feedback_events VALUES (?,?,?,?,?)')
           .run(randomUUID(), record.recordId, record.headEventId, record.revisionId, 'retrieved');
@@ -2435,8 +2453,7 @@ export class ProbeStore {
   }
   #eligible(record: MemoryRecord): void {
     check(record.scope.resolved && record.verification === 'verified' && !record.conflictSetId, 'memory-not-eligible');
-    check((!record.validFrom || Date.now() >= Date.parse(record.validFrom))
-      && (!record.validUntil || Date.now() < Date.parse(record.validUntil)), 'memory-not-current');
+    check(!memoryTemporalStatus(record, Date.now()), 'memory-not-current');
     this.#validateSource(record.source, undefined, record.scope);
     this.#checkVerification(record, true);
   }
@@ -2475,7 +2492,7 @@ export class ProbeStore {
       && revision.source_hash === record.source.hash && revision.source_content_hash === record.source.contentHash
       && revision.source_locator === record.source.locator && sha256(record.content) === record.contentHash, 'memory-evidence-gap');
   }
-  #replayMemory(recordId: string, projects: readonly string[] = [this.#binding.projectId]): MemoryRecord {
+  #replayMemory(recordId: string): MemoryRecord {
     const owner = this.#db.prepare('SELECT owner_id,claim_key,source_lineage FROM memory_records WHERE record_id=?').get(recordId);
     check(owner?.owner_id === this.#binding.ownerId, 'memory-not-found');
     const events = this.#db.prepare('SELECT * FROM memory_events WHERE record_id=? ORDER BY seq').all(recordId);
@@ -2511,7 +2528,7 @@ export class ProbeStore {
   #readMemoryUnsafe(recordId: string, projects: readonly string[] = [this.#binding.projectId]): MemoryRecord {
     const row = this.#db.prepare('SELECT * FROM memory_heads WHERE record_id=?').get(recordId);
     check(row, 'memory-evidence-gap');
-    const record = this.#replayMemory(recordId, projects);
+    const record = this.#replayMemory(recordId);
     check(this.#snapshotBytes(record) === row.snapshot && record.hash === row.snapshot_hash
       && record.revisionId === row.revision_id && record.lifecycle === row.lifecycle
       && record.verification === row.verification && record.scope.kind === row.scope_kind && record.scope.id === row.scope_id
@@ -2818,6 +2835,11 @@ export class ProbeStore {
     };
   }
   close(): void { this.#db.close(); }
+}
+
+function memoryTemporalStatus(record: Pick<MemoryRecord, 'validFrom' | 'validUntil'>, now: number): 'not-yet-valid' | 'expired' | null {
+  return record.validFrom && now < Date.parse(record.validFrom) ? 'not-yet-valid'
+    : record.validUntil && now >= Date.parse(record.validUntil) ? 'expired' : null;
 }
 
 function memoryProjectionExposure(record: MemoryRecord): 'normal' | 'status_only' | null {
