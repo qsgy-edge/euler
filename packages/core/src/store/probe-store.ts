@@ -1814,8 +1814,10 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       const canonical = this.#db.prepare(`SELECT record_id FROM memory_heads
         WHERE ${this.#visibleScopeSql('memory_heads')}`).all(...this.#scopeParameters());
-      this.#db.prepare(`DELETE FROM search_documents WHERE owner_id=? AND ${this.#visibleScopeSql('search_documents')}`)
-        .run(this.#binding.ownerId, ...this.#scopeParameters());
+      this.#db.prepare(`DELETE FROM search_documents WHERE (owner_id=? AND ${this.#visibleScopeSql('search_documents')})
+        OR EXISTS (SELECT 1 FROM memory_heads h JOIN memory_records r ON r.record_id=h.record_id
+          WHERE h.record_id=search_documents.record_id AND r.owner_id=? AND ${this.#visibleScopeSql('h')})`)
+        .run(this.#binding.ownerId, ...this.#scopeParameters(), this.#binding.ownerId, ...this.#scopeParameters());
       const receipts: SearchProjectionReceipt[] = [];
       for (const row of canonical) {
         const record = this.#readMemoryUnsafe(String(row.record_id));
@@ -1904,11 +1906,11 @@ export class ProbeStore {
       const match = terms.map(term => `"${term.replaceAll('"', '""')}"`).join(' OR ');
       let rows: Record<string, unknown>[];
       try {
-        rows = this.#db.prepare(`SELECT d.*, bm25(search_fts) AS rank FROM search_fts
+        rows = this.#db.prepare(`SELECT d.* FROM search_fts
           JOIN search_documents d ON d.rowid=search_fts.rowid
           JOIN memory_records r ON r.record_id=d.record_id
           WHERE search_fts MATCH ? AND d.owner_id=? AND ${this.#searchScopeSql('d', projects)}${projectedSourceSql}
-          ORDER BY rank, r.rowid LIMIT 257`).all(
+          ORDER BY r.rowid LIMIT 257`).all(
           match, this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
       } catch { return { status: 'unavailable', results: [], coverage: unavailableCoverage('index-unavailable'), truncated: true, nextCursor: null }; }
       if (rows.length > 256) return { status: 'unavailable', results: [],
@@ -1934,8 +1936,10 @@ export class ProbeStore {
           return { status: 'unavailable', results: [], coverage: unavailableCoverage(reason), truncated: true, nextCursor: null };
         }
         const words = normalizeSearchText(record.content).split(' ');
-        if (!numericContextMatches(groups, words)
-          || !groups.some(group => words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text))) continue;
+        const matchingGroups = groups.flatMap((group, index) =>
+          words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text) ? [index] : []);
+        if (!numericContextMatches(groups, words) || matchingGroups.length === 0) continue;
+        const rank = -matchingGroups.length;
         const projectId = record.source.binding.projectId;
         const targetProjects = record.scope.kind === 'project' ? [record.scope.id]
           : record.scope.kind === 'personal' ? projects
@@ -1962,17 +1966,16 @@ export class ProbeStore {
             const reason = temporal ?? (record.verification === 'stale' ? 'stale' : 'conflicted');
             candidates.push({ kind: 'status', unitId: record.recordId, claimRef: sha256(record.claimKey),
               verification: record.verification, reason, conflictSetId: record.conflictSetId,
-              projectId, targetProjectId, target, exposureMode: 'status_only', rank: Number(row.rank) });
+              projectId, targetProjectId, target, exposureMode: 'status_only', rank });
           } else candidates.push({ kind: 'memory', unitId: record.recordId, record, projectId, targetProjectId, target,
-            applicability, exposureMode: applicability === 'needs-verification' ? 'reference_only' : 'normal', rank: Number(row.rank) });
+            applicability, exposureMode: applicability === 'needs-verification' ? 'reference_only' : 'normal', rank });
           if (candidates.length > 256) return { status: 'unavailable', results: [],
             coverage: unavailableCoverage('candidate-limit'), truncated: true, nextCursor: null };
           const hit = candidates[candidates.length - 1]!;
-          groups.forEach((group, index) => {
-            if (words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text)) lanes[index]!.push(hit);
-          });
+          for (const index of matchingGroups) lanes[index]!.push(hit);
         }
       }
+      for (const lane of lanes) lane.sort((a, b) => a.rank - b.rank);
       const fused: SearchResult[] = [];
       const selected = new Set<SearchResult>();
       while (fused.length < candidates.length) {

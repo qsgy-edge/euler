@@ -144,6 +144,76 @@ test('missing FTS posting reports a dirty projection instead of an empty answer'
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('excluded project terms cannot influence visible scores', () => {
+  const sandbox = createSandbox();
+  const other = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
+  createSandboxSession(sandbox, other);
+  const first = openProbe(sandbox);
+  const second = openProbe(sandbox, undefined, undefined, other);
+  try {
+    const visibleSource = first.archive.append(randomUUID(), 'visible evidence');
+    const visible = first.store.captureMemory(first.activity, visibleSource, 'Alpha route', {
+      type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+    }).record;
+    const v = first.store.verifyMemory(first.activity, visible.recordId, visible, 'pass', [visibleSource]).record;
+    first.store.activateMemory(first.activity, v.recordId, v);
+    first.store.drainSearchProjection(first.activity);
+    const hiddenSource = second.archive.append(randomUUID(), 'hidden evidence');
+    const hidden = second.store.captureMemory(second.activity, hiddenSource, 'Hidden alpha', {
+      type: 'fact', scope: { kind: 'project', id: other.projectId, resolved: true }, appliesTo: [],
+    }).record;
+    const hv = second.store.verifyMemory(second.activity, hidden.recordId, hidden, 'pass', [hiddenSource]).record;
+    const active = second.store.activateMemory(second.activity, hv.recordId, hv).record;
+    const fillerSource = second.archive.append(randomUUID(), 'filler evidence');
+    const filler = second.store.captureMemory(second.activity, fillerSource, 'Other term', {
+      type: 'fact', scope: { kind: 'project', id: other.projectId, resolved: true }, appliesTo: [],
+    }).record;
+    const fv = second.store.verifyMemory(second.activity, filler.recordId, filler, 'pass', [fillerSource]).record;
+    second.store.activateMemory(second.activity, fv.recordId, fv);
+    second.store.drainSearchProjection(second.activity);
+    const goal = 'Analyze only project A';
+    const input = first.archive.append(randomUUID(), goal);
+    const intent = first.store.transitionIntent(first.activity, null, input, { status: 'active', step: 'analysis' }, goal);
+    const approval = first.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
+      intentId: intent.intentId, goalEventId: intent.goalInput.eventId,
+      projectIds: [sandbox.fixture.projectId], targets: {}, maxResults: 4, maxBytes: 131072 }));
+    const { grantId } = first.store.authorizeMemoryDiscovery(first.activity, approval, [sandbox.fixture.projectId], 4);
+    const before = first.store.searchMemories(first.activity, { query: 'alpha', grantId });
+    const changedSource = second.archive.append(randomUUID(), 'replacement evidence');
+    second.store.reviseMemory(second.activity, active.recordId, active, changedSource, 'Hidden omega', [changedSource]);
+    second.store.drainSearchProjection(second.activity);
+    assert.equal(second.store.searchMemories(second.activity, { query: 'omega' }).results[0]?.unitId, hidden.recordId);
+    const after = first.store.searchMemories(first.activity, { query: 'alpha', grantId });
+    assert.equal(before.status, 'ready');
+    assert.equal(after.status, 'ready');
+    assert.deepEqual(before.results.map(hit => [hit.unitId, hit.rank]), after.results.map(hit => [hit.unitId, hit.rank]));
+    assert.deepEqual(before.results.map(hit => hit.projectId), [sandbox.fixture.projectId]);
+  } finally { second.close(); first.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('rebuild deletes canonical rows even when projected owner or scope was corrupted', () => {
+  for (const field of ['owner_id', 'scope_id'] as const) {
+    const sandbox = createSandbox();
+    const probe = openProbe(sandbox);
+    const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
+    try {
+      const source = probe.archive.append(randomUUID(), 'rebuild evidence');
+      const captured = probe.store.captureMemory(probe.activity, source, 'Atlas repair', {
+        type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+      }).record;
+      const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
+      probe.store.activateMemory(probe.activity, verified.recordId, verified);
+      probe.store.drainSearchProjection(probe.activity);
+      db.prepare(`UPDATE search_documents SET ${field}=? WHERE record_id=?`).run(randomUUID(), captured.recordId);
+      assert.equal(probe.store.searchMemories(probe.activity, { query: 'Atlas' }).status, 'dirty');
+      probe.store.rebuildSearchProjection(probe.activity);
+      const repaired = probe.store.searchMemories(probe.activity, { query: 'Atlas' });
+      assert.equal(repaired.status, 'ready', field);
+      assert.equal(repaired.results[0]?.unitId, captured.recordId, field);
+    } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+  }
+});
+
 test('CJK bigrams do not cross punctuation boundaries', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);
