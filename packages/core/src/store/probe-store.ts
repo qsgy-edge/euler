@@ -91,11 +91,11 @@ export interface MemoryDiscoveryApproval {
 }
 export interface SourceUnitInput {
   ref: SourceAck; kind: 'source' | 'report-section' | 'handoff'; projectId: string;
-  offset: number; length: number; supersedes?: string; approval?: SourceAck;
+  offset: number; length: number; supersedes?: string; approval: SourceAck;
 }
 export interface SourceUnit {
   schema: 'source-unit@1'; unitId: string; ref: SourceAck; kind: SourceUnitInput['kind']; projectId: string;
-  offset: number; length: number; contentHash: string; version: number; supersedes: string | null; approval: SourceAck | null;
+  offset: number; length: number; contentHash: string; version: number; supersedes: string | null; approval: SourceAck;
 }
 export interface SourceSearchRequest { query: string; limit?: number; byteBudget?: number; cursor?: string; grantId?: string; queryId?: string }
 export interface SourceSearchHit { unitId: string; locator: string; kind: SourceUnitInput['kind'] | 'proposal'; projectId: string;
@@ -164,7 +164,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=11), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=12), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -475,6 +475,21 @@ CREATE TABLE search_documents (
   projection_generation INTEGER NOT NULL CHECK(projection_generation > 0),
   owner_kind TEXT NOT NULL CHECK(owner_kind IN ('memory','session','proposal'))
 ) STRICT;
+CREATE TABLE source_projection_health (
+  project_id TEXT PRIMARY KEY REFERENCES projects(project_id), dirty INTEGER NOT NULL CHECK(dirty IN (0,1))
+) STRICT;
+CREATE TRIGGER source_document_insert AFTER INSERT ON search_documents
+WHEN NEW.owner_kind IN ('session','proposal') BEGIN
+  INSERT OR REPLACE INTO source_projection_health VALUES (NEW.project_id,1);
+END;
+CREATE TRIGGER source_document_update AFTER UPDATE ON search_documents BEGIN
+  INSERT OR REPLACE INTO source_projection_health SELECT OLD.project_id,1 WHERE OLD.owner_kind IN ('session','proposal');
+  INSERT OR REPLACE INTO source_projection_health SELECT NEW.project_id,1 WHERE NEW.owner_kind IN ('session','proposal');
+END;
+CREATE TRIGGER source_document_delete AFTER DELETE ON search_documents
+WHEN OLD.owner_kind IN ('session','proposal') BEGIN
+  INSERT OR REPLACE INTO source_projection_health VALUES (OLD.project_id,1);
+END;
 CREATE VIRTUAL TABLE search_fts USING fts5(content, content='search_documents', content_rowid='rowid');
 CREATE TABLE search_projection_jobs (
   job_id TEXT PRIMARY KEY REFERENCES projection_jobs(job_id), status TEXT NOT NULL CHECK(status IN ('done','failed')),
@@ -534,7 +549,7 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=11;
+PRAGMA user_version=12;
 ` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events','source_query_receipts'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
@@ -590,15 +605,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,11,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,12,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 11, 'unsupported-probe-schema');
+        check(version === 12, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 11 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 12 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -777,14 +792,13 @@ export class ProbeStore {
       check(Buffer.byteLength(content) <= 16384, 'invalid-source-unit');
       const prior = input.supersedes ? this.#sourceUnit(input.supersedes).unit : null;
       check(!prior || prior.projectId === projectId && prior.kind === kind, 'source-version-mismatch');
+      check(input.approval, 'source-publication-approval-required');
       const unit: SourceUnit = { schema: 'source-unit@1', unitId: randomUUID(), ref: structuredClone(ref), kind,
         projectId, offset, length, contentHash: sha256(content), version: (prior?.version ?? 0) + 1,
-        supersedes: prior?.unitId ?? null, approval: input.approval ? structuredClone(input.approval) : null };
-      if (projectId !== ref.binding.projectId) {
-        const intent = this.readIntent(activity);
-        check(intent?.status === 'active', 'source-publication-approval-required');
-        this.#publicationApproval(unit, intent);
-      } else check(!input.approval, 'invalid-source-unit');
+        supersedes: prior?.unitId ?? null, approval: structuredClone(input.approval) };
+      const intent = this.readIntent(activity);
+      check(intent?.status === 'active', 'source-publication-approval-required');
+      this.#publicationApproval(unit, intent);
       const requestHash = sha256(JSON.stringify({ ref, projectId, kind, offset, length,
         supersedes: prior?.unitId ?? null, approval: input.approval ?? null }));
       const existing = this.#db.prepare('SELECT unit_id FROM source_units WHERE request_hash=?').get(requestHash);
@@ -833,8 +847,7 @@ export class ProbeStore {
       && unit.length > 0 && unit.length <= 4096, 'source-evidence-gap');
     const project = this.#db.prepare('SELECT owner_id FROM projects WHERE project_id=?').get(unit.projectId);
     check(project?.owner_id === this.#binding.ownerId, 'source-evidence-gap');
-    if (unit.projectId !== unit.ref.binding.projectId) this.#publicationApproval(unit);
-    else check(unit.approval === null, 'source-evidence-gap');
+    this.#publicationApproval(unit);
     const points = Array.from(this.#archiveRef(unit.ref).text);
     check(unit.offset + unit.length <= points.length, 'source-evidence-gap');
     const text = points.slice(unit.offset, unit.offset + unit.length).join('');
@@ -1134,10 +1147,14 @@ export class ProbeStore {
         && new Set(usedMemories.map(item => item.recordId)).size === usedMemories.length, 'invalid-assembly-selection');
       const snapshots = usedMemories.map(use => this.#assemblyMemory(use, true));
       if (input.route === 'local-counting') {
-        let payload: { schema?: string; memories?: unknown };
+        let payload: { schema?: string; memories?: unknown; messages?: { role?: string; content?: unknown }[] };
         try { payload = JSON.parse(input.payload) as typeof payload; }
         catch { throw new Error('assembly-payload-mismatch'); }
-        check(payload.schema === 'synthetic-request@1' && JSON.stringify(payload.memories ?? []) === JSON.stringify(
+        check(payload.schema === 'synthetic-request@1' && input.sources.length === 1
+          && sameBinding(input.sources[0]!.binding, this.#binding) && Array.isArray(payload.messages)
+          && payload.messages.length === 2 && payload.messages[1]?.role === 'user'
+          && payload.messages[1].content === this.#archiveRef(input.sources[0]!).text
+          && JSON.stringify(payload.memories ?? []) === JSON.stringify(
           snapshots.map(record => ({ kind: 'untrusted-memory', recordId: record.recordId,
             revisionId: record.revisionId, content: record.content }))), 'assembly-payload-mismatch');
       } else check(usedMemories.length === 0, 'assembly-memory-unavailable');
@@ -2064,6 +2081,7 @@ export class ProbeStore {
       this.#db.exec(`DROP TABLE search_fts;
         CREATE VIRTUAL TABLE search_fts USING fts5(content, content='search_documents', content_rowid='rowid');
         INSERT INTO search_fts(search_fts) VALUES ('rebuild');`);
+      this.#db.prepare('INSERT OR REPLACE INTO source_projection_health VALUES (?,0)').run(projectId);
       return sources.length + proposals.length;
     });
   }
@@ -2071,16 +2089,20 @@ export class ProbeStore {
   drainSourceProjection(activity: Activity, limit = 32): number {
     return this.withActivity(activity, () => {
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= 128, 'invalid-projection-limit');
-      const rows = this.#db.prepare(`SELECT s.unit_id FROM source_units s
+      const rows = this.#db.prepare(`SELECT s.unit_id,s.project_id FROM source_units s
         LEFT JOIN search_documents d ON d.unit_id=s.unit_id AND d.owner_kind='session'
         WHERE s.owner_id=? AND d.unit_id IS NULL ORDER BY s.rowid LIMIT ?`)
         .all(this.#binding.ownerId, limit);
-      const proposals = this.#db.prepare(`SELECT p.proposal_id FROM evolution_proposals p
+      const proposals = this.#db.prepare(`SELECT p.proposal_id,p.scope_id AS project_id FROM evolution_proposals p
         LEFT JOIN search_documents d ON d.unit_id=p.proposal_id AND d.owner_kind='proposal'
         WHERE p.owner=? AND p.scope_kind='project' AND d.unit_id IS NULL ORDER BY p.rowid LIMIT ?`)
         .all(this.#binding.ownerId, limit - rows.length);
+      const projects = [...new Set([...rows, ...proposals].map(row => String(row.project_id)))];
+      const state = this.#db.prepare('SELECT dirty FROM source_projection_health WHERE project_id=?');
+      const cleanProjects = projects.filter(id => state.get(id)?.dirty !== 1);
       for (const row of rows) this.#indexSourceUnit(String(row.unit_id));
-      for (const row of proposals) this.#indexProposal(String(row.proposal_id), this.#registeredProjects());
+      for (const row of proposals) this.#indexProposal(String(row.proposal_id), [String(row.project_id)]);
+      for (const projectId of cleanProjects) this.#db.prepare('UPDATE source_projection_health SET dirty=0 WHERE project_id=?').run(projectId);
       return rows.length + proposals.length;
     });
   }
@@ -2124,6 +2146,8 @@ export class ProbeStore {
         return page;
       };
       const ids = projects.map(() => '?').join(',');
+      if (this.#db.prepare(`SELECT 1 FROM source_projection_health WHERE project_id IN (${ids}) AND dirty=1 LIMIT 1`)
+        .get(...projects)) return finalize(unavailable('index-damaged', 'dirty'));
       const missing = this.#db.prepare(`SELECT 1 FROM source_units s LEFT JOIN search_documents d ON d.unit_id=s.unit_id
         WHERE s.owner_id=? AND s.project_id IN (${ids}) AND (d.unit_id IS NULL OR d.owner_kind!='session'
           OR d.owner_id!=s.source_owner OR d.project_id!=s.project_id OR d.scope_kind!='project'
@@ -2140,7 +2164,8 @@ export class ProbeStore {
         WHERE p.owner=? AND p.scope_kind='project' AND p.scope_id IN (${ids})
           AND (d.unit_id IS NULL OR d.owner_kind!='proposal' OR d.owner_id!=p.proposal_id
             OR d.project_id!=p.scope_id OR d.scope_id!=p.scope_id OR d.revision_id!=p.proposal_id
-            OR d.content_hash!=p.payload_hash OR d.source_seq!=p.version OR d.tokenizer_version!='latin-cjk@3') LIMIT 1`)
+            OR d.content_hash!=p.payload_hash OR d.source_seq!=p.version OR d.projection_generation!=p.version
+            OR d.tokenizer_version!='latin-cjk@3') LIMIT 1`)
         .get(this.#binding.ownerId, ...projects);
       const extraProposal = this.#db.prepare(`SELECT 1 FROM search_documents d
         LEFT JOIN evolution_proposals p ON p.proposal_id=d.unit_id
@@ -2927,7 +2952,10 @@ export class ProbeStore {
     check(this.#readSource, 'source-reader-unavailable');
     let result: { text: string; role?: 'user' | 'assistant' | 'tool' };
     try { result = this.#readSource(ref); }
-    catch (error) { throw new Error('source-evidence-gap', { cause: error }); }
+    catch (error) {
+      if (error instanceof Error && error.message.startsWith('archive-integrity')) throw error;
+      throw new Error('source-evidence-gap', { cause: error });
+    }
     check(sha256(result.text) === ref.contentHash, 'source-evidence-gap');
     return result;
   }

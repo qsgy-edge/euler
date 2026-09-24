@@ -1,9 +1,9 @@
 {
   "schema": "t11-source-cases@1",
   "report": {
-    "text": "Project A private review\nAtlas handoff approved for Project B\nProject A private follow-up",
+    "text": "Project A 🙂 private review\nAtlas handoff approved for Project B\nProject A private follow-up",
     "approved": "Atlas handoff approved for Project B",
-    "hidden": "Project A private review"
+    "hidden": "Project A 🙂 private review"
   },
   "proposal": {
     "target": "Atlas configuration",

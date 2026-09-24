@@ -4,20 +4,20 @@ import { rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { sha256 } from '@euler/core';
+import { sha256, type SourceUnitInput } from '@euler/core';
 import { createSandbox, createSandboxSession, bindingOf, resourcesOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
+import { approvedSourceUnit } from './support/source-publication.ts';
 
 test('an unknown cross-project source query can reconcile its stable identity without spending budget twice', () => {
   const sandbox = createSandbox();
   let probe = openProbe(sandbox);
   try {
     const ref = probe.archive.append(randomUUID(), 'Atlas recoverable query');
-    probe.store.publishSourceUnit(probe.activity, { ref, projectId: sandbox.fixture.projectId,
-      kind: 'source', offset: 0, length: Array.from('Atlas recoverable query').length });
+    probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref, projectId: sandbox.fixture.projectId,
+      kind: 'source', offset: 0, length: Array.from('Atlas recoverable query').length }));
     probe.store.drainSourceProjection(probe.activity);
-    const goal = probe.archive.append(randomUUID(), 'Analyze Atlas source');
-    const intent = probe.store.transitionIntent(probe.activity, null, goal, { step: 'analysis', status: 'active' }, 'Analyze Atlas source');
+    const intent = probe.store.readIntent(probe.activity)!;
     const approval = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
       intentId: intent.intentId, goalEventId: intent.goalInput.eventId,
       projectIds: [sandbox.fixture.projectId], targets: {}, maxResults: 1, maxBytes: 131072 }));
@@ -41,11 +41,10 @@ test('replaying a changed source-query result returns a gap, not new bytes under
   const probe = openProbe(sandbox);
   try {
     const first = probe.archive.append(randomUUID(), 'Atlas first');
-    probe.store.publishSourceUnit(probe.activity, { ref: first, projectId: sandbox.fixture.projectId,
-      kind: 'source', offset: 0, length: 'Atlas first'.length });
+    probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref: first, projectId: sandbox.fixture.projectId,
+      kind: 'source', offset: 0, length: 'Atlas first'.length }));
     probe.store.drainSourceProjection(probe.activity);
-    const goal = probe.archive.append(randomUUID(), 'Analyze Atlas');
-    const intent = probe.store.transitionIntent(probe.activity, null, goal, { step: 'analysis', status: 'active' }, 'Analyze Atlas');
+    const intent = probe.store.readIntent(probe.activity)!;
     const approval = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
       intentId: intent.intentId, goalEventId: intent.goalInput.eventId, projectIds: [sandbox.fixture.projectId],
       targets: {}, maxResults: 2, maxBytes: 131072 }));
@@ -53,8 +52,8 @@ test('replaying a changed source-query result returns a gap, not new bytes under
     const request = { query: 'Atlas', grantId, queryId: randomUUID() };
     assert.equal(probe.store.searchSources(probe.activity, request).results.length, 1);
     const second = probe.archive.append(randomUUID(), 'Atlas second');
-    probe.store.publishSourceUnit(probe.activity, { ref: second, projectId: sandbox.fixture.projectId,
-      kind: 'source', offset: 0, length: 'Atlas second'.length });
+    probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref: second, projectId: sandbox.fixture.projectId,
+      kind: 'source', offset: 0, length: 'Atlas second'.length }));
     probe.store.drainSourceProjection(probe.activity);
     const stale = probe.store.searchSources(probe.activity, request);
     assert.equal(stale.status, 'unavailable');
@@ -72,9 +71,9 @@ test('an owner-published source chunk is discoverable only after indexing and ex
     const ref = probe.archive.append(randomUUID(), text);
     const offset = Array.from(text).indexOf('A');
     const length = Array.from('Atlas deployment section').length;
-    const unit = probe.store.publishSourceUnit(probe.activity, {
+    const unit = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, {
       ref, projectId: sandbox.fixture.projectId, kind: 'source', offset, length,
-    });
+    }));
     const lag = probe.store.searchSources(probe.activity, { query: 'Atlas' });
     assert.equal(lag.status, 'dirty');
     assert.deepEqual(lag.results, []);
@@ -93,6 +92,37 @@ test('an owner-published source chunk is discoverable only after indexing and ex
     assert.equal(expanded.excerptHash, sha256(expanded.text));
     assert.ok(!JSON.stringify(page).includes('private tail'));
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('a same-project mixed report cannot become discoverable without an exact approved range', () => {
+  const sandbox = createSandbox();
+  const nextSession = { ...bindingOf(sandbox), sessionId: randomUUID() };
+  createSandboxSession(sandbox, nextSession);
+  const origin = openProbe(sandbox);
+  const reader = openProbe(sandbox, undefined, undefined, nextSession);
+  try {
+    const report = 'Project A Atlas summary\nProject B secret\n';
+    const ref = origin.archive.append(randomUUID(), report, 'assistant');
+    for (const kind of ['source', 'report-section', 'handoff'] as const) {
+      assert.throws(() => origin.store.publishSourceUnit(origin.activity, { ref,
+        projectId: sandbox.fixture.projectId, kind, offset: 0, length: Array.from(report).length } as SourceUnitInput),
+      /source-publication-approval-required/);
+    }
+    const goal = origin.archive.append(randomUUID(), 'Deliver Atlas only');
+    const intent = origin.store.transitionIntent(origin.activity, null, goal, { step: 'handoff', status: 'active' }, 'Deliver Atlas only');
+    const length = Array.from('Project A Atlas summary').length;
+    const approval = origin.archive.append(randomUUID(), JSON.stringify({ schema: 'source-publication-approval@1',
+      intentId: intent.intentId, goalEventId: intent.goalInput.eventId, ref, projectId: sandbox.fixture.projectId,
+      kind: 'report-section', offset: 0, length }));
+    const unit = origin.store.publishSourceUnit(origin.activity, { ref, projectId: sandbox.fixture.projectId,
+      kind: 'report-section', offset: 0, length, approval });
+    origin.store.drainSourceProjection(origin.activity);
+    assert.deepEqual(reader.store.searchSources(reader.activity, { query: 'Atlas' }).results.map(hit => hit.unitId), [unit.unitId]);
+    assert.deepEqual(reader.store.searchSources(reader.activity, { query: 'secret' }).results, []);
+    assert.equal(reader.store.expandSource(reader.activity, { unitId: unit.unitId, offset: 0, limit: 80 }).text,
+      'Project A Atlas summary');
+    assert.throws(() => reader.store.expandSource(reader.activity, { ref, offset: 0, limit: 80 }), /source-scope-mismatch/);
+  } finally { reader.close(); origin.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
 test('a mixed report exposes only the approved section, and revoked grants cannot follow old refs', () => {
@@ -117,8 +147,8 @@ test('a mixed report exposes only the approved section, and revoked grants canno
     assert.throws(() => origin.store.publishSourceUnit(origin.activity, { ...unitInput, approval: forged }), /source-publication-approval-required/);
     const approval = origin.archive.append(randomUUID(), JSON.stringify(decision));
     const published = origin.store.publishSourceUnit(origin.activity, { ...unitInput, approval });
-    const unpublished = origin.store.publishSourceUnit(origin.activity, {
-      ref, projectId: sandbox.fixture.projectId, kind: 'source', offset, length: 'Project A secret'.length });
+    const unpublished = origin.store.publishSourceUnit(origin.activity, approvedSourceUnit(origin, {
+      ref, projectId: sandbox.fixture.projectId, kind: 'source', offset, length: 'Project A secret'.length }));
     origin.store.drainSourceProjection(origin.activity);
     assert.deepEqual(target.store.searchSources(target.activity, { query: 'Atlas' }).results.map(hit => hit.unitId), [published.unitId]);
     assert.deepEqual(target.store.searchSources(target.activity, { query: 'secret' }).results, []);
@@ -172,6 +202,11 @@ test('pre-stored inert proposal versions are searchable and restore their own hi
     assert.ok(old.text.includes('Atlas plan alpha'));
     assert.ok(!old.text.includes('Atlas plan beta'));
     assert.deepEqual(probe.store.searchMemories(probe.activity, { query: 'Atlas' }).results, []);
+    const db = new DatabaseSync(resourcesOf(sandbox).store.path);
+    try { db.prepare('UPDATE search_documents SET projection_generation=? WHERE unit_id=?').run(99, first.proposalId); }
+    finally { db.close(); }
+    assert.equal(probe.store.searchSources(probe.activity, { query: 'Atlas' }).status, 'dirty');
+    probe.store.rebuildSourceProjection(probe.activity);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
@@ -210,8 +245,8 @@ test('source and memory keep separate lanes through each projection rebuild', ()
   const probe = openProbe(sandbox);
   try {
     const ref = probe.archive.append(randomUUID(), 'Atlas shared index source');
-    const unit = probe.store.publishSourceUnit(probe.activity, { ref, projectId: sandbox.fixture.projectId,
-      kind: 'source', offset: 0, length: Array.from('Atlas shared index source').length });
+    const unit = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref, projectId: sandbox.fixture.projectId,
+      kind: 'source', offset: 0, length: Array.from('Atlas shared index source').length }));
     const scope = { kind: 'project' as const, id: sandbox.fixture.projectId, resolved: true };
     const captured = probe.store.captureMemory(probe.activity, ref, 'Atlas memory fact', { type: 'fact', scope, appliesTo: [] }).record;
     const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [ref]).record;
@@ -239,13 +274,14 @@ test('published revisions replay by stable identity, retain their older bytes an
   const probe = openProbe(sandbox);
   try {
     const original = probe.archive.append(randomUUID(), 'Atlas archival version one');
-    const input = { ref: original, projectId: sandbox.fixture.projectId, kind: 'handoff' as const,
-      offset: 0, length: Array.from('Atlas archival version one').length };
+    const input = approvedSourceUnit(probe, { ref: original, projectId: sandbox.fixture.projectId, kind: 'handoff' as const,
+      offset: 0, length: Array.from('Atlas archival version one').length });
     const first = probe.store.publishSourceUnit(probe.activity, input);
     assert.deepEqual(probe.store.publishSourceUnit(probe.activity, input), first);
     const revised = probe.archive.append(randomUUID(), 'Atlas archival version two');
-    const second = probe.store.publishSourceUnit(probe.activity, { ...input, ref: revised,
-      supersedes: first.unitId, length: Array.from('Atlas archival version two').length });
+    const second = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref: revised,
+      projectId: sandbox.fixture.projectId, kind: 'handoff', offset: 0,
+      supersedes: first.unitId, length: Array.from('Atlas archival version two').length }));
     probe.store.drainSourceProjection(probe.activity);
     assert.deepEqual(probe.store.searchSources(probe.activity, { query: 'Atlas' }).results.map(hit => hit.version), [1, 2]);
     assert.equal(probe.store.expandSource(probe.activity, { unitId: first.unitId, offset: 0, limit: 64 }).text, 'Atlas archival version one');
@@ -258,13 +294,39 @@ test('published revisions replay by stable identity, retain their older bytes an
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('a consistent index-body and FTS rewrite cannot hide a canonical source hit', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const ref = probe.archive.append(randomUUID(), 'Atlas canonical handoff');
+    const unit = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref,
+      projectId: sandbox.fixture.projectId, kind: 'handoff', offset: 0, length: Array.from('Atlas canonical handoff').length }));
+    probe.store.drainSourceProjection(probe.activity);
+    const db = new DatabaseSync(resourcesOf(sandbox).store.path);
+    try {
+      db.prepare('UPDATE search_documents SET content=? WHERE unit_id=?').run('unrelated indexed body', unit.unitId);
+      db.exec("INSERT INTO search_fts(search_fts) VALUES ('rebuild')");
+    } finally { db.close(); }
+    const page = probe.store.searchSources(probe.activity, { query: 'Atlas' });
+    assert.equal(page.status, 'dirty');
+    assert.deepEqual(page.results, []);
+    const newer = probe.archive.append(randomUUID(), 'Atlas fresh handoff');
+    probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref: newer,
+      projectId: sandbox.fixture.projectId, kind: 'handoff', offset: 0, length: Array.from('Atlas fresh handoff').length }));
+    probe.store.drainSourceProjection(probe.activity);
+    assert.equal(probe.store.searchSources(probe.activity, { query: 'Atlas' }).status, 'dirty');
+    probe.store.rebuildSourceProjection(probe.activity);
+    assert.equal(probe.store.searchSources(probe.activity, { query: 'Atlas' }).results.length, 2);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('a lost archived source returns a gap without using the stale indexed body', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);
   try {
     const ref = probe.archive.append(randomUUID(), 'Atlas source that will disappear');
-    const unit = probe.store.publishSourceUnit(probe.activity, { ref, projectId: sandbox.fixture.projectId,
-      kind: 'source', offset: 0, length: Array.from('Atlas source that will disappear').length });
+    const unit = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref, projectId: sandbox.fixture.projectId,
+      kind: 'source', offset: 0, length: Array.from('Atlas source that will disappear').length }));
     probe.store.drainSourceProjection(probe.activity);
     const path = join(sandbox.root, 'session.jsonl');
     const header = readFileSync(path, 'utf8').split('\n')[0] + '\n';

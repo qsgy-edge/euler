@@ -5,9 +5,10 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createSandbox, createSandboxSession, bindingOf } from '../apps/cli/src/sandbox.ts';
 import { openProbe } from '../apps/cli/src/probe.ts';
+import type { SourceUnitInput } from '@euler/core';
 
 const fixturePath = new URL('../fixtures/t11-source-cases.json', import.meta.url);
-const expectedDigest = '9b8f153152d41fe4aec51703cb5166b8edb39fc07553a46aca9ac15d4bd25c7c';
+const expectedDigest = '13bfeb501644eb497d97914f3e508a7b7e21ef2b52b82ef5d5f34105dfb11e7e';
 const bytes = readFileSync(fixturePath);
 const digest = createHash('sha256').update(bytes).digest('hex');
 assert.equal(digest, expectedDigest, 'T11 fixture changed');
@@ -31,7 +32,13 @@ try {
   const goal = origin.archive.append(randomUUID(), 'Synthetic approved analysis handoff');
   const intent = origin.store.transitionIntent(origin.activity, null, goal, { status: 'active', step: 'analysis' },
     'Synthetic approved analysis handoff');
-  const offset = Array.from(fixture.report.text).join('').indexOf(fixture.report.approved);
+  const index = fixture.report.text.indexOf(fixture.report.approved);
+  assert(index >= 0);
+  const offset = Array.from(fixture.report.text.slice(0, index)).length;
+  let unapprovedDenied = false;
+  try { origin.store.publishSourceUnit(origin.activity, { ref: report, projectId: sandbox.fixture.projectId,
+    kind: 'report-section', offset: 0, length: Array.from(fixture.report.hidden).length } as SourceUnitInput); }
+  catch (error) { unapprovedDenied = error instanceof Error && error.message === 'source-publication-approval-required'; }
   const approval = origin.archive.append(randomUUID(), JSON.stringify({ schema: 'source-publication-approval@1',
     intentId: intent.intentId, goalEventId: intent.goalInput.eventId, ref: report,
     projectId: targetBinding.projectId, kind: 'report-section', offset, length: Array.from(fixture.report.approved).length }));
@@ -81,7 +88,7 @@ try {
   catch (error) { revoked = error instanceof Error && error.message === 'discovery-not-authorized'; }
   observations.source = { acknowledgement: report, recoveredAck, replayedUnitId: replay.unitId,
     unitId: unit.unitId, localStatus: local.status, localIds: local.results.map(hit => hit.unitId),
-    hiddenIds: hidden.results.map(hit => hit.unitId), rawDenied, excerpt, fixtureDigest: digest };
+    hiddenIds: hidden.results.map(hit => hit.unitId), unapprovedDenied, rawDenied, excerpt, fixtureDigest: digest };
   observations.proposal = { first: { id: first.proposalId, version: first.version, hash: first.hash },
     second: { id: second.proposalId, version: second.version, hash: second.hash },
     crossStatus: cross.status, crossIds: cross.results.map(hit => hit.unitId),
@@ -96,7 +103,7 @@ try {
   assert.deepEqual(local.results.map(hit => hit.unitId), [unit.unitId]);
   assert.deepEqual(hidden.results, []);
   assert.equal(excerpt.text, fixture.report.approved);
-  assert(rawDenied && revoked);
+  assert(unapprovedDenied && rawDenied && revoked);
   assert.equal(cross.status, 'ready');
   assert.deepEqual(cross.results.map(hit => hit.unitId), [first.proposalId, second.proposalId]);
   assert.equal(historical.contentHash, first.hash);
