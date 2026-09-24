@@ -1,0 +1,14 @@
+{
+  "schema": "t10-discovery-cases@1",
+  "cases": [
+    { "id": "X01", "scenario": "default-local", "query": "Atlas index", "gold": "only-primary-project" },
+    { "id": "X02", "scenario": "owner-granted-cross-project", "query": "Atlas index", "gold": "both-projects-labelled" },
+    { "id": "X03", "scenario": "target-linux-from-windows", "query": "Linux socket", "gold": "applicable-to-target" },
+    { "id": "X04", "scenario": "target-environment-unknown", "query": "Linux socket", "gold": "reference-needs-verification" },
+    { "id": "X05", "scenario": "intent-completed-or-grant-revoked", "query": "Atlas index", "gold": "old-grant-and-cursor-denied" },
+    { "id": "X06", "scenario": "index-pending-or-corrupt", "query": "Atlas index", "gold": "dirty-not-empty-answer" },
+    { "id": "X07", "scenario": "rebuilt-index", "query": "Atlas index", "gold": "same-current-canonical" },
+    { "id": "X08", "scenario": "conflicted-head", "query": "Atlas index", "gold": "status-only-without-content" },
+    { "id": "X09", "scenario": "unauthorized-project-id", "query": "Atlas index", "gold": "no-name-or-content-disclosed" }
+  ]
+}

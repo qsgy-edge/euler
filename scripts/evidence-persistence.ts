@@ -91,7 +91,7 @@ function readRaw(path: string) {
   const db = new DatabaseSync(join(temp, dbName), { readOnly: true });
   try {
     sqliteVersion = String(db.prepare('SELECT sqlite_version() AS v').get()!.v);
-    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 9);
+    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 10);
     assert.deepEqual(db.prepare('PRAGMA quick_check').all().map(row => row.quick_check), ['ok']);
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     const tables: Record<string, Record<string, any>[]> = {};

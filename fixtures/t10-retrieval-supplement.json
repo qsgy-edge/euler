@@ -1,0 +1,11 @@
+{
+  "schema": "t10-retrieval-supplement@1",
+  "set": "development",
+  "cases": [
+    { "id": "S01", "records": ["Cache admission rules", "Socket wake rules"], "query": "cache socket", "gold": [0, 1] },
+    { "id": "S02", "records": ["Atlas route evidence one", "Atlas route evidence two"], "claimKey": "atlas-route", "query": "Atlas", "gold": [0] },
+    { "id": "S03", "records": ["Cache admission rules", "Unrelated private line"], "query": "cache\" OR private", "gold": [0, 1] },
+    { "id": "S04", "scenario": "corrupt-index-document", "query": "Atlas", "gold": "unavailable-without-fact" },
+    { "id": "S05", "scenario": "byte-budget-exceeded", "query": "Atlas", "gold": "unavailable-without-fact" }
+  ]
+}

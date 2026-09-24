@@ -1,0 +1,11 @@
+{
+  "schema": "t10-retrieval-corpus@1",
+  "set": "development",
+  "cases": [
+    { "id": "D01", "content": "RFC 42 controls the cache route", "query": "rfc 42", "gold": "hit" },
+    { "id": "D02", "content": "本地缓存失效边界", "query": "失效边", "gold": "hit" },
+    { "id": "D03", "content": "本地,路由", "query": "地路", "gold": "empty" },
+    { "id": "D04", "content": "网络切换策略", "query": "改用另一条线路", "gold": "empty" },
+    { "id": "D05", "content": "本地路由优先", "query": "路", "gold": "empty" }
+  ]
+}
