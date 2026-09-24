@@ -168,6 +168,9 @@ test('a mixed report exposes only the approved section, and revoked grants canno
     const read = { unitId: unpublished.unitId, offset: 0, limit: 50, grantId, queryId: readId };
     const firstRead = target.store.expandSource(target.activity, read);
     assert.equal(firstRead.text, 'Project A secret');
+    const usageDb = new DatabaseSync(resourcesOf(sandbox).store.path);
+    try { assert.equal(usageDb.prepare('SELECT used_results FROM memory_discovery_grants WHERE grant_id=?').get(grantId)?.used_results, 2); }
+    finally { usageDb.close(); }
     assert.deepEqual(target.store.expandSource(target.activity, read), firstRead);
     assert.throws(() => target.store.expandSource(target.activity, { ...read, limit: 49 }), /source-query-identity-conflict/);
     target.store.revokeMemoryDiscovery(target.activity, grantId);
@@ -262,6 +265,62 @@ test('source projection drain consumes its durable outbox and does not heal a di
     probe.store.rebuildSourceProjection(probe.activity);
     assert.equal(probe.store.searchSources(probe.activity, { query: 'Atlas' }).status, 'ready');
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('replaying an expanded source after archive loss returns a stale result', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const text = 'Atlas replay source';
+    const ref = probe.archive.append(randomUUID(), text);
+    const unit = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, {
+      ref, projectId: sandbox.fixture.projectId, kind: 'source', offset: 0, length: Array.from(text).length,
+    }));
+    probe.store.drainSourceProjection(probe.activity);
+    const intent = probe.store.readIntent(probe.activity)!;
+    const approval = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
+      intentId: intent.intentId, goalEventId: intent.goalInput.eventId, projectIds: [sandbox.fixture.projectId],
+      targets: {}, maxResults: 4, maxBytes: 131072 }));
+    const { grantId } = probe.store.authorizeMemoryDiscovery(probe.activity, approval, [sandbox.fixture.projectId], 4);
+    const request = { unitId: unit.unitId, offset: 0, limit: 64, grantId, queryId: randomUUID() };
+    assert.equal(probe.store.expandSource(probe.activity, request).text, text);
+    const sourcePath = join(sandbox.root, 'session.jsonl');
+    const header = readFileSync(sourcePath, 'utf8').split('\n')[0] + '\n';
+    writeFileSync(sourcePath, header);
+    assert.throws(() => probe.store.expandSource(probe.activity, request), /source-query-result-stale/);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('non-project inert proposals stay canonical without entering project projection', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  const db = new DatabaseSync(resourcesOf(sandbox).store.path);
+  try {
+    const source = probe.archive.append(randomUUID(), 'Personal Atlas evidence');
+    const proposal = probe.store.saveEvolutionProposal(probe.activity, source, {
+      target: 'Personal Atlas guidance', expectedChange: 'Keep the proposal inert', owner: sandbox.fixture.ownerId,
+      scope: { kind: 'personal', id: sandbox.fixture.ownerId, resolved: true }, evidenceRefs: [source],
+      evaluation: { schema: 'evaluation-contract@1', level: 'L0', assertions: ['Synthetic check'] },
+    });
+    assert.equal(db.prepare('SELECT scope_kind FROM evolution_proposals WHERE proposal_id=?').get(proposal.proposalId)?.scope_kind, 'personal');
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM source_projection_jobs WHERE unit_id=?').get(proposal.proposalId)?.count, 0);
+    assert.equal(probe.store.drainSourceProjection(probe.activity), 0);
+  } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('a published source request replays after its intent completes', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const text = 'Atlas replay publication';
+    const ref = probe.archive.append(randomUUID(), text);
+    const input = approvedSourceUnit(probe, { ref, projectId: sandbox.fixture.projectId, kind: 'source', offset: 0, length: Array.from(text).length });
+    const first = probe.store.publishSourceUnit(probe.activity, input);
+    const current = probe.store.readIntent(probe.activity)!;
+    const end = probe.archive.append(randomUUID(), 'Finish publication', 'user');
+    probe.store.transitionIntent(probe.activity, current.eventId, end, { status: 'completed', step: 'done' });
+    assert.deepEqual(probe.store.publishSourceUnit(probe.activity, input), first);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
 test('source and memory keep separate lanes through each projection rebuild', () => {

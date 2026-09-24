@@ -4,6 +4,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, copyFileSync, readdirSync } from 'node:fs';
 import { arch, release } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { createSandbox, createSandboxSession, bindingOf } from '../apps/cli/src/sandbox.ts';
 import { openProbe } from '../apps/cli/src/probe.ts';
 import type { SourceUnitInput } from '@euler/core';
@@ -26,6 +27,12 @@ const startedAt = new Date().toISOString();
 type ProcessReceipt = { command: string; args: string[]; cwd: string; startedAt: string; finishedAt: string;
   code: number | null; signal: string | null; stdout: { path: string; sha256: string }; stderr: { path: string; sha256: string } };
 const processes: ProcessReceipt[] = [];
+const mainStderr: string[] = [];
+const originalStderrWrite = process.stderr.write.bind(process.stderr);
+process.stderr.write = ((chunk: string | Uint8Array, ...args: any[]) => {
+  mainStderr.push(Buffer.from(chunk).toString('utf8'));
+  return originalStderrWrite(chunk, ...args);
+}) as typeof process.stderr.write;
 
 const fixturePath = new URL('../fixtures/t11-source-cases.json', import.meta.url);
 const expectedDigest = '13bfeb501644eb497d97914f3e508a7b7e21ef2b52b82ef5d5f34105dfb11e7e';
@@ -142,6 +149,59 @@ finally {
   rmSync(sandbox.root, { recursive: true, force: true });
 }
 
+const rawValidation = (() => {
+  try {
+    const approvedOffset = Array.from(fixture.report.text.slice(0, fixture.report.text.indexOf(fixture.report.approved))).length;
+    const archiveLines = readFileSync(join(directory, 'raw', 'session.jsonl'), 'utf8').trim().split('\n');
+    const rawEvents = archiveLines.slice(1).map(line => JSON.parse(line) as { schema: string; eventId: string; role: string; text: string });
+    const reportEvent = rawEvents.find(event => event.text === fixture.report.text);
+    assert(reportEvent, 'raw archive report missing');
+    const reportLine = JSON.stringify({ schema: reportEvent.schema, eventId: reportEvent.eventId,
+      role: reportEvent.role, text: reportEvent.text });
+    const db = new DatabaseSync(join(directory, 'raw', 'probe.sqlite'));
+    try {
+      const source = db.prepare(`SELECT unit_id, source_event_id, source_hash, source_byte_length, source_content_hash,
+        project_id, offset, length, content_hash FROM source_units
+        WHERE project_id=? AND kind='report-section' AND offset=? AND length=?`).get(
+        targetBinding.projectId, approvedOffset, Array.from(fixture.report.approved).length) as Record<string, unknown> | undefined;
+      assert(source, 'raw source unit missing');
+      assert.equal(source.source_event_id, reportEvent.eventId);
+      assert.equal(source.source_hash, sha256(reportLine));
+      assert.equal(source.source_byte_length, Buffer.byteLength(reportLine));
+      assert.equal(source.source_content_hash, sha256(fixture.report.text));
+      assert.equal(source.content_hash, sha256(fixture.report.approved));
+      const projection = db.prepare(`SELECT content, content_hash, owner_kind FROM search_documents WHERE unit_id=?`)
+        .get(String(source.unit_id)) as Record<string, unknown> | undefined;
+      assert(projection, 'raw source projection missing');
+      assert.equal(projection.content, fixture.report.approved.toLocaleLowerCase());
+      assert.equal(projection.content_hash, sha256(fixture.report.approved));
+      assert.equal(projection.owner_kind, 'session');
+      const job = db.prepare(`SELECT status, content_hash FROM source_projection_jobs WHERE owner_kind='session' AND unit_id=?
+        ORDER BY generation DESC LIMIT 1`).get(String(source.unit_id)) as Record<string, unknown> | undefined;
+      assert.equal(job?.status, 'done');
+      assert.equal(job?.content_hash, sha256(fixture.report.approved));
+      const proposals = db.prepare(`SELECT proposal_id, version, expected_change, payload, payload_hash
+        FROM evolution_proposals WHERE scope_kind='project' AND scope_id=? AND expected_change IN (?,?) ORDER BY version`)
+        .all(sandbox.fixture.projectId, fixture.proposal.first, fixture.proposal.second) as Record<string, unknown>[];
+      assert.equal(proposals.length, 2);
+      assert.equal(proposals[0]?.version, 1);
+      assert.equal(proposals[1]?.version, 2);
+      assert.notEqual(proposals[0]?.payload_hash, proposals[1]?.payload_hash);
+      for (const proposal of proposals) assert.equal(proposal.payload_hash, sha256(String(proposal.payload)));
+      const assembly = db.prepare(`SELECT state, sources, used_memories FROM request_assemblies WHERE state='finished' LIMIT 1`)
+        .get() as Record<string, unknown> | undefined;
+      assert(assembly, 'raw finished assembly missing');
+      assert.notEqual(String(assembly.sources), '[]');
+      assert.notEqual(String(assembly.used_memories), '[]');
+      return { status: 'pass', reportEventId: reportEvent.eventId, reportHash: sha256(reportLine),
+        sourceUnitId: String(source.unit_id), sourceContentHash: String(source.content_hash),
+        proposalIds: proposals.map(proposal => String(proposal.proposal_id)), assemblyState: String(assembly.state) };
+    } finally { db.close(); }
+  } catch (error) {
+    return { status: 'fail', error: error instanceof Error ? error.message : String(error) };
+  }
+})();
+
 let focusedRaw = '', focusedStderr = '', focusedPass = false;
 let focusedCode: number | null = null;
 let focusedSignal: string | null = null;
@@ -179,17 +239,20 @@ const assertions = [
   { name: 'focused T11 tests pass', passed: focusedPass },
 ].map(assertion => assertion.passed ? assertion : { ...assertion, error: scenarioError ?? 'assertion failed' });
 
+const preliminaryStatus = !scenarioError && focusedPass && rawValidation.status === 'pass' && assertions.every(assertion => assertion.passed) ? 'pass' : 'fail';
+const receiptObservations = JSON.parse(JSON.stringify(observations, (key, value) =>
+  ['text', 'content', 'expectedChange'].includes(key) ? undefined : value));
 writeFileSync(join(directory, 'fixture.json'), bytes, { flag: 'wx' });
-writeFileSync(join(directory, 'observations.json'), JSON.stringify(observations, null, 2) + '\n', { flag: 'wx' });
+writeFileSync(join(directory, 'owner-observations.json'), JSON.stringify(observations, null, 2) + '\n', { flag: 'wx' });
 writeFileSync(join(directory, 'focused-test.txt'), focusedRaw, { flag: 'wx' });
 writeFileSync(join(directory, 'focused-stderr.txt'), focusedStderr, { flag: 'wx' });
-writeFileSync(join(directory, 'console-output.txt'), JSON.stringify({ scenarioError, focusedCode, focusedSignal }) + '\n', { flag: 'wx' });
-writeFileSync(join(directory, 'main-stderr.txt'), '', { flag: 'wx' });
+const consoleOutput = JSON.stringify({ path: join(directory, 'summary.json'), passed: preliminaryStatus === 'pass', fixtureDigest, scenarioError }) + '\n';
+writeFileSync(join(directory, 'console-output.txt'), consoleOutput, { flag: 'wx' });
+writeFileSync(join(directory, 'main-stderr.txt'), mainStderr.join(''), { flag: 'wx' });
 const finishedAt = new Date().toISOString();
 const implementationCommit = execFileSync('git', ['--no-optional-locks', 'rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
 const implementationTree = execFileSync('git', ['--no-optional-locks', 'rev-parse', 'HEAD^{tree}'], { cwd: repo, encoding: 'utf8' }).trim();
 const workingTree = execFileSync('git', ['--no-optional-locks', 'status', '--short'], { cwd: repo, encoding: 'utf8' }).trim();
-const preliminaryStatus = !scenarioError && focusedPass && assertions.every(assertion => assertion.passed) ? 'pass' : 'fail';
 const artifactFiles = listFiles(directory).filter(path => path !== 'summary.json');
 const files = artifactFiles.map(path => ({ path, sha256: sha256(readFileSync(join(directory, path))) }));
 const focusedProcess: ProcessReceipt = { command: process.execPath, args: focusedArgs, cwd: repo, startedAt: focusedStartedAt,
@@ -223,13 +286,14 @@ const output = {
   heldOut: { digest: null, owner: null, sealedCommit: null, releasedCommit: null, contaminationCaseIds: [], replacementCaseIds: [],
     applicability: 'not-applicable: deterministic synthetic fixture; no held-out quality claim' },
   processes, assertions, files, controlledSideEffects,
-  artifactDigests: { stdout: focusedProcess.stdout, stderr: focusedProcess.stderr,
+  artifactDigests: { stdout: mainProcess.stdout, stderr: mainProcess.stderr,
     database: databaseArtifacts, sidecars: sidecarArtifacts },
-  independentValidation: { method: 'raw fixture/observation/console sidecars and node:crypto; no Core replay or reported verdict',
+  independentValidation: { method: 'raw fixture/archive/SQLite recomputation and node:crypto; no Core replay or reported verdict',
     verifier: { path: 'scripts/evidence-source-recovery.ts', sha256: sha256(readFileSync(new URL('./evidence-source-recovery.ts', import.meta.url))) }, status: preliminaryStatus },
-  observations, scenarioError, focusedPass, status: preliminaryStatus,
+  rawValidation, observations: receiptObservations, scenarioError, focusedPass, status: preliminaryStatus,
   exit: { code: preliminaryStatus === 'pass' ? 0 : 1, signal: null as string | null },
-  evidenceGaps: ['Real provider/Host consumers and authenticated owner UI remain unverified',
+  evidenceGaps: ['Unknown append outcomes and archive-flushed/pending-job restart fault injection remain unverified',
+    'Real provider/Host consumers and authenticated owner UI remain unverified',
     'Report/proposal generation and export remain T13/T18 work', 'Production schema migration and backup/purge remain outside T11',
     'Other OS host results require their matching CI/host artifacts'],
 };
@@ -267,11 +331,11 @@ function validateReceipt(receipt: typeof output) {
 let receiptError: string | null = null;
 try { validateReceipt(output); }
 catch (error) { receiptError = error instanceof Error ? error.stack ?? error.message : String(error); }
-output.independentValidation.status = receiptError ? 'fail' : 'pass';
+output.independentValidation.status = receiptError || rawValidation.status !== 'pass' ? 'fail' : 'pass';
 output.status = preliminaryStatus === 'pass' && !receiptError ? 'pass' : 'fail';
 output.exit.code = output.status === 'pass' ? 0 : 1;
 mainProcess.code = output.exit.code;
 (output as typeof output & { receiptError: string | null }).receiptError = receiptError;
 writeFileSync(join(directory, 'summary.json'), JSON.stringify(output, null, 2) + '\n', { flag: 'wx' });
-console.log(JSON.stringify({ path: join(directory, 'summary.json'), passed: output.status === 'pass', fixtureDigest, scenarioError, receiptError }));
+process.stdout.write(consoleOutput);
 if (output.status !== 'pass') process.exitCode = 1;

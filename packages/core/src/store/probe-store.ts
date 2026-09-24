@@ -822,13 +822,16 @@ export class ProbeStore {
       const unit: SourceUnit = { schema: 'source-unit@1', unitId: randomUUID(), ref: structuredClone(ref), kind,
         projectId, offset, length, contentHash: sha256(content), version: (prior?.version ?? 0) + 1,
         supersedes: prior?.unitId ?? null, approval: structuredClone(input.approval) };
-      const intent = this.readIntent(activity);
-      check(intent?.status === 'active', 'source-publication-approval-required');
-      this.#publicationApproval(unit, intent);
       const requestHash = sha256(JSON.stringify({ ref, projectId, kind, offset, length,
         supersedes: prior?.unitId ?? null, approval: input.approval ?? null }));
       const existing = this.#db.prepare('SELECT unit_id FROM source_units WHERE request_hash=?').get(requestHash);
-      if (existing) return this.#sourceUnit(String(existing.unit_id)).unit;
+      if (existing) {
+        this.#publicationApproval(unit);
+        return this.#sourceUnit(String(existing.unit_id)).unit;
+      }
+      const intent = this.readIntent(activity);
+      check(intent?.status === 'active', 'source-publication-approval-required');
+      this.#publicationApproval(unit, intent);
       const payload = JSON.stringify(unit);
       this.#db.prepare(`INSERT INTO source_units
         (unit_id,owner_id,project_id,source_owner,source_event_id,source_host_id,source_project_id,source_branch_id,
@@ -2913,7 +2916,7 @@ export class ProbeStore {
         this.#db.prepare('INSERT INTO proposal_evidence VALUES (?,?,?,?,?,?,?)')
           .run(proposalId, ordinal, ref.binding.sessionId, ref.eventId, ref.locator, ref.hash, ref.contentHash);
       }
-      this.#enqueueSourceProjection('proposal', proposalId, proposalId, scope.id, version, result.hash);
+      if (scope.kind === 'project') this.#enqueueSourceProjection('proposal', proposalId, proposalId, scope.id, version, result.hash);
       return result;
     });
   }
@@ -3003,26 +3006,40 @@ export class ProbeStore {
 
   #expandSourceUnit(activity: Activity, request: { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string }): SourceUnitExcerpt {
     check(Object.keys(request).every(key => ['unitId','offset','limit','grantId','queryId'].includes(key)), 'invalid-source-request');
-    const grant = request.grantId ? this.#discoveryProjects(activity, request.grantId) : null;
-    check((!grant && request.queryId === undefined) || (grant && typeof request.queryId === 'string'), 'source-query-id-required');
-    if (grant) uuid(request.queryId!);
+    check((!request.grantId && request.queryId === undefined) || (request.grantId && typeof request.queryId === 'string'), 'source-query-id-required');
+    if (request.grantId) uuid(request.queryId!);
     const requestHash = sha256(JSON.stringify({ operation: 'expand', sessionId: this.#binding.sessionId,
       grantId: request.grantId, unitId: request.unitId, offset: request.offset, limit: request.limit }));
-    const receipt = grant ? this.#db.prepare('SELECT * FROM source_query_receipts WHERE grant_id=? AND query_id=?')
-      .get(request.grantId!, request.queryId!) : null;
+    const receipt = request.grantId ? this.#db.prepare('SELECT * FROM source_query_receipts WHERE grant_id=? AND query_id=?')
+      .get(request.grantId, request.queryId!) : null;
     check(!receipt || receipt.request_hash === requestHash, 'source-query-identity-conflict');
+    let grant: { projects: string[]; targets: Map<string, SearchTarget>; remaining: number; remainingBytes: number; remainingQueries: number } | null = null;
+    try { grant = request.grantId ? this.#discoveryProjects(activity, request.grantId) : null; }
+    catch (error) {
+      const state = request.grantId ? this.#db.prepare('SELECT state FROM memory_discovery_grants WHERE grant_id=?')
+        .get(request.grantId)?.state : null;
+      if (receipt && state === 'active' && error instanceof Error && error.message.startsWith('source-evidence-gap')) {
+        throw new Error('source-query-result-stale', { cause: error });
+      }
+      throw error;
+    }
     const projects = grant?.projects ?? [this.#binding.projectId];
     const published = this.#db.prepare('SELECT project_id FROM source_units WHERE unit_id=? AND owner_id=?')
       .get(request.unitId, this.#binding.ownerId);
     let kind: SourceUnitExcerpt['kind'], version: number, contentHash: string, full: string;
-    if (published) {
-      check(projects.includes(String(published.project_id)), 'source-scope-mismatch');
-      const { unit, text } = this.#sourceUnit(request.unitId);
-      kind = unit.kind; version = unit.version; contentHash = unit.contentHash; full = text;
-    } else {
-      const proposal = this.#proposalForProjects(request.unitId, projects);
-      const row = this.#db.prepare('SELECT payload FROM evolution_proposals WHERE proposal_id=?').get(request.unitId)!;
-      kind = 'proposal'; version = proposal.version; contentHash = proposal.hash; full = String(row.payload);
+    try {
+      if (published) {
+        check(projects.includes(String(published.project_id)), 'source-scope-mismatch');
+        const { unit, text } = this.#sourceUnit(request.unitId);
+        kind = unit.kind; version = unit.version; contentHash = unit.contentHash; full = text;
+      } else {
+        const proposal = this.#proposalForProjects(request.unitId, projects);
+        const row = this.#db.prepare('SELECT payload FROM evolution_proposals WHERE proposal_id=?').get(request.unitId)!;
+        kind = 'proposal'; version = proposal.version; contentHash = proposal.hash; full = String(row.payload);
+      }
+    } catch (error) {
+      if (receipt) throw new Error('source-query-result-stale', { cause: error });
+      throw error;
     }
     const points = Array.from(full);
     check(request.offset <= points.length, 'invalid-range');
@@ -3038,11 +3055,11 @@ export class ProbeStore {
         check(receipt.page_hash === sha256(JSON.stringify(result)), 'source-query-result-stale');
       } else {
         check(grant.remainingQueries > 0 && grant.remainingBytes >= size, 'discovery-budget-exhausted');
-        check(this.#db.prepare(`UPDATE memory_discovery_grants SET used_queries=used_queries+1, used_bytes=used_bytes+?
-          WHERE grant_id=? AND state='active' AND used_queries<max_queries AND used_bytes+?<=max_bytes`)
+        check(this.#db.prepare(`UPDATE memory_discovery_grants SET used_queries=used_queries+1, used_results=used_results+1, used_bytes=used_bytes+?
+          WHERE grant_id=? AND state='active' AND used_queries<max_queries AND used_results+1<=max_results AND used_bytes+?<=max_bytes`)
           .run(size, request.grantId!, size).changes === 1, 'discovery-budget-stale');
         this.#db.prepare('INSERT INTO source_query_receipts VALUES (?,?,?,?,?,?)')
-          .run(request.grantId!, request.queryId!, requestHash, sha256(JSON.stringify(result)), 0, size);
+          .run(request.grantId!, request.queryId!, requestHash, sha256(JSON.stringify(result)), 1, size);
       }
     }
     return result;
