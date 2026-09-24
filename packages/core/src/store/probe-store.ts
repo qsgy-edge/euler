@@ -164,7 +164,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=12), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=13), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -460,13 +460,38 @@ CREATE TABLE projection_jobs (
 CREATE TABLE source_units (
   unit_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(project_id),
   source_owner TEXT NOT NULL REFERENCES sessions(session_id), source_event_id TEXT NOT NULL,
+  source_host_id TEXT NOT NULL, source_project_id TEXT NOT NULL REFERENCES projects(project_id), source_branch_id TEXT NOT NULL,
+  source_locator TEXT NOT NULL, source_hash TEXT NOT NULL, source_byte_length INTEGER NOT NULL CHECK(source_byte_length>0),
+  source_content_hash TEXT NOT NULL,
   kind TEXT NOT NULL CHECK(kind IN ('source','report-section','handoff')), version INTEGER NOT NULL CHECK(version>0),
-  supersedes TEXT REFERENCES source_units(unit_id), payload TEXT NOT NULL, payload_hash TEXT NOT NULL,
-  request_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
+  supersedes TEXT REFERENCES source_units(unit_id), offset INTEGER NOT NULL CHECK(offset>=0),
+  length INTEGER NOT NULL CHECK(length>0 AND length<=4096), content_hash TEXT NOT NULL,
+  approval_event_id TEXT NOT NULL, approval_locator TEXT NOT NULL, approval_hash TEXT NOT NULL,
+  approval_byte_length INTEGER NOT NULL CHECK(approval_byte_length>0), approval_content_hash TEXT NOT NULL,
+  payload TEXT NOT NULL, payload_hash TEXT NOT NULL, request_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL
 ) STRICT;
 CREATE INDEX source_units_project ON source_units(owner_id,project_id,unit_id);
+CREATE INDEX source_units_source ON source_units(source_owner,source_event_id);
 CREATE TRIGGER immutable_source_units_update BEFORE UPDATE ON source_units BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_source_units_delete BEFORE DELETE ON source_units BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TABLE source_projection_jobs (
+  job_id TEXT PRIMARY KEY, owner_kind TEXT NOT NULL CHECK(owner_kind IN ('session','proposal')),
+  unit_id TEXT NOT NULL, owner_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(project_id),
+  generation INTEGER NOT NULL CHECK(generation>0), content_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','done','failed')),
+  created_at TEXT NOT NULL, processed_at TEXT, reason TEXT,
+  UNIQUE(owner_kind,unit_id,generation)
+) STRICT;
+CREATE INDEX source_projection_pending ON source_projection_jobs(status,project_id,owner_kind,unit_id);
+CREATE TRIGGER source_projection_job_guard BEFORE UPDATE ON source_projection_jobs
+WHEN NEW.job_id IS NOT OLD.job_id OR NEW.owner_kind IS NOT OLD.owner_kind OR NEW.unit_id IS NOT OLD.unit_id
+  OR NEW.owner_id IS NOT OLD.owner_id OR NEW.project_id IS NOT OLD.project_id OR NEW.generation IS NOT OLD.generation
+  OR NEW.content_hash IS NOT OLD.content_hash OR NEW.created_at IS NOT OLD.created_at
+  OR (OLD.status='done' AND NEW.status!='done') OR (OLD.status='failed' AND NEW.status!='failed')
+  OR (OLD.status='pending' AND NEW.status NOT IN ('done','failed'))
+BEGIN SELECT RAISE(ABORT,'source-projection-job-immutable'); END;
+CREATE TRIGGER immutable_source_projection_jobs_delete BEFORE DELETE ON source_projection_jobs
+BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TABLE search_documents (
   unit_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, record_id TEXT NOT NULL UNIQUE,
   revision_id TEXT NOT NULL, project_id TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
@@ -549,15 +574,15 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=12;
+PRAGMA user_version=13;
 ` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events','source_query_receipts'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 `).join('') + ['memory_heads','intent_heads','owner_fences','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
-  'verification_runs','verification_evidence','proposal_evidence','projection_jobs','feedback_events','search_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts'].map(table => `
+  'verification_runs','verification_evidence','proposal_evidence','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
-`).join('') + ['memory_heads','intent_heads','owner_fences','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
+`).join('') + ['memory_heads','intent_heads','owner_fences','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts','source_projection_jobs'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
 CREATE TRIGGER owned_${table}_${operation.toLowerCase()} BEFORE ${operation} ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
 `)).join('') + `
@@ -605,15 +630,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,12,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,13,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 12, 'unsupported-probe-schema');
+        check(version === 13, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 12 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 13 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -786,7 +811,8 @@ export class ProbeStore {
       check(this.#db.prepare('SELECT 1 FROM projects WHERE project_id=? AND owner_id=?')
         .get(projectId, this.#binding.ownerId), 'source-project-unavailable');
       check(Number.isSafeInteger(offset) && offset >= 0 && Number.isSafeInteger(length) && length > 0 && length <= 4096, 'invalid-range');
-      const points = Array.from(this.#archiveRef(ref).text);
+      const archive = this.#archiveRef(ref);
+      const points = Array.from(archive.text);
       check(offset + length <= points.length, 'invalid-range');
       const content = points.slice(offset, offset + length).join('');
       check(Buffer.byteLength(content) <= 16384, 'invalid-source-unit');
@@ -804,11 +830,38 @@ export class ProbeStore {
       const existing = this.#db.prepare('SELECT unit_id FROM source_units WHERE request_hash=?').get(requestHash);
       if (existing) return this.#sourceUnit(String(existing.unit_id)).unit;
       const payload = JSON.stringify(unit);
-      this.#db.prepare('INSERT INTO source_units VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
-        .run(unit.unitId, this.#binding.ownerId, projectId, ref.binding.sessionId, ref.eventId, kind,
-          unit.version, unit.supersedes, payload, sha256(payload), requestHash, new Date().toISOString());
+      this.#db.prepare(`INSERT INTO source_units
+        (unit_id,owner_id,project_id,source_owner,source_event_id,source_host_id,source_project_id,source_branch_id,
+         source_locator,source_hash,source_byte_length,source_content_hash,kind,version,supersedes,offset,length,content_hash,
+         approval_event_id,approval_locator,approval_hash,approval_byte_length,approval_content_hash,payload,payload_hash,request_hash,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(unit.unitId, this.#binding.ownerId, projectId, ref.binding.sessionId, ref.eventId, ref.binding.hostId,
+          ref.binding.projectId, ref.binding.branchId, ref.locator, ref.hash, ref.byteLength, ref.contentHash, kind, unit.version,
+          unit.supersedes, unit.offset, unit.length, unit.contentHash, unit.approval.eventId, unit.approval.locator,
+          unit.approval.hash, unit.approval.byteLength, unit.approval.contentHash, payload, sha256(payload), requestHash,
+          new Date().toISOString());
+      this.#enqueueSourceProjection('session', unit.unitId, unit.ref.binding.sessionId, projectId, unit.version, unit.contentHash);
       return unit;
     });
+  }
+
+  #enqueueSourceProjection(ownerKind: 'session' | 'proposal', unitId: string, ownerId: string,
+    projectId: string, generation: number, contentHash: string): void {
+    this.#db.prepare(`INSERT INTO source_projection_jobs
+      (job_id,owner_kind,unit_id,owner_id,project_id,generation,content_hash,status,created_at,processed_at,reason)
+      VALUES (?,?,?,?,?,?,?,'pending',?,NULL,NULL)`)
+      .run(randomUUID(), ownerKind, unitId, ownerId, projectId, generation, contentHash, new Date().toISOString());
+  }
+
+  #sourceAckFromUnitRow(row: Record<string, unknown>, approval: boolean): SourceAck {
+    const binding: Binding = { ownerId: String(row.owner_id), hostId: String(row.source_host_id),
+      projectId: String(row.source_project_id), sessionId: String(row.source_owner), branchId: String(row.source_branch_id) };
+    return { schema: 'cli-source-ack@1', status: 'durable', binding,
+      eventId: String(row[approval ? 'approval_event_id' : 'source_event_id']),
+      locator: String(row[approval ? 'approval_locator' : 'source_locator']),
+      hash: String(row[approval ? 'approval_hash' : 'source_hash']),
+      byteLength: Number(row[approval ? 'approval_byte_length' : 'source_byte_length']),
+      contentHash: String(row[approval ? 'approval_content_hash' : 'source_content_hash']) };
   }
 
   #publicationApproval(unit: SourceUnit, intent?: Intent): void {
@@ -837,14 +890,27 @@ export class ProbeStore {
     const row = this.#db.prepare('SELECT * FROM source_units WHERE unit_id=? AND owner_id=?')
       .get(unitId, this.#binding.ownerId);
     check(row && sha256(String(row.payload)) === row.payload_hash, 'source-evidence-gap');
-    let unit: SourceUnit;
-    try { unit = JSON.parse(String(row.payload)) as SourceUnit; }
+    const stored = row as Record<string, unknown>;
+    const ref = this.#sourceAckFromUnitRow(stored, false);
+    const approval = this.#sourceAckFromUnitRow(stored, true);
+    const unit: SourceUnit = { schema: 'source-unit@1', unitId, ref, kind: String(stored.kind) as SourceUnit['kind'],
+      projectId: String(stored.project_id), offset: Number(stored.offset), length: Number(stored.length),
+      contentHash: String(stored.content_hash), version: Number(stored.version),
+      supersedes: stored.supersedes === null ? null : String(stored.supersedes), approval };
+    let encoded: unknown;
+    try { encoded = JSON.parse(String(stored.payload)); }
     catch { throw new Error('source-evidence-gap'); }
-    check(unit.schema === 'source-unit@1' && unit.unitId === unitId && unit.projectId === row.project_id
-      && unit.kind === row.kind && unit.version === row.version && unit.supersedes === row.supersedes
-      && unit.ref?.binding.sessionId === row.source_owner && unit.ref.eventId === row.source_event_id
+    check(JSON.stringify(encoded) === JSON.stringify(unit)
+      && unit.schema === 'source-unit@1' && unit.unitId === unitId && unit.projectId === stored.project_id
+      && unit.kind === stored.kind && unit.version === stored.version && unit.supersedes === stored.supersedes
+      && unit.ref.binding.sessionId === stored.source_owner && unit.ref.eventId === stored.source_event_id
+      && unit.ref.locator === stored.source_locator && unit.ref.hash === stored.source_hash
+      && unit.ref.byteLength === stored.source_byte_length && unit.ref.contentHash === stored.source_content_hash
+      && unit.approval.eventId === stored.approval_event_id && unit.approval.locator === stored.approval_locator
+      && unit.approval.hash === stored.approval_hash && unit.approval.byteLength === stored.approval_byte_length
+      && unit.approval.contentHash === stored.approval_content_hash
       && Number.isSafeInteger(unit.offset) && unit.offset >= 0 && Number.isSafeInteger(unit.length)
-      && unit.length > 0 && unit.length <= 4096, 'source-evidence-gap');
+      && unit.length > 0 && unit.length <= 4096 && /^[0-9a-f]{64}$/i.test(unit.contentHash), 'source-evidence-gap');
     const project = this.#db.prepare('SELECT owner_id FROM projects WHERE project_id=?').get(unit.projectId);
     check(project?.owner_id === this.#binding.ownerId, 'source-evidence-gap');
     this.#publicationApproval(unit);
@@ -2043,10 +2109,13 @@ export class ProbeStore {
   #indexSourceUnit(unitId: string): void {
     const { unit, text } = this.#sourceUnit(unitId);
     const indexed = `${normalizeSearchText(text)} ${cjkBigrams(text)}`.trim();
+    const old = this.#db.prepare("SELECT rowid FROM search_documents WHERE unit_id=? AND owner_kind='session'").get(unit.unitId);
+    if (old) this.#db.prepare('DELETE FROM search_fts WHERE rowid=?').run(Number(old.rowid));
+    this.#db.prepare("DELETE FROM search_documents WHERE unit_id=? AND owner_kind='session'").run(unit.unitId);
     this.#db.prepare('INSERT INTO search_documents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
       .run(unit.unitId, unit.ref.binding.sessionId, unit.unitId, unit.unitId, unit.projectId, 'project', unit.projectId,
         'published', 'unverified', 'normal', indexed, unit.contentHash, unit.version, 'latin-cjk@3', unit.version, 'session');
-    const projected = this.#db.prepare('SELECT rowid FROM search_documents WHERE unit_id=?').get(unit.unitId)!;
+    const projected = this.#db.prepare('SELECT rowid FROM search_documents WHERE unit_id=? AND owner_kind=\'session\'').get(unit.unitId)!;
     this.#db.prepare('INSERT INTO search_fts(rowid,content) VALUES (?,?)').run(Number(projected.rowid), indexed);
   }
 
@@ -2055,11 +2124,14 @@ export class ProbeStore {
     check(proposal.scope.kind === 'project', 'proposal-scope-unavailable');
     const content = `${proposal.target} ${proposal.expectedChange}`;
     const indexed = `${normalizeSearchText(content)} ${cjkBigrams(content)}`.trim();
+    const old = this.#db.prepare("SELECT rowid FROM search_documents WHERE unit_id=? AND owner_kind='proposal'").get(proposal.proposalId);
+    if (old) this.#db.prepare('DELETE FROM search_fts WHERE rowid=?').run(Number(old.rowid));
+    this.#db.prepare("DELETE FROM search_documents WHERE unit_id=? AND owner_kind='proposal'").run(proposal.proposalId);
     this.#db.prepare('INSERT INTO search_documents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
       .run(proposal.proposalId, proposal.proposalId, proposal.proposalId, proposal.proposalId,
         proposal.scope.id, 'project', proposal.scope.id, 'published', 'unverified', 'normal', indexed,
         proposal.hash, proposal.version, 'latin-cjk@3', proposal.version, 'proposal');
-    const projected = this.#db.prepare('SELECT rowid FROM search_documents WHERE unit_id=?').get(proposal.proposalId)!;
+    const projected = this.#db.prepare("SELECT rowid FROM search_documents WHERE unit_id=? AND owner_kind='proposal'").get(proposal.proposalId)!;
     this.#db.prepare('INSERT INTO search_fts(rowid,content) VALUES (?,?)').run(Number(projected.rowid), indexed);
   }
 
@@ -2076,8 +2148,22 @@ export class ProbeStore {
         OR EXISTS (SELECT 1 FROM evolution_proposals p WHERE p.proposal_id=search_documents.unit_id
           AND p.owner=? AND p.scope_kind='project' AND p.scope_id=?)`)
         .run(projectId, this.#binding.ownerId, projectId, this.#binding.ownerId, projectId);
-      for (const row of sources) this.#indexSourceUnit(String(row.unit_id));
-      for (const row of proposals) this.#indexProposal(String(row.proposal_id), [projectId]);
+      for (const row of sources) {
+        const unitId = String(row.unit_id);
+        this.#indexSourceUnit(unitId);
+        const canonical = this.#sourceUnit(unitId).unit;
+        this.#db.prepare(`UPDATE source_projection_jobs SET status='done',processed_at=?,reason='rebuild'
+          WHERE owner_kind='session' AND unit_id=? AND generation=? AND content_hash=? AND status='pending'`)
+          .run(new Date().toISOString(), unitId, canonical.version, canonical.contentHash);
+      }
+      for (const row of proposals) {
+        const proposalId = String(row.proposal_id);
+        this.#indexProposal(proposalId, [projectId]);
+        const canonical = this.#proposalForProjects(proposalId, [projectId]);
+        this.#db.prepare(`UPDATE source_projection_jobs SET status='done',processed_at=?,reason='rebuild'
+          WHERE owner_kind='proposal' AND unit_id=? AND generation=? AND content_hash=? AND status='pending'`)
+          .run(new Date().toISOString(), proposalId, canonical.version, canonical.hash);
+      }
       this.#db.exec(`DROP TABLE search_fts;
         CREATE VIRTUAL TABLE search_fts USING fts5(content, content='search_documents', content_rowid='rowid');
         INSERT INTO search_fts(search_fts) VALUES ('rebuild');`);
@@ -2089,21 +2175,39 @@ export class ProbeStore {
   drainSourceProjection(activity: Activity, limit = 32): number {
     return this.withActivity(activity, () => {
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= 128, 'invalid-projection-limit');
-      const rows = this.#db.prepare(`SELECT s.unit_id,s.project_id FROM source_units s
-        LEFT JOIN search_documents d ON d.unit_id=s.unit_id AND d.owner_kind='session'
-        WHERE s.owner_id=? AND d.unit_id IS NULL ORDER BY s.rowid LIMIT ?`)
-        .all(this.#binding.ownerId, limit);
-      const proposals = this.#db.prepare(`SELECT p.proposal_id,p.scope_id AS project_id FROM evolution_proposals p
-        LEFT JOIN search_documents d ON d.unit_id=p.proposal_id AND d.owner_kind='proposal'
-        WHERE p.owner=? AND p.scope_kind='project' AND d.unit_id IS NULL ORDER BY p.rowid LIMIT ?`)
-        .all(this.#binding.ownerId, limit - rows.length);
-      const projects = [...new Set([...rows, ...proposals].map(row => String(row.project_id)))];
-      const state = this.#db.prepare('SELECT dirty FROM source_projection_health WHERE project_id=?');
-      const cleanProjects = projects.filter(id => state.get(id)?.dirty !== 1);
-      for (const row of rows) this.#indexSourceUnit(String(row.unit_id));
-      for (const row of proposals) this.#indexProposal(String(row.proposal_id), [String(row.project_id)]);
-      for (const projectId of cleanProjects) this.#db.prepare('UPDATE source_projection_health SET dirty=0 WHERE project_id=?').run(projectId);
-      return rows.length + proposals.length;
+      const jobs = this.#db.prepare(`SELECT * FROM source_projection_jobs
+        WHERE status='pending' ORDER BY rowid LIMIT ?`).all(limit);
+      const initialDirty = new Map<string, number>();
+      for (const job of jobs) {
+        const projectId = String(job.project_id);
+        if (!initialDirty.has(projectId)) {
+          initialDirty.set(projectId, Number(this.#db.prepare('SELECT dirty FROM source_projection_health WHERE project_id=?')
+            .get(projectId)?.dirty ?? 0));
+        }
+        if (job.owner_kind === 'session') {
+          const canonical = this.#sourceUnit(String(job.unit_id)).unit;
+          check(canonical.projectId === projectId && canonical.version === Number(job.generation)
+            && canonical.contentHash === String(job.content_hash), 'source-projection-job-stale');
+          this.#indexSourceUnit(canonical.unitId);
+        } else {
+          const canonical = this.#proposalForProjects(String(job.unit_id), [projectId]);
+          check(canonical.scope.kind === 'project' && canonical.scope.id === projectId
+            && canonical.version === Number(job.generation) && canonical.hash === String(job.content_hash), 'source-projection-job-stale');
+          this.#indexProposal(canonical.proposalId, [projectId]);
+        }
+        check(this.#db.prepare(`UPDATE source_projection_jobs
+          SET status='done',processed_at=?,reason=NULL
+          WHERE job_id=? AND status='pending' AND generation=? AND content_hash=?`).run(
+            new Date().toISOString(), String(job.job_id), Number(job.generation), String(job.content_hash)).changes === 1,
+        'source-projection-job-race');
+      }
+      for (const projectId of initialDirty.keys()) {
+        const pending = this.#db.prepare("SELECT 1 FROM source_projection_jobs WHERE project_id=? AND status!='done' LIMIT 1").get(projectId);
+        if (!pending && initialDirty.get(projectId) !== 1) {
+          this.#db.prepare('UPDATE source_projection_health SET dirty=0 WHERE project_id=?').run(projectId);
+        }
+      }
+      return jobs.length;
     });
   }
 
@@ -2146,13 +2250,16 @@ export class ProbeStore {
         return page;
       };
       const ids = projects.map(() => '?').join(',');
+      const pending = this.#db.prepare(`SELECT 1 FROM source_projection_jobs
+        WHERE project_id IN (${ids}) AND status!='done' LIMIT 1`).get(...projects);
+      if (pending) return finalize(unavailable('index-lag', 'dirty'));
       if (this.#db.prepare(`SELECT 1 FROM source_projection_health WHERE project_id IN (${ids}) AND dirty=1 LIMIT 1`)
         .get(...projects)) return finalize(unavailable('index-damaged', 'dirty'));
       const missing = this.#db.prepare(`SELECT 1 FROM source_units s LEFT JOIN search_documents d ON d.unit_id=s.unit_id
         WHERE s.owner_id=? AND s.project_id IN (${ids}) AND (d.unit_id IS NULL OR d.owner_kind!='session'
           OR d.owner_id!=s.source_owner OR d.project_id!=s.project_id OR d.scope_kind!='project'
           OR d.scope_id!=s.project_id OR d.revision_id!=s.unit_id OR d.record_id!=s.unit_id
-          OR d.content_hash!=json_extract(s.payload,'$.contentHash')
+          OR d.content_hash!=s.content_hash
           OR d.source_seq!=s.version OR d.projection_generation!=s.version OR d.tokenizer_version!='latin-cjk@3') LIMIT 1`)
         .get(this.#binding.ownerId, ...projects);
       const extra = this.#db.prepare(`SELECT 1 FROM search_documents d LEFT JOIN source_units s ON s.unit_id=d.unit_id
@@ -2217,7 +2324,7 @@ export class ProbeStore {
           candidates.push({ unitId: unit.unitId, locator: sourceUnitLocator(unit.kind, unit.unitId, unit.version),
             kind: unit.kind, projectId: unit.projectId,
             sourceProjectId: unit.ref.binding.projectId, version: unit.version, contentHash: unit.contentHash,
-            range: { offset: unit.offset, end: unit.offset + unit.length, total: Array.from(this.#readSource!(unit.ref).text).length },
+            range: { offset: 0, end: unit.length, total: unit.length },
             status: 'available', preview: Array.from(text).slice(0, 128).join('') });
         } catch { return finalize(unavailable('source-evidence-gap')); }
       }
@@ -2806,6 +2913,7 @@ export class ProbeStore {
         this.#db.prepare('INSERT INTO proposal_evidence VALUES (?,?,?,?,?,?,?)')
           .run(proposalId, ordinal, ref.binding.sessionId, ref.eventId, ref.locator, ref.hash, ref.contentHash);
       }
+      this.#enqueueSourceProjection('proposal', proposalId, proposalId, scope.id, version, result.hash);
       return result;
     });
   }

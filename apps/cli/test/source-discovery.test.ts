@@ -240,6 +240,30 @@ test('a proposal from another project needs a task grant even when its locator i
 });
 
 
+test('source projection drain consumes its durable outbox and does not heal a dirty index by scanning', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  const db = new DatabaseSync(resourcesOf(sandbox).store.path);
+  try {
+    const text = 'Atlas durable projection job';
+    const ref = probe.archive.append(randomUUID(), text);
+    const unit = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, {
+      ref, projectId: sandbox.fixture.projectId, kind: 'source', offset: 0, length: Array.from(text).length,
+    }));
+    assert.equal(db.prepare("SELECT status FROM source_projection_jobs WHERE owner_kind='session' AND unit_id=?")
+      .get(unit.unitId)?.status, 'pending');
+    assert.equal(probe.store.drainSourceProjection(probe.activity), 1);
+    assert.equal(db.prepare("SELECT status FROM source_projection_jobs WHERE owner_kind='session' AND unit_id=?")
+      .get(unit.unitId)?.status, 'done');
+    db.prepare('DELETE FROM search_fts WHERE rowid=(SELECT rowid FROM search_documents WHERE unit_id=?)').run(unit.unitId);
+    assert.equal(probe.store.searchSources(probe.activity, { query: 'Atlas' }).status, 'dirty');
+    assert.equal(probe.store.drainSourceProjection(probe.activity), 0);
+    assert.equal(probe.store.searchSources(probe.activity, { query: 'Atlas' }).status, 'dirty');
+    probe.store.rebuildSourceProjection(probe.activity);
+    assert.equal(probe.store.searchSources(probe.activity, { query: 'Atlas' }).status, 'ready');
+  } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('source and memory keep separate lanes through each projection rebuild', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);

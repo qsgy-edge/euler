@@ -1,23 +1,45 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, copyFileSync, readdirSync } from 'node:fs';
+import { arch, release } from 'node:os';
 import { join } from 'node:path';
 import { createSandbox, createSandboxSession, bindingOf } from '../apps/cli/src/sandbox.ts';
 import { openProbe } from '../apps/cli/src/probe.ts';
 import type { SourceUnitInput } from '@euler/core';
 
+const repo = process.cwd();
+const sha256 = (value: string | Uint8Array): string => createHash('sha256').update(value).digest('hex');
+const copyTree = (source: string, target: string): void => {
+  mkdirSync(target, { recursive: true });
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    const from = join(source, entry.name), to = join(target, entry.name);
+    if (entry.isDirectory()) copyTree(from, to);
+    else copyFileSync(from, to);
+  }
+};
+const listFiles = (root: string, prefix = ''): string[] => readdirSync(join(root, prefix), { withFileTypes: true }).flatMap(entry => {
+  const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+  return entry.isDirectory() ? listFiles(root, relative) : [relative];
+});
+const startedAt = new Date().toISOString();
+type ProcessReceipt = { command: string; args: string[]; cwd: string; startedAt: string; finishedAt: string;
+  code: number | null; signal: string | null; stdout: { path: string; sha256: string }; stderr: { path: string; sha256: string } };
+const processes: ProcessReceipt[] = [];
+
 const fixturePath = new URL('../fixtures/t11-source-cases.json', import.meta.url);
 const expectedDigest = '13bfeb501644eb497d97914f3e508a7b7e21ef2b52b82ef5d5f34105dfb11e7e';
 const bytes = readFileSync(fixturePath);
-const digest = createHash('sha256').update(bytes).digest('hex');
-assert.equal(digest, expectedDigest, 'T11 fixture changed');
+const fixtureDigest = sha256(bytes);
+assert.equal(fixtureDigest, expectedDigest, 'T11 fixture changed');
 const fixture = JSON.parse(bytes.toString('utf8')) as {
   schema: string; report: { text: string; approved: string; hidden: string };
   proposal: { target: string; first: string; second: string };
 };
 assert.equal(fixture.schema, 't11-source-cases@1');
 const sandbox = createSandbox();
+const directory = join('artifacts', `t11-${Date.now()}`);
+mkdirSync(directory, { recursive: true });
 const targetBinding = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
 createSandboxSession(sandbox, targetBinding);
 const origin = openProbe(sandbox);
@@ -88,7 +110,7 @@ try {
   catch (error) { revoked = error instanceof Error && error.message === 'discovery-not-authorized'; }
   observations.source = { acknowledgement: report, recoveredAck, replayedUnitId: replay.unitId,
     unitId: unit.unitId, localStatus: local.status, localIds: local.results.map(hit => hit.unitId),
-    hiddenIds: hidden.results.map(hit => hit.unitId), unapprovedDenied, rawDenied, excerpt, fixtureDigest: digest };
+    hiddenIds: hidden.results.map(hit => hit.unitId), unapprovedDenied, rawDenied, excerpt, fixtureDigest };
   observations.proposal = { first: { id: first.proposalId, version: first.version, hash: first.hash },
     second: { id: second.proposalId, version: second.version, hash: second.hash },
     crossStatus: cross.status, crossIds: cross.results.map(hit => hit.unitId),
@@ -113,22 +135,143 @@ try {
   assert.equal(inspected.memories[0]?.snapshot.hash, active.hash);
   assert.notEqual(origin.store.readMemory(origin.activity, active.recordId).content, inspected.memories[0]?.snapshot.content);
 } catch (error) { scenarioError = error instanceof Error ? error.stack ?? error.message : String(error); }
-finally { target.close(); origin.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+finally {
+  target.close();
+  origin.close();
+  copyTree(sandbox.root, join(directory, 'raw'));
+  rmSync(sandbox.root, { recursive: true, force: true });
+}
 
-let focusedRaw = '', focusedPass = true;
-try { focusedRaw = execFileSync(process.execPath,
-  ['--test', 'apps/cli/test/source-discovery.test.ts', 'apps/cli/test/source-recovery.test.ts'],
-  { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 }); }
-catch (error) { focusedPass = false; focusedRaw = String((error as { stdout?: string }).stdout ?? error); }
-const passed = !scenarioError && focusedPass;
-const output = { schema: 't11-source-evidence@1', at: new Date().toISOString(),
-  commit: execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(),
-  worktreeStatus: execFileSync('git', ['status', '--short'], { encoding: 'utf8' }).trim().split('\n').filter(Boolean),
-  environment, fixture: { schema: fixture.schema, digest }, observations, scenarioError, focusedPass, passed };
-const directory = join('artifacts', `t11-${Date.now()}`);
-mkdirSync(directory, { recursive: true });
-const path = join(directory, 'summary.json');
-writeFileSync(path, JSON.stringify(output, null, 2) + '\n', { flag: 'wx' });
+let focusedRaw = '', focusedStderr = '', focusedPass = false;
+let focusedCode: number | null = null;
+let focusedSignal: string | null = null;
+const focusedArgs = ['--test', 'apps/cli/test/source-discovery.test.ts', 'apps/cli/test/source-recovery.test.ts'];
+const focusedStartedAt = new Date().toISOString();
+const focusedResult = spawnSync(process.execPath, focusedArgs, {
+  cwd: repo, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+});
+focusedRaw = String(focusedResult.stdout ?? '');
+focusedStderr = String(focusedResult.stderr ?? '');
+focusedCode = focusedResult.status;
+focusedSignal = focusedResult.signal;
+focusedPass = focusedResult.status === 0 && focusedResult.signal === null && !focusedResult.error;
+const focusedFinishedAt = new Date().toISOString();
+
+const sourceObservation = observations.source as { acknowledgement?: unknown; recoveredAck?: unknown; localStatus?: string;
+  unitId?: string; replayedUnitId?: string; excerpt?: { text?: string }; unapprovedDenied?: boolean; rawDenied?: boolean;
+  revoked?: boolean } | undefined;
+const proposalObservation = observations.proposal as { historical?: { contentHash?: string; text?: string };
+  first?: { hash?: string }; second?: { hash?: string }; crossStatus?: string; revoked?: boolean } | undefined;
+const assemblyObservation = observations.assembly as { state?: string; sent?: string; usedSourceIds?: string[];
+  usedMemory?: unknown[] } | undefined;
+const assertions = [
+  { name: 'archive acknowledgement survives lookup', passed: !scenarioError && Boolean(sourceObservation?.acknowledgement && sourceObservation.recoveredAck) },
+  { name: 'published source identity is stable', passed: !scenarioError && sourceObservation?.unitId === sourceObservation?.replayedUnitId },
+  { name: 'search and bounded expansion return the approved range', passed: !scenarioError && sourceObservation?.localStatus === 'ready'
+      && sourceObservation.excerpt?.text === fixture.report.approved },
+  { name: 'publication, raw scope and revocation denials are explicit', passed: !scenarioError
+      && sourceObservation?.unapprovedDenied === true && sourceObservation?.rawDenied === true && proposalObservation?.revoked === true },
+  { name: 'historical proposal bytes remain independent', passed: !scenarioError && proposalObservation?.crossStatus === 'ready'
+      && proposalObservation.historical?.text?.includes(fixture.proposal.first) === true
+      && proposalObservation.historical?.text?.includes(fixture.proposal.second) === false },
+  { name: 'assembly inspect reports the frozen used snapshots', passed: !scenarioError && assemblyObservation?.state === 'finished'
+      && assemblyObservation.usedSourceIds?.length === 1 && (assemblyObservation.usedMemory?.length ?? 0) === 1 },
+  { name: 'focused T11 tests pass', passed: focusedPass },
+].map(assertion => assertion.passed ? assertion : { ...assertion, error: scenarioError ?? 'assertion failed' });
+
+writeFileSync(join(directory, 'fixture.json'), bytes, { flag: 'wx' });
+writeFileSync(join(directory, 'observations.json'), JSON.stringify(observations, null, 2) + '\n', { flag: 'wx' });
 writeFileSync(join(directory, 'focused-test.txt'), focusedRaw, { flag: 'wx' });
-console.log(JSON.stringify({ path, passed, fixtureDigest: digest, scenarioError }));
-if (!passed) process.exitCode = 1;
+writeFileSync(join(directory, 'focused-stderr.txt'), focusedStderr, { flag: 'wx' });
+writeFileSync(join(directory, 'console-output.txt'), JSON.stringify({ scenarioError, focusedCode, focusedSignal }) + '\n', { flag: 'wx' });
+writeFileSync(join(directory, 'main-stderr.txt'), '', { flag: 'wx' });
+const finishedAt = new Date().toISOString();
+const implementationCommit = execFileSync('git', ['--no-optional-locks', 'rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+const implementationTree = execFileSync('git', ['--no-optional-locks', 'rev-parse', 'HEAD^{tree}'], { cwd: repo, encoding: 'utf8' }).trim();
+const workingTree = execFileSync('git', ['--no-optional-locks', 'status', '--short'], { cwd: repo, encoding: 'utf8' }).trim();
+const preliminaryStatus = !scenarioError && focusedPass && assertions.every(assertion => assertion.passed) ? 'pass' : 'fail';
+const artifactFiles = listFiles(directory).filter(path => path !== 'summary.json');
+const files = artifactFiles.map(path => ({ path, sha256: sha256(readFileSync(join(directory, path))) }));
+const focusedProcess: ProcessReceipt = { command: process.execPath, args: focusedArgs, cwd: repo, startedAt: focusedStartedAt,
+  finishedAt: focusedFinishedAt, code: focusedCode, signal: focusedSignal,
+  stdout: { path: 'focused-test.txt', sha256: files.find(file => file.path === 'focused-test.txt')!.sha256 },
+  stderr: { path: 'focused-stderr.txt', sha256: files.find(file => file.path === 'focused-stderr.txt')!.sha256 } };
+const mainProcess: ProcessReceipt = { command: process.execPath, args: [...process.execArgv, ...process.argv.slice(1)], cwd: repo,
+  startedAt, finishedAt, code: preliminaryStatus === 'pass' ? 0 : 1, signal: null,
+  stdout: { path: 'console-output.txt', sha256: files.find(file => file.path === 'console-output.txt')!.sha256 },
+  stderr: { path: 'main-stderr.txt', sha256: files.find(file => file.path === 'main-stderr.txt')!.sha256 } };
+processes.push(mainProcess, focusedProcess);
+const controlledSideEffects = [
+  { path: sandbox.root, disposition: 'remove' as const, existsAtFinish: existsSync(sandbox.root) },
+  { path: directory, disposition: 'retain' as const, existsAtFinish: existsSync(directory) },
+];
+const databaseArtifacts = files.filter(file => file.path.startsWith('raw/')
+  && (file.path.endsWith('probe.sqlite') || file.path.includes('probe.sqlite-')));
+const sidecarArtifacts = files.filter(file => file.path.startsWith('raw/') && !databaseArtifacts.some(database => database.path === file.path));
+const output = {
+  schema: 't11-source-evidence@2', schemaVersion: 2, experimentId: 'X-04/T11-source-recovery-synthetic',
+  specCommit: '56217fc292a1a640805ee65096d60ff014430db3',
+  authorityRefs: ['https://github.com/qsgy-edge/euler/issues/11', 'docs/implementation/t11-source-recovery.md',
+    'docs/architecture/issues/12-build-evidence-experiment-matrix.md#统一-receipt-与复刻位置',
+    'docs/architecture/issues/15-euler-v1-spec.md#source-recovery-and-actual-used'],
+  command: { executable: process.execPath, args: [...process.execArgv, ...process.argv.slice(1)], cwd: repo },
+  startedAt, finishedAt, implementationCommit, implementationTree, workingTree,
+  environment: { platform: process.platform, release: release(), architecture: arch(), node: process.version,
+    sqlite: environment && typeof environment === 'object' && 'sqlite' in environment ? (environment as { sqlite: unknown }).sqlite : 'unknown',
+    provider: 'none: no provider requests', model: 'none', adapter: 'euler-cli-carrier@1', runner: process.env.CI ? 'CI' : 'local' },
+  fixture: { path: 'fixtures/t11-source-cases.json', rawDigest: fixtureDigest, digest: fixtureDigest, synthetic: true, heldOut: false },
+  heldOut: { digest: null, owner: null, sealedCommit: null, releasedCommit: null, contaminationCaseIds: [], replacementCaseIds: [],
+    applicability: 'not-applicable: deterministic synthetic fixture; no held-out quality claim' },
+  processes, assertions, files, controlledSideEffects,
+  artifactDigests: { stdout: focusedProcess.stdout, stderr: focusedProcess.stderr,
+    database: databaseArtifacts, sidecars: sidecarArtifacts },
+  independentValidation: { method: 'raw fixture/observation/console sidecars and node:crypto; no Core replay or reported verdict',
+    verifier: { path: 'scripts/evidence-source-recovery.ts', sha256: sha256(readFileSync(new URL('./evidence-source-recovery.ts', import.meta.url))) }, status: preliminaryStatus },
+  observations, scenarioError, focusedPass, status: preliminaryStatus,
+  exit: { code: preliminaryStatus === 'pass' ? 0 : 1, signal: null as string | null },
+  evidenceGaps: ['Real provider/Host consumers and authenticated owner UI remain unverified',
+    'Report/proposal generation and export remain T13/T18 work', 'Production schema migration and backup/purge remain outside T11',
+    'Other OS host results require their matching CI/host artifacts'],
+};
+function validateReceipt(receipt: typeof output) {
+  for (const key of ['schema','schemaVersion','experimentId','specCommit','authorityRefs','command','startedAt','finishedAt',
+    'implementationCommit','implementationTree','workingTree','environment','fixture','heldOut','processes','assertions','files',
+    'controlledSideEffects','artifactDigests','independentValidation','status','exit'] as const) assert.ok(Object.hasOwn(receipt, key), `missing ${key}`);
+  assert.ok(receipt.authorityRefs.length > 0);
+  for (const key of ['platform','release','architecture','node','sqlite','provider','model','adapter'] as const) assert.ok(receipt.environment[key]);
+  for (const key of ['digest','owner','sealedCommit','releasedCommit','contaminationCaseIds','replacementCaseIds','applicability'] as const) {
+    assert.ok(Object.hasOwn(receipt.heldOut, key), `missing heldOut.${key}`);
+  }
+  assert.equal(receipt.fixture.rawDigest, sha256(readFileSync(join(repo, receipt.fixture.path))));
+  assert.ok(receipt.command.executable && receipt.command.args.length > 0 && receipt.command.cwd);
+  assert.ok(Date.parse(receipt.finishedAt) >= Date.parse(receipt.startedAt));
+  for (const process of receipt.processes) {
+    assert.ok(process.command && process.args && process.cwd && process.startedAt && process.finishedAt);
+    assert.ok(Date.parse(process.finishedAt) >= Date.parse(process.startedAt));
+    assert.ok(Object.hasOwn(process, 'code') && Object.hasOwn(process, 'signal'));
+    assert.ok(process.stdout.path && process.stderr.path && process.stdout.sha256 && process.stderr.sha256);
+    assert.equal(process.stdout.sha256, receipt.files.find(file => file.path === process.stdout.path)?.sha256);
+    assert.equal(process.stderr.sha256, receipt.files.find(file => file.path === process.stderr.path)?.sha256);
+  }
+  assert.ok(receipt.assertions.length > 0 && receipt.assertions.every(assertion => Object.hasOwn(assertion, 'name') && Object.hasOwn(assertion, 'passed'))
+    && receipt.files.length > 0);
+  assert.ok(receipt.artifactDigests.database.length > 0 && receipt.artifactDigests.sidecars.length > 0);
+  assert.equal(receipt.independentValidation.verifier.sha256,
+    sha256(readFileSync(join(repo, receipt.independentValidation.verifier.path))));
+  for (const file of receipt.files) {
+    assert.ok(!file.path.startsWith('/') && !file.path.split('/').includes('..'));
+    assert.equal(file.sha256, sha256(readFileSync(join(directory, file.path))), `raw digest: ${file.path}`);
+  }
+  for (const effect of receipt.controlledSideEffects) assert.equal(effect.existsAtFinish, effect.disposition === 'retain', effect.path);
+}
+let receiptError: string | null = null;
+try { validateReceipt(output); }
+catch (error) { receiptError = error instanceof Error ? error.stack ?? error.message : String(error); }
+output.independentValidation.status = receiptError ? 'fail' : 'pass';
+output.status = preliminaryStatus === 'pass' && !receiptError ? 'pass' : 'fail';
+output.exit.code = output.status === 'pass' ? 0 : 1;
+mainProcess.code = output.exit.code;
+(output as typeof output & { receiptError: string | null }).receiptError = receiptError;
+writeFileSync(join(directory, 'summary.json'), JSON.stringify(output, null, 2) + '\n', { flag: 'wx' });
+console.log(JSON.stringify({ path: join(directory, 'summary.json'), passed: output.status === 'pass', fixtureDigest, scenarioError, receiptError }));
+if (output.status !== 'pass') process.exitCode = 1;
