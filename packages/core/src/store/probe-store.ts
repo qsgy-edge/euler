@@ -2221,14 +2221,27 @@ export class ProbeStore {
       const limit = request.limit ?? 10, byteBudget = request.byteBudget ?? 8192;
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= 32
         && Number.isSafeInteger(byteBudget) && byteBudget > 0 && byteBudget <= 65536, 'invalid-source-search');
-      const baseGrant = request.grantId ? this.#discoveryProjects(activity, request.grantId) : null;
-      check((!baseGrant && request.queryId === undefined) || (baseGrant && typeof request.queryId === 'string'), 'source-query-id-required');
-      if (baseGrant) uuid(request.queryId!);
+      check((!request.grantId && request.queryId === undefined)
+        || (typeof request.grantId === 'string' && typeof request.queryId === 'string'), 'source-query-id-required');
+      if (request.grantId) uuid(request.grantId);
       const requestHash = sha256(JSON.stringify({ sessionId: this.#binding.sessionId, grantId: request.grantId,
         query: request.query, limit, byteBudget, cursor: request.cursor ?? null }));
-      const receipt = baseGrant ? this.#db.prepare(`SELECT * FROM source_query_receipts WHERE grant_id=? AND query_id=?`)
-        .get(request.grantId!, request.queryId!) : null;
+      const receipt = request.grantId ? this.#db.prepare(`SELECT * FROM source_query_receipts WHERE grant_id=? AND query_id=?`)
+        .get(request.grantId, request.queryId!) : null;
       check(!receipt || receipt.request_hash === requestHash, 'source-query-identity-conflict');
+      let baseGrant: { projects: string[]; remaining: number; remainingBytes: number;
+        remainingQueries: number; targets: Map<string, SearchTarget> } | null = null;
+      if (request.grantId) {
+        try { baseGrant = this.#discoveryProjects(activity, request.grantId); }
+        catch (error) {
+          if (receipt && error instanceof Error && error.message === 'source-evidence-gap') {
+            return { status: 'unavailable', results: [], coverage: { allowedProjects: [], inspectedProjects: [],
+              unavailableProjects: [], candidateCount: null, complete: false, reason: 'query-result-stale' },
+              truncated: true, nextCursor: null };
+          }
+          throw error;
+        }
+      }
       const grant = baseGrant && receipt ? { ...baseGrant, remaining: baseGrant.remaining + Number(receipt.result_count),
         remainingBytes: baseGrant.remainingBytes + Number(receipt.byte_length), remainingQueries: baseGrant.remainingQueries + 1 } : baseGrant;
       const projects = grant?.projects ?? [this.#binding.projectId];

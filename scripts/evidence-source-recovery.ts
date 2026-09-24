@@ -276,7 +276,7 @@ const output = {
   specCommit: '56217fc292a1a640805ee65096d60ff014430db3',
   authorityRefs: ['https://github.com/qsgy-edge/euler/issues/11', 'docs/implementation/t11-source-recovery.md',
     'docs/architecture/issues/12-build-evidence-experiment-matrix.md#统一-receipt-与复刻位置',
-    'docs/architecture/issues/15-euler-v1-spec.md#source-recovery-and-actual-used'],
+    'docs/architecture/issues/15-euler-v1-spec.md:177-179 (I08 Context admission 与有界恢复)'],
   command: { executable: process.execPath, args: [...process.execArgv, ...process.argv.slice(1)], cwd: repo },
   startedAt, finishedAt, implementationCommit, implementationTree, workingTree,
   environment: { platform: process.platform, release: release(), architecture: arch(), node: process.version,

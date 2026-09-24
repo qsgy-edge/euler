@@ -291,6 +291,33 @@ test('replaying an expanded source after archive loss returns a stale result', (
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('replaying a source search after archive loss returns a stale result', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const text = 'Atlas replay search';
+    const ref = probe.archive.append(randomUUID(), text);
+    probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, {
+      ref, projectId: sandbox.fixture.projectId, kind: 'source', offset: 0, length: Array.from(text).length,
+    }));
+    probe.store.drainSourceProjection(probe.activity);
+    const intent = probe.store.readIntent(probe.activity)!;
+    const approval = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
+      intentId: intent.intentId, goalEventId: intent.goalInput.eventId, projectIds: [sandbox.fixture.projectId],
+      targets: {}, maxResults: 4, maxBytes: 131072 }));
+    const { grantId } = probe.store.authorizeMemoryDiscovery(probe.activity, approval, [sandbox.fixture.projectId], 4);
+    const request = { query: 'Atlas', grantId, queryId: randomUUID() };
+    assert.equal(probe.store.searchSources(probe.activity, request).results.length, 1);
+    const sourcePath = join(sandbox.root, 'session.jsonl');
+    const header = readFileSync(sourcePath, 'utf8').split('\n')[0] + '\n';
+    writeFileSync(sourcePath, header);
+    const stale = probe.store.searchSources(probe.activity, request);
+    assert.equal(stale.status, 'unavailable');
+    assert.equal(stale.coverage.reason, 'query-result-stale');
+    assert.deepEqual(stale.results, []);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('non-project inert proposals stay canonical without entering project projection', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);
