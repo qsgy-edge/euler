@@ -310,7 +310,7 @@ test('replaying a source search after archive loss returns a stale result', () =
     assert.equal(probe.store.searchSources(probe.activity, request).results.length, 1);
     const sourcePath = join(sandbox.root, 'session.jsonl');
     const header = readFileSync(sourcePath, 'utf8').split('\n')[0] + '\n';
-    writeFileSync(sourcePath, header);
+    writeFileSync(sourcePath, header + '{"broken');
     const stale = probe.store.searchSources(probe.activity, request);
     assert.equal(stale.status, 'unavailable');
     assert.equal(stale.coverage.reason, 'query-result-stale');

@@ -2234,7 +2234,8 @@ export class ProbeStore {
       if (request.grantId) {
         try { baseGrant = this.#discoveryProjects(activity, request.grantId); }
         catch (error) {
-          if (receipt && error instanceof Error && error.message === 'source-evidence-gap') {
+          const message = error instanceof Error ? error.message : String(error);
+          if (receipt && (message === 'source-evidence-gap' || message.startsWith('archive-integrity'))) {
             return { status: 'unavailable', results: [], coverage: { allowedProjects: [], inspectedProjects: [],
               unavailableProjects: [], candidateCount: null, complete: false, reason: 'query-result-stale' },
               truncated: true, nextCursor: null };

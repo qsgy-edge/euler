@@ -52,6 +52,8 @@ createSandboxSession(sandbox, targetBinding);
 const origin = openProbe(sandbox);
 const target = openProbe(sandbox, undefined, undefined, targetBinding);
 const observations: Record<string, unknown> = {};
+let crossGrantId: string | null = null;
+let crossQueryId: string | null = null;
 let scenarioError: string | null = null;
 let environment: unknown;
 try {
@@ -107,7 +109,11 @@ try {
     intentId: targetIntent.intentId, goalEventId: targetIntent.goalInput.eventId,
     projectIds: [sandbox.fixture.projectId], targets: {}, maxResults: 4, maxBytes: 131072 }));
   const { grantId } = target.store.authorizeMemoryDiscovery(target.activity, consent, [sandbox.fixture.projectId], 4);
-  const cross = target.store.searchSources(target.activity, { query: 'Atlas', grantId, queryId: randomUUID() });
+  crossGrantId = grantId;
+  crossQueryId = randomUUID();
+  const crossRequest = { query: 'Atlas', grantId, queryId: crossQueryId };
+  const cross = target.store.searchSources(target.activity, crossRequest);
+  const crossReplay = target.store.searchSources(target.activity, crossRequest);
   const historical = target.store.expandSource(target.activity, { unitId: first.proposalId, offset: 0, limit: 4096,
     grantId, queryId: randomUUID() });
   target.store.revokeMemoryDiscovery(target.activity, grantId);
@@ -120,7 +126,7 @@ try {
     hiddenIds: hidden.results.map(hit => hit.unitId), unapprovedDenied, rawDenied, excerpt, fixtureDigest };
   observations.proposal = { first: { id: first.proposalId, version: first.version, hash: first.hash },
     second: { id: second.proposalId, version: second.version, hash: second.hash },
-    crossStatus: cross.status, crossIds: cross.results.map(hit => hit.unitId),
+    crossStatus: cross.status, crossReplayStatus: crossReplay.status, crossIds: cross.results.map(hit => hit.unitId),
     historical: { contentHash: historical.contentHash, excerptHash: historical.excerptHash, text: historical.text }, revoked };
   observations.assembly = { id: turn.assemblyId, state: inspected.state, sent: sent.outcome,
     usedSourceIds: inspected.sources.map(item => item.ref.eventId),
@@ -134,6 +140,7 @@ try {
   assert.equal(excerpt.text, fixture.report.approved);
   assert(unapprovedDenied && rawDenied && revoked);
   assert.equal(cross.status, 'ready');
+  assert.equal(crossReplay.status, 'ready');
   assert.deepEqual(cross.results.map(hit => hit.unitId), [first.proposalId, second.proposalId]);
   assert.equal(historical.contentHash, first.hash);
   assert(historical.text.includes(fixture.proposal.first) && !historical.text.includes(fixture.proposal.second));
@@ -161,21 +168,62 @@ const rawValidation = (() => {
     const db = new DatabaseSync(join(directory, 'raw', 'probe.sqlite'));
     try {
       const source = db.prepare(`SELECT unit_id, source_event_id, source_hash, source_byte_length, source_content_hash,
-        project_id, offset, length, content_hash FROM source_units
-        WHERE project_id=? AND kind='report-section' AND offset=? AND length=?`).get(
+        source_locator, kind, version, supersedes, offset, length, content_hash, approval_event_id, approval_locator,
+        approval_hash, approval_byte_length, approval_content_hash, payload, payload_hash, project_id
+        FROM source_units WHERE project_id=? AND kind='report-section' AND offset=? AND length=?`).get(
         targetBinding.projectId, approvedOffset, Array.from(fixture.report.approved).length) as Record<string, unknown> | undefined;
       assert(source, 'raw source unit missing');
       assert.equal(source.source_event_id, reportEvent.eventId);
+      assert.equal(source.source_locator, `cli-jsonl@1/${sandbox.fixture.sessionId}/${reportEvent.eventId}`);
       assert.equal(source.source_hash, sha256(reportLine));
       assert.equal(source.source_byte_length, Buffer.byteLength(reportLine));
       assert.equal(source.source_content_hash, sha256(fixture.report.text));
       assert.equal(source.content_hash, sha256(fixture.report.approved));
-      const projection = db.prepare(`SELECT content, content_hash, owner_kind FROM search_documents WHERE unit_id=?`)
+      const approvalEvent = rawEvents.find(event => event.eventId === source.approval_event_id);
+      assert(approvalEvent, 'raw approval event missing');
+      const approvalLine = JSON.stringify({ schema: approvalEvent.schema, eventId: approvalEvent.eventId,
+        role: approvalEvent.role, text: approvalEvent.text });
+      assert.equal(source.approval_locator, `cli-jsonl@1/${sandbox.fixture.sessionId}/${approvalEvent.eventId}`);
+      assert.equal(source.approval_hash, sha256(approvalLine));
+      assert.equal(source.approval_byte_length, Buffer.byteLength(approvalLine));
+      assert.equal(source.approval_content_hash, sha256(approvalEvent.text));
+      const sourcePayload = JSON.parse(String(source.payload)) as { schema: string; unitId: string; projectId: string;
+        kind: string; offset: number; length: number; contentHash: string; version: number; supersedes: string | null;
+        ref: { eventId: string; locator: string; hash: string; byteLength: number; contentHash: string };
+        approval: { eventId: string; locator: string; hash: string; byteLength: number; contentHash: string } };
+      assert.equal(source.payload_hash, sha256(String(source.payload)));
+      assert.equal(sourcePayload.schema, 'source-unit@1');
+      assert.equal(sourcePayload.unitId, source.unit_id);
+      assert.equal(sourcePayload.projectId, source.project_id);
+      assert.equal(sourcePayload.kind, source.kind);
+      assert.equal(sourcePayload.offset, source.offset);
+      assert.equal(sourcePayload.length, source.length);
+      assert.equal(sourcePayload.contentHash, source.content_hash);
+      assert.equal(sourcePayload.version, source.version);
+      assert.equal(sourcePayload.supersedes, source.supersedes);
+      assert.equal(sourcePayload.ref.eventId, source.source_event_id);
+      assert.equal(sourcePayload.ref.locator, source.source_locator);
+      assert.equal(sourcePayload.ref.hash, source.source_hash);
+      assert.equal(sourcePayload.ref.byteLength, source.source_byte_length);
+      assert.equal(sourcePayload.ref.contentHash, source.source_content_hash);
+      assert.equal(sourcePayload.approval.eventId, source.approval_event_id);
+      assert.equal(sourcePayload.approval.locator, source.approval_locator);
+      assert.equal(sourcePayload.approval.hash, source.approval_hash);
+      assert.equal(sourcePayload.approval.byteLength, source.approval_byte_length);
+      assert.equal(sourcePayload.approval.contentHash, source.approval_content_hash);
+      const projection = db.prepare(`SELECT content, content_hash, owner_kind, record_id, revision_id, scope_kind, scope_id,
+        source_seq, projection_generation FROM search_documents WHERE unit_id=?`)
         .get(String(source.unit_id)) as Record<string, unknown> | undefined;
       assert(projection, 'raw source projection missing');
       assert.equal(projection.content, fixture.report.approved.toLocaleLowerCase());
       assert.equal(projection.content_hash, sha256(fixture.report.approved));
       assert.equal(projection.owner_kind, 'session');
+      assert.equal(projection.record_id, source.unit_id);
+      assert.equal(projection.revision_id, source.unit_id);
+      assert.equal(projection.scope_kind, 'project');
+      assert.equal(projection.scope_id, source.project_id);
+      assert.equal(projection.source_seq, source.version);
+      assert.equal(projection.projection_generation, source.version);
       const job = db.prepare(`SELECT status, content_hash FROM source_projection_jobs WHERE owner_kind='session' AND unit_id=?
         ORDER BY generation DESC LIMIT 1`).get(String(source.unit_id)) as Record<string, unknown> | undefined;
       assert.equal(job?.status, 'done');
@@ -188,6 +236,27 @@ const rawValidation = (() => {
       assert.equal(proposals[1]?.version, 2);
       assert.notEqual(proposals[0]?.payload_hash, proposals[1]?.payload_hash);
       for (const proposal of proposals) assert.equal(proposal.payload_hash, sha256(String(proposal.payload)));
+      assert(crossGrantId && crossQueryId, 'cross query identity missing');
+      const queryReceipt = db.prepare('SELECT request_hash, page_hash, result_count, byte_length FROM source_query_receipts WHERE grant_id=? AND query_id=?')
+        .get(crossGrantId, crossQueryId) as Record<string, unknown> | undefined;
+      assert(queryReceipt, 'source query receipt missing');
+      const queryResults = proposals.map(proposal => {
+        const payload = JSON.parse(String(proposal.payload)) as { input: { binding: { projectId: string } }; scope: { id: string } };
+        const proposalId = String(proposal.proposal_id), version = Number(proposal.version), expectedChange = String(proposal.expected_change);
+        const total = Array.from(String(proposal.payload)).length;
+        return { unitId: proposalId, locator: `proposal@1/${proposalId}/${version}`, kind: 'proposal', projectId: payload.scope.id,
+          sourceProjectId: payload.input.binding.projectId, version, contentHash: String(proposal.payload_hash),
+          range: { offset: 0, end: total, total }, status: 'inert', preview: Array.from(expectedChange).slice(0, 128).join('') };
+      });
+      const queryPage = { status: 'ready', results: queryResults,
+        coverage: { allowedProjects: [sandbox.fixture.projectId], inspectedProjects: [sandbox.fixture.projectId], unavailableProjects: [],
+          candidateCount: queryResults.length, complete: false, reason: null }, truncated: false, nextCursor: null };
+      assert.equal(queryReceipt.request_hash, sha256(JSON.stringify({ sessionId: targetBinding.sessionId, grantId: crossGrantId,
+        query: 'Atlas', limit: 10, byteBudget: 8192, cursor: null })));
+      assert.equal(queryReceipt.page_hash, sha256(JSON.stringify(queryPage)));
+      assert.equal(queryReceipt.result_count, queryResults.length);
+      const grantUsage = db.prepare('SELECT used_results FROM memory_discovery_grants WHERE grant_id=?').get(crossGrantId) as Record<string, unknown> | undefined;
+      assert.equal(grantUsage?.used_results, queryResults.length + 1);
       const assembly = db.prepare(`SELECT state, sources, used_memories FROM request_assemblies WHERE state='finished' LIMIT 1`)
         .get() as Record<string, unknown> | undefined;
       assert(assembly, 'raw finished assembly missing');
@@ -195,7 +264,11 @@ const rawValidation = (() => {
       assert.notEqual(String(assembly.used_memories), '[]');
       return { status: 'pass', reportEventId: reportEvent.eventId, reportHash: sha256(reportLine),
         sourceUnitId: String(source.unit_id), sourceContentHash: String(source.content_hash),
-        proposalIds: proposals.map(proposal => String(proposal.proposal_id)), assemblyState: String(assembly.state) };
+        sourceApprovalHash: String(source.approval_hash), sourceProjectionGeneration: Number(projection.projection_generation),
+        proposalIds: proposals.map(proposal => String(proposal.proposal_id)),
+        queryReceipt: { requestHash: String(queryReceipt.request_hash), pageHash: String(queryReceipt.page_hash),
+          resultCount: Number(queryReceipt.result_count), usedResults: Number(grantUsage?.used_results) } ,
+        assemblyState: String(assembly.state) };
     } finally { db.close(); }
   } catch (error) {
     return { status: 'fail', error: error instanceof Error ? error.message : String(error) };
