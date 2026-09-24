@@ -1,0 +1,27 @@
+# T11: source recovery and actual-used inspection (synthetic)
+
+Issue: [#11](https://github.com/qsgy-edge/euler/issues/11). This slice uses only disposable SQLite and synthetic CLI archives. The schema is disposable version 11; there is no production migration or live owner switch.
+
+`ProbeStore.expandSource` verifies the complete archive acknowledgement and original text hash before returning a bounded Unicode-code-point page. An unpublished raw ref is readable only in its owning session. `publishSourceUnit` registers a bounded, immutable source/archive range with its real source owner and target project; cross-project publication requires a separate archived `user`-role decision bound to the originating active intent, source ref, exact range, kind and target project. Repeated publication reconciles by stable request identity. A source unit never changes the archive binding. Its target project can discover only the published range, not follow the returned locator to the mixed original. Reports/handoffs are pre-stored synthetic inputs here; their generation, delivery and export belong to T13.
+
+`searchSources` uses the existing external-content FTS with distinct `memory`, `session` and `proposal` owner kinds. The canonical owner is checked again on each hit and each expand; unpublished archive history is not scanned on ordinary search. Unprojected units, metadata mismatch or FTS damage return a dirty/unavailable coverage state, not an authoritative empty answer. `drainSourceProjection` is bounded; `rebuildSourceProjection` repairs the local project's source/proposal slice without dropping memory or other projects. Existing inert `evolution_proposals` are indexed by their owner and project scope; expansion restores the exact historical proposal payload/hash, never promotes a proposal to verified memory. Neither search nor expand activates guidance or tools.
+
+Cross-project reads reuse T10's task-bound grant, cumulative result/byte/query limits and revocation checks. A granted search/expand supplies a stable `queryId`: a content-free receipt records its request/result hashes and budget charge in the same transaction. Repeating that identity rechecks the current grant and immutable source, returns the same result without charging again, or reports `query-result-stale` if it cannot reconstruct the original result. Changing the request under the same ID fails. Local, ungranted reads do not create receipts. The synthetic Host must carry a stable operation ID through an unknown result; no model field can mint a grant or publication decision.
+
+`ProbeSession.prepare(..., selected)` embeds eligible, current memory snapshots as untrusted data in the actual local-counting payload. The assembly ledger stores only source/memory refs, identities, hashes, order and reasons. Store admission checks that the memory content actually appears in that frozen synthetic payload; it rechecks current eligibility before starting/sending. `inspectAssembly` recovers only the frozen selected memory event/revision and selected archive refs, including after a later correction. An unselected record ID, duplicate selection, missing hash or lost selected source is an explicit gap. A not-dispatched assembly has frozen candidates but does not claim a provider received them; its state and attempts remain separate.
+
+## Reproduce
+
+```powershell
+node --test apps/cli/test/source-recovery.test.ts apps/cli/test/source-discovery.test.ts
+node --test apps/cli/test/memory-retrieval.test.ts apps/cli/test/search-projection.test.ts apps/cli/test/request-ledger.test.ts
+npm run typecheck
+node scripts/evidence-source-recovery.ts
+npm run check
+```
+
+The evidence command validates the SHA-256 of `fixtures/t11-source-cases.json` (`9b8f153152d41fe4aec51703cb5166b8edb39fc07553a46aca9ac15d4bd25c7c`), records the implementation commit/worktree, Node/platform/SQLite, actual ack, unit/version and assembly identities, search/expand outcomes, negative scope/revocation observations and focused test output under ignored `artifacts/t11-*/`. The CLI carrier is file-backed and the counting transport records one local synthetic send; this is not evidence for a real provider or for authenticated owner UI input.
+
+## Evidence Boundary
+
+The tested publication decision is a structured synthetic Host user-role event; owner-channel UI authentication and actual report/proposal generation/export remain T13/T18 integration work. No MC archive, real user files, production data or remote provider were accessed. The combined source/proposal projection and its new controlled copies need T20/T22a/T22b backup/purge coverage before live enablement. The disposable schema and search checks do not freeze the initial production schema or establish full-history coverage.
