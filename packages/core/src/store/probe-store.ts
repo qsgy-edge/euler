@@ -805,6 +805,7 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       check(input && Object.keys(input).every(key => ['ref','kind','projectId','offset','length','supersedes','approval'].includes(key))
         && ['source','report-section','handoff'].includes(input.kind), 'invalid-source-unit');
+      check(input.supersedes === undefined || typeof input.supersedes === 'string', 'invalid-source-unit');
       const { ref, projectId, kind, offset, length } = input;
       check(sameBinding(ref?.binding, this.#binding), 'source-scope-mismatch');
       uuid(projectId);
@@ -816,21 +817,28 @@ export class ProbeStore {
       check(offset + length <= points.length, 'invalid-range');
       const content = points.slice(offset, offset + length).join('');
       check(Buffer.byteLength(content) <= 16384, 'invalid-source-unit');
-      const prior = input.supersedes ? this.#sourceUnit(input.supersedes).unit : null;
+      const prior = input.supersedes === undefined ? null : this.#sourceUnit(input.supersedes).unit;
       check(!prior || prior.projectId === projectId && prior.kind === kind, 'source-version-mismatch');
       check(input.approval, 'source-publication-approval-required');
-      const unit: SourceUnit = { schema: 'source-unit@1', unitId: randomUUID(), ref: structuredClone(ref), kind,
-        projectId, offset, length, contentHash: sha256(content), version: (prior?.version ?? 0) + 1,
-        supersedes: prior?.unitId ?? null, approval: structuredClone(input.approval) };
       const requestHash = sha256(JSON.stringify({ ref, projectId, kind, offset, length,
         supersedes: prior?.unitId ?? null, approval: input.approval ?? null }));
       const existing = this.#db.prepare('SELECT unit_id FROM source_units WHERE request_hash=?').get(requestHash);
       if (existing) {
-        this.#publicationApproval(unit);
-        return this.#sourceUnit(String(existing.unit_id)).unit;
+        const existingUnit = this.#sourceUnit(String(existing.unit_id)).unit;
+        this.#publicationApproval(existingUnit);
+        return existingUnit;
+      }
+      if (prior) {
+        const current = this.#db.prepare(`SELECT unit_id FROM source_units
+          WHERE owner_id=? AND project_id=? AND kind=? ORDER BY version DESC, rowid DESC LIMIT 1`)
+          .get(this.#binding.ownerId, projectId, kind);
+        check(current?.unit_id === prior.unitId, 'source-version-stale');
       }
       const intent = this.readIntent(activity);
       check(intent?.status === 'active', 'source-publication-approval-required');
+      const unit: SourceUnit = { schema: 'source-unit@1', unitId: randomUUID(), ref: structuredClone(ref), kind,
+        projectId, offset, length, contentHash: sha256(content), version: (prior?.version ?? 0) + 1,
+        supersedes: prior?.unitId ?? null, approval: structuredClone(input.approval) };
       this.#publicationApproval(unit, intent);
       const payload = JSON.stringify(unit);
       this.#db.prepare(`INSERT INTO source_units
@@ -2156,7 +2164,7 @@ export class ProbeStore {
         this.#indexSourceUnit(unitId);
         const canonical = this.#sourceUnit(unitId).unit;
         this.#db.prepare(`UPDATE source_projection_jobs SET status='done',processed_at=?,reason='rebuild'
-          WHERE owner_kind='session' AND unit_id=? AND generation=? AND content_hash=? AND status='pending'`)
+          WHERE owner_kind='session' AND unit_id=? AND generation=? AND content_hash=? AND status IN ('pending','failed')`)
           .run(new Date().toISOString(), unitId, canonical.version, canonical.contentHash);
       }
       for (const row of proposals) {
@@ -2164,7 +2172,7 @@ export class ProbeStore {
         this.#indexProposal(proposalId, [projectId]);
         const canonical = this.#proposalForProjects(proposalId, [projectId]);
         this.#db.prepare(`UPDATE source_projection_jobs SET status='done',processed_at=?,reason='rebuild'
-          WHERE owner_kind='proposal' AND unit_id=? AND generation=? AND content_hash=? AND status='pending'`)
+          WHERE owner_kind='proposal' AND unit_id=? AND generation=? AND content_hash=? AND status IN ('pending','failed')`)
           .run(new Date().toISOString(), proposalId, canonical.version, canonical.hash);
       }
       this.#db.exec(`DROP TABLE search_fts;
@@ -2187,22 +2195,31 @@ export class ProbeStore {
           initialDirty.set(projectId, Number(this.#db.prepare('SELECT dirty FROM source_projection_health WHERE project_id=?')
             .get(projectId)?.dirty ?? 0));
         }
-        if (job.owner_kind === 'session') {
-          const canonical = this.#sourceUnit(String(job.unit_id)).unit;
-          check(canonical.projectId === projectId && canonical.version === Number(job.generation)
-            && canonical.contentHash === String(job.content_hash), 'source-projection-job-stale');
-          this.#indexSourceUnit(canonical.unitId);
-        } else {
-          const canonical = this.#proposalForProjects(String(job.unit_id), [projectId]);
-          check(canonical.scope.kind === 'project' && canonical.scope.id === projectId
-            && canonical.version === Number(job.generation) && canonical.hash === String(job.content_hash), 'source-projection-job-stale');
-          this.#indexProposal(canonical.proposalId, [projectId]);
-        }
-        check(this.#db.prepare(`UPDATE source_projection_jobs
-          SET status='done',processed_at=?,reason=NULL
-          WHERE job_id=? AND status='pending' AND generation=? AND content_hash=?`).run(
+        try {
+          if (job.owner_kind === 'session') {
+            const canonical = this.#sourceUnit(String(job.unit_id)).unit;
+            check(canonical.projectId === projectId && canonical.version === Number(job.generation)
+              && canonical.contentHash === String(job.content_hash), 'source-projection-job-stale');
+            this.#indexSourceUnit(canonical.unitId);
+          } else {
+            const canonical = this.#proposalForProjects(String(job.unit_id), [projectId]);
+            check(canonical.scope.kind === 'project' && canonical.scope.id === projectId
+              && canonical.version === Number(job.generation) && canonical.hash === String(job.content_hash), 'source-projection-job-stale');
+            this.#indexProposal(canonical.proposalId, [projectId]);
+          }
+          check(this.#db.prepare(`UPDATE source_projection_jobs
+            SET status='done',processed_at=?,reason=NULL
+            WHERE job_id=? AND status='pending' AND generation=? AND content_hash=?`).run(
             new Date().toISOString(), String(job.job_id), Number(job.generation), String(job.content_hash)).changes === 1,
-        'source-projection-job-race');
+          'source-projection-job-race');
+        } catch (error) {
+          const reason = error instanceof Error ? error.message.split(':', 1)[0] ?? 'source-projection-failed' : 'source-projection-failed';
+          check(this.#db.prepare(`UPDATE source_projection_jobs
+            SET status='failed',processed_at=?,reason=?
+            WHERE job_id=? AND status='pending' AND generation=? AND content_hash=?`).run(
+            new Date().toISOString(), reason, String(job.job_id), Number(job.generation), String(job.content_hash)).changes === 1,
+          'source-projection-job-race');
+        }
       }
       for (const projectId of initialDirty.keys()) {
         const pending = this.#db.prepare("SELECT 1 FROM source_projection_jobs WHERE project_id=? AND status!='done' LIMIT 1").get(projectId);
@@ -2223,7 +2240,7 @@ export class ProbeStore {
         && Number.isSafeInteger(byteBudget) && byteBudget > 0 && byteBudget <= 65536, 'invalid-source-search');
       check((!request.grantId && request.queryId === undefined)
         || (typeof request.grantId === 'string' && typeof request.queryId === 'string'), 'source-query-id-required');
-      if (request.grantId) uuid(request.grantId);
+      if (request.grantId) { uuid(request.grantId); uuid(request.queryId!); }
       const requestHash = sha256(JSON.stringify({ sessionId: this.#binding.sessionId, grantId: request.grantId,
         query: request.query, limit, byteBudget, cursor: request.cursor ?? null }));
       const receipt = request.grantId ? this.#db.prepare(`SELECT * FROM source_query_receipts WHERE grant_id=? AND query_id=?`)
@@ -2267,8 +2284,11 @@ export class ProbeStore {
         return page;
       };
       const ids = projects.map(() => '?').join(',');
+      const failed = this.#db.prepare(`SELECT 1 FROM source_projection_jobs
+        WHERE project_id IN (${ids}) AND status='failed' LIMIT 1`).get(...projects);
+      if (failed) return finalize(unavailable('index-failed'));
       const pending = this.#db.prepare(`SELECT 1 FROM source_projection_jobs
-        WHERE project_id IN (${ids}) AND status!='done' LIMIT 1`).get(...projects);
+        WHERE project_id IN (${ids}) AND status='pending' LIMIT 1`).get(...projects);
       if (pending) return finalize(unavailable('index-lag', 'dirty'));
       if (this.#db.prepare(`SELECT 1 FROM source_projection_health WHERE project_id IN (${ids}) AND dirty=1 LIMIT 1`)
         .get(...projects)) return finalize(unavailable('index-damaged', 'dirty'));

@@ -267,6 +267,55 @@ test('source projection drain consumes its durable outbox and does not heal a di
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('source projection records a durable failure when canonical archive evidence is gone', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  const db = new DatabaseSync(resourcesOf(sandbox).store.path);
+  try {
+    const text = 'Atlas failed projection';
+    const ref = probe.archive.append(randomUUID(), text);
+    const unit = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, {
+      ref, projectId: sandbox.fixture.projectId, kind: 'source', offset: 0, length: text.length,
+    }));
+    const sourcePath = join(sandbox.root, 'session.jsonl');
+    const header = readFileSync(sourcePath, 'utf8').split('\n')[0] + '\n';
+    writeFileSync(sourcePath, header);
+    assert.equal(probe.store.drainSourceProjection(probe.activity), 1);
+    const failedJob = db.prepare("SELECT status, reason FROM source_projection_jobs WHERE owner_kind='session' AND unit_id=?")
+      .get(unit.unitId) as { status: string; reason: string };
+    assert.equal(failedJob.status, 'failed');
+    assert.equal(failedJob.reason, 'source-evidence-gap');
+    const page = probe.store.searchSources(probe.activity, { query: 'Atlas' });
+    assert.equal(page.status, 'unavailable');
+    assert.equal(page.coverage.reason, 'index-failed');
+    assert.deepEqual(page.results, []);
+  } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('a stale source supersession cannot fork the current version chain', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const firstText = 'Atlas source version one';
+    const firstRef = probe.archive.append(randomUUID(), firstText);
+    const first = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, {
+      ref: firstRef, projectId: sandbox.fixture.projectId, kind: 'handoff', offset: 0, length: firstText.length,
+    }));
+    const secondText = 'Atlas source version two';
+    const secondRef = probe.archive.append(randomUUID(), secondText);
+    probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, {
+      ref: secondRef, projectId: sandbox.fixture.projectId, kind: 'handoff', offset: 0,
+      length: secondText.length, supersedes: first.unitId,
+    }));
+    const staleText = 'Atlas stale source branch';
+    const staleRef = probe.archive.append(randomUUID(), staleText);
+    assert.throws(() => probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, {
+      ref: staleRef, projectId: sandbox.fixture.projectId, kind: 'handoff', offset: 0,
+      length: staleText.length, supersedes: first.unitId,
+    })), /source-version-stale/);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('replaying an expanded source after archive loss returns a stale result', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);
