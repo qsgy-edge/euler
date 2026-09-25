@@ -54,6 +54,7 @@ const target = openProbe(sandbox, undefined, undefined, targetBinding);
 const observations: Record<string, unknown> = {};
 let crossGrantId: string | null = null;
 let crossQueryId: string | null = null;
+let crossExpandQueryId: string | null = null;
 let scenarioError: string | null = null;
 let environment: unknown;
 try {
@@ -114,8 +115,9 @@ try {
   const crossRequest = { query: 'Atlas', grantId, queryId: crossQueryId };
   const cross = target.store.searchSources(target.activity, crossRequest);
   const crossReplay = target.store.searchSources(target.activity, crossRequest);
-  const historical = target.store.expandSource(target.activity, { unitId: first.proposalId, offset: 0, limit: 4096,
-    grantId, queryId: randomUUID() });
+  const crossExpandRequest = { unitId: first.proposalId, offset: 0, limit: 4096, grantId, queryId: randomUUID() };
+  crossExpandQueryId = crossExpandRequest.queryId;
+  const historical = target.store.expandSource(target.activity, crossExpandRequest);
   target.store.revokeMemoryDiscovery(target.activity, grantId);
   let revoked = false;
   try { target.store.expandSource(target.activity, { unitId: first.proposalId, offset: 0, limit: 40,
@@ -159,15 +161,25 @@ finally {
 const rawValidation = (() => {
   try {
     const approvedOffset = Array.from(fixture.report.text.slice(0, fixture.report.text.indexOf(fixture.report.approved))).length;
-    const archiveLines = readFileSync(join(directory, 'raw', 'session.jsonl'), 'utf8').trim().split('\n');
-    const rawEvents = archiveLines.slice(1).map(line => JSON.parse(line) as { schema: string; eventId: string; role: string; text: string });
+    const archiveText = readFileSync(join(directory, 'raw', 'session.jsonl'), 'utf8');
+    assert(archiveText.endsWith('\n'), 'raw archive incomplete');
+    const archiveLines = archiveText.slice(0, -1).split('\n');
+    const header = JSON.parse(archiveLines.shift()!);
+    assert.equal(header.schema, 'cli-session@1');
+    const rawEvents = archiveLines.map(rawLine => {
+      const event = JSON.parse(rawLine) as { schema: string; eventId: string; role: string; text: string };
+      assert.equal(rawLine, JSON.stringify(event), 'raw archive line is not canonical JSON');
+      assert.equal(event.schema, 'cli-input@1');
+      assert(['user', 'assistant', 'tool'].includes(event.role));
+      assert(typeof event.text === 'string' && event.text.length > 0);
+      return { ...event, rawLine };
+    });
     const reportEvent = rawEvents.find(event => event.text === fixture.report.text);
     assert(reportEvent, 'raw archive report missing');
-    const reportLine = JSON.stringify({ schema: reportEvent.schema, eventId: reportEvent.eventId,
-      role: reportEvent.role, text: reportEvent.text });
-    const db = new DatabaseSync(join(directory, 'raw', 'probe.sqlite'));
+    const reportLine = reportEvent.rawLine;
+    const db = new DatabaseSync(join(directory, 'raw', 'probe.sqlite'), { readOnly: true });
     try {
-      const source = db.prepare(`SELECT unit_id, source_event_id, source_hash, source_byte_length, source_content_hash,
+      const source = db.prepare(`SELECT unit_id, source_event_id, source_host_id, source_project_id, source_branch_id, source_hash, source_byte_length, source_content_hash,
         source_locator, kind, version, supersedes, offset, length, content_hash, approval_event_id, approval_locator,
         approval_hash, approval_byte_length, approval_content_hash, payload, payload_hash, project_id
         FROM source_units WHERE project_id=? AND kind='report-section' AND offset=? AND length=?`).get(
@@ -179,17 +191,9 @@ const rawValidation = (() => {
       assert.equal(source.source_byte_length, Buffer.byteLength(reportLine));
       assert.equal(source.source_content_hash, sha256(fixture.report.text));
       assert.equal(source.content_hash, sha256(fixture.report.approved));
-      const approvalEvent = rawEvents.find(event => event.eventId === source.approval_event_id);
-      assert(approvalEvent, 'raw approval event missing');
-      const approvalLine = JSON.stringify({ schema: approvalEvent.schema, eventId: approvalEvent.eventId,
-        role: approvalEvent.role, text: approvalEvent.text });
-      assert.equal(source.approval_locator, `cli-jsonl@1/${sandbox.fixture.sessionId}/${approvalEvent.eventId}`);
-      assert.equal(source.approval_hash, sha256(approvalLine));
-      assert.equal(source.approval_byte_length, Buffer.byteLength(approvalLine));
-      assert.equal(source.approval_content_hash, sha256(approvalEvent.text));
       const sourcePayload = JSON.parse(String(source.payload)) as { schema: string; unitId: string; projectId: string;
         kind: string; offset: number; length: number; contentHash: string; version: number; supersedes: string | null;
-        ref: { eventId: string; locator: string; hash: string; byteLength: number; contentHash: string };
+        ref: { binding: { sessionId: string; hostId: string; projectId: string; branchId: string }; eventId: string; locator: string; hash: string; byteLength: number; contentHash: string };
         approval: { eventId: string; locator: string; hash: string; byteLength: number; contentHash: string } };
       assert.equal(source.payload_hash, sha256(String(source.payload)));
       assert.equal(sourcePayload.schema, 'source-unit@1');
@@ -206,13 +210,36 @@ const rawValidation = (() => {
       assert.equal(sourcePayload.ref.hash, source.source_hash);
       assert.equal(sourcePayload.ref.byteLength, source.source_byte_length);
       assert.equal(sourcePayload.ref.contentHash, source.source_content_hash);
+      assert.equal(sourcePayload.ref.binding.hostId, source.source_host_id);
+      assert.equal(sourcePayload.ref.binding.projectId, source.source_project_id);
+      assert.equal(sourcePayload.ref.binding.branchId, source.source_branch_id);
+      const approvalEvent = rawEvents.find(event => event.eventId === source.approval_event_id);
+      assert(approvalEvent, 'raw approval event missing');
+      assert.equal(approvalEvent.role, 'user');
+      const approvalDecision = JSON.parse(approvalEvent.text) as { schema: string; intentId: string; goalEventId: string;
+        ref: typeof sourcePayload.ref; projectId: string; kind: string; offset: number; length: number };
+      assert.equal(approvalDecision.schema, 'source-publication-approval@1');
+      assert.equal(Object.keys(approvalDecision).sort().join(','),
+        'goalEventId,intentId,kind,length,offset,projectId,ref,schema');
+      assert.deepEqual(approvalDecision.ref, sourcePayload.ref);
+      assert.equal(approvalDecision.projectId, source.project_id);
+      assert.equal(approvalDecision.kind, source.kind);
+      assert.equal(approvalDecision.offset, source.offset);
+      assert.equal(approvalDecision.length, source.length);
+      assert(db.prepare(`SELECT 1 FROM intent_events WHERE intent_id=? AND goal_input_event_id=?
+        AND session_id=? AND branch_id=? LIMIT 1`).get(approvalDecision.intentId, approvalDecision.goalEventId,
+        sourcePayload.ref.binding.sessionId, sourcePayload.ref.binding.branchId));
+      assert.equal(source.approval_locator, `cli-jsonl@1/${sandbox.fixture.sessionId}/${approvalEvent.eventId}`);
+      assert.equal(source.approval_hash, sha256(approvalEvent.rawLine));
+      assert.equal(source.approval_byte_length, Buffer.byteLength(approvalEvent.rawLine));
+      assert.equal(source.approval_content_hash, sha256(approvalEvent.text));
       assert.equal(sourcePayload.approval.eventId, source.approval_event_id);
       assert.equal(sourcePayload.approval.locator, source.approval_locator);
       assert.equal(sourcePayload.approval.hash, source.approval_hash);
       assert.equal(sourcePayload.approval.byteLength, source.approval_byte_length);
       assert.equal(sourcePayload.approval.contentHash, source.approval_content_hash);
-      const projection = db.prepare(`SELECT content, content_hash, owner_kind, record_id, revision_id, scope_kind, scope_id,
-        source_seq, projection_generation FROM search_documents WHERE unit_id=?`)
+      const projection = db.prepare(`SELECT rowid, content, content_hash, owner_kind, record_id, revision_id, scope_kind, scope_id,
+        source_seq, tokenizer_version, projection_generation FROM search_documents WHERE unit_id=?`)
         .get(String(source.unit_id)) as Record<string, unknown> | undefined;
       assert(projection, 'raw source projection missing');
       assert.equal(projection.content, fixture.report.approved.toLocaleLowerCase());
@@ -223,10 +250,14 @@ const rawValidation = (() => {
       assert.equal(projection.scope_kind, 'project');
       assert.equal(projection.scope_id, source.project_id);
       assert.equal(projection.source_seq, source.version);
+      assert.equal(projection.tokenizer_version, 'latin-cjk@3');
       assert.equal(projection.projection_generation, source.version);
-      const job = db.prepare(`SELECT status, content_hash FROM source_projection_jobs WHERE owner_kind='session' AND unit_id=?
+      assert(db.prepare(`SELECT d.unit_id FROM search_fts JOIN search_documents d ON d.rowid=search_fts.rowid
+        WHERE search_fts MATCH ? AND d.unit_id=?`).get('"Atlas"', String(source.unit_id)));
+      const job = db.prepare(`SELECT status, generation, content_hash FROM source_projection_jobs WHERE owner_kind='session' AND unit_id=?
         ORDER BY generation DESC LIMIT 1`).get(String(source.unit_id)) as Record<string, unknown> | undefined;
       assert.equal(job?.status, 'done');
+      assert.equal(job?.generation, source.version);
       assert.equal(job?.content_hash, sha256(fixture.report.approved));
       const proposals = db.prepare(`SELECT proposal_id, version, expected_change, payload, payload_hash
         FROM evolution_proposals WHERE scope_kind='project' AND scope_id=? AND expected_change IN (?,?) ORDER BY version`)
@@ -235,11 +266,47 @@ const rawValidation = (() => {
       assert.equal(proposals[0]?.version, 1);
       assert.equal(proposals[1]?.version, 2);
       assert.notEqual(proposals[0]?.payload_hash, proposals[1]?.payload_hash);
-      for (const proposal of proposals) assert.equal(proposal.payload_hash, sha256(String(proposal.payload)));
-      assert(crossGrantId && crossQueryId, 'cross query identity missing');
+      for (const proposal of proposals) {
+        assert.equal(proposal.payload_hash, sha256(String(proposal.payload)));
+        const payload = JSON.parse(String(proposal.payload)) as { proposalId: string; version: number; target: string;
+          expectedChange: string; owner: string; scope: { kind: string; id: string }; hash?: string };
+        const proposalId = String(proposal.proposal_id), version = Number(proposal.version);
+        assert.equal(payload.proposalId, proposalId);
+        assert.equal(payload.version, version);
+        const proposalProjection = db.prepare(`SELECT rowid, content, content_hash, owner_kind, owner_id, record_id,
+          revision_id, project_id, scope_kind, scope_id, source_seq, tokenizer_version, projection_generation
+          FROM search_documents WHERE unit_id=?`).get(proposalId) as Record<string, unknown> | undefined;
+        assert(proposalProjection, `raw proposal projection missing: ${proposalId}`);
+        const indexedProposal = `${payload.target} ${payload.expectedChange}`.toLowerCase();
+        assert.equal(proposalProjection.content, indexedProposal);
+        assert.equal(proposalProjection.content_hash, proposal.payload_hash);
+        assert.equal(proposalProjection.owner_kind, 'proposal');
+        assert.equal(proposalProjection.owner_id, proposalId);
+        assert.equal(proposalProjection.record_id, proposalId);
+        assert.equal(proposalProjection.revision_id, proposalId);
+        assert.equal(proposalProjection.project_id, sandbox.fixture.projectId);
+        assert.equal(proposalProjection.scope_kind, 'project');
+        assert.equal(proposalProjection.scope_id, sandbox.fixture.projectId);
+        assert.equal(proposalProjection.source_seq, version);
+        assert.equal(proposalProjection.tokenizer_version, 'latin-cjk@3');
+        assert.equal(proposalProjection.projection_generation, version);
+        assert(db.prepare(`SELECT d.unit_id FROM search_fts JOIN search_documents d ON d.rowid=search_fts.rowid
+          WHERE search_fts MATCH ? AND d.unit_id=?`).get('"Atlas"', proposalId));
+        const proposalJob = db.prepare(`SELECT status, generation, content_hash FROM source_projection_jobs
+          WHERE owner_kind='proposal' AND unit_id=? ORDER BY generation DESC LIMIT 1`).get(proposalId) as Record<string, unknown> | undefined;
+        assert.equal(proposalJob?.status, 'done');
+        assert.equal(proposalJob?.generation, version);
+        assert.equal(proposalJob?.content_hash, proposal.payload_hash);
+      }
+      assert(crossGrantId && crossQueryId && crossExpandQueryId, 'cross query identity missing');
+      const receipts = db.prepare('SELECT query_id FROM source_query_receipts WHERE grant_id=?').all(crossGrantId) as Record<string, unknown>[];
+      assert.equal(receipts.length, 2, 'search and expand must create exactly two receipts');
       const queryReceipt = db.prepare('SELECT request_hash, page_hash, result_count, byte_length FROM source_query_receipts WHERE grant_id=? AND query_id=?')
         .get(crossGrantId, crossQueryId) as Record<string, unknown> | undefined;
+      const expandReceipt = db.prepare('SELECT request_hash, page_hash, result_count, byte_length FROM source_query_receipts WHERE grant_id=? AND query_id=?')
+        .get(crossGrantId, crossExpandQueryId) as Record<string, unknown> | undefined;
       assert(queryReceipt, 'source query receipt missing');
+      assert(expandReceipt, 'source expand receipt missing');
       const queryResults = proposals.map(proposal => {
         const payload = JSON.parse(String(proposal.payload)) as { input: { binding: { projectId: string } }; scope: { id: string } };
         const proposalId = String(proposal.proposal_id), version = Number(proposal.version), expectedChange = String(proposal.expected_change);
@@ -255,8 +322,27 @@ const rawValidation = (() => {
         query: 'Atlas', limit: 10, byteBudget: 8192, cursor: null })));
       assert.equal(queryReceipt.page_hash, sha256(JSON.stringify(queryPage)));
       assert.equal(queryReceipt.result_count, queryResults.length);
-      const grantUsage = db.prepare('SELECT used_results FROM memory_discovery_grants WHERE grant_id=?').get(crossGrantId) as Record<string, unknown> | undefined;
-      assert.equal(grantUsage?.used_results, queryResults.length + 1);
+      assert.equal(queryReceipt.byte_length, queryResults.reduce((sum, item) => sum + Buffer.byteLength(JSON.stringify(item)), 0));
+      const firstProposal = proposals[0]!;
+      const expansionText = String(firstProposal.payload);
+      const expansionResult = { unitId: String(firstProposal.proposal_id), locator: `proposal@1/${firstProposal.proposal_id}/${firstProposal.version}`,
+        kind: 'proposal', version: Number(firstProposal.version), contentHash: String(firstProposal.payload_hash), text: expansionText,
+        offset: 0, end: Array.from(expansionText).length, total: Array.from(expansionText).length, truncated: false,
+        excerptHash: sha256(expansionText) };
+      assert.equal(expandReceipt.request_hash, sha256(JSON.stringify({ operation: 'expand', sessionId: targetBinding.sessionId,
+        grantId: crossGrantId, unitId: String(firstProposal.proposal_id), offset: 0, limit: 4096 })));
+      assert.equal(expandReceipt.page_hash, sha256(JSON.stringify(expansionResult)));
+      assert.equal(expandReceipt.result_count, 1);
+      assert.equal(expandReceipt.byte_length, Buffer.byteLength(JSON.stringify(expansionResult)));
+      const grantUsage = db.prepare(`SELECT used_queries, used_results, used_bytes, max_queries, max_results, max_bytes
+        FROM memory_discovery_grants WHERE grant_id=?`).get(crossGrantId) as Record<string, unknown> | undefined;
+      assert(grantUsage, 'cross grant missing');
+      assert.equal(grantUsage.used_queries, 2);
+      assert.equal(grantUsage.used_results, Number(queryReceipt.result_count) + Number(expandReceipt.result_count));
+      assert.equal(grantUsage.used_bytes, Number(queryReceipt.byte_length) + Number(expandReceipt.byte_length));
+      assert(Number(grantUsage.used_queries) <= Number(grantUsage.max_queries));
+      assert(Number(grantUsage.used_results) <= Number(grantUsage.max_results));
+      assert(Number(grantUsage.used_bytes) <= Number(grantUsage.max_bytes));
       const assembly = db.prepare(`SELECT state, sources, used_memories FROM request_assemblies WHERE state='finished' LIMIT 1`)
         .get() as Record<string, unknown> | undefined;
       assert(assembly, 'raw finished assembly missing');
@@ -267,7 +353,12 @@ const rawValidation = (() => {
         sourceApprovalHash: String(source.approval_hash), sourceProjectionGeneration: Number(projection.projection_generation),
         proposalIds: proposals.map(proposal => String(proposal.proposal_id)),
         queryReceipt: { requestHash: String(queryReceipt.request_hash), pageHash: String(queryReceipt.page_hash),
-          resultCount: Number(queryReceipt.result_count), usedResults: Number(grantUsage?.used_results) } ,
+          resultCount: Number(queryReceipt.result_count), byteLength: Number(queryReceipt.byte_length), usedResults: Number(grantUsage?.used_results) },
+        expandReceipt: { requestHash: String(expandReceipt.request_hash), pageHash: String(expandReceipt.page_hash),
+          resultCount: Number(expandReceipt.result_count), byteLength: Number(expandReceipt.byte_length) },
+        grantUsage: { usedQueries: Number(grantUsage.used_queries), usedResults: Number(grantUsage.used_results),
+          usedBytes: Number(grantUsage.used_bytes) },
+        projections: { sourceFtsHit: true, proposalIds: proposals.map(proposal => String(proposal.proposal_id)) },
         assemblyState: String(assembly.state) };
     } finally { db.close(); }
   } catch (error) {
@@ -312,14 +403,29 @@ const assertions = [
   { name: 'focused T11 tests pass', passed: focusedPass },
 ].map(assertion => assertion.passed ? assertion : { ...assertion, error: scenarioError ?? 'assertion failed' });
 
-const preliminaryStatus = !scenarioError && focusedPass && rawValidation.status === 'pass' && assertions.every(assertion => assertion.passed) ? 'pass' : 'fail';
+const runtimeStatus: 'pass' | 'fail' = !scenarioError && focusedPass && rawValidation.status === 'pass'
+  && assertions.every(assertion => assertion.passed) ? 'pass' : 'fail';
+const evidenceGaps = [
+  'Unknown append outcomes and archive-flushed/pending-job restart fault injection remain unverified',
+  'Real provider/Host consumers and authenticated owner UI remain unverified',
+  'Report/proposal generation and export remain T13/T18 work',
+  'Production schema migration and backup/purge remain outside T11',
+  'Other OS host results require their matching CI/host artifacts',
+];
+type EvidenceStatus = 'pass' | 'fail' | 'evidence-gap';
+const status: EvidenceStatus = runtimeStatus === 'fail' ? 'fail' : evidenceGaps.length > 0 ? 'evidence-gap' : 'pass';
+const exitCode = status === 'fail' ? 1 : 0;
 const receiptObservations = JSON.parse(JSON.stringify(observations, (key, value) =>
   ['text', 'content', 'expectedChange'].includes(key) ? undefined : value));
+const writeReceiptConsole = (receiptStatus: EvidenceStatus, receiptError: string | null): string => JSON.stringify({
+  path: join(directory, 'summary.json'), status: receiptStatus, passed: receiptStatus === 'pass',
+  evidenceGap: receiptStatus === 'evidence-gap', fixtureDigest, scenarioError, receiptError,
+}) + '\n';
 writeFileSync(join(directory, 'fixture.json'), bytes, { flag: 'wx' });
 writeFileSync(join(directory, 'owner-observations.json'), JSON.stringify(observations, null, 2) + '\n', { flag: 'wx' });
 writeFileSync(join(directory, 'focused-test.txt'), focusedRaw, { flag: 'wx' });
 writeFileSync(join(directory, 'focused-stderr.txt'), focusedStderr, { flag: 'wx' });
-const consoleOutput = JSON.stringify({ path: join(directory, 'summary.json'), passed: preliminaryStatus === 'pass', fixtureDigest, scenarioError }) + '\n';
+let consoleOutput = writeReceiptConsole(status, null);
 writeFileSync(join(directory, 'console-output.txt'), consoleOutput, { flag: 'wx' });
 writeFileSync(join(directory, 'main-stderr.txt'), mainStderr.join(''), { flag: 'wx' });
 const finishedAt = new Date().toISOString();
@@ -333,7 +439,7 @@ const focusedProcess: ProcessReceipt = { command: process.execPath, args: focuse
   stdout: { path: 'focused-test.txt', sha256: files.find(file => file.path === 'focused-test.txt')!.sha256 },
   stderr: { path: 'focused-stderr.txt', sha256: files.find(file => file.path === 'focused-stderr.txt')!.sha256 } };
 const mainProcess: ProcessReceipt = { command: process.execPath, args: [...process.execArgv, ...process.argv.slice(1)], cwd: repo,
-  startedAt, finishedAt, code: preliminaryStatus === 'pass' ? 0 : 1, signal: null,
+  startedAt, finishedAt, code: exitCode, signal: null,
   stdout: { path: 'console-output.txt', sha256: files.find(file => file.path === 'console-output.txt')!.sha256 },
   stderr: { path: 'main-stderr.txt', sha256: files.find(file => file.path === 'main-stderr.txt')!.sha256 } };
 processes.push(mainProcess, focusedProcess);
@@ -358,23 +464,23 @@ const output = {
   fixture: { path: 'fixtures/t11-source-cases.json', rawDigest: fixtureDigest, digest: fixtureDigest, synthetic: true, heldOut: false },
   heldOut: { digest: null, owner: null, sealedCommit: null, releasedCommit: null, contaminationCaseIds: [], replacementCaseIds: [],
     applicability: 'not-applicable: deterministic synthetic fixture; no held-out quality claim' },
-  processes, assertions, files, controlledSideEffects,
+  processes, assertions: [...assertions, { name: 'independent raw archive/SQLite/receipt validation passes', passed: rawValidation.status === 'pass',
+    error: rawValidation.status === 'fail' ? rawValidation.error : undefined }], files, controlledSideEffects,
   artifactDigests: { stdout: mainProcess.stdout, stderr: mainProcess.stderr,
     database: databaseArtifacts, sidecars: sidecarArtifacts },
   independentValidation: { method: 'raw fixture/archive/SQLite recomputation and node:crypto; no Core replay or reported verdict',
-    verifier: { path: 'scripts/evidence-source-recovery.ts', sha256: sha256(readFileSync(new URL('./evidence-source-recovery.ts', import.meta.url))) }, status: preliminaryStatus },
-  rawValidation, observations: receiptObservations, scenarioError, focusedPass, status: preliminaryStatus,
-  exit: { code: preliminaryStatus === 'pass' ? 0 : 1, signal: null as string | null },
-  evidenceGaps: ['Unknown append outcomes and archive-flushed/pending-job restart fault injection remain unverified',
-    'Real provider/Host consumers and authenticated owner UI remain unverified',
-    'Report/proposal generation and export remain T13/T18 work', 'Production schema migration and backup/purge remain outside T11',
-    'Other OS host results require their matching CI/host artifacts'],
+    verifier: { path: 'scripts/evidence-source-recovery.ts', sha256: sha256(readFileSync(new URL('./evidence-source-recovery.ts', import.meta.url))) }, status: rawValidation.status },
+  rawValidation, observations: receiptObservations, scenarioError, focusedPass, status,
+  exit: { code: exitCode, signal: null as string | null }, evidenceGaps, receiptError: null as string | null,
 };
 function validateReceipt(receipt: typeof output) {
   for (const key of ['schema','schemaVersion','experimentId','specCommit','authorityRefs','command','startedAt','finishedAt',
     'implementationCommit','implementationTree','workingTree','environment','fixture','heldOut','processes','assertions','files',
-    'controlledSideEffects','artifactDigests','independentValidation','status','exit'] as const) assert.ok(Object.hasOwn(receipt, key), `missing ${key}`);
+    'controlledSideEffects','artifactDigests','independentValidation','status','exit','evidenceGaps'] as const) assert.ok(Object.hasOwn(receipt, key), `missing ${key}`);
   assert.ok(receipt.authorityRefs.length > 0);
+  assert.ok(['pass', 'fail', 'evidence-gap'].includes(receipt.status));
+  if (receipt.status === 'pass') assert.equal(receipt.evidenceGaps.length, 0);
+  if (receipt.status === 'evidence-gap') assert(receipt.evidenceGaps.length > 0);
   for (const key of ['platform','release','architecture','node','sqlite','provider','model','adapter'] as const) assert.ok(receipt.environment[key]);
   for (const key of ['digest','owner','sealedCommit','releasedCommit','contaminationCaseIds','replacementCaseIds','applicability'] as const) {
     assert.ok(Object.hasOwn(receipt.heldOut, key), `missing heldOut.${key}`);
@@ -390,6 +496,7 @@ function validateReceipt(receipt: typeof output) {
     assert.equal(process.stdout.sha256, receipt.files.find(file => file.path === process.stdout.path)?.sha256);
     assert.equal(process.stderr.sha256, receipt.files.find(file => file.path === process.stderr.path)?.sha256);
   }
+  assert.equal(receipt.exit.code, receipt.status === 'fail' ? 1 : 0);
   assert.ok(receipt.assertions.length > 0 && receipt.assertions.every(assertion => Object.hasOwn(assertion, 'name') && Object.hasOwn(assertion, 'passed'))
     && receipt.files.length > 0);
   assert.ok(receipt.artifactDigests.database.length > 0 && receipt.artifactDigests.sidecars.length > 0);
@@ -404,11 +511,19 @@ function validateReceipt(receipt: typeof output) {
 let receiptError: string | null = null;
 try { validateReceipt(output); }
 catch (error) { receiptError = error instanceof Error ? error.stack ?? error.message : String(error); }
-output.independentValidation.status = receiptError || rawValidation.status !== 'pass' ? 'fail' : 'pass';
-output.status = preliminaryStatus === 'pass' && !receiptError ? 'pass' : 'fail';
-output.exit.code = output.status === 'pass' ? 0 : 1;
-mainProcess.code = output.exit.code;
-(output as typeof output & { receiptError: string | null }).receiptError = receiptError;
+if (receiptError) {
+  output.receiptError = receiptError;
+  output.status = 'fail';
+  output.exit.code = 1;
+  output.independentValidation.status = 'fail';
+  mainProcess.code = 1;
+  consoleOutput = writeReceiptConsole('fail', receiptError);
+  writeFileSync(join(directory, 'console-output.txt'), consoleOutput);
+  const stdoutFile = output.files.find(file => file.path === 'console-output.txt');
+  assert(stdoutFile);
+  stdoutFile.sha256 = sha256(consoleOutput);
+  mainProcess.stdout.sha256 = stdoutFile.sha256;
+}
 writeFileSync(join(directory, 'summary.json'), JSON.stringify(output, null, 2) + '\n', { flag: 'wx' });
 process.stdout.write(consoleOutput);
-if (output.status !== 'pass') process.exitCode = 1;
+if (output.status === 'fail') process.exitCode = 1;
