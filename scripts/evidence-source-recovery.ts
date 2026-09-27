@@ -3,13 +3,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, copyFileSync, readdirSync } from 'node:fs';
 import { arch, release } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { createSandbox, createSandboxSession, bindingOf } from '../apps/cli/src/sandbox.ts';
 import { openProbe } from '../apps/cli/src/probe.ts';
 import type { SourceUnitInput } from '@euler/core';
 
-const repo = process.cwd();
+const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sha256 = (value: string | Uint8Array): string => createHash('sha256').update(value).digest('hex');
 const copyTree = (source: string, target: string): void => {
   mkdirSync(target, { recursive: true });

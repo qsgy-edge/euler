@@ -428,6 +428,15 @@ test('non-project inert proposals stay canonical without entering project projec
     assert.equal(db.prepare('SELECT scope_kind FROM evolution_proposals WHERE proposal_id=?').get(proposal.proposalId)?.scope_kind, 'personal');
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM source_projection_jobs WHERE unit_id=?').get(proposal.proposalId)?.count, 0);
     assert.equal(probe.store.drainSourceProjection(probe.activity), 0);
+    const restored = probe.store.readEvolutionProposal(probe.activity, proposal.proposalId);
+    assert.equal(restored.scope.kind, 'personal');
+    const revised = probe.store.saveEvolutionProposal(probe.activity, source, {
+      target: 'Personal Atlas guidance', expectedChange: 'Keep the revised proposal inert', owner: sandbox.fixture.ownerId,
+      scope: { kind: 'personal', id: sandbox.fixture.ownerId, resolved: true }, evidenceRefs: [source],
+      supersedes: proposal.proposalId,
+      evaluation: { schema: 'evaluation-contract@1', level: 'L0', assertions: ['Synthetic check'] },
+    });
+    assert.equal(revised.version, 2);
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 

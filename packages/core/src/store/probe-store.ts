@@ -3008,7 +3008,7 @@ export class ProbeStore {
   }
 
   readEvolutionProposal(activity: Activity, proposalId: string): EvolutionProposal {
-    return this.withActivity(activity, () => this.#proposalForProjects(proposalId, [this.#binding.projectId]));
+    return this.withActivity(activity, () => this.#proposalForProjects(proposalId, this.#registeredProjects()));
   }
 
   #registeredProjects(): string[] {
@@ -3019,7 +3019,7 @@ export class ProbeStore {
   #proposalForProjects(proposalId: string, projects: readonly string[]): EvolutionProposal {
       uuid(proposalId);
       const row = this.#db.prepare('SELECT * FROM evolution_proposals WHERE proposal_id=? AND owner=?').get(proposalId, this.#binding.ownerId);
-      check(row && projects.includes(String(row.scope_id)), 'source-scope-mismatch');
+      check(row && (String(row.scope_kind) !== 'project' || projects.includes(String(row.scope_id))), 'source-scope-mismatch');
       check(sha256(String(row.payload)) === row.payload_hash, 'proposal-evidence-gap');
       let value: Omit<EvolutionProposal, 'hash'>;
       try { value = JSON.parse(String(row.payload)) as Omit<EvolutionProposal, 'hash'>; }
