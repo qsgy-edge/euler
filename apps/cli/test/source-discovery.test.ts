@@ -267,6 +267,23 @@ test('source projection drain consumes its durable outbox and does not heal a di
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('bounded source projection drains converge to ready after the final batch', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    for (const text of ['Atlas batch one', 'Atlas batch two']) {
+      const ref = probe.archive.append(randomUUID(), text);
+      probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, {
+        ref, projectId: sandbox.fixture.projectId, kind: 'source', offset: 0, length: text.length,
+      }));
+    }
+    assert.equal(probe.store.drainSourceProjection(probe.activity, 1), 1);
+    assert.equal(probe.store.searchSources(probe.activity, { query: 'Atlas' }).status, 'dirty');
+    assert.equal(probe.store.drainSourceProjection(probe.activity, 1), 1);
+    assert.equal(probe.store.searchSources(probe.activity, { query: 'Atlas' }).status, 'ready');
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('source projection records a durable failure when canonical archive evidence is gone', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);

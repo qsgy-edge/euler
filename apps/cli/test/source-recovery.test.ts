@@ -39,13 +39,10 @@ test('actual-used inspect returns the frozen memory revision after its current h
     assert.equal(selected.snapshot.hash, active.hash);
     assert.equal(selected.reason, 'selected-memory');
     const recoveredSource = probe.store.expandSource(probe.activity, {
-      unitId: published.unitId, assemblyId: turn.assemblyId, sourceOrdinal: 0, offset: 0, limit: 256,
+      ref: used.sources[0]!.ref, offset: 0, limit: 256,
     });
-    assert.equal(recoveredSource.sourceSessionId, sandbox.fixture.sessionId);
-    assert.equal(recoveredSource.sourceProjectId, sandbox.fixture.projectId);
-    assert.throws(() => probe.store.expandSource(probe.activity, {
-      unitId: published.unitId, assemblyId: turn.assemblyId, sourceOrdinal: 1, offset: 0, limit: 256,
-    }), /assembly-source-not-used/);
+    assert.equal(recoveredSource.ref.eventId, sandbox.fixture.eventId);
+    assert.equal(recoveredSource.ref.binding.sessionId, sandbox.fixture.sessionId);
     assert.throws(() => probe.store.inspectAssembly(probe.activity, turn.assemblyId, unrelated.recordId), /assembly-source-not-used/);
     assert.notEqual(probe.store.readMemory(probe.activity, active.recordId).content, selected.snapshot.content);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }

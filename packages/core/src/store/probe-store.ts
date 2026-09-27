@@ -110,7 +110,7 @@ export interface SourceSearchHit { unitId: string; locator: string; kind: Source
 export interface SourceSearchPage { status: 'ready' | 'dirty' | 'unavailable'; results: SourceSearchHit[];
   coverage: SearchPage['coverage']; truncated: boolean; nextCursor: string | null }
 export type SourceExpandRequest = { ref: SourceAck; offset: number; limit: number }
-  | { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string; assemblyId?: string; sourceOrdinal?: number };
+  | { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string };
 export interface SourceUnitExcerpt { unitId: string; locator: string; kind: SourceSearchHit['kind']; version: number;
   projectId: string; sourceProjectId: string; sourceOwnerId: string; sourceSessionId: string;
   contentHash: string; text: string; offset: number; end: number; total: number; truncated: boolean; excerptHash: string }
@@ -2189,18 +2189,64 @@ export class ProbeStore {
     });
   }
 
+  #sourceProjectionHealthy(projectId: string): boolean {
+    const missing = this.#db.prepare(`SELECT 1 FROM source_units s LEFT JOIN search_documents d ON d.unit_id=s.unit_id
+      WHERE s.owner_id=? AND s.project_id=? AND (d.unit_id IS NULL OR d.owner_kind!='session'
+        OR d.owner_id!=s.source_owner OR d.project_id!=s.project_id OR d.scope_kind!='project'
+        OR d.scope_id!=s.project_id OR d.revision_id!=s.unit_id OR d.record_id!=s.unit_id
+        OR d.content_hash!=s.content_hash OR d.source_seq!=s.version
+        OR d.projection_generation!=s.version OR d.tokenizer_version!='latin-cjk@3') LIMIT 1`)
+      .get(this.#binding.ownerId, projectId);
+    const extra = this.#db.prepare(`SELECT 1 FROM search_documents d LEFT JOIN source_units s ON s.unit_id=d.unit_id
+      WHERE d.owner_kind='session' AND d.project_id=?
+        AND (s.unit_id IS NULL OR s.owner_id!=? OR s.project_id!=d.project_id) LIMIT 1`)
+      .get(projectId, this.#binding.ownerId);
+    const missingProposal = this.#db.prepare(`SELECT 1 FROM evolution_proposals p LEFT JOIN search_documents d ON d.unit_id=p.proposal_id
+      WHERE p.owner=? AND p.scope_kind='project' AND p.scope_id=?
+        AND (d.unit_id IS NULL OR d.owner_kind!='proposal' OR d.owner_id!=p.proposal_id
+          OR d.project_id!=p.scope_id OR d.scope_id!=p.scope_id OR d.revision_id!=p.proposal_id
+          OR d.content_hash!=p.payload_hash OR d.source_seq!=p.version
+          OR d.projection_generation!=p.version OR d.tokenizer_version!='latin-cjk@3') LIMIT 1`)
+      .get(this.#binding.ownerId, projectId);
+    const extraProposal = this.#db.prepare(`SELECT 1 FROM search_documents d LEFT JOIN evolution_proposals p ON p.proposal_id=d.unit_id
+      WHERE d.owner_kind='proposal' AND d.project_id=?
+        AND (p.proposal_id IS NULL OR p.owner!=? OR p.scope_id!=d.project_id) LIMIT 1`)
+      .get(projectId, this.#binding.ownerId);
+    if (missing || extra || missingProposal || extraProposal) return false;
+    try {
+      const sources = this.#db.prepare('SELECT unit_id FROM source_units WHERE owner_id=? AND project_id=?').all(this.#binding.ownerId, projectId);
+      for (const row of sources) {
+        const { unit, text } = this.#sourceUnit(String(row.unit_id));
+        const document = this.#db.prepare("SELECT content FROM search_documents WHERE unit_id=? AND owner_kind='session'")
+          .get(unit.unitId);
+        const expected = `${normalizeSearchText(text)} ${cjkBigrams(text)}`.trim();
+        if (!document || String(document.content) !== expected) return false;
+      }
+      const proposals = this.#db.prepare("SELECT proposal_id FROM evolution_proposals WHERE owner=? AND scope_kind='project' AND scope_id=?")
+        .all(this.#binding.ownerId, projectId);
+      for (const row of proposals) {
+        const proposal = this.#proposalForProjects(String(row.proposal_id), [projectId]);
+        const document = this.#db.prepare("SELECT content FROM search_documents WHERE unit_id=? AND owner_kind='proposal'")
+          .get(proposal.proposalId);
+        const content = `${proposal.target} ${proposal.expectedChange}`;
+        const expected = `${normalizeSearchText(content)} ${cjkBigrams(content)}`.trim();
+        if (!document || String(document.content) !== expected.trim()) return false;
+      }
+    } catch { return false; }
+    try { this.#db.exec("INSERT INTO search_fts(search_fts,rank) VALUES ('integrity-check',1)"); }
+    catch { return false; }
+    return true;
+  }
+
   drainSourceProjection(activity: Activity, limit = 32): number {
     return this.withActivity(activity, () => {
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= 128, 'invalid-projection-limit');
       const jobs = this.#db.prepare(`SELECT * FROM source_projection_jobs
         WHERE status='pending' ORDER BY rowid LIMIT ?`).all(limit);
-      const initialDirty = new Map<string, number>();
+      const projects = new Set<string>();
       for (const job of jobs) {
         const projectId = String(job.project_id);
-        if (!initialDirty.has(projectId)) {
-          initialDirty.set(projectId, Number(this.#db.prepare('SELECT dirty FROM source_projection_health WHERE project_id=?')
-            .get(projectId)?.dirty ?? 0));
-        }
+        projects.add(projectId);
         try {
           if (job.owner_kind === 'session') {
             const canonical = this.#sourceUnit(String(job.unit_id)).unit;
@@ -2227,9 +2273,9 @@ export class ProbeStore {
           'source-projection-job-race');
         }
       }
-      for (const projectId of initialDirty.keys()) {
+      for (const projectId of projects) {
         const pending = this.#db.prepare("SELECT 1 FROM source_projection_jobs WHERE project_id=? AND status!='done' LIMIT 1").get(projectId);
-        if (!pending && initialDirty.get(projectId) !== 1) {
+        if (!pending && this.#sourceProjectionHealthy(projectId)) {
           this.#db.prepare('UPDATE source_projection_health SET dirty=0 WHERE project_id=?').run(projectId);
         }
       }
@@ -3024,7 +3070,7 @@ export class ProbeStore {
     return null;
   }
   expandSource(activity: Activity, request: { ref: SourceAck; offset: number; limit: number }): SourceExcerpt;
-  expandSource(activity: Activity, request: { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string; assemblyId?: string; sourceOrdinal?: number }): SourceUnitExcerpt;
+  expandSource(activity: Activity, request: { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string }): SourceUnitExcerpt;
   expandSource(activity: Activity, request: SourceExpandRequest): SourceExcerpt | SourceUnitExcerpt {
     return this.withActivity(activity, () => {
       check(request && typeof request === 'object', 'invalid-source-request');
@@ -3044,23 +3090,12 @@ export class ProbeStore {
     });
   }
 
-  #expandSourceUnit(activity: Activity, request: { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string; assemblyId?: string; sourceOrdinal?: number }): SourceUnitExcerpt {
-    check(Object.keys(request).every(key => ['unitId','offset','limit','grantId','queryId','assemblyId','sourceOrdinal'].includes(key)), 'invalid-source-request');
+  #expandSourceUnit(activity: Activity, request: { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string }): SourceUnitExcerpt {
+    check(Object.keys(request).every(key => ['unitId','offset','limit','grantId','queryId'].includes(key)), 'invalid-source-request');
     check((!request.grantId && request.queryId === undefined) || (request.grantId && typeof request.queryId === 'string'), 'source-query-id-required');
     if (request.grantId) uuid(request.queryId!);
-    if (request.assemblyId !== undefined || request.sourceOrdinal !== undefined) {
-      uuid(request.assemblyId!);
-      check(Number.isSafeInteger(request.sourceOrdinal) && request.sourceOrdinal! >= 0, 'invalid-source-request');
-      const assemblyRow = this.#db.prepare('SELECT run_id FROM request_assemblies WHERE assembly_id=?').get(request.assemblyId!);
-      check(assemblyRow, 'unknown-assembly');
-      const status = this.requestStatus(activity, String(assemblyRow.run_id));
-      const assembly = status.assemblies.find(item => item.assemblyId === request.assemblyId);
-      check(assembly?.state === 'finished', 'assembly-source-not-used');
-      check(assembly.sources[request.sourceOrdinal!], 'assembly-source-not-used');
-    }
     const requestHash = sha256(JSON.stringify({ operation: 'expand', sessionId: this.#binding.sessionId,
-      grantId: request.grantId, unitId: request.unitId, offset: request.offset, limit: request.limit,
-      ...(request.assemblyId !== undefined ? { assemblyId: request.assemblyId, sourceOrdinal: request.sourceOrdinal } : {}) }));
+      grantId: request.grantId, unitId: request.unitId, offset: request.offset, limit: request.limit }));
     const receipt = request.grantId ? this.#db.prepare('SELECT * FROM source_query_receipts WHERE grant_id=? AND query_id=?')
       .get(request.grantId, request.queryId!) : null;
     check(!receipt || receipt.request_hash === requestHash, 'source-query-identity-conflict');
@@ -3069,7 +3104,8 @@ export class ProbeStore {
     catch (error) {
       const state = request.grantId ? this.#db.prepare('SELECT state FROM memory_discovery_grants WHERE grant_id=?')
         .get(request.grantId)?.state : null;
-      if (receipt && state === 'active' && error instanceof Error && error.message.startsWith('source-evidence-gap')) {
+      if (receipt && state === 'active' && error instanceof Error
+        && (error.message.startsWith('source-evidence-gap') || error.message.startsWith('archive-integrity'))) {
         throw new Error('source-query-result-stale', { cause: error });
       }
       throw error;
@@ -3092,11 +3128,6 @@ export class ProbeStore {
         expectedSource = proposal.input;
         projectId = proposal.scope.kind === 'project' ? proposal.scope.id : this.#binding.projectId;
       }
-      if (request.assemblyId !== undefined) {
-        const assemblyRow = this.#db.prepare('SELECT run_id FROM request_assemblies WHERE assembly_id=?').get(request.assemblyId)!;
-        const assembly = this.requestStatus(activity, String(assemblyRow.run_id)).assemblies.find(item => item.assemblyId === request.assemblyId)!;
-        check(sameSourceAck(assembly.sources[request.sourceOrdinal!], expectedSource), 'assembly-source-not-used');
-      }
     } catch (error) {
       if (receipt) throw new Error('source-query-result-stale', { cause: error });
       throw error;
@@ -3115,7 +3146,7 @@ export class ProbeStore {
       if (receipt) {
         check(receipt.page_hash === sha256(JSON.stringify(result)), 'source-query-result-stale');
       } else {
-        check(grant.remainingQueries > 0 && grant.remainingBytes >= size, 'discovery-budget-exhausted');
+        check(grant.remaining > 0 && grant.remainingQueries > 0 && grant.remainingBytes >= size, 'discovery-budget-exhausted');
         check(this.#db.prepare(`UPDATE memory_discovery_grants SET used_queries=used_queries+1, used_results=used_results+1, used_bytes=used_bytes+?
           WHERE grant_id=? AND state='active' AND used_queries<max_queries AND used_results+1<=max_results AND used_bytes+?<=max_bytes`)
           .run(size, request.grantId!, size).changes === 1, 'discovery-budget-stale');
