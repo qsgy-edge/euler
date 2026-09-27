@@ -278,7 +278,8 @@ test('source projection records a durable failure when canonical archive evidenc
       ref, projectId: sandbox.fixture.projectId, kind: 'source', offset: 0, length: text.length,
     }));
     const sourcePath = join(sandbox.root, 'session.jsonl');
-    const header = readFileSync(sourcePath, 'utf8').split('\n')[0] + '\n';
+    const archived = readFileSync(sourcePath, 'utf8');
+    const header = archived.split('\n')[0] + '\n';
     writeFileSync(sourcePath, header);
     assert.equal(probe.store.drainSourceProjection(probe.activity), 1);
     const failedJob = db.prepare("SELECT status, reason FROM source_projection_jobs WHERE owner_kind='session' AND unit_id=?")
@@ -289,6 +290,11 @@ test('source projection records a durable failure when canonical archive evidenc
     assert.equal(page.status, 'unavailable');
     assert.equal(page.coverage.reason, 'index-failed');
     assert.deepEqual(page.results, []);
+    writeFileSync(sourcePath, archived);
+    assert.equal(probe.store.rebuildSourceProjection(probe.activity), 1);
+    const recovered = probe.store.searchSources(probe.activity, { query: 'Atlas' });
+    assert.equal(recovered.status, 'ready');
+    assert.equal(recovered.results.length, 1);
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
@@ -313,6 +319,30 @@ test('a stale source supersession cannot fork the current version chain', () => 
       ref: staleRef, projectId: sandbox.fixture.projectId, kind: 'handoff', offset: 0,
       length: staleText.length, supersedes: first.unitId,
     })), /source-version-stale/);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('independent source lineages can advance separately under parent CAS', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const firstRef = probe.archive.append(randomUUID(), 'Atlas lineage A root');
+    const first = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, {
+      ref: firstRef, projectId: sandbox.fixture.projectId, kind: 'handoff', offset: 0,
+      length: Array.from('Atlas lineage A root').length,
+    }));
+    const secondRef = probe.archive.append(randomUUID(), 'Atlas lineage B root');
+    const second = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, {
+      ref: secondRef, projectId: sandbox.fixture.projectId, kind: 'handoff', offset: 0,
+      length: Array.from('Atlas lineage B root').length,
+    }));
+    const childRef = probe.archive.append(randomUUID(), 'Atlas lineage A child');
+    const child = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, {
+      ref: childRef, projectId: sandbox.fixture.projectId, kind: 'handoff', offset: 0,
+      length: Array.from('Atlas lineage A child').length, supersedes: first.unitId,
+    }));
+    assert.equal(child.version, 2);
+    assert.equal(second.version, 1);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 

@@ -97,6 +97,12 @@ export interface SourceUnit {
   schema: 'source-unit@1'; unitId: string; ref: SourceAck; kind: SourceUnitInput['kind']; projectId: string;
   offset: number; length: number; contentHash: string; version: number; supersedes: string | null; approval: SourceAck;
 }
+function sameSourceAck(left: SourceAck | undefined, right: SourceAck | undefined): boolean {
+  return !!left && !!right && left.schema === right.schema && left.status === right.status
+    && sameBinding(left.binding, right.binding) && left.eventId === right.eventId
+    && left.locator === right.locator && left.hash === right.hash
+    && left.byteLength === right.byteLength && left.contentHash === right.contentHash;
+}
 export interface SourceSearchRequest { query: string; limit?: number; byteBudget?: number; cursor?: string; grantId?: string; queryId?: string }
 export interface SourceSearchHit { unitId: string; locator: string; kind: SourceUnitInput['kind'] | 'proposal'; projectId: string;
   sourceProjectId: string; version: number; contentHash: string; range: { offset: number; end: number; total: number };
@@ -104,8 +110,9 @@ export interface SourceSearchHit { unitId: string; locator: string; kind: Source
 export interface SourceSearchPage { status: 'ready' | 'dirty' | 'unavailable'; results: SourceSearchHit[];
   coverage: SearchPage['coverage']; truncated: boolean; nextCursor: string | null }
 export type SourceExpandRequest = { ref: SourceAck; offset: number; limit: number }
-  | { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string };
+  | { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string; assemblyId?: string; sourceOrdinal?: number };
 export interface SourceUnitExcerpt { unitId: string; locator: string; kind: SourceSearchHit['kind']; version: number;
+  projectId: string; sourceProjectId: string; sourceOwnerId: string; sourceSessionId: string;
   contentHash: string; text: string; offset: number; end: number; total: number; truncated: boolean; excerptHash: string }
 export interface SearchRequest { query: string; limit?: number; byteBudget?: number; cursor?: string; grantId?: string;
   noActiveProject?: true; target?: SearchTarget }
@@ -487,7 +494,7 @@ CREATE TRIGGER source_projection_job_guard BEFORE UPDATE ON source_projection_jo
 WHEN NEW.job_id IS NOT OLD.job_id OR NEW.owner_kind IS NOT OLD.owner_kind OR NEW.unit_id IS NOT OLD.unit_id
   OR NEW.owner_id IS NOT OLD.owner_id OR NEW.project_id IS NOT OLD.project_id OR NEW.generation IS NOT OLD.generation
   OR NEW.content_hash IS NOT OLD.content_hash OR NEW.created_at IS NOT OLD.created_at
-  OR (OLD.status='done' AND NEW.status!='done') OR (OLD.status='failed' AND NEW.status!='failed')
+  OR (OLD.status='done' AND NEW.status!='done') OR (OLD.status='failed' AND NOT (NEW.status='done' AND NEW.reason='rebuild'))
   OR (OLD.status='pending' AND NEW.status NOT IN ('done','failed'))
 BEGIN SELECT RAISE(ABORT,'source-projection-job-immutable'); END;
 CREATE TRIGGER immutable_source_projection_jobs_delete BEFORE DELETE ON source_projection_jobs
@@ -829,10 +836,8 @@ export class ProbeStore {
         return existingUnit;
       }
       if (prior) {
-        const current = this.#db.prepare(`SELECT unit_id FROM source_units
-          WHERE owner_id=? AND project_id=? AND kind=? ORDER BY version DESC, rowid DESC LIMIT 1`)
-          .get(this.#binding.ownerId, projectId, kind);
-        check(current?.unit_id === prior.unitId, 'source-version-stale');
+        const child = this.#db.prepare('SELECT unit_id FROM source_units WHERE supersedes=? LIMIT 1').get(prior.unitId);
+        check(!child, 'source-version-stale');
       }
       const intent = this.readIntent(activity);
       check(intent?.status === 'active', 'source-publication-approval-required');
@@ -1213,6 +1218,7 @@ export class ProbeStore {
       check(input.degradation === 'none' && input.estimator === 'utf8-bytes-upper-bound@1'
         && input.route.length > 0 && input.model.length > 0 && input.policyHash.length === 64
         && input.sources.length > 0 && input.sources.every(source => source.schema === 'cli-source-ack@1' && source.status === 'durable')
+        && input.sources.every((source, index) => input.sources.findIndex(candidate => sameSourceAck(candidate, source)) === index)
         && input.selection.length === input.sources.length, 'invalid-assembly');
       validateBudget(input.budget);
       check(Object.entries(run.budget).every(([key, value]) => input.budget[key as keyof ProbeBudget] === value), 'assembly-budget-mismatch');
@@ -3018,7 +3024,7 @@ export class ProbeStore {
     return null;
   }
   expandSource(activity: Activity, request: { ref: SourceAck; offset: number; limit: number }): SourceExcerpt;
-  expandSource(activity: Activity, request: { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string }): SourceUnitExcerpt;
+  expandSource(activity: Activity, request: { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string; assemblyId?: string; sourceOrdinal?: number }): SourceUnitExcerpt;
   expandSource(activity: Activity, request: SourceExpandRequest): SourceExcerpt | SourceUnitExcerpt {
     return this.withActivity(activity, () => {
       check(request && typeof request === 'object', 'invalid-source-request');
@@ -3038,12 +3044,23 @@ export class ProbeStore {
     });
   }
 
-  #expandSourceUnit(activity: Activity, request: { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string }): SourceUnitExcerpt {
-    check(Object.keys(request).every(key => ['unitId','offset','limit','grantId','queryId'].includes(key)), 'invalid-source-request');
+  #expandSourceUnit(activity: Activity, request: { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string; assemblyId?: string; sourceOrdinal?: number }): SourceUnitExcerpt {
+    check(Object.keys(request).every(key => ['unitId','offset','limit','grantId','queryId','assemblyId','sourceOrdinal'].includes(key)), 'invalid-source-request');
     check((!request.grantId && request.queryId === undefined) || (request.grantId && typeof request.queryId === 'string'), 'source-query-id-required');
     if (request.grantId) uuid(request.queryId!);
+    if (request.assemblyId !== undefined || request.sourceOrdinal !== undefined) {
+      uuid(request.assemblyId!);
+      check(Number.isSafeInteger(request.sourceOrdinal) && request.sourceOrdinal! >= 0, 'invalid-source-request');
+      const assemblyRow = this.#db.prepare('SELECT run_id FROM request_assemblies WHERE assembly_id=?').get(request.assemblyId!);
+      check(assemblyRow, 'unknown-assembly');
+      const status = this.requestStatus(activity, String(assemblyRow.run_id));
+      const assembly = status.assemblies.find(item => item.assemblyId === request.assemblyId);
+      check(assembly?.state === 'finished', 'assembly-source-not-used');
+      check(assembly.sources[request.sourceOrdinal!], 'assembly-source-not-used');
+    }
     const requestHash = sha256(JSON.stringify({ operation: 'expand', sessionId: this.#binding.sessionId,
-      grantId: request.grantId, unitId: request.unitId, offset: request.offset, limit: request.limit }));
+      grantId: request.grantId, unitId: request.unitId, offset: request.offset, limit: request.limit,
+      ...(request.assemblyId !== undefined ? { assemblyId: request.assemblyId, sourceOrdinal: request.sourceOrdinal } : {}) }));
     const receipt = request.grantId ? this.#db.prepare('SELECT * FROM source_query_receipts WHERE grant_id=? AND query_id=?')
       .get(request.grantId, request.queryId!) : null;
     check(!receipt || receipt.request_hash === requestHash, 'source-query-identity-conflict');
@@ -3061,15 +3078,24 @@ export class ProbeStore {
     const published = this.#db.prepare('SELECT project_id FROM source_units WHERE unit_id=? AND owner_id=?')
       .get(request.unitId, this.#binding.ownerId);
     let kind: SourceUnitExcerpt['kind'], version: number, contentHash: string, full: string;
+    let expectedSource: SourceAck, projectId: string;
     try {
       if (published) {
         check(projects.includes(String(published.project_id)), 'source-scope-mismatch');
         const { unit, text } = this.#sourceUnit(request.unitId);
         kind = unit.kind; version = unit.version; contentHash = unit.contentHash; full = text;
+        expectedSource = unit.ref; projectId = unit.projectId;
       } else {
         const proposal = this.#proposalForProjects(request.unitId, projects);
         const row = this.#db.prepare('SELECT payload FROM evolution_proposals WHERE proposal_id=?').get(request.unitId)!;
         kind = 'proposal'; version = proposal.version; contentHash = proposal.hash; full = String(row.payload);
+        expectedSource = proposal.input;
+        projectId = proposal.scope.kind === 'project' ? proposal.scope.id : this.#binding.projectId;
+      }
+      if (request.assemblyId !== undefined) {
+        const assemblyRow = this.#db.prepare('SELECT run_id FROM request_assemblies WHERE assembly_id=?').get(request.assemblyId)!;
+        const assembly = this.requestStatus(activity, String(assemblyRow.run_id)).assemblies.find(item => item.assemblyId === request.assemblyId)!;
+        check(sameSourceAck(assembly.sources[request.sourceOrdinal!], expectedSource), 'assembly-source-not-used');
       }
     } catch (error) {
       if (receipt) throw new Error('source-query-result-stale', { cause: error });
@@ -3080,7 +3106,8 @@ export class ProbeStore {
     const end = Math.min(points.length, request.offset + request.limit);
     const text = points.slice(request.offset, end).join('');
     const result: SourceUnitExcerpt = { unitId: request.unitId, locator: sourceUnitLocator(kind, request.unitId, version),
-      kind, version, contentHash,
+      kind, version, projectId, sourceProjectId: expectedSource.binding.projectId, sourceOwnerId: expectedSource.binding.ownerId,
+      sourceSessionId: expectedSource.binding.sessionId, contentHash,
       text, offset: request.offset, end, total: points.length, truncated: request.offset > 0 || end < points.length,
       excerptHash: sha256(text) };
     if (grant) {

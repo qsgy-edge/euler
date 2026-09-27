@@ -172,12 +172,16 @@ const rawValidation = (() => {
     for (const key of ['ownerId', 'hostId', 'projectId', 'sessionId', 'branchId'] as const) {
       assert.equal(header.binding?.[key], expectedBinding[key]);
     }
+    const rawEventIds = new Set<string>();
     const rawEvents = archiveLines.map(rawLine => {
       const event = JSON.parse(rawLine) as Omit<RawEvent, 'rawLine'>;
       assert.equal(rawLine, JSON.stringify(event), 'raw archive line is not canonical JSON');
       assert.equal(event.schema, 'cli-input@1');
+      assert(/^[0-9a-f-]{36}$/.test(event.eventId), 'raw event id is not UUID');
+      assert(!rawEventIds.has(event.eventId), 'raw event id is duplicated');
+      rawEventIds.add(event.eventId);
       assert(['user', 'assistant', 'tool'].includes(event.role));
-      assert(typeof event.text === 'string' && event.text.length > 0);
+      assert(typeof event.text === 'string' && event.text.length > 0 && Buffer.byteLength(event.text) <= 65536);
       return { ...event, rawLine };
     });
     const sourceAckFor = (event: RawEvent, binding: RawBinding) => ({ schema: 'cli-source-ack@1', status: 'durable', binding,
@@ -207,8 +211,8 @@ const rawValidation = (() => {
       assert.equal(source.content_hash, sha256(fixture.report.approved));
       const sourcePayload = JSON.parse(String(source.payload)) as { schema: string; unitId: string; projectId: string;
         kind: string; offset: number; length: number; contentHash: string; version: number; supersedes: string | null;
-        ref: { binding: { ownerId: string; hostId: string; projectId: string; sessionId: string; branchId: string }; eventId: string; locator: string; hash: string; byteLength: number; contentHash: string };
-        approval: { eventId: string; locator: string; hash: string; byteLength: number; contentHash: string } };
+        ref: { binding: RawBinding; eventId: string; locator: string; hash: string; byteLength: number; contentHash: string };
+        approval: { binding: RawBinding; eventId: string; locator: string; hash: string; byteLength: number; contentHash: string } };
       assert.equal(source.payload_hash, sha256(String(source.payload)));
       assert.equal(sourcePayload.schema, 'source-unit@1');
       assert.equal(sourcePayload.unitId, source.unit_id);
@@ -254,6 +258,7 @@ const rawValidation = (() => {
       assert.equal(sourcePayload.approval.hash, source.approval_hash);
       assert.equal(sourcePayload.approval.byteLength, source.approval_byte_length);
       assert.equal(sourcePayload.approval.contentHash, source.approval_content_hash);
+      assert.deepEqual(sourcePayload.approval.binding, header.binding);
       const projection = db.prepare(`SELECT rowid, content, content_hash, owner_kind, owner_id, record_id, revision_id, scope_kind, scope_id,
         source_seq, tokenizer_version, projection_generation FROM search_documents WHERE unit_id=?`)
         .get(String(source.unit_id)) as Record<string, unknown> | undefined;
@@ -306,11 +311,16 @@ const rawValidation = (() => {
         assert.deepEqual(payload.input, sourceAckFor(inputEvent, header.binding));
         const proposalEvidence = db.prepare(`SELECT source_owner, source_event_id, locator, hash, content_hash
           FROM proposal_evidence WHERE proposal_id=? ORDER BY ordinal`).all(proposalId) as Record<string, unknown>[];
-        assert(proposalEvidence.length >= payload.evidenceRefs.length);
-        for (const evidence of proposalEvidence) {
-          const ref = payload.evidenceRefs.find(item => item.eventId === evidence.source_event_id);
-          assert(ref, `proposal evidence event missing: ${proposalId}`);
+        const expectedEvidenceRefs = [payload.input, ...payload.evidenceRefs];
+        assert.equal(proposalEvidence.length, expectedEvidenceRefs.length);
+        for (const [ordinal, evidence] of proposalEvidence.entries()) {
+          const ref = expectedEvidenceRefs[ordinal];
+          assert(ref, `proposal evidence ordinal missing: ${proposalId}:${ordinal}`);
+          const evidenceEvent = rawEvents.find(event => event.eventId === ref.eventId);
+          assert(evidenceEvent, `proposal evidence raw event missing: ${proposalId}:${ordinal}`);
+          assert.deepEqual(ref, sourceAckFor(evidenceEvent, header.binding));
           assert.equal(evidence.source_owner, ref.binding.sessionId);
+          assert.equal(evidence.source_event_id, ref.eventId);
           assert.equal(evidence.locator, ref.locator);
           assert.equal(evidence.hash, ref.hash);
           assert.equal(evidence.content_hash, ref.contentHash);
@@ -366,9 +376,12 @@ const rawValidation = (() => {
       assert.equal(queryReceipt.result_count, queryResults.length);
       assert.equal(queryReceipt.byte_length, queryResults.reduce((sum, item) => sum + Buffer.byteLength(JSON.stringify(item)), 0));
       const firstProposal = proposals[0]!;
+      const expansionPayload = JSON.parse(String(firstProposal.payload)) as { scope: { id: string }; input: { binding: RawBinding } };
       const expansionText = String(firstProposal.payload);
       const expansionResult = { unitId: String(firstProposal.proposal_id), locator: `proposal@1/${firstProposal.proposal_id}/${firstProposal.version}`,
-        kind: 'proposal', version: Number(firstProposal.version), contentHash: String(firstProposal.payload_hash), text: expansionText,
+        kind: 'proposal', version: Number(firstProposal.version), projectId: expansionPayload.scope.id,
+        sourceProjectId: expansionPayload.input.binding.projectId, sourceOwnerId: expansionPayload.input.binding.ownerId,
+        sourceSessionId: expansionPayload.input.binding.sessionId, contentHash: String(firstProposal.payload_hash), text: expansionText,
         offset: 0, end: Array.from(expansionText).length, total: Array.from(expansionText).length, truncated: false,
         excerptHash: sha256(expansionText) };
       assert.equal(expandReceipt.request_hash, sha256(JSON.stringify({ operation: 'expand', sessionId: targetBinding.sessionId,
@@ -432,20 +445,24 @@ const rawValidation = (() => {
       assert(Number(grantUsage.used_queries) <= Number(grantUsage.max_queries));
       assert(Number(grantUsage.used_results) <= Number(grantUsage.max_results));
       assert(Number(grantUsage.used_bytes) <= Number(grantUsage.max_bytes));
-      const assembly = db.prepare(`SELECT * FROM request_assemblies WHERE state='finished' LIMIT 1`)
-        .get() as Record<string, unknown> | undefined;
+      const assembly = db.prepare('SELECT * FROM request_assemblies WHERE assembly_id=? AND state=\'finished\'')
+        .get(String((observations.assembly as { id?: string } | undefined)?.id)) as Record<string, unknown> | undefined;
       assert(assembly, 'raw finished assembly missing');
-      const assemblySources = JSON.parse(String(assembly.sources)) as { eventId: string; hash: string }[];
+      const assemblySources = JSON.parse(String(assembly.sources)) as { schema: string; status: string; binding: RawBinding; eventId: string;
+        locator: string; hash: string; byteLength: number; contentHash: string }[];
       const assemblyMemories = JSON.parse(String(assembly.used_memories)) as { recordId: string; revisionId: string;
         headEventId: string; hash: string; contentHash: string; reason: string }[];
+      const assemblySelection = JSON.parse(String(assembly.selection)) as { ordinal: number; hash: string; reason: string }[];
       assert.equal(assemblySources.length, 1);
+      assert.equal(assemblySelection.length, 1);
+      assert.equal(assemblySelection[0]?.ordinal, 0);
+      assert.equal(assemblySelection[0]?.hash, assemblySources[0]?.hash);
+      assert.equal(assemblySelection[0]?.reason, 'mandatory-source');
       assert.equal(assemblyMemories.length, 1);
       assert.equal(assemblyMemories[0]?.reason, 'selected-memory');
       const assemblySourceEvent = rawEvents.find(event => event.eventId === assemblySources[0]!.eventId);
       assert(assemblySourceEvent, 'raw assembly source missing');
-      assert.deepEqual(sourceAckFor(assemblySourceEvent, header.binding), {
-        ...sourceAckFor(assemblySourceEvent, header.binding), hash: assemblySources[0]!.hash,
-      });
+      assert.deepEqual(assemblySources[0], sourceAckFor(assemblySourceEvent, header.binding));
       const intentRow = db.prepare('SELECT snapshot, hash FROM intent_events WHERE event_id=?').get(String(assembly.intent_event_id)) as Record<string, unknown> | undefined;
       assert(intentRow, 'raw assembly intent missing');
       assert.equal(assembly.intent_hash, intentRow.hash);

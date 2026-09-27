@@ -21,6 +21,11 @@ test('actual-used inspect returns the frozen memory revision after its current h
     const unrelatedEvidence = probe.archive.append(randomUUID(), 'Unselected memory evidence');
     const unrelated = probe.store.captureMemory(probe.activity, unrelatedEvidence, 'Atlas mode beta', { type: 'fact', scope, appliesTo: [] }).record;
     const turn = probe.session.prepare(sandbox.fixture.eventId, sandbox.fixture.text, [active]);
+    const published = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, {
+      ref: turn.input, projectId: sandbox.fixture.projectId, kind: 'source', offset: 0,
+      length: Array.from(sandbox.fixture.text).length,
+    }));
+    probe.store.drainSourceProjection(probe.activity);
     assert.equal(JSON.parse(turn.payload).memories[0].content, 'Atlas mode alpha');
     probe.session.dispatch(turn);
     const correction = probe.archive.append(randomUUID(), 'Atlas mode changed');
@@ -33,6 +38,14 @@ test('actual-used inspect returns the frozen memory revision after its current h
     assert.equal(selected.snapshot.content, 'Atlas mode alpha');
     assert.equal(selected.snapshot.hash, active.hash);
     assert.equal(selected.reason, 'selected-memory');
+    const recoveredSource = probe.store.expandSource(probe.activity, {
+      unitId: published.unitId, assemblyId: turn.assemblyId, sourceOrdinal: 0, offset: 0, limit: 256,
+    });
+    assert.equal(recoveredSource.sourceSessionId, sandbox.fixture.sessionId);
+    assert.equal(recoveredSource.sourceProjectId, sandbox.fixture.projectId);
+    assert.throws(() => probe.store.expandSource(probe.activity, {
+      unitId: published.unitId, assemblyId: turn.assemblyId, sourceOrdinal: 1, offset: 0, limit: 256,
+    }), /assembly-source-not-used/);
     assert.throws(() => probe.store.inspectAssembly(probe.activity, turn.assemblyId, unrelated.recordId), /assembly-source-not-used/);
     assert.notEqual(probe.store.readMemory(probe.activity, active.recordId).content, selected.snapshot.content);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
@@ -81,6 +94,13 @@ test('assembly rejects a claimed memory that is absent from the frozen counting 
     }), /assembly-payload-mismatch/);
     assert.equal(probe.store.requestStatus(probe.activity, probe.session.runId).assemblies.length, 1);
     assert.throws(() => probe.session.prepare(randomUUID(), 'duplicate', [active, active]), /invalid-assembly-selection/);
+    const duplicateSources = {
+      ...original,
+      payload: turn.payload,
+      sources: [...original.sources, original.sources[0]!],
+      selection: [...original.selection, { ordinal: 1, hash: original.sources[0]!.hash, reason: 'mandatory-source' as const }],
+    };
+    assert.throws(() => probe.store.appendRequestAssembly(probe.activity, duplicateSources), /invalid-assembly/);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
