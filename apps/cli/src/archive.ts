@@ -116,4 +116,9 @@ export class CliArchive {
   inspect(): { eventCount: number } {
     return this.#gate(() => ({ eventCount: this.#scan().length }));
   }
+
+  /** Durable events in archive order, for Host backfill and referent resolution. */
+  events(): { role: RawEvent['role']; text: string; ack: SourceAck }[] {
+    return this.#gate(() => this.#scan().map(({ event, ack }) => ({ role: event.role, text: event.text, ack })));
+  }
 }

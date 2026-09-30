@@ -43,6 +43,9 @@ jobs:
       - name: Record source recovery observations
         if: always()
         run: npm run evidence:source-recovery
+      - name: Record owner memory fast lane observations
+        if: always()
+        run: npm run evidence:owner-memory
       - uses: actions/upload-artifact@v4
         if: always()
         with:
