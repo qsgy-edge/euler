@@ -40,6 +40,9 @@ jobs:
       - name: Record controlled guidance observations
         if: always()
         run: npm run evidence:guidance
+      - name: Record source recovery observations
+        if: always()
+        run: npm run evidence:source-recovery
       - uses: actions/upload-artifact@v4
         if: always()
         with:

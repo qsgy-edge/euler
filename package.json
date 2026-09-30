@@ -14,7 +14,8 @@
     "evidence:memory": "node scripts/evidence-memory.ts",
     "evidence:maintenance": "node scripts/evidence-maintenance.ts",
     "evidence:persistence": "node scripts/evidence-persistence.ts",
-    "evidence:guidance": "node scripts/evidence-guidance.ts"
+    "evidence:guidance": "node scripts/evidence-guidance.ts",
+    "evidence:source-recovery": "node scripts/evidence-source-recovery.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
