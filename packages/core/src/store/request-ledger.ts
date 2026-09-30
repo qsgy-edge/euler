@@ -36,17 +36,22 @@ export interface RequestRun {
 
 // The payload is frozen at assembly time (hash + byte length + estimator) and is
 // never persisted; the ledger keeps only the frozen identity facts.
+export interface AssemblyMemoryUse {
+  recordId: string; revisionId: string; headEventId: string; hash: string; contentHash: string;
+  reason: 'selected-memory';
+}
+
 export interface RequestAssemblyInput {
   runId: string; epoch: number; route: string; model: string; policyHash: string;
   estimator: 'utf8-bytes-upper-bound@1';
-  sources: SourceAck[]; intent: { eventId: string; hash: string } | null;
+  sources: SourceAck[]; usedMemories?: AssemblyMemoryUse[]; intent: { eventId: string; hash: string } | null;
   payload: string; payloadHash: string; byteLength: number; estimatedTokens: number;
   budget: ProbeBudget; zones: { p0: number; p1: number; p2: number; p3: number };
   selection: { ordinal: number; hash: string; reason: 'mandatory-source' }[];
   degradation: 'none';
 }
-export interface RequestAssembly extends Omit<RequestAssemblyInput, 'payload'> {
-  assemblyId: string; identityHash: string;
+export interface RequestAssembly extends Omit<RequestAssemblyInput, 'payload' | 'usedMemories'> {
+  assemblyId: string; identityHash: string; usedMemories: AssemblyMemoryUse[];
 }
 export interface RequestAttempt extends AttemptOwnership {
   assemblyId: string; ordinal: number; payloadHash: string; byteLength: number;
@@ -86,6 +91,7 @@ export function assemblyIdentityHash(input: Omit<RequestAssemblyInput, 'payload'
   return sha256(JSON.stringify({
     runId: input.runId, epoch: input.epoch, route: input.route, model: input.model,
     policyHash: input.policyHash, estimator: input.estimator, sources: input.sources,
+    usedMemories: input.usedMemories ?? [],
     intent: input.intent, payloadHash: input.payloadHash, byteLength: input.byteLength,
     estimatedTokens: input.estimatedTokens, budget: input.budget, zones: input.zones,
     selection: input.selection, degradation: input.degradation,

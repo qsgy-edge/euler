@@ -21,4 +21,5 @@ export type {
   MemoryScope, MemoryCaptureOptions, MemoryRecord, MemoryOperation, ConflictOperation,
   MemoryChange, MemoryPresentation, MemoryOperationResult, OwnerReceipt, ActivationBatch,
   EvolutionProposalInput, EvolutionProposal, SearchTarget, MemoryDiscoveryApproval, SearchRequest, SearchResult, SearchPage, SearchProjectionReceipt,
+  SourceUnitInput, SourceUnit, SourceSearchRequest, SourceSearchHit, SourceSearchPage, SourceExpandRequest, SourceUnitExcerpt,
 } from './store/probe-store.ts';

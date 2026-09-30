@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { API_VERSION, CORE_TOOLS, DEFAULT_BUDGET, check, sameBinding, sha256, validateBudget } from '../contracts.ts';
 import type { HostAdapter, ProbeBudget, SourceAck, SourceExcerpt } from '../contracts.ts';
 import { REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, REQUEST_POLICY_HASH, freezeRequestPayload } from '../store/request-ledger.ts';
-import type { Activity, ExecutionStream, Intent, IntentTransition, ProbeStore } from '../store/probe-store.ts';
+import type { Activity, ExecutionStream, Intent, IntentTransition, MemoryRecord, ProbeStore } from '../store/probe-store.ts';
 import type { RequestAttempt, RequestRecovery } from '../store/request-ledger.ts';
 
 export interface PreparedTurn {
@@ -67,8 +67,14 @@ export class ProbeSession {
     check(!this.#stopped, this.#stopped ?? 'run-stopped');
   }
 
-  prepare(eventId: string, text: string): PreparedTurn {
+  prepare(eventId: string, text: string, selected: MemoryRecord[] = []): PreparedTurn {
     this.#active();
+    check(Array.isArray(selected) && selected.length <= 16, 'invalid-assembly-selection');
+    const used = selected.map(record => {
+      const current = this.#store.readMemory(this.#activity, record.recordId);
+      check(JSON.stringify(record) === JSON.stringify(current), 'memory-stale');
+      return current;
+    });
     const input = this.#host.source.append(eventId, text);
     check(input.status === 'durable' && sameBinding(input.binding, this.#host.binding), 'source-ack-required');
     check(this.#host.source.read(input).text === text, 'source-evidence-gap');
@@ -83,6 +89,8 @@ export class ProbeSession {
         { role: 'user', content: text },
       ],
       intent: { goal: intent.goal, constraints: intent.constraints, step: intent.step, status: intent.status },
+      ...(used.length ? { memories: used.map(record => ({ kind: 'untrusted-memory', recordId: record.recordId,
+        revisionId: record.revisionId, content: record.content })) } : {}),
       tools: [],
     });
     // Barrier 1: the frozen assembly (content, route, policy, budget, epoch) is
@@ -91,6 +99,8 @@ export class ProbeSession {
     const assembly = this.#store.appendRequestAssembly(this.#activity, {
       runId: this.runId, epoch: this.#activity.epoch, route: 'local-counting', model: 'none',
       policyHash: REQUEST_POLICY_HASH, estimator: 'utf8-bytes-upper-bound@1', sources: [input],
+      usedMemories: used.map(record => ({ recordId: record.recordId, revisionId: record.revisionId,
+        headEventId: record.headEventId, hash: record.hash, contentHash: record.contentHash, reason: 'selected-memory' })),
       intent: { eventId: intent.eventId, hash: intent.hash }, payload,
       payloadHash: frozen.payloadHash, byteLength: frozen.byteLength, estimatedTokens: frozen.byteLength,
       budget: this.#budget, zones: { p0: frozen.byteLength, p1: 0, p2: 0, p3: 0 },
@@ -183,7 +193,7 @@ export class ProbeSession {
     check(this.#tools < this.#budget.maxToolCalls, 'tool-budget-exhausted');
     this.#tools++;
     const started = performance.now();
-    const result = this.#host.source.expand(ref, offset, limit);
+    const result = this.#store.expandSource(this.#activity, { ref, offset, limit });
     check(performance.now() - started < this.#budget.toolTimeoutMs, 'tool-timeout');
     const tokens = Buffer.byteLength(JSON.stringify(result));
     check(this.#tokens + tokens <= this.#budget.maxTotalTokens, 'token-budget-exhausted');
