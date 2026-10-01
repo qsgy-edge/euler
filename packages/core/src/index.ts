@@ -11,6 +11,8 @@ export { parseFileCall, fileToolSchemas } from './context/file-contract.ts';
 export type { FileCapability, FileTarget, FileAdmission, FileReceipt, FilePresentation, FileDecision, FileFailureReason } from './context/file-contract.ts';
 export type { AgentEvent, AgentStatus, ModelReply, ModelRoute, RunTerminal, ToolCall } from './context/agent-state.ts';
 export { ProbeSession } from './context/probe-session.ts';
+export { OWNER_MEMORY_FORMS, parseOwnerStatement, parseMemoryProposal, parseOwnerAgreement, encodeOwnerAgreement, isOwnerAgreement, isOwnerDecline, isUntypedRemember } from './context/owner-memory.ts';
+export type { OwnerMemoryType, OwnerMemoryStatement, OwnerAgreement } from './context/owner-memory.ts';
 export type { PreparedTurn, ProbeReceipt } from './context/probe-session.ts';
 export type { FileIdentity, BoundFile, StoreResources } from './store/probe-store.ts';
 export { ProbeStore, fileIdentity, sameFile, probeSchemaDigest } from './store/probe-store.ts';
@@ -18,7 +20,7 @@ export { REQUEST_POLICY_HASH, REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, assembly
 export type { RequestAssembly, RequestAssemblyInput, RequestAttempt, RequestAttemptOutcome, RequestAssemblyState, RequestEvent, RequestEventKind, RequestOwnerKind, RequestRun, RequestRunState, RequestStatus, RequestRecovery, RequestReconciliation } from './store/request-ledger.ts';
 export type {
   Activity, ExecutionOwner, ExecutionStream, AttemptOwnership, Intent, IntentTransition, MemoryType, MemoryLifecycle, MemoryVerification, MemoryScopeKind,
-  MemoryScope, MemoryCaptureOptions, MemoryRecord, MemoryOperation, ConflictOperation,
+  MemoryScope, MemoryCaptureOptions, MemoryRecord, MemoryOperation, ConflictOperation, RememberRequest, RememberVerification, RememberResult, HostInfo, HostInfoDelivery, HostInfoView,
   MemoryChange, MemoryPresentation, MemoryOperationResult, OwnerReceipt, ActivationBatch,
   EvolutionProposalInput, EvolutionProposal, SearchTarget, MemoryDiscoveryApproval, SearchRequest, SearchResult, SearchPage, SearchProjectionReceipt,
   SourceUnitInput, SourceUnit, SourceSearchRequest, SourceSearchHit, SourceSearchPage, SourceExpandRequest, SourceUnitExcerpt,

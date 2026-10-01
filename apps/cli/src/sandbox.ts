@@ -16,6 +16,8 @@ export interface Fixture extends Binding {
 }
 export const fixture: Fixture = fixtureData;
 export const fixtureDigest = sha256(JSON.stringify(fixture));
+/** The owner-facing Info carrier (T12); maintenance treats it as a known disposable carrier. */
+export const OWNER_INFO_FILE = 'owner-info.jsonl';
 
 export function syncFile(path: string): void {
   const fd = openSync(path, 'r+');
@@ -37,6 +39,8 @@ export interface Sandbox {
   sourceName?: string;
   storeIdentity: FileIdentity;
   receiverIdentity: FileIdentity;
+  /** Owner-facing append-only Info carrier (T12); a Host presentation, never model context. */
+  ownerInfoIdentity?: FileIdentity;
   fixtureDigest: string;
   fixture: Fixture;
 }
@@ -83,9 +87,12 @@ export function createSandbox(appId = 'euler'): Sandbox {
   const receiverStoreId = randomUUID();
   writeFileSync(receiver, JSON.stringify({ schema: 'counting-receiver@1', storeId: receiverStoreId }) + '\n', { flag: 'wx', mode: 0o600 });
   syncFile(receiver);
+  const ownerInfo = join(root, OWNER_INFO_FILE);
+  writeFileSync(ownerInfo, JSON.stringify({ schema: 'owner-info@1', storeId: receiverStoreId }) + '\n', { flag: 'wx', mode: 0o600 });
+  syncFile(ownerInfo);
   const sandbox: Sandbox = {
     schema: 'euler-disposable@1', appId, storeId: receiverStoreId, root,
-    receiverIdentity: fileIdentity(receiver),
+    receiverIdentity: fileIdentity(receiver), ownerInfoIdentity: fileIdentity(ownerInfo),
     rootIdentity: fileIdentity(root), archiveIdentity: fileIdentity(archive), storeIdentity: fileIdentity(store),
     fixtureDigest, fixture,
   };
