@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, closeSync, copyFileSync, openSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { chmodSync, closeSync, copyFileSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
@@ -18,7 +20,7 @@ async function nth(cli: Cli, event: string, index: number, timeoutMs = 20000): P
     const hits = cli.observations.filter(item => item.event === event);
     if (hits.length > index) return hits[index]!;
     if (cli.observations.some(item => item.event === 'process-exit')) throw new Error(`exited before ${event}#${index}: ${cli.stderr()}`);
-    if (Date.now() - started > timeoutMs) throw new Error(`timeout ${event}#${index}: ${cli.stderr()}`);
+    if (Date.now() - started > timeoutMs) throw new Error(`timeout ${event}#${index}: ${cli.stderr()}; ${JSON.stringify(cli.observations.slice(-3))}`);
     await new Promise(resolve => setTimeout(resolve, 10));
   }
 }
@@ -41,20 +43,21 @@ test('an oversized owner entry is rejected before writing and leaves prior Info 
     const remembered = probe.store.rememberMemory(probe.activity, {
       input: probe.archive.append(randomUUID(), '记住偏好：使用 pnpm'), hostInfo: 'durable' });
     const batch = probe.store.readActivationBatch(probe.activity, remembered.batchId!);
-    const log = new OwnerInfoLog(sandbox);
+    const log = new OwnerInfoLog(sandbox, action => probe.store.withActivity(probe.activity, action));
     const entry = log.append(batch);
     const before = readFileSync(log.path);
     const payload = 'x'.repeat(4_194_304);
     assert.throws(() => log.append({ ...batch, batchId: randomUUID(), payload, digest: sha256(payload) }), /owner-info-limit/);
     assert.deepEqual(readFileSync(log.path), before);
-    assert.deepEqual(new OwnerInfoLog(sandbox).entries(), [entry]);
+    assert.deepEqual(new OwnerInfoLog(sandbox, action => probe.store.withActivity(probe.activity, action)).entries(), [entry]);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
 test('an owner remembers, agrees and reads Info in the actual CLI without Info identities reaching the model', async () => {
   const sandbox = createSandbox();
+  const clients: Cli[] = [];
   try {
-    const cli = startCli(['remember', '--sandbox', sandbox.root, '--synthetic-proposals']);
+    const cli = startCli(['remember', '--sandbox', sandbox.root, '--synthetic-proposals']); clients.push(cli);
     const ready = await cli.waitFor('remember-ready');
     assert.deepEqual([ready.hostInfo, ready.pending, ready.unread], ['durable', 0, 0]);
     const preference = await send(cli, '记住偏好：包管理器使用 pnpm', 'remember-result');
@@ -75,6 +78,11 @@ test('an owner remembers, agrees and reads Info in the actual CLI without Info i
     assert.deepEqual([member!.recordId, member!.outcome, member!.before?.lifecycle, member!.after?.lifecycle, member!.after?.content,
       member!.current?.lifecycle, member!.changed], [preference.recordId, 'activate', 'candidate', 'active', '包管理器使用 pnpm', 'active', false]);
     assert.equal(member!.eventId, (notice?.members as { eventId: string }[])[0]!.eventId);
+    const frozen = JSON.parse(entries(sandbox.root)[0].payload).events[0];
+    const withHash = (value: object) => ({ ...value, hash: sha256(JSON.stringify(value)) });
+    assert.deepEqual(member!.before, withHash(frozen.before));
+    assert.deepEqual(member!.after, withHash(frozen.after));
+    assert.deepEqual(member!.current, withHash(frozen.after));
     assert.equal((await nth(cli, 'info-read', 0)).read, 'read');
     assert.equal((await send(cli, 'ask 记住偏好：包管理器使用 npm', 'ask-refused')).reason, 'owner-statement-not-question');
     const answer = await send(cli, 'ask 包管理器', 'ask-result');
@@ -97,7 +105,7 @@ test('an owner remembers, agrees and reads Info in the actual CLI without Info i
     assert.equal((await open.waitFor('info-read')).read, 'read');
     assert.equal((await open.exit).code, 0);
 
-    const again = startCli(['remember', '--sandbox', sandbox.root]);
+    const again = startCli(['remember', '--sandbox', sandbox.root]); clients.push(again);
     const reopened = await again.waitFor('remember-ready');
     assert.deepEqual([reopened.pending, reopened.unread], [0, 0]);
     assert.equal((await again.waitFor('owner-backfill')).actionable, 2);
@@ -111,7 +119,105 @@ test('an owner remembers, agrees and reads Info in the actual CLI without Info i
       assert.deepEqual(records.map(record => record.lifecycle), ['active', 'active']);
       assert.deepEqual(probe.store.listHostInfo(probe.activity).map(info => [info.delivery, info.read]), [['delivered', 'read'], ['delivered', 'read']]);
     } finally { probe.close(); }
-  } finally { rmSync(sandbox.root, { recursive: true, force: true }); }
+  } finally {
+    for (const cli of clients) if (!cli.observations.some(row => row.event === 'process-exit')) { cli.child.kill('SIGKILL'); await cli.exit; }
+    rmSync(sandbox.root, { recursive: true, force: true });
+  }
+});
+
+test('a complete line whose fsync failed stays pending until a retry really flushes', async () => {
+  const sandbox = createSandbox();
+  const temp = mkdtempSync(join(tmpdir(), 't12-flush-'));
+  const enabled = join(temp, 'fail'), calls = join(temp, 'calls'), preload = join(temp, 'preload.mjs');
+  const clients: Cli[] = [];
+  try {
+    writeFileSync(enabled, '1');
+    writeFileSync(preload, `import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
+      const target = fs.statSync(${JSON.stringify(join(sandbox.root, 'owner-info.jsonl'))});
+      const original = fs.fsyncSync;
+      fs.fsyncSync = fd => {
+        const stat = fs.fstatSync(fd);
+        if (stat.dev === target.dev && stat.ino === target.ino && fs.existsSync(${JSON.stringify(enabled)})) {
+          fs.appendFileSync(${JSON.stringify(calls)}, 'x'); throw new Error('injected-info-flush-failed');
+        }
+        return original(fd);
+      }; syncBuiltinESMExports();`);
+    const previous = process.env.NODE_OPTIONS;
+    let cli: Cli;
+    try {
+      process.env.NODE_OPTIONS = `${previous ?? ''} --import=${pathToFileURL(preload).href}`;
+      cli = startCli(['remember', '--sandbox', sandbox.root]); clients.push(cli);
+    } finally { if (previous === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS = previous; }
+    await cli.waitFor('remember-ready');
+    const first = await send(cli, '记住偏好：使用 pnpm', 'remember-result');
+    assert.equal(first.info, 'pending-redelivery');
+    assert.equal(entries(sandbox.root).length, 1);
+    assert.equal((await send(cli, 'ask pnpm', 'ask-refused')).reason, 'host-info-recovery-required');
+    assert.equal(readFileSync(calls, 'utf8').length, 2);
+    rmSync(enabled);
+    await send(cli, 'ask pnpm', 'ask-result');
+    assert.equal(entries(sandbox.root).length, 1);
+    await stop(cli);
+  } finally {
+    for (const cli of clients) if (!cli.observations.some(row => row.event === 'process-exit')) { cli.child.kill('SIGKILL'); await cli.exit; }
+    rmSync(sandbox.root, { recursive: true, force: true }); rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('a lost delivered owner entry blocks restart dispatch without changing activation or read history', async () => {
+  const sandbox = createSandbox();
+  const clients: Cli[] = [];
+  try {
+    const first = startCli(['remember', '--sandbox', sandbox.root]); clients.push(first);
+    await first.waitFor('remember-ready');
+    const result = await send(first, '记住偏好：使用 pnpm', 'remember-result');
+    await send(first, `info ${result.batchId}`, 'info-read');
+    await stop(first);
+    const path = join(sandbox.root, 'owner-info.jsonl');
+    const original = readFileSync(path);
+    writeFileSync(path, original.toString('utf8').split('\n')[0] + '\n');
+    const again = startCli(['remember', '--sandbox', sandbox.root]); clients.push(again);
+    await again.waitFor('remember-ready');
+    await send(again, `info ${result.batchId}`, 'info-view-error');
+    await send(again, 'ask pnpm', 'ask-refused');
+    assert.equal(only(again, 'ask-result').length, 0);
+    writeFileSync(path, original);
+    await send(again, 'ask pnpm', 'ask-result');
+    assert.equal(only(again, 'info-notice').length, 0);
+    await stop(again);
+    const probe = openProbe(sandbox);
+    try {
+      assert.deepEqual(probe.store.listHostInfo(probe.activity).map(row => [row.batchId, row.delivery, row.read]),
+        [[result.batchId, 'delivered', 'read']]);
+      assert.equal(probe.store.inspectMemory(probe.activity, String(result.recordId)).history.filter(row => row.kind === 'activate').length, 1);
+    } finally { probe.close(); }
+  } finally {
+    for (const cli of clients) if (!cli.observations.some(row => row.event === 'process-exit')) { cli.child.kill('SIGKILL'); await cli.exit; }
+    rmSync(sandbox.root, { recursive: true, force: true });
+  }
+});
+
+test('two real CLI processes recovering the same batch append and announce it only once', async () => {
+  const sandbox = createSandbox();
+  const clients: Cli[] = [];
+  try {
+    const probe = openProbe(sandbox);
+    let batchId: string;
+    try {
+      batchId = probe.store.rememberMemory(probe.activity, {
+        input: probe.archive.append(randomUUID(), '记住偏好：使用 pnpm'), hostInfo: 'durable' }).batchId!;
+    } finally { probe.close(); }
+    clients.push(startCli(['remember', '--sandbox', sandbox.root]), startCli(['remember', '--sandbox', sandbox.root]));
+    await Promise.all(clients.map(cli => cli.waitFor('remember-ready')));
+    assert.equal(clients.flatMap(cli => only(cli, 'info-notice')).length, 1);
+    assert.deepEqual(entries(sandbox.root).map(row => row.batchId), [batchId]);
+    // Recovery above is concurrent; model turns sharing one session remain sequential.
+    for (const cli of clients) await send(cli, 'ask pnpm', 'ask-result');
+    await Promise.all(clients.map(stop));
+  } finally {
+    for (const cli of clients) if (!cli.observations.some(row => row.event === 'process-exit')) { cli.child.kill('SIGKILL'); await cli.exit; }
+    rmSync(sandbox.root, { recursive: true, force: true });
+  }
 });
 
 // Kill points of the automatic Info path (12 X-11): restart only fills a missing delivery,

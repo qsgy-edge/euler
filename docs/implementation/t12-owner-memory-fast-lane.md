@@ -43,7 +43,9 @@ On start the Host backfills durable owner events whose capture was lost (idempot
 - `error` (`committed: false`): the owner input could not be made durable or verified (for example `file-identity-changed`, `source-evidence-gap`); no canonical change.
 - `cancelled` (`owner-declined`), `not-actionable` (`agreement-target-missing`), `needs-input` (`memory-type-required`).
 
-Info notices explicitly label content truncation. `info <batchId>` displays stable update event IDs and complete frozen before/after snapshots separately from query-time current state. Owner entries enforce their 4 MiB cap before appending, so a rejected append does not corrupt the existing carrier.
+Info notices explicitly label content truncation. `info <batchId>` displays stable update event IDs and complete frozen before/after snapshots (including scope, source and identity) separately from query-time current state. Owner entries enforce their 4 MiB cap before appending, so a rejected append does not corrupt the existing carrier.
+
+The two-process regression races Info recovery, then checks subsequent questions sequentially; concurrent model turns sharing one session are not a T12 claim. The existing Store admission transaction serializes recheck/append/delivery acknowledgement across CLI processes; the carrier uses the same gate as the archive. Reusing an existing line repeats fsync and strict readback before recording delivery. Startup and every `ask` also check delivered rows against actual entry ID/hash/digest. Missing or mismatched delivered entries fail closed without downgrading read history or rebuilding activation: restore the exact owner-held artifact before dispatch can resume.
 
 `ask` selects `ready` search results plus the pinned delta; the model payload carries only `untrusted-memory` content, never batch IDs, digests or owner entry identities.
 
@@ -53,6 +55,7 @@ Info notices explicitly label content truncation. `info <batchId>` displays stab
 - Fixed evidence/robustness findings: failure-path child reaping/root retention, pre-write owner-entry size cap, fixture-wide receipt body checks, model eligibility independently checked against SQLite, receipt shape checks, and inconsistent result fields. Added actual CLI restart/Info observations after Store-driven owner changes. A mutation disabling the replay guard reproduced re-activation; an injected evidence-scenario failure preserved the killed child's logs and raw root.
 - Retained boundaries: session-bound approval `host_presentations` is not reused as owner-wide Info state; legacy `memory`/`memory-worker` stay explicitly synthetic harnesses. These choices do not make them new owner-facing automatic-update modes. Normal-mode stdin cannot mint assistant events; the explicit synthetic flag is for fixtures only.
 - Consolidated stable duplication (bounded durable append, kill point, Info queries/counts/hints) and removed unused caller options; no general receipt framework or storage rearchitecture was introduced for subjective style findings.
+- Astra re-review (`38f4845`) found previously uncovered fsync retry, concurrent append, lost delivered entries, incomplete snapshots, asynchronous runner errors and failure-receipt leakage. Fixed using existing admission transactions and fail-closed checks; actual CLI tests cover fsync failure/retry, two-process recovery, lost/restored carrier and full snapshots. Runner negative tests inject malformed child stdout, spawn failure and body-bearing assertion/validation fields; children/roots/raw diagnostics are retained, while a rejected receipt is replaced by a minimal failure envelope referencing the raw artifact. No fault switches were added to the product.
 
 ## Reproduce
 
@@ -62,6 +65,8 @@ npm run evidence:owner-memory
 ```
 
 The evidence runner drives real CLI processes (a main owner session, a no-session query, a restart, seven SIGKILL points, an Info write failure, a Host without Info and boundary cases), also restarts after Store-driven rollback/correction and queries actual CLI Info (the owner mutation UI belongs to T15–T17), records each process's stdout/stderr/exit/signal, reaps live children and retains every synthetic root even if a scenario fails under `artifacts/t12-*/raw/`, and recomputes its verdict from the raw archive, `owner-info.jsonl`, counting receiver and SQLite rows. Kill points: `crash-before-activation-commit`, `crash-after-activation-commit`, `crash-before-info-append`, `crash-after-info-append`, `crash-after-info-delivery`, `crash-before-info-read`, `crash-after-info-read`.
+
+The runner stores complete diagnostic exceptions in `errors/` artifacts; summary fields contain only kind/locator/hash. Body checks cover the final serialized receipt including raw-validation fields. If it remains unsafe, `t12-owner-memory-evidence-failure@1` is an explicit non-passing envelope referencing the rejected raw object, not a success receipt. Automated runner-negative tests are `apps/cli/test/owner-evidence.test.ts`; their own temporary artifact directories are removed only after assertions.
 
 ## Evidence boundary
 

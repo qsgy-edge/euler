@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { closeSync, fsyncSync, openSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { DEFAULT_BUDGET, OWNER_MEMORY_FORMS, check, encodeOwnerAgreement, isOwnerAgreement, isOwnerDecline, isUntypedRemember,
@@ -31,15 +31,19 @@ export interface OwnerInfoEntry { record: OwnerInfoRecord; entryHash: string }
 export class OwnerInfoLog {
   readonly #sandbox: Sandbox;
   readonly #path: string;
-  constructor(sandbox: Sandbox) {
+  readonly #gate: <T>(action: () => T) => T;
+  constructor(sandbox: Sandbox, gate: <T>(action: () => T) => T) {
     check(sandbox.ownerInfoIdentity, 'owner-info-unavailable');
+    this.#gate = gate;
     this.#sandbox = sandbox;
     this.#path = join(sandbox.root, OWNER_INFO_FILE);
     this.entries();
   }
   get path(): string { return this.#path; }
 
-  entries(): OwnerInfoEntry[] {
+  entries(): OwnerInfoEntry[] { return this.#gate(() => this.#entries()); }
+
+  #entries(): OwnerInfoEntry[] {
     sameFile(this.#path, this.#sandbox.ownerInfoIdentity!);
     const bytes = readFileSync(this.#path, 'utf8');
     check(bytes.endsWith('\n') && Buffer.byteLength(bytes) <= OWNER_INFO_MAX_BYTES, 'owner-info-evidence-gap');
@@ -59,10 +63,19 @@ export class OwnerInfoLog {
 
   /** Idempotent by batch: a surviving entry from an interrupted delivery is reused, never duplicated. */
   append(batch: ActivationBatch): OwnerInfoEntry {
-    const existing = this.entries().find(entry => entry.record.batchId === batch.batchId);
+    return this.#gate(() => this.#append(batch));
+  }
+
+  #append(batch: ActivationBatch): OwnerInfoEntry {
+    const existing = this.#entries().find(entry => entry.record.batchId === batch.batchId);
     if (existing) {
       check(existing.record.digest === batch.digest, 'owner-info-conflict');
-      return existing;
+      // A complete cached line is not proof that an earlier fsync succeeded.
+      const fd = openSync(this.#path, 'r+');
+      try { fsyncSync(fd); } finally { closeSync(fd); }
+      const recovered = this.#entries().find(entry => entry.record.entryId === existing.record.entryId);
+      check(recovered?.entryHash === existing.entryHash, 'owner-info-ack-failed');
+      return recovered;
     }
     check(sha256(batch.payload) === batch.digest, 'owner-info-evidence-gap');
     const record: OwnerInfoRecord = { schema: 'owner-info-entry@1', entryId: randomUUID(), kind: 'memory-activation',
@@ -76,8 +89,8 @@ export class OwnerInfoLog {
   }
 }
 
-function openOwnerInfo(sandbox: Sandbox): OwnerInfoLog | null {
-  try { return new OwnerInfoLog(sandbox); }
+function openOwnerInfo(sandbox: Sandbox, probe: ReturnType<typeof openProbe>): OwnerInfoLog | null {
+  try { return new OwnerInfoLog(sandbox, action => probe.store.withActivity(probe.activity, action)); }
   catch (error) { emit('owner-info-unavailable', { level: 'warning', reason: (error as Error).message }); return null; }
 }
 
@@ -90,8 +103,7 @@ function report(via: 'live' | 'backfill', status: string, level: 'info' | 'warni
   emit('remember-result', { via, status, stage: null, reason: null, level, info: 'not-applicable', input: null, recordId: null,
     type: null, content: null, batchId: null, range: null, verifier: null, ...fields });
 }
-const snapshot = (record: MemoryRecord) => ({ revisionId: record.revisionId, type: record.type, content: record.content,
-  lifecycle: record.lifecycle, verification: record.verification });
+const snapshot = (record: MemoryRecord) => structuredClone(record);
 const counts = (rows: HostInfo[]) => ({ pending: rows.filter(row => row.delivery === 'pending').length,
   unread: rows.filter(row => row.read === 'unread').length });
 
@@ -129,16 +141,28 @@ class OwnerMemoryHost {
         emit('info-error', { level: 'error', batchId: null, delivery: 'pending-redelivery', reason: (error as Error).message });
         return false;
       }
-      if (!this.log) return pending.length === 0 && !more;
+      if (!this.log) return !more && store.listHostInfo(activity).length === 0;
       for (const info of pending) {
         this.#kill('crash-before-info-append');
         let batch: ActivationBatch, entry: OwnerInfoEntry;
         try {
-          batch = store.readActivationBatch(activity, info.batchId);
-          entry = this.log.append(batch);
-          this.#kill('crash-after-info-append');
-          store.recordHostInfoDelivery(activity, { batchId: info.batchId, digest: info.digest,
-            entryId: entry.record.entryId, entryHash: entry.entryHash });
+          // Serialize across Hosts using the existing BEGIN IMMEDIATE admission fence.
+          // Recheck after taking it: another process may already have delivered this batch.
+          const result = store.withActivity(activity, () => {
+            const current = store.readHostInfo(activity, info.batchId).info;
+            const frozen = store.readActivationBatch(activity, info.batchId);
+            if (current.delivery === 'delivered') {
+              this.#verifyEntry(current);
+              return null;
+            }
+            const appended = this.log!.append(frozen);
+            this.#kill('crash-after-info-append');
+            store.recordHostInfoDelivery(activity, { batchId: info.batchId, digest: info.digest,
+              entryId: appended.record.entryId, entryHash: appended.entryHash });
+            return { batch: frozen, entry: appended };
+          });
+          if (!result) continue;
+          ({ batch, entry } = result);
         } catch (error) {
           emit('info-error', { level: 'error', batchId: info.batchId, delivery: 'pending-redelivery', reason: (error as Error).message });
           return false;
@@ -147,8 +171,27 @@ class OwnerMemoryHost {
         emit('info-notice', { level: 'info', authoritative: false, batchId: info.batchId, digest: info.digest, memberCount: info.memberCount,
           delivery: 'delivered', read: info.read, entryId: entry.record.entryId, members: notice(batch) });
       }
-      if (!more) return true;
+      if (!more) {
+        try {
+          store.withActivity(activity, () => {
+            for (const info of store.listHostInfo(activity)) {
+              check(info.delivery === 'delivered', 'owner-info-recovery-required');
+              this.#verifyEntry(info);
+            }
+          });
+          return true;
+        } catch (error) {
+          emit('info-error', { level: 'error', batchId: null, delivery: 'evidence-gap', reason: (error as Error).message });
+          return false;
+        }
+      }
     }
+  }
+
+  #verifyEntry(info: HostInfo): void {
+    const entry = this.log?.entries().find(item => item.record.batchId === info.batchId);
+    check(entry && entry.record.entryId === info.entryId && entry.entryHash === info.entryHash
+      && entry.record.digest === info.digest, 'owner-info-evidence-gap');
   }
 
   #delivered(batchId: string): boolean {
@@ -210,7 +253,7 @@ class OwnerMemoryHost {
 
   showInfo(batchId: string): void {
     const { store, activity } = this.probe;
-    this.deliver();
+    if (!this.deliver()) { emit('info-view-error', { batchId, reason: 'host-info-recovery-required' }); return; }
     const info = store.listHostInfo(activity).find(item => item.batchId === batchId);
     if (!info) { emit('info-view-error', { batchId, reason: 'host-info-not-found' }); return; }
     if (info.delivery !== 'delivered') { emit('info-view-error', { batchId, reason: 'host-info-not-delivered' }); return; }
@@ -274,7 +317,7 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
   const probe = openProbe(sandbox, OWNER_BUDGET, undefined, undefined, undefined, true);
   const lines = createInterface({ input: process.stdin });
   try {
-    const log = options.hostInfo === 'durable' ? openOwnerInfo(sandbox) : null;
+    const log = options.hostInfo === 'durable' ? openOwnerInfo(sandbox, probe) : null;
     const host = new OwnerMemoryHost(probe, log, options.scenario as OwnerScenario, options.noActiveProject);
     host.backfill();
     host.drain();
@@ -330,7 +373,7 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
 export function runInfoQuery(sandbox: Sandbox, batchId?: string): void {
   const probe = openProbe(sandbox, OWNER_BUDGET, undefined, undefined, undefined, true);
   try {
-    const host = new OwnerMemoryHost(probe, openOwnerInfo(sandbox), 'success', false);
+    const host = new OwnerMemoryHost(probe, openOwnerInfo(sandbox, probe), 'success', false);
     if (batchId) host.showInfo(batchId); else host.listInfo();
   } finally { probe.close(); }
 }

@@ -56,6 +56,15 @@ const fixtureBodies = Object.entries(fixture).filter(([key]) => key !== 'schema'
   .filter(body => body.length > 2);
 const directory = join('artifacts', `t12-${Date.now()}`);
 mkdirSync(join(directory, 'processes'), { recursive: true });
+mkdirSync(join(directory, 'errors'), { recursive: true });
+let diagnosticCount = 0;
+// Full exception details belong to owner-held raw artifacts, never to receipt fields.
+function diagnostic(kind: string, error: unknown): string {
+  const raw = error instanceof Error ? error.stack ?? error.message : String(error);
+  const path = `errors/${++diagnosticCount}-${kind}.txt`;
+  writeFileSync(join(directory, path), raw, { flag: 'wx' });
+  return `${kind}: ${path} sha256=${sha256(raw)}`;
+}
 
 interface Observation { event: string; [key: string]: unknown }
 type ProcessReceipt = { label: string; command: string; args: string[]; cwd: string; startedAt: string; finishedAt: string;
@@ -73,6 +82,9 @@ function drive(label: string, args: string[]) {
   const stdout: Buffer[] = [], stderr: Buffer[] = [];
   const observations: Observation[] = [];
   let pending = '';
+  let failure: Error | null = null;
+  let closed = false;
+  child.once('error', error => { failure ??= error; });
   child.stdout.on('data', (chunk: Buffer) => {
     stdout.push(chunk);
     pending += chunk.toString('utf8');
@@ -80,13 +92,19 @@ function drive(label: string, args: string[]) {
     while ((index = pending.indexOf('\n')) >= 0) {
       const line = pending.slice(0, index);
       pending = pending.slice(index + 1);
-      if (line) observations.push(JSON.parse(line) as Observation);
+      if (line && !failure) {
+        try { observations.push(JSON.parse(line) as Observation); }
+        catch (error) { failure = error instanceof Error ? error : new Error('invalid-child-output'); child.kill('SIGKILL'); }
+      }
     }
   });
   child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
   const guard = setTimeout(() => child.kill('SIGKILL'), 60000);
-  const exit = new Promise<{ code: number | null; signal: string | null }>(resolveExit => child.once('close', (code, signal) => {
+  const exit = new Promise<{ code: number | null; signal: string | null }>((resolveExit, rejectExit) => child.once('close', (code, signal) => {
     clearTimeout(guard);
+    closed = true;
+    try {
+    if (pending.trim() && !failure) failure = new Error('incomplete-child-output');
     const out = Buffer.concat(stdout), err = Buffer.concat(stderr);
     const name = `processes/${String(processes.length + 1).padStart(2, '0')}-${label}`;
     writeFileSync(join(directory, `${name}.stdout.txt`), out, { flag: 'wx' });
@@ -95,16 +113,20 @@ function drive(label: string, args: string[]) {
       finishedAt: new Date().toISOString(), code, signal,
       stdout: { path: `${name}.stdout.txt`, sha256: sha256(out) }, stderr: { path: `${name}.stderr.txt`, sha256: sha256(err) } });
     outputs.set(label, observations);
-    running.delete(child);
-    resolveExit({ code, signal });
+    } catch (error) { failure ??= error instanceof Error ? error : new Error('child-evidence-write-failed'); }
+    finally { running.delete(child); }
+    if (failure) rejectExit(failure); else resolveExit({ code, signal });
   }));
+  // Observe rejection even when it races an nth() wait; runScenario still reaps and retains.
+  void exit.catch(() => {});
   running.set(child, exit);
   async function nth(event: string, index = 0): Promise<Observation> {
     const deadline = Date.now() + 30000;
     for (;;) {
+      if (failure) throw failure;
       const hits = observations.filter(item => item.event === event);
       if (hits.length > index) return hits[index]!;
-      if (child.exitCode !== null || child.signalCode !== null || Date.now() > deadline) {
+      if (closed || child.exitCode !== null || child.signalCode !== null || Date.now() > deadline) {
         throw new Error(`${label}: missing ${event}#${index}: ${Buffer.concat(stderr).toString('utf8').slice(-2000)}`);
       }
       await new Promise(resolveWait => setTimeout(resolveWait, 10));
@@ -141,7 +163,7 @@ async function runScenario(name: string, body: (sandbox: Sandbox) => Promise<voi
   const sandbox = createSandbox();
   try { await body(sandbox); }
   finally {
-    for (const [child, exit] of [...running]) { child.kill('SIGKILL'); await exit; }
+    for (const [child, exit] of [...running]) { child.kill('SIGKILL'); await exit.catch(() => {}); }
     retain(name, sandbox.root);
   }
 }
@@ -242,7 +264,7 @@ try {
     assert.equal((await restarted.stop()).code, 0);
     await drive('owner-changes-info', ['info', '--sandbox', sandbox.root, '--batch', String(preference.batchId)]).exit;
   });
-} catch (error) { scenarioError = error instanceof Error ? error.stack ?? error.message : String(error); }
+} catch (error) { scenarioError = diagnostic('scenario-failed', error); }
 
 type Row = Record<string, unknown>;
 type RawEvent = { schema: string; eventId: string; role: string; text: string; rawLine: string };
@@ -471,7 +493,7 @@ const rawValidation = (() => {
     assert.deepEqual([member?.recordId, member?.after.lifecycle, member?.current?.lifecycle, member?.changed],
       [rolled.recordId, 'active', 'candidate', true], 'owner-changes: Info shows the frozen activation and the current rollback');
     return { status: 'pass' as const, roots: [...summaries.keys()] };
-  } catch (error) { return { status: 'fail' as const, error: error instanceof Error ? error.stack ?? error.message : String(error) }; }
+  } catch (error) { return { status: 'fail' as const, error: diagnostic('raw-validation-failed', error) }; }
 })();
 
 const focusedArgs = ['--test', 'apps/cli/test/owner-memory.test.ts', 'apps/cli/test/owner-memory-cli.test.ts'];
@@ -572,7 +594,7 @@ function validateReceipt(receipt: typeof output) {
   assert.equal(receipt.exit.code, receipt.status === 'fail' ? 1 : 0);
   assert.ok(receipt.artifactDigests.database.length > 0 && receipt.artifactDigests.sidecars.length > 0);
   assert.equal(receipt.independentValidation.verifier.sha256, sha256(readFileSync(join(repo, receipt.independentValidation.verifier.path))));
-  const serialized = JSON.stringify({ ...receipt, rawValidation: null });
+  const serialized = JSON.stringify(receipt);
   assert.ok(fixtureBodies.length > 0, 'fixture body extraction');
   for (const [index, body] of fixtureBodies.entries()) {
     assert.equal(serialized.includes(body), false, `receipt embeds fixture body #${index}`);
@@ -585,7 +607,7 @@ function validateReceipt(receipt: typeof output) {
 }
 let receiptError: string | null = null;
 try { validateReceipt(output); }
-catch (error) { receiptError = error instanceof Error ? error.stack ?? error.message : String(error); }
+catch (error) { receiptError = diagnostic('receipt-validation-failed', error); }
 if (receiptError) {
   output.receiptError = receiptError;
   output.status = 'fail';
@@ -598,6 +620,23 @@ if (receiptError) {
   stdoutFile.sha256 = sha256(consoleOutput);
   mainProcess.stdout.sha256 = stdoutFile.sha256;
 }
-writeFileSync(join(directory, 'summary.json'), JSON.stringify(output, null, 2) + '\n', { flag: 'wx' });
+// Include diagnostics created by receipt validation itself.
+for (const path of listFiles(join(directory, 'errors')).map(name => `errors/${name}`)) {
+  if (!output.files.some(file => file.path === path)) output.files.push({ path, sha256: sha256(readFileSync(join(directory, path))) });
+}
+const serializedOutput = JSON.stringify(output, null, 2) + '\n';
+if (fixtureBodies.some(body => serializedOutput.includes(body))) {
+  // Fail closed: never re-emit the rejected object. Keep it only in the owner-held raw area.
+  const rawPath = 'errors/rejected-receipt.json';
+  writeFileSync(join(directory, rawPath), serializedOutput, { flag: 'wx' });
+  const safeFailure = { schema: 't12-owner-memory-evidence-failure@1', status: 'fail', exit: { code: 1, signal: null },
+    reason: 'receipt-body-rejected', raw: { path: rawPath, sha256: sha256(serializedOutput) } };
+  consoleOutput = JSON.stringify({ path: join(directory, 'summary.json'), status: 'fail', reason: safeFailure.reason }) + '\n';
+  writeFileSync(join(directory, 'console-output.txt'), consoleOutput);
+  writeFileSync(join(directory, 'summary.json'), JSON.stringify(safeFailure, null, 2) + '\n', { flag: 'wx' });
+  process.exitCode = 1;
+} else {
+  writeFileSync(join(directory, 'summary.json'), serializedOutput, { flag: 'wx' });
+  if (output.status === 'fail') process.exitCode = 1;
+}
 process.stdout.write(consoleOutput);
-if (output.status === 'fail') process.exitCode = 1;
