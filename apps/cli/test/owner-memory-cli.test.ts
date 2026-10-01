@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, closeSync, copyFileSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
@@ -43,13 +43,13 @@ test('an oversized owner entry is rejected before writing and leaves prior Info 
     const remembered = probe.store.rememberMemory(probe.activity, {
       input: probe.archive.append(randomUUID(), '记住偏好：使用 pnpm'), hostInfo: 'durable' });
     const batch = probe.store.readActivationBatch(probe.activity, remembered.batchId!);
-    const log = new OwnerInfoLog(sandbox, action => probe.store.withActivity(probe.activity, action));
+    const log = new OwnerInfoLog(sandbox, action => probe.store.withActivity(probe.activity, action), () => assert.fail('unexpected torn tail'));
     const entry = log.append(batch);
     const before = readFileSync(log.path);
     const payload = 'x'.repeat(4_194_304);
     assert.throws(() => log.append({ ...batch, batchId: randomUUID(), payload, digest: sha256(payload) }), /owner-info-limit/);
     assert.deepEqual(readFileSync(log.path), before);
-    assert.deepEqual(new OwnerInfoLog(sandbox, action => probe.store.withActivity(probe.activity, action)).entries(), [entry]);
+    assert.deepEqual(new OwnerInfoLog(sandbox, action => probe.store.withActivity(probe.activity, action), () => assert.fail('unexpected torn tail')).entries(), [entry]);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
@@ -181,6 +181,10 @@ test('a lost delivered owner entry blocks restart dispatch without changing acti
     await send(again, `info ${result.batchId}`, 'info-view-error');
     await send(again, 'ask pnpm', 'ask-refused');
     assert.equal(only(again, 'ask-result').length, 0);
+    const damagedDelivered = original.subarray(0, original.length - 10);
+    writeFileSync(path, damagedDelivered);
+    await send(again, 'ask pnpm', 'ask-refused');
+    assert.deepEqual(readFileSync(path), damagedDelivered, 'an acknowledged torn entry must not be silently truncated');
     writeFileSync(path, original);
     await send(again, 'ask pnpm', 'ask-result');
     assert.equal(only(again, 'info-notice').length, 0);
@@ -274,27 +278,67 @@ for (const { scenario, activated, notices, unread } of KILLS) {
   });
 }
 
-test('a committed activation whose Info write fails is reported, blocks the next dispatch and is redelivered once', async () => {
+for (const mode of ['open', 'partial']) {
+  test(`Info ${mode} write failure survives restart and redelivers once without losing a read prefix`, async () => {
+    const sandbox = createSandbox();
+    const temp = mkdtempSync(join(tmpdir(), 't12-write-'));
+    const flag = join(temp, 'fail');
+    const clients: Cli[] = [];
+    const env = { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${new URL('./support/owner-info-write-fault.mjs', import.meta.url).href}`,
+      T12_WRITE_FAULT_FILE: join(sandbox.root, 'owner-info.jsonl'), T12_WRITE_FAULT_FLAG: flag, T12_WRITE_FAULT_MODE: mode };
+    try {
+      const cli = startCli(['remember', '--sandbox', sandbox.root], 15000, undefined, env); clients.push(cli);
+      await cli.waitFor('remember-ready');
+      const prior = await send(cli, '记住决定：使用 Node 24', 'remember-result');
+      await send(cli, `info ${prior.batchId}`, 'info-read');
+      const prefix = readFileSync(env.T12_WRITE_FAULT_FILE);
+      writeFileSync(flag, '1');
+      const failed = await send(cli, '记住偏好：包管理器使用 pnpm', 'remember-result');
+      assert.deepEqual([failed.status, failed.stage, failed.info, failed.level], ['activated', 'active', 'pending-redelivery', 'error']);
+      assert.match(String(only(cli, 'info-error')[0]?.reason), /injected-info-/);
+      if (mode === 'partial') assert.equal(readFileSync(env.T12_WRITE_FAULT_FILE).length, prefix.length + 17);
+      await stop(cli);
+      const again = startCli(['remember', '--sandbox', sandbox.root], 15000, undefined, env); clients.push(again);
+      await again.waitFor('remember-ready');
+      await send(again, 'ask 包管理器', 'ask-refused');
+      assert.equal(only(again, 'ask-result').length, 0);
+      rmSync(flag);
+      const answer = await send(again, 'ask 包管理器', 'ask-result');
+      assert.ok((answer.selected as string[]).includes(failed.recordId as string));
+      assert.equal(only(again, 'info-notice', item => item.batchId === failed.batchId).length, 1);
+      await stop(again);
+      assert.deepEqual(entries(sandbox.root).map(entry => entry.batchId), [prior.batchId, failed.batchId]);
+      assert.ok(readFileSync(env.T12_WRITE_FAULT_FILE).subarray(0, prefix.length).equals(prefix));
+      const probe = openProbe(sandbox);
+      try { assert.equal(probe.store.listHostInfo(probe.activity).find(row => row.batchId === prior.batchId)?.read, 'read'); }
+      finally { probe.close(); }
+    } finally {
+      for (const cli of clients) if (!cli.observations.some(row => row.event === 'process-exit')) { cli.child.kill('SIGKILL'); await cli.exit; }
+      rmSync(sandbox.root, { recursive: true, force: true }); rmSync(temp, { recursive: true, force: true });
+    }
+  });
+}
+
+test('no-active-project questions exclude previously active project memories', async () => {
   const sandbox = createSandbox();
-  const infoPath = join(sandbox.root, 'owner-info.jsonl');
+  const clients: Cli[] = [];
   try {
-    const cli = startCli(['remember', '--sandbox', sandbox.root]);
+    const probe = openProbe(sandbox);
+    try {
+      probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：使用 pnpm'), hostInfo: 'durable' });
+      assert.equal(probe.store.pinnedMemoryDelta(probe.activity).records.length, 1);
+      assert.deepEqual(probe.store.pinnedMemoryDelta(probe.activity, { noActiveProject: true }), { records: [], truncated: false });
+    } finally { probe.close(); }
+    const cli = startCli(['remember', '--sandbox', sandbox.root, '--no-active-project']); clients.push(cli);
     await cli.waitFor('remember-ready');
-    chmodSync(infoPath, 0o444);
-    assert.throws(() => closeSync(openSync(infoPath, 'a')), /EACCES|EPERM/); // the carrier really rejects writes
-    const failed = await send(cli, '记住偏好：包管理器使用 pnpm', 'remember-result');
-    assert.deepEqual([failed.status, failed.stage, failed.info, failed.level], ['activated', 'active', 'pending-redelivery', 'error']);
-    const [error] = only(cli, 'info-error');
-    assert.deepEqual([error?.batchId, error?.delivery, error?.level], [failed.batchId, 'pending-redelivery', 'error']);
-    assert.equal((await send(cli, 'ask 包管理器', 'ask-refused')).reason, 'host-info-recovery-required');
-    assert.equal(only(cli, 'ask-result').length, 0);
-    chmodSync(infoPath, 0o644);
-    const answer = await send(cli, 'ask 包管理器', 'ask-result');
-    assert.ok((answer.selected as string[]).includes(failed.recordId as string));
-    assert.equal(only(cli, 'info-notice', item => item.batchId === failed.batchId).length, 1);
+    const answer = await send(cli, 'ask pnpm', 'ask-result');
+    assert.deepEqual([answer.searchReason, answer.pinned, answer.selected, JSON.parse(String(answer.payload)).memories ?? []],
+      ['no-active-project', [], [], []]);
     await stop(cli);
-    assert.deepEqual(entries(sandbox.root).map(entry => entry.batchId), [failed.batchId]);
-  } finally { chmodSync(infoPath, 0o644); rmSync(sandbox.root, { recursive: true, force: true }); }
+  } finally {
+    for (const cli of clients) if (!cli.observations.some(row => row.event === 'process-exit')) { cli.child.kill('SIGKILL'); await cli.exit; }
+    rmSync(sandbox.root, { recursive: true, force: true });
+  }
 });
 
 test('an Info registration failure after commit is a known outcome that blocks dispatch until recovered once', async () => {

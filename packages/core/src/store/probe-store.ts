@@ -2890,8 +2890,11 @@ export class ProbeStore {
    * the search projection yet, bounded like one assembly selection. Search keeps
    * reporting its own lag; this only lets the next turn use a just-activated memory.
    */
-  pinnedMemoryDelta(activity: Activity): { records: MemoryRecord[]; truncated: boolean } {
+  pinnedMemoryDelta(activity: Activity, boundary: Pick<SearchRequest, 'noActiveProject'> = {}): { records: MemoryRecord[]; truncated: boolean } {
     return this.withActivity(activity, () => {
+      check(boundary && Object.keys(boundary).every(key => key === 'noActiveProject')
+        && (boundary.noActiveProject === undefined || boundary.noActiveProject === true), 'invalid-search-request');
+      if (boundary.noActiveProject) return { records: [], truncated: false };
       const limit = PINNED_DELTA_LIMIT;
       const rows = this.#db.prepare(`SELECT h.record_id FROM memory_heads h
         JOIN projection_jobs j ON j.kind='search' AND j.event_id=h.head_event_id
@@ -3033,6 +3036,20 @@ export class ProbeStore {
         }
       });
       return { info, batch, members };
+    });
+  }
+
+  /** Recovery proof for the shared physical Info carrier, not a scope-filtered owner query.
+   * Never discard a torn tail if ANY delivered identity would be lost, even outside the current scope.
+   */
+  assertHostInfoCarrier(activity: Activity, entries: HostInfoDelivery[]): void {
+    this.withActivity(activity, () => {
+      const prefix = new Map(entries.map(entry => [entry.batchId, entry]));
+      for (const row of this.#db.prepare("SELECT batch_id,digest,entry_id,entry_hash FROM host_info_batches WHERE delivery='delivered'").all()) {
+        const entry = prefix.get(String(row.batch_id));
+        check(entry && entry.digest === row.digest && entry.entryId === row.entry_id && entry.entryHash === row.entry_hash,
+          'owner-info-evidence-gap');
+      }
     });
   }
 

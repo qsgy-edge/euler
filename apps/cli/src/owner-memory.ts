@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, fsyncSync, openSync, readFileSync } from 'node:fs';
+import { closeSync, ftruncateSync, fsyncSync, openSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { DEFAULT_BUDGET, OWNER_MEMORY_FORMS, check, encodeOwnerAgreement, isOwnerAgreement, isOwnerDecline, isUntypedRemember,
@@ -32,7 +32,9 @@ export class OwnerInfoLog {
   readonly #sandbox: Sandbox;
   readonly #path: string;
   readonly #gate: <T>(action: () => T) => T;
-  constructor(sandbox: Sandbox, gate: <T>(action: () => T) => T) {
+  readonly #verifyPrefix: (entries: OwnerInfoEntry[]) => void;
+  constructor(sandbox: Sandbox, gate: <T>(action: () => T) => T, verifyPrefix: (entries: OwnerInfoEntry[]) => void) {
+    this.#verifyPrefix = verifyPrefix;
     check(sandbox.ownerInfoIdentity, 'owner-info-unavailable');
     this.#gate = gate;
     this.#sandbox = sandbox;
@@ -45,8 +47,25 @@ export class OwnerInfoLog {
 
   #entries(): OwnerInfoEntry[] {
     sameFile(this.#path, this.#sandbox.ownerInfoIdentity!);
-    const bytes = readFileSync(this.#path, 'utf8');
-    check(bytes.endsWith('\n') && Buffer.byteLength(bytes) <= OWNER_INFO_MAX_BYTES, 'owner-info-evidence-gap');
+    const bytes = readFileSync(this.#path);
+    check(bytes.length <= OWNER_INFO_MAX_BYTES, 'owner-info-evidence-gap');
+    const end = bytes.lastIndexOf(10) + 1;
+    check(end > 0, 'owner-info-evidence-gap');
+    const prefix = new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, end));
+    const entries = this.#parse(prefix);
+    if (end !== bytes.length) {
+      // Discard ONLY an unacknowledged torn tail, under the admission write lock.
+      // If truncation would remove any delivered identity, this is corruption, not a retry.
+      this.#verifyPrefix(entries);
+      const fd = openSync(this.#path, 'r+');
+      try { ftruncateSync(fd, end); fsyncSync(fd); } finally { closeSync(fd); }
+      sameFile(this.#path, this.#sandbox.ownerInfoIdentity!);
+      check(readFileSync(this.#path).equals(bytes.subarray(0, end)), 'owner-info-ack-failed');
+    }
+    return entries;
+  }
+
+  #parse(bytes: string): OwnerInfoEntry[] {
     const lines = bytes.slice(0, -1).split('\n');
     const header = JSON.parse(lines.shift()!);
     check(header?.schema === 'owner-info@1' && header.storeId === this.#sandbox.storeId, 'owner-info-evidence-gap');
@@ -90,7 +109,9 @@ export class OwnerInfoLog {
 }
 
 function openOwnerInfo(sandbox: Sandbox, probe: ReturnType<typeof openProbe>): OwnerInfoLog | null {
-  try { return new OwnerInfoLog(sandbox, action => probe.store.withActivity(probe.activity, action)); }
+  try { return new OwnerInfoLog(sandbox, action => probe.store.withActivity(probe.activity, action),
+    entries => probe.store.assertHostInfoCarrier(probe.activity, entries.map(entry => ({
+      batchId: entry.record.batchId, digest: entry.record.digest, entryId: entry.record.entryId, entryHash: entry.entryHash })))); }
   catch (error) { emit('owner-info-unavailable', { level: 'warning', reason: (error as Error).message }); return null; }
 }
 
@@ -287,8 +308,9 @@ class OwnerMemoryHost {
     }
     // Ticket 14: a committed batch whose presentation is missing is recovered before the next dispatch.
     if (!this.deliver()) { emit('ask-refused', { reason: 'host-info-recovery-required' }); return; }
-    const page = store.searchMemories(activity, { query: question });
-    const delta = store.pinnedMemoryDelta(activity);
+    const boundary = this.#noActiveProject ? { noActiveProject: true as const } : {};
+    const page = store.searchMemories(activity, { query: question, ...boundary });
+    const delta = store.pinnedMemoryDelta(activity, boundary);
     const selected = new Map<string, MemoryRecord>();
     if (page.status === 'ready') {
       for (const hit of page.results) {

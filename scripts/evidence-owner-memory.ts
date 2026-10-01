@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
-import { chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { arch, release } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -75,8 +75,8 @@ const outputs = new Map<string, Observation[]>();
 const running = new Map<ChildProcess, Promise<unknown>>();
 
 // One real CLI child: raw stdout/stderr bytes and exit/signal are recorded as produced.
-function drive(label: string, args: string[]) {
-  const child = spawn(process.execPath, [cliEntry, ...args], { cwd: repo, stdio: 'pipe', windowsHide: true });
+function drive(label: string, args: string[], env: NodeJS.ProcessEnv = process.env) {
+  const child = spawn(process.execPath, [cliEntry, ...args], { cwd: repo, stdio: 'pipe', windowsHide: true, env });
   child.stdin.on('error', () => {}); // a killed child may close stdin first; exit/signal is still recorded
   const started = new Date().toISOString();
   const stdout: Buffer[] = [], stderr: Buffer[] = [];
@@ -205,19 +205,21 @@ try {
   }
   await runScenario('write-failure', async sandbox => {
     const info = join(sandbox.root, OWNER_INFO_FILE);
-    const cli = drive('write-failure', ['remember', '--sandbox', sandbox.root]);
+    const flag = resolve(directory, 'write-fault-enabled');
+    const preload = new URL('../apps/cli/test/support/owner-info-write-fault.mjs', import.meta.url).href;
+    const cli = drive('write-failure', ['remember', '--sandbox', sandbox.root], { ...process.env,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${preload}`,
+      T12_WRITE_FAULT_FILE: info, T12_WRITE_FAULT_FLAG: flag, T12_WRITE_FAULT_MODE: 'open' });
     try {
       await cli.nth('remember-ready');
-      chmodSync(info, 0o444);
-      let blocked = false;
-      try { closeSync(openSync(info, 'a')); } catch { blocked = true; }
-      facts.writeFailurePrecondition = blocked;
+      writeFileSync(flag, '1', { flag: 'wx' });
       await cli.send(fixture.writeFailure.statement, 'remember-result');
+      facts.writeFailurePrecondition = cli.observations.some(row => row.event === 'info-error' && row.reason === 'injected-info-open-failed');
       await cli.send(fixture.writeFailure.question, 'ask-refused');
-      chmodSync(info, 0o644);
+      rmSync(flag);
       await cli.send(fixture.writeFailure.question, 'ask-result');
       assert.equal((await cli.stop()).code, 0);
-    } finally { chmodSync(info, 0o644); }
+    } finally { rmSync(flag, { force: true }); }
   });
   await runScenario('unavailable', async sandbox => {
     const plain = drive('unavailable', ['remember', '--sandbox', sandbox.root, '--host-info', 'unavailable']);
