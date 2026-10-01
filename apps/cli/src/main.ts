@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
-import { openSync, closeSync, ftruncateSync, fsyncSync, writeSync } from 'node:fs';
+import { openSync, closeSync, ftruncateSync, fsyncSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
@@ -12,6 +12,7 @@ import { openProbe } from './probe.ts';
 import { startCli } from './process-driver.ts';
 import { AGENT_BUDGET, runAgentDemo } from './agent-cli.ts';
 import { runInfoQuery, runRememberSession } from './owner-memory.ts';
+import { killPoint } from './kill-point.ts';
 import memoryFixture from '../../../fixtures/scoped-memory.json' with { type: 'json' };
 
 function emit(event: string, fields: Record<string, unknown> = {}) {
@@ -203,12 +204,8 @@ async function memoryWorker(sandbox: Sandbox, scenario: string) {
     for await (const line of lines) {
       if (line !== 'commit') break;
       const change = () => probe.store.correctMemory(probe.activity, expected.recordId, expected, source, request.args.content);
-      const checkpoint = (stage: string) => {
-        writeSync(1, JSON.stringify({ event: 'memory-checkpoint', stage, pid: process.pid }) + '\n');
-        // Deliberately leave the transaction/process open for the parent kill probe.
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);
-        throw new Error('checkpoint-was-not-killed');
-      };
+      // Deliberately leave the transaction/process open for the parent kill probe.
+      const checkpoint = (stage: string) => killPoint('memory-checkpoint', stage, 5000);
       if (scenario === 'crash-in-transaction') {
         probe.store.withActivity(probe.activity, () => { change(); checkpoint('uncommitted'); });
       } else {
@@ -229,8 +226,8 @@ async function main() {
     attempt: { type: 'string' },
     'accept-duplicate-risk': { type: 'boolean', default: false },
     'wait-child-launch': { type: 'boolean', default: false },
-    presentation: { type: 'string', default: 'durable' }, 'no-active-project': { type: 'boolean', default: false },
-    batch: { type: 'string' },
+    'host-info': { type: 'string', default: 'durable' }, 'no-active-project': { type: 'boolean', default: false },
+    'synthetic-proposals': { type: 'boolean', default: false }, batch: { type: 'string' },
   } });
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
@@ -258,9 +255,10 @@ async function main() {
     return;
   }
   if (command === 'remember') {
-    check(['durable', 'none'].includes(args.values.presentation), 'invalid-presentation');
-    return runRememberSession(sandbox, { presentation: args.values.presentation as 'durable' | 'none',
-      noActiveProject: args.values['no-active-project'], scenario: args.values.scenario });
+    check(['durable', 'unavailable'].includes(args.values['host-info']), 'invalid-host-info');
+    return runRememberSession(sandbox, { hostInfo: args.values['host-info'] as 'durable' | 'unavailable',
+      noActiveProject: args.values['no-active-project'], scenario: args.values.scenario,
+      syntheticProposals: args.values['synthetic-proposals'] });
   }
   if (command === 'info') return runInfoQuery(sandbox, args.values.batch);
   if (requestCommands.includes(command)) {

@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { chmodSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { arch, release } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { cliEntry } from '../apps/cli/src/process-driver.ts';
-import { createSandbox, fixture as bindingFixture } from '../apps/cli/src/sandbox.ts';
+import { openProbe } from '../apps/cli/src/probe.ts';
+import { OWNER_INFO_FILE, createSandbox, fixture as bindingFixture } from '../apps/cli/src/sandbox.ts';
+import type { Sandbox } from '../apps/cli/src/sandbox.ts';
 
 // T12 evidence: real CLI processes over disposable synthetic roots; every verdict below is
 // recomputed from retained raw archive/owner-info/SQLite bytes, not from the CLI's own report.
@@ -33,17 +36,24 @@ process.stderr.write = ((chunk: string | Uint8Array, ...args: any[]) => {
 }) as typeof process.stderr.write;
 
 const fixturePath = new URL('../fixtures/t12-owner-memory-cases.json', import.meta.url);
-const expectedDigest = 'e1bd5babea413a88e823e5aa34f40e1c8ad285418419a34db2543ce43f89d21a';
+const expectedDigest = '4f19240cedc6312cfbfa362778458c934f36afc9e44261125759454591d221f4';
 const bytes = readFileSync(fixturePath);
 const fixtureDigest = sha256(bytes);
 assert.equal(fixtureDigest, expectedDigest, 'T12 fixture changed');
 const fixture = JSON.parse(bytes.toString('utf8')) as {
   schema: string;
-  main: { preference: string; proposal: string; agreement: string; fact: string; question: string };
+  main: { preference: string; proposal: string; agreement: string; fact: string; question: string; forgedProposal: string };
   crash: { statement: string }; writeFailure: { statement: string; question: string }; unavailable: { statement: string };
   boundaries: { unscoped: string; untyped: string; proposal: string; decline: string; orphanAgreement: string; broken: string };
+  ownerChanges: { preference: string; decision: string; correctionSource: string; correction: string };
 };
 assert.equal(fixture.schema, 't12-owner-memory-cases@1');
+// Every memory/source body in the fixture; none may appear in the receipt (bodies stay in the retained raw roots).
+const fixtureBodies = Object.entries(fixture).filter(([key]) => key !== 'schema')
+  .flatMap(([, group]) => Object.values(group as Record<string, string>))
+  .flatMap(text => text.replace(/^(propose |ask )/u, '').split('\\n'))
+  .map(line => line.replace(/^(建议)?记住(偏好|决定|事实)?[：:]\s*/u, '').replace(/^更正[：:]\s*/u, '').trim())
+  .filter(body => body.length > 2);
 const directory = join('artifacts', `t12-${Date.now()}`);
 mkdirSync(join(directory, 'processes'), { recursive: true });
 
@@ -52,6 +62,8 @@ type ProcessReceipt = { label: string; command: string; args: string[]; cwd: str
   code: number | null; signal: string | null; stdout: { path: string; sha256: string }; stderr: { path: string; sha256: string } };
 const processes: ProcessReceipt[] = [];
 const outputs = new Map<string, Observation[]>();
+// Children still running when a scenario ends are killed and reaped there, so their receipts are complete.
+const running = new Map<ChildProcess, Promise<unknown>>();
 
 // One real CLI child: raw stdout/stderr bytes and exit/signal are recorded as produced.
 function drive(label: string, args: string[]) {
@@ -83,8 +95,10 @@ function drive(label: string, args: string[]) {
       finishedAt: new Date().toISOString(), code, signal,
       stdout: { path: `${name}.stdout.txt`, sha256: sha256(out) }, stderr: { path: `${name}.stderr.txt`, sha256: sha256(err) } });
     outputs.set(label, observations);
+    running.delete(child);
     resolveExit({ code, signal });
   }));
+  running.set(child, exit);
   async function nth(event: string, index = 0): Promise<Observation> {
     const deadline = Date.now() + 30000;
     for (;;) {
@@ -122,50 +136,53 @@ const KILLS = ['crash-before-activation-commit', 'crash-after-activation-commit'
   'crash-after-info-delivery', 'crash-before-info-read', 'crash-after-info-read'] as const;
 const facts: Record<string, unknown> = {};
 let scenarioError: string | null = null;
+// Each scenario retains its synthetic root and reaps its children even when it fails part-way.
+async function runScenario(name: string, body: (sandbox: Sandbox) => Promise<void>): Promise<void> {
+  const sandbox = createSandbox();
+  try { await body(sandbox); }
+  finally {
+    for (const [child, exit] of [...running]) { child.kill('SIGKILL'); await exit; }
+    retain(name, sandbox.root);
+  }
+}
 try {
-  {
-    const sandbox = createSandbox();
-    const main = drive('main', ['remember', '--sandbox', sandbox.root]);
+  await runScenario('main', async sandbox => {
+    const main = drive('main', ['remember', '--sandbox', sandbox.root, '--synthetic-proposals']);
     await main.nth('remember-ready');
     const preference = await main.send(fixture.main.preference, 'remember-result');
-    const proposal = await main.send(fixture.main.proposal, 'assistant-proposal');
+    await main.send(fixture.main.proposal, 'assistant-proposal');
     const decision = await main.send(fixture.main.agreement, 'remember-result');
-    const blockedFact = await main.send(fixture.main.fact, 'remember-result');
+    await main.send(fixture.main.fact, 'remember-result');
     await main.send('info', 'info-list');
     await main.send(`info ${preference.batchId}`, 'info-read');
-    const answer = await main.send(fixture.main.question, 'ask-result');
+    await main.send(fixture.main.question, 'ask-result');
     assert.equal((await main.stop()).code, 0);
-    const listed = drive('main-info-query', ['info', '--sandbox', sandbox.root]);
-    await listed.exit;
-    const opened = drive('main-info-open', ['info', '--sandbox', sandbox.root, '--batch', String(decision.batchId)]);
-    await opened.exit;
+    await drive('main-info-query', ['info', '--sandbox', sandbox.root]).exit;
+    await drive('main-info-open', ['info', '--sandbox', sandbox.root, '--batch', String(decision.batchId)]).exit;
     const restart = drive('main-restart', ['remember', '--sandbox', sandbox.root]);
     await restart.nth('remember-ready');
-    await restart.stop();
-    facts.main = { preferenceBatch: preference.batchId, decisionBatch: decision.batchId, proposalEvent: proposal.eventId,
-      preferenceRecord: preference.recordId, decisionRecord: decision.recordId, factRecord: blockedFact.recordId, askRun: (answer.receipt as { runId: string }).runId };
-    retain('main', sandbox.root);
-  }
+    await restart.send(fixture.main.forgedProposal, 'command-rejected');
+    assert.equal((await restart.stop()).code, 0);
+  });
   for (const scenario of KILLS) {
-    const sandbox = createSandbox();
-    const crashing = drive(`${scenario}`, ['remember', '--sandbox', sandbox.root, '--scenario', scenario]);
-    await crashing.nth('remember-ready');
-    if (scenario === 'crash-before-info-read' || scenario === 'crash-after-info-read') {
-      const remembered = await crashing.send(fixture.crash.statement, 'remember-result');
-      crashing.child.stdin.write(`info ${remembered.batchId}\n`);
-    } else crashing.child.stdin.write(fixture.crash.statement + '\n');
-    await crashing.nth('owner-checkpoint');
-    crashing.child.kill('SIGKILL');
-    await crashing.exit;
-    if (scenario === 'crash-after-activation-commit') await drive(`${scenario}-info-query`, ['info', '--sandbox', sandbox.root]).exit;
-    const restarted = drive(`${scenario}-restart`, ['remember', '--sandbox', sandbox.root]);
-    await restarted.nth('remember-ready');
-    assert.equal((await restarted.stop()).code, 0);
-    retain(scenario, sandbox.root);
+    await runScenario(scenario, async sandbox => {
+      const crashing = drive(scenario, ['remember', '--sandbox', sandbox.root, '--scenario', scenario]);
+      await crashing.nth('remember-ready');
+      if (scenario === 'crash-before-info-read' || scenario === 'crash-after-info-read') {
+        const remembered = await crashing.send(fixture.crash.statement, 'remember-result');
+        crashing.child.stdin.write(`info ${remembered.batchId}\n`);
+      } else crashing.child.stdin.write(fixture.crash.statement + '\n');
+      await crashing.nth('owner-checkpoint');
+      crashing.child.kill('SIGKILL');
+      await crashing.exit;
+      if (scenario === 'crash-after-activation-commit') await drive(`${scenario}-info-query`, ['info', '--sandbox', sandbox.root]).exit;
+      const restarted = drive(`${scenario}-restart`, ['remember', '--sandbox', sandbox.root]);
+      await restarted.nth('remember-ready');
+      assert.equal((await restarted.stop()).code, 0);
+    });
   }
-  {
-    const sandbox = createSandbox();
-    const info = join(sandbox.root, 'owner-info.jsonl');
+  await runScenario('write-failure', async sandbox => {
+    const info = join(sandbox.root, OWNER_INFO_FILE);
     const cli = drive('write-failure', ['remember', '--sandbox', sandbox.root]);
     try {
       await cli.nth('remember-ready');
@@ -179,22 +196,18 @@ try {
       await cli.send(fixture.writeFailure.question, 'ask-result');
       assert.equal((await cli.stop()).code, 0);
     } finally { chmodSync(info, 0o644); }
-    retain('write-failure', sandbox.root);
-  }
-  {
-    const sandbox = createSandbox();
-    const plain = drive('unavailable', ['remember', '--sandbox', sandbox.root, '--presentation', 'none']);
+  });
+  await runScenario('unavailable', async sandbox => {
+    const plain = drive('unavailable', ['remember', '--sandbox', sandbox.root, '--host-info', 'unavailable']);
     await plain.nth('remember-ready');
     await plain.send(fixture.unavailable.statement, 'remember-result');
     assert.equal((await plain.stop()).code, 0);
     const durable = drive('unavailable-durable-restart', ['remember', '--sandbox', sandbox.root]);
     await durable.nth('remember-ready');
     assert.equal((await durable.stop()).code, 0);
-    retain('unavailable', sandbox.root);
-  }
-  {
-    const sandbox = createSandbox();
-    const cli = drive('boundaries', ['remember', '--sandbox', sandbox.root, '--no-active-project']);
+  });
+  await runScenario('boundaries', async sandbox => {
+    const cli = drive('boundaries', ['remember', '--sandbox', sandbox.root, '--no-active-project', '--synthetic-proposals']);
     await cli.nth('remember-ready');
     await cli.send(fixture.boundaries.unscoped, 'remember-result');
     await cli.send(fixture.boundaries.untyped, 'remember-result');
@@ -206,8 +219,29 @@ try {
     renameSync(`${archive}.copy`, archive);
     await cli.send(fixture.boundaries.broken, 'remember-result');
     assert.equal((await cli.stop()).code, 0);
-    retain('boundaries', sandbox.root);
-  }
+  });
+  await runScenario('owner-changes', async sandbox => {
+    const cli = drive('owner-changes', ['remember', '--sandbox', sandbox.root]);
+    await cli.nth('remember-ready');
+    const preference = await cli.send(fixture.ownerChanges.preference, 'remember-result');
+    const decision = await cli.send(fixture.ownerChanges.decision, 'remember-result');
+    assert.equal((await cli.stop()).code, 0);
+    // Later owner changes arrive through the Store API (their Host entries are T15-T17); then the CLI restarts.
+    const probe = openProbe(sandbox);
+    try {
+      const rolled = probe.store.readMemory(probe.activity, String(preference.recordId));
+      const activation = probe.store.inspectMemory(probe.activity, rolled.recordId).history.find(event => event.kind === 'activate');
+      assert(activation, 'owner-changes: activation event');
+      probe.store.rollbackMemory(probe.activity, rolled.recordId, rolled, activation.eventId);
+      const current = probe.store.readMemory(probe.activity, String(decision.recordId));
+      probe.store.correctMemory(probe.activity, current.recordId, current,
+        probe.archive.append(randomUUID(), fixture.ownerChanges.correctionSource), fixture.ownerChanges.correction);
+    } finally { probe.close(); }
+    const restarted = drive('owner-changes-restart', ['remember', '--sandbox', sandbox.root]);
+    await restarted.nth('remember-ready');
+    assert.equal((await restarted.stop()).code, 0);
+    await drive('owner-changes-info', ['info', '--sandbox', sandbox.root, '--batch', String(preference.batchId)]).exit;
+  });
 } catch (error) { scenarioError = error instanceof Error ? error.stack ?? error.message : String(error); }
 
 type Row = Record<string, unknown>;
@@ -288,11 +322,13 @@ function validateRoot(name: string, root: string) {
       const activations = history.filter(item => item.kind === 'activate');
       if (activations.length) {
         summary.active = Number(summary.active) + 1;
-        assert.deepEqual(history.map(item => item.kind), ['capture', 'verify', 'activate'], `${name}: activation chain`);
+        // Later owner events (rollback/correct/forget) may follow, but there is only ever one fast-lane activation.
+        assert.deepEqual([history.slice(0, 3).map(item => item.kind), activations.length], [['capture', 'verify', 'activate'], 1],
+          `${name}: activation chain`);
         const after = JSON.parse(String(activations[0]!.after_snapshot)) as Row & { type: string; scope: { resolved: boolean } };
         assert.deepEqual([after.lifecycle, after.verification, after.scope.resolved], ['active', 'verified', true]);
         assert.notEqual(after.type, 'fact', `${name}: fact activated`);
-        assert.equal(all("SELECT result FROM verification_runs WHERE record_id=? AND result='pass'", recordId).length, 1);
+        assert.equal(all("SELECT 1 FROM verification_runs WHERE record_id=? AND result='pass' AND verifier='owner-fast-lane@1'", recordId).length, 1);
         assert(activations[0]!.batch_id, `${name}: activation without batch`);
       }
     }
@@ -321,6 +357,18 @@ function validateRoot(name: string, root: string) {
     summary.info = all('SELECT delivery, read_state FROM host_info_batches ORDER BY rowid').map(row => [row.delivery, row.read_state]);
     summary.entries = entries.length;
     summary.verificationRuns = Number(all('SELECT count(*) AS n FROM verification_runs')[0]!.n);
+    const pendingCaptures = all("SELECT * FROM capture_jobs WHERE status='pending'");
+    for (const job of pendingCaptures) {
+      assert.equal(job.record_id, null);
+      assert.equal(sha256(String(job.payload)), job.payload_hash);
+      const pending = JSON.parse(String(job.payload));
+      assert.equal(pending.reason, 'memory-type-required');
+      const event = archiveEvent(pending.source);
+      assert.equal(event.role, 'user');
+      assert(/^记住[：:]/u.test(event.text.trim()), `${name}: pending owner capture source`);
+      assert.deepEqual(pending.range, [pending.source]);
+    }
+    summary.pendingCaptures = pendingCaptures.length;
     summary.payloadHashes = all('SELECT payload_hash FROM request_assemblies').map(row => String(row.payload_hash));
     const receiver = readFileSync(join(root, 'counting-receiver.jsonl'), 'utf8').trimEnd().split('\n').slice(1)
       .map(line => JSON.parse(line) as { record: { payloadHash: string }; hash: string });
@@ -331,6 +379,12 @@ function validateRoot(name: string, root: string) {
       ...entries.map(entry => String(entry.record.entryId)), ...entries.map(entry => entry.entryHash)];
     summary.archive = archive.map(event => ({ role: event.role, eventId: event.eventId }));
     summary.scopes = all('SELECT scope_kind, scope_resolved FROM memory_heads ORDER BY rowid').map(row => [row.scope_kind, row.scope_resolved]);
+    summary.heads = all(`SELECT h.record_id, h.lifecycle, h.verification, h.scope_resolved, r.type, r.content FROM memory_heads h
+      JOIN memory_revisions r ON r.record_id=h.record_id AND r.revision_id=h.revision_id ORDER BY h.rowid`)
+      .map(row => ({ recordId: String(row.record_id), lifecycle: row.lifecycle, verification: row.verification,
+        resolved: row.scope_resolved === 1, type: row.type, content: String(row.content) }));
+    summary.histories = Object.fromEntries(records.map(recordId => [recordId,
+      all('SELECT kind FROM memory_events WHERE record_id=? ORDER BY seq', recordId).map(row => String(row.kind))]));
     return summary;
   } finally { db.close(); }
 }
@@ -339,8 +393,13 @@ const rawValidation = (() => {
   try {
     assert.equal(scenarioError, null, 'scenario did not complete');
     const summaries = new Map([...roots].map(([name, root]) => [name, validateRoot(name, root)]));
+    type Head = { recordId: string; lifecycle: string; verification: string; resolved: boolean; type: string; content: string };
     const main = summaries.get('main')!;
-    const mainFacts = facts.main as Record<string, string>;
+    // Which records are the preference and the fact comes from SQLite, not from what the CLI printed.
+    const mainHeads = main.heads as Head[];
+    const preferenceHead = mainHeads.find(head => head.type === 'preference')!;
+    const factHead = mainHeads.find(head => head.type === 'fact')!;
+    assert(preferenceHead && factHead && mainHeads.length === 3, 'main: canonical heads');
     assert.deepEqual([main.records, main.active, main.batches, main.entries], [3, 2, 2, 2], 'main: canonical counts');
     assert.deepEqual(main.info, [['delivered', 'read'], ['delivered', 'read']], 'main: Info state after open');
     const asked = byEvent('main', 'ask-result');
@@ -350,10 +409,17 @@ const rawValidation = (() => {
       'main: stdout payload is not the ledgered and received bytes');
     for (const identity of main.digests as string[]) assert.equal(payload.includes(identity), false, 'main: Info identity reached the model');
     const sent = JSON.parse(payload).memories as { kind: string; recordId: string }[];
-    assert(sent.every(item => item.kind === 'untrusted-memory') && sent.some(item => item.recordId === mainFacts.preferenceRecord)
-      && !sent.some(item => item.recordId === mainFacts.factRecord), 'main: model memory set');
+    for (const item of sent) {
+      const head = mainHeads.find(row => row.recordId === item.recordId);
+      assert(item.kind === 'untrusted-memory' && head && head.lifecycle === 'active' && head.verification === 'verified'
+        && head.resolved && head.type !== 'fact', 'main: model received an ineligible memory');
+    }
+    assert(sent.some(item => item.recordId === preferenceHead.recordId) && !sent.some(item => item.recordId === factHead.recordId),
+      'main: model memory set');
     const used = (main.usedMemories as { recordId: string }[][]).flat().map(item => item.recordId);
-    assert(used.includes(mainFacts.preferenceRecord!) && !used.includes(mainFacts.factRecord!), 'main: used memory set');
+    assert(used.includes(preferenceHead.recordId) && !used.includes(factHead.recordId), 'main: used memory set');
+    assert.equal(byEvent('main-restart', 'command-rejected')[0]?.reason, 'synthetic-proposals-disabled', 'main: forged proposal accepted');
+    assert.equal((main.archive as { role: string }[]).filter(event => event.role === 'assistant').length, 1, 'main: forged assistant event');
     assert.deepEqual(byEvent('main-restart', 'remember-result'), [], 'main: restart re-activated');
     assert.deepEqual(byEvent('main-restart', 'info-notice'), [], 'main: restart re-delivered');
     for (const scenario of KILLS) {
@@ -372,7 +438,7 @@ const rawValidation = (() => {
     assert.equal(facts.writeFailurePrecondition, true, 'write-failure precondition');
     assert.deepEqual([failure.records, failure.active, failure.entries, failure.info], [1, 1, 1, [['delivered', 'unread']]]);
     const failed = byEvent('write-failure', 'remember-result')[0];
-    assert.deepEqual([failed?.status, failed?.presentation, failed?.level], ['activated', 'pending-redelivery', 'error']);
+    assert.deepEqual([failed?.status, failed?.info, failed?.level], ['activated', 'pending-redelivery', 'error']);
     assert.equal(byEvent('write-failure', 'ask-refused')[0]?.reason, 'host-info-recovery-required');
     assert.equal(byEvent('write-failure', 'info-notice').length, 1);
     const unavailable = summaries.get('unavailable')!;
@@ -382,9 +448,28 @@ const rawValidation = (() => {
     const boundaries = summaries.get('boundaries')!;
     assert.deepEqual([boundaries.records, boundaries.active, boundaries.batches, boundaries.entries, boundaries.verificationRuns], [1, 0, 0, 0, 0]);
     assert.deepEqual(boundaries.scopes, [['session', 0]]);
+    assert.equal(boundaries.pendingCaptures, 1, 'boundaries: untyped remember has a durable job');
     assert.deepEqual(byEvent('boundaries', 'remember-result').map(item => [item.status, item.reason]), [
       ['blocked', 'scope-unresolved'], ['needs-input', 'memory-type-required'], ['cancelled', 'owner-declined'],
       ['not-actionable', 'agreement-target-missing'], ['error', 'file-identity-changed']]);
+    const changes = summaries.get('owner-changes')!;
+    const changeHeads = changes.heads as Head[];
+    const rolled = changeHeads.find(head => head.type === 'preference')!;
+    const corrected = changeHeads.find(head => head.type === 'decision')!;
+    assert.deepEqual([changes.records, changes.active, changes.batches, changes.entries], [2, 2, 2, 2], 'owner-changes: counts');
+    const histories = changes.histories as Record<string, string[]>;
+    assert.deepEqual([histories[rolled.recordId], rolled.lifecycle], [['capture', 'verify', 'activate', 'rollback'], 'candidate'],
+      'owner-changes: the rollback survived the restart');
+    assert.deepEqual([histories[corrected.recordId], corrected.lifecycle, corrected.content === fixture.ownerChanges.correction],
+      [['capture', 'verify', 'activate', 'correct'], 'active', true], 'owner-changes: the correction survived the restart');
+    assert.deepEqual(changes.info, [['delivered', 'read'], ['delivered', 'unread']], 'owner-changes: Info state');
+    for (const event of ['remember-result', 'info-notice', 'info-error', 'command-error']) {
+      assert.deepEqual(byEvent('owner-changes-restart', event), [], `owner-changes: restart emitted ${event}`);
+    }
+    const [member] = (byEvent('owner-changes-info', 'info-view')[0]?.members ?? []) as { recordId: string; after: { lifecycle: string };
+      current: { lifecycle: string } | null; changed: boolean }[];
+    assert.deepEqual([member?.recordId, member?.after.lifecycle, member?.current?.lifecycle, member?.changed],
+      [rolled.recordId, 'active', 'candidate', true], 'owner-changes: Info shows the frozen activation and the current rollback');
     return { status: 'pass' as const, roots: [...summaries.keys()] };
   } catch (error) { return { status: 'fail' as const, error: error instanceof Error ? error.stack ?? error.message : String(error) }; }
 })();
@@ -407,9 +492,10 @@ const assertions = [
 ].map(assertion => assertion.passed ? assertion : { ...assertion, error: scenarioError ?? (rawValidation.status === 'fail' ? rawValidation.error : 'assertion failed') });
 // Mandatory 12 X-07/X-11 items this ticket does not exercise stay explicit gaps (never pass).
 const evidenceGaps = [
-  'X-11: Info after a maintenance purge of a batch member (no body resurrection, redacted batch not rebuilt) is unverified; purge is T20/T22',
+  'X-11: Info after a logical purge of a batch member (no body resurrection, redacted batch not rebuilt) is unverified; purge is T21/T22b, whose closure must include host_info_batches and owner-info.jsonl',
   'X-07: later project confirmation of a session-local unresolved candidate has no Host entry yet and is unverified',
-  'The assistant proposal is a synthetic archive event; real provider/model turns and authenticated owner UI remain unverified',
+  'Untyped explicit remember requests persist as pending capture jobs; semantic extraction/processing of that normal-lane queue belongs to T13 and is not exercised here',
+  'The agreed assistant proposal is a synthetic archive event (--synthetic-proposals); real provider/model turns and authenticated owner UI remain unverified',
   'Non-CLI Host modes (Pi TUI/RPC/JSON/print) and their X-10/X-11 presentation evidence are deferred',
   'Source append crash/unknown outcome for the owner statement itself remains unverified (#38)',
   'Other OS host results require their matching CI artifacts',
@@ -418,7 +504,7 @@ type EvidenceStatus = 'pass' | 'fail' | 'evidence-gap';
 const runtimeStatus = assertions.every(assertion => assertion.passed) ? 'pass' : 'fail';
 const status: EvidenceStatus = runtimeStatus === 'fail' ? 'fail' : evidenceGaps.length ? 'evidence-gap' : 'pass';
 const exitCode = status === 'fail' ? 1 : 0;
-const stripped = new Set(['content', 'text', 'payload', 'members', 'frozen', 'current', 'commands', 'infoPath']);
+const stripped = new Set(['content', 'text', 'payload', 'members', 'accepted', 'commands', 'infoPath']);
 const observations = Object.fromEntries([...outputs].map(([label, items]) => [label,
   JSON.parse(JSON.stringify(items, (key, value) => stripped.has(key) ? undefined : value))]));
 const writeConsole = (receiptStatus: EvidenceStatus, receiptError: string | null) => JSON.stringify({
@@ -464,10 +550,18 @@ function validateReceipt(receipt: typeof output) {
   for (const key of ['schema', 'schemaVersion', 'experimentId', 'specCommit', 'authorityRefs', 'command', 'startedAt', 'finishedAt',
     'implementationCommit', 'implementationTree', 'workingTree', 'environment', 'fixture', 'heldOut', 'processes', 'assertions', 'files',
     'controlledSideEffects', 'artifactDigests', 'independentValidation', 'status', 'exit', 'evidenceGaps'] as const) assert.ok(Object.hasOwn(receipt, key), `missing ${key}`);
+  assert.ok(receipt.authorityRefs.length > 0);
+  assert.ok(['pass', 'fail', 'evidence-gap'].includes(receipt.status));
   if (receipt.status === 'pass') assert.equal(receipt.evidenceGaps.length, 0);
   if (receipt.status === 'evidence-gap') assert(receipt.evidenceGaps.length > 0);
+  for (const key of ['platform', 'release', 'architecture', 'node', 'sqlite', 'provider', 'model', 'adapter'] as const) assert.ok(receipt.environment[key]);
+  for (const key of ['digest', 'owner', 'sealedCommit', 'releasedCommit', 'contaminationCaseIds', 'replacementCaseIds', 'applicability'] as const) {
+    assert.ok(Object.hasOwn(receipt.heldOut, key), `missing heldOut.${key}`);
+  }
   assert.equal(receipt.fixture.rawDigest, sha256(readFileSync(join(repo, receipt.fixture.path))));
+  assert.ok(receipt.command.executable && receipt.command.args.length > 0 && receipt.command.cwd);
   assert.ok(Date.parse(receipt.finishedAt) >= Date.parse(receipt.startedAt));
+  assert.ok(receipt.assertions.length > 0 && receipt.assertions.every(assertion => Object.hasOwn(assertion, 'name') && Object.hasOwn(assertion, 'passed')));
   assert.ok(receipt.processes.length > 2);
   for (const item of receipt.processes) {
     assert.ok(item.command && item.args && item.cwd && Date.parse(item.finishedAt) >= Date.parse(item.startedAt));
@@ -479,9 +573,9 @@ function validateReceipt(receipt: typeof output) {
   assert.ok(receipt.artifactDigests.database.length > 0 && receipt.artifactDigests.sidecars.length > 0);
   assert.equal(receipt.independentValidation.verifier.sha256, sha256(readFileSync(join(repo, receipt.independentValidation.verifier.path))));
   const serialized = JSON.stringify({ ...receipt, rawValidation: null });
-  for (const text of [...Object.values(fixture.main), fixture.crash.statement, fixture.unavailable.statement]) {
-    const body = text.replace(/^(propose |ask )/u, '').split(/[：:]/u).at(-1)!;
-    assert.equal(serialized.includes(body), false, 'receipt embeds a memory or source body');
+  assert.ok(fixtureBodies.length > 0, 'fixture body extraction');
+  for (const [index, body] of fixtureBodies.entries()) {
+    assert.equal(serialized.includes(body), false, `receipt embeds fixture body #${index}`);
   }
   for (const file of receipt.files) {
     assert.ok(!file.path.startsWith('/') && !file.path.split('/').includes('..'));

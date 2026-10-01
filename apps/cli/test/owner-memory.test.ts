@@ -93,7 +93,30 @@ test('model hints, non-owner sources and inexplicit wording cannot drive the fas
   });
 });
 
-test('objective facts and unresolved scope stay blocked with durable reasons', () => {
+test('an untyped explicit remember creates an idempotent pending job without guessing a memory type', () => {
+  const sandbox = createSandbox();
+  let probe = openProbe(sandbox);
+  try {
+    const input = probe.archive.append(randomUUID(), '记住：以后都用 bun');
+    const queued = probe.store.queueOwnerCapture(probe.activity, input, true);
+    assert.deepEqual([queued.stage, queued.reason], ['pending', 'memory-type-required']);
+    probe.close();
+    probe = openProbe(sandbox);
+    assert.deepEqual(probe.store.queueOwnerCapture(probe.activity, input), queued);
+    assert.deepEqual(probe.store.recoverMemories(probe.activity), []);
+    const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`, { readOnly: true });
+    try {
+      const rows = db.prepare('SELECT * FROM capture_jobs').all();
+      assert.equal(rows.length, 1);
+      assert.deepEqual([rows[0]!.record_id, rows[0]!.status], [null, 'pending']);
+      const payload = JSON.parse(String(rows[0]!.payload));
+      assert.deepEqual(payload.range, [input]);
+      assert.deepEqual(payload.scope, { kind: 'session', id: sandbox.fixture.sessionId, resolved: false });
+    } finally { db.close(); }
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('objective facts and unresolved scope stay blocked with reasons re-derived from durable state', () => {
   withProbe((probe, sandbox) => {
     const fact = probe.archive.append(randomUUID(), '记住事实：生产数据库端口是 5432');
     const blocked = probe.store.rememberMemory(probe.activity, { input: fact, hostInfo: 'durable' });
@@ -107,6 +130,11 @@ test('objective facts and unresolved scope stay blocked with durable reasons', (
     const queued = probe.store.rememberMemory(probe.activity, { input: unscoped, hostInfo: 'durable', noActiveProject: true });
     assert.deepEqual([queued.status, queued.stage, queued.reason, queued.verification], ['blocked', 'candidate', 'scope-unresolved', null]);
     assert.deepEqual(queued.record.scope, { kind: 'session', id: sandbox.fixture.sessionId, resolved: false });
+    // A replay, even from a Host that now has an active project, cannot confirm the scope by itself.
+    for (const request of [{ input: unscoped, hostInfo: 'durable' as const, noActiveProject: true as const }, { input: unscoped, hostInfo: 'durable' as const }]) {
+      const replay = probe.store.rememberMemory(probe.activity, request);
+      assert.deepEqual([replay.status, replay.reason, replay.record.recordId], ['blocked', 'scope-unresolved', queued.record.recordId]);
+    }
     assert.deepEqual(probe.store.pendingMemoryProjections(probe.activity).filter(job => job.kind === 'host-info'), []);
     assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
     probe.store.drainSearchProjection(probe.activity);
@@ -129,16 +157,65 @@ test('a Host without a durable Info surface verifies but does not activate until
   });
 });
 
-test('a repeated statement does not add a second active claim and a forgotten claim stays suppressed', () => {
+test('a repeated statement only appends provenance to the active claim, and a forgotten claim stays suppressed', () => {
+  withProbe((probe, sandbox) => {
+    const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`, { readOnly: true });
+    try {
+      const refs = (recordId: string) => db.prepare(`SELECT source_event_id AS eventId, json_extract(payload,'$.role') AS role
+        FROM provenance_refs WHERE record_id=? ORDER BY rowid`).all(recordId).map(row => ({ eventId: row.eventId, role: row.role }));
+      const firstInput = probe.archive.append(randomUUID(), '记住偏好：使用 pnpm');
+      const first = probe.store.rememberMemory(probe.activity, { input: firstInput, hostInfo: 'durable' });
+      const again = probe.archive.append(randomUUID(), '记住偏好：使用 pnpm');
+      const repeated = probe.store.rememberMemory(probe.activity, { input: again, hostInfo: 'durable' });
+      assert.deepEqual([repeated.status, repeated.reason, repeated.record, repeated.batchId],
+        ['no_op', 'claim-already-active', first.record, first.batchId]);
+      const expected = [{ eventId: firstInput.eventId, role: null }, { eventId: again.eventId, role: 'corroboration' }];
+      assert.deepEqual(refs(first.record.recordId), expected);
+      const replayed = probe.store.rememberMemory(probe.activity, { input: again, hostInfo: 'durable' });
+      assert.deepEqual([replayed.status, replayed.reason, replayed.record.recordId], ['no_op', 'claim-already-active', first.record.recordId]);
+      assert.deepEqual(refs(first.record.recordId), expected);
+      assert.deepEqual(probe.store.inspectMemory(probe.activity, first.record.recordId).history.map(event => event.kind),
+        ['capture', 'verify', 'activate']);
+      probe.store.forgetMemory(probe.activity, first.record.recordId, first.record);
+      const afterForget = probe.store.rememberMemory(probe.activity, { input: again, hostInfo: 'durable' });
+      assert.deepEqual([afterForget.status, afterForget.reason, afterForget.record.lifecycle], ['no_op', 'later-memory-change', 'tombstoned']);
+      const later = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：使用 pnpm'), hostInfo: 'durable' });
+      assert.deepEqual([later.status, later.reason, later.record.recordId, later.record.lifecycle],
+        ['no_op', 'memory-suppressed', first.record.recordId, 'tombstoned']);
+      assert.deepEqual(refs(first.record.recordId), expected);
+      assert.equal(probe.store.recoverMemories(probe.activity).length, 1);
+    } finally { db.close(); }
+  });
+});
+
+test('replaying an owner statement never undoes a later rollback, correction or forget', () => {
   withProbe(probe => {
-    const first = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：使用 pnpm'), hostInfo: 'durable' });
-    const repeated = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：使用 pnpm'), hostInfo: 'durable' });
-    assert.deepEqual([repeated.status, repeated.reason, repeated.record.recordId], ['no_op', 'claim-already-active', first.record.recordId]);
-    probe.store.forgetMemory(probe.activity, first.record.recordId, first.record);
-    const later = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：使用 pnpm'), hostInfo: 'durable' });
-    assert.deepEqual([later.status, later.reason, later.record.recordId, later.record.lifecycle],
-      ['no_op', 'memory-suppressed', first.record.recordId, 'tombstoned']);
-    assert.equal(probe.store.recoverMemories(probe.activity).length, 1);
+    const remember = (text: string) => {
+      const input = probe.archive.append(randomUUID(), text);
+      return { input, result: probe.store.rememberMemory(probe.activity, { input, hostInfo: 'durable' }) };
+    };
+    const rolled = remember('记住偏好：包管理器使用 pnpm');
+    const activation = probe.store.inspectMemory(probe.activity, rolled.result.record.recordId).history.find(event => event.kind === 'activate')!;
+    const afterRollback = probe.store.rollbackMemory(probe.activity, rolled.result.record.recordId, rolled.result.record, activation.eventId).record;
+    const corrected = remember('记住决定：运行时固定为 Node 24');
+    const afterCorrection = probe.store.correctMemory(probe.activity, corrected.result.record.recordId, corrected.result.record,
+      probe.archive.append(randomUUID(), '更正：运行时固定为 Node 22'), '运行时固定为 Node 22').record;
+    const forgotten = remember('记住偏好：测试使用 node:test');
+    const afterForget = probe.store.forgetMemory(probe.activity, forgotten.result.record.recordId, forgotten.result.record).record;
+    const cases = [[rolled, afterRollback], [corrected, afterCorrection], [forgotten, afterForget]] as const;
+    const history = () => cases.map(([{ result }]) => probe.store.inspectMemory(probe.activity, result.record.recordId).history.map(event => event.kind));
+    const before = history();
+    const infoBatches = () => probe.store.registerHostInfo(probe.activity).pending.map(info => info.batchId);
+    const batches = infoBatches();
+    for (const [{ input, result }, current] of cases) {
+      for (const hostInfo of ['durable', 'unavailable'] as const) {
+        const replay = probe.store.rememberMemory(probe.activity, { input, hostInfo });
+        assert.deepEqual([replay.status, replay.reason, replay.batchId, replay.record], ['no_op', 'later-memory-change', result.batchId, current]);
+      }
+    }
+    assert.deepEqual(history(), before);
+    assert.deepEqual(infoBatches(), batches);
+    assert.equal(probe.store.readMemory(probe.activity, rolled.result.record.recordId).lifecycle, 'candidate');
   });
 });
 
@@ -169,10 +246,11 @@ test('Host Info is an idempotent durable consumer: pending to delivered, unread 
   try {
     const result = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：使用 pnpm'), hostInfo: 'durable' });
     const batchId = result.batchId!;
-    const pending = probe.store.registerHostInfo(probe.activity);
+    const { pending, more } = probe.store.registerHostInfo(probe.activity);
+    assert.equal(more, false);
     assert.deepEqual(pending.map(info => [info.batchId, info.delivery, info.read, info.memberCount]), [[batchId, 'pending', 'unread', 1]]);
     assert.equal(pending[0]!.digest, probe.store.readActivationBatch(probe.activity, batchId).digest);
-    assert.deepEqual(probe.store.registerHostInfo(probe.activity), pending);
+    assert.deepEqual(probe.store.registerHostInfo(probe.activity), { pending, more: false });
     assert.throws(() => probe.store.acknowledgeHostInfo(probe.activity, batchId), /^Error: host-info-not-delivered$/);
     const entry = { batchId, digest: pending[0]!.digest, entryId: randomUUID(), entryHash: 'a'.repeat(64) };
     assert.throws(() => probe.store.recordHostInfoDelivery(probe.activity, { ...entry, digest: 'b'.repeat(64) }), /^Error: host-info-digest-mismatch$/);
@@ -180,18 +258,19 @@ test('Host Info is an idempotent durable consumer: pending to delivered, unread 
     assert.deepEqual([delivered.delivery, delivered.read, delivered.entryId, delivered.entryHash], ['delivered', 'unread', entry.entryId, entry.entryHash]);
     assert.deepEqual(probe.store.recordHostInfoDelivery(probe.activity, entry), delivered);
     assert.throws(() => probe.store.recordHostInfoDelivery(probe.activity, { ...entry, entryId: randomUUID() }), /^Error: host-info-delivery-conflict$/);
-    assert.deepEqual(probe.store.registerHostInfo(probe.activity), []);
+    assert.deepEqual(probe.store.registerHostInfo(probe.activity), { pending: [], more: false });
     probe.close();
     probe = openProbe(sandbox);
-    assert.deepEqual(probe.store.listHostInfo(probe.activity, { unread: true }), [delivered]);
+    const unread = () => probe.store.listHostInfo(probe.activity).filter(info => info.read === 'unread');
+    assert.deepEqual(unread(), [delivered]);
     const read = probe.store.acknowledgeHostInfo(probe.activity, batchId);
     assert.deepEqual([read.delivery, read.read, read.entryId], ['delivered', 'read', entry.entryId]);
     assert.deepEqual(probe.store.acknowledgeHostInfo(probe.activity, batchId), read);
     probe.close();
     probe = openProbe(sandbox);
     assert.deepEqual(probe.store.listHostInfo(probe.activity), [read]);
-    assert.deepEqual(probe.store.listHostInfo(probe.activity, { unread: true }), []);
-    assert.deepEqual(probe.store.registerHostInfo(probe.activity), []);
+    assert.deepEqual(unread(), []);
+    assert.deepEqual(probe.store.registerHostInfo(probe.activity), { pending: [], more: false });
     assert.equal(probe.store.rememberMemory(probe.activity, { input: result.range[0]!, hostInfo: 'durable' }).status, 'no_op');
     assert.deepEqual(probe.store.listHostInfo(probe.activity), [read]);
     const regressions = ["UPDATE host_info_batches SET read_state='unread', read_at=NULL", 'DELETE FROM host_info_batches',
@@ -208,22 +287,22 @@ test('Info keeps the frozen batch and shows current member state after a later o
     const first = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：使用 pnpm'), hostInfo: 'durable' });
     probe.store.registerHostInfo(probe.activity);
     probe.store.forgetMemory(probe.activity, first.record.recordId, first.record);
-    assert.deepEqual(probe.store.registerHostInfo(probe.activity).map(info => info.batchId), [first.batchId]);
+    assert.deepEqual(probe.store.registerHostInfo(probe.activity).pending.map(info => info.batchId), [first.batchId]);
     const view = probe.store.readHostInfo(probe.activity, first.batchId!);
-    assert.deepEqual([view.batch.events.length, view.batch.events[0]!.after.lifecycle, view.batch.events[0]!.after.content],
-      [1, 'active', '使用 pnpm']);
+    assert.deepEqual([view.batch.events.length, view.batch.events[0]!.kind, view.batch.events[0]!.before.lifecycle,
+      view.batch.events[0]!.after.lifecycle, view.batch.events[0]!.after.content], [1, 'activate', 'candidate', 'active', '使用 pnpm']);
     assert.deepEqual([view.members[0]!.recordId, view.members[0]!.current?.lifecycle, view.members[0]!.changed, view.members[0]!.unavailable],
       [first.record.recordId, 'tombstoned', true, null]);
     const second = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住决定：使用 Node 24'), hostInfo: 'durable' });
     assert.notEqual(second.batchId, first.batchId);
-    assert.deepEqual(probe.store.registerHostInfo(probe.activity).map(info => info.batchId), [first.batchId, second.batchId]);
+    assert.deepEqual(probe.store.registerHostInfo(probe.activity).pending.map(info => info.batchId), [first.batchId, second.batchId]);
     assert.deepEqual(probe.store.readHostInfo(probe.activity, first.batchId!).batch.events.map(event => event.recordId), [first.record.recordId]);
     const activation = probe.store.inspectMemory(probe.activity, second.record.recordId).history.find(event => event.kind === 'activate')!;
     probe.store.rollbackMemory(probe.activity, second.record.recordId, second.record, activation.eventId);
     const rolled = probe.store.readHostInfo(probe.activity, second.batchId!);
     assert.deepEqual([rolled.batch.events[0]!.after.lifecycle, rolled.members[0]!.current?.lifecycle, rolled.members[0]!.changed],
       ['active', 'candidate', true]);
-    assert.deepEqual(probe.store.registerHostInfo(probe.activity).map(info => info.batchId), [first.batchId, second.batchId]);
+    assert.deepEqual(probe.store.registerHostInfo(probe.activity).pending.map(info => info.batchId), [first.batchId, second.batchId]);
   });
 });
 

@@ -11,7 +11,7 @@ export { parseFileCall, fileToolSchemas } from './context/file-contract.ts';
 export type { FileCapability, FileTarget, FileAdmission, FileReceipt, FilePresentation, FileDecision, FileFailureReason } from './context/file-contract.ts';
 export type { AgentEvent, AgentStatus, ModelReply, ModelRoute, RunTerminal, ToolCall } from './context/agent-state.ts';
 export { ProbeSession } from './context/probe-session.ts';
-export { parseOwnerStatement, parseMemoryProposal, parseOwnerAgreement, encodeOwnerAgreement, isOwnerAgreement, isOwnerDecline, isUntypedRemember } from './context/owner-memory.ts';
+export { OWNER_MEMORY_FORMS, parseOwnerStatement, parseMemoryProposal, parseOwnerAgreement, encodeOwnerAgreement, isOwnerAgreement, isOwnerDecline, isUntypedRemember } from './context/owner-memory.ts';
 export type { OwnerMemoryType, OwnerMemoryStatement, OwnerAgreement } from './context/owner-memory.ts';
 export type { PreparedTurn, ProbeReceipt } from './context/probe-session.ts';
 export type { FileIdentity, BoundFile, StoreResources } from './store/probe-store.ts';

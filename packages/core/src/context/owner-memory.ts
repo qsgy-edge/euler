@@ -8,6 +8,8 @@ export interface OwnerMemoryStatement { type: OwnerMemoryType; content: string }
 export interface OwnerAgreement { schema: 'owner-agreement@1'; text: string; proposal: SourceAck }
 
 const TYPES: Record<string, OwnerMemoryType> = { 偏好: 'preference', 决定: 'decision', 事实: 'fact' };
+/** The accepted explicit owner forms, for Host hints; the parsers below are the authority. */
+export const OWNER_MEMORY_FORMS = ['记住偏好：…', '记住决定：…', '记住事实：…'] as const;
 const STATEMENT = /^记住(偏好|决定|事实)[：:]\s*(\S[^\n]*)$/u;
 const PROPOSAL = /^建议记住(偏好|决定|事实)[：:]\s*(\S[^\n]*)$/u;
 const AGREE = new Set(['同意', 'agree']);

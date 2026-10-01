@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { chmodSync, closeSync, copyFileSync, openSync, readFileSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
+import { sha256 } from '@euler/core';
+import { OwnerInfoLog } from '../src/owner-memory.ts';
 import { startCli } from '../src/process-driver.ts';
 import type { Observation } from '../src/process-driver.ts';
 import { createSandbox } from '../src/sandbox.ts';
@@ -31,14 +34,31 @@ async function stop(cli: Cli): Promise<void> {
 const entries = (root: string) => readFileSync(join(root, 'owner-info.jsonl'), 'utf8').trimEnd().split('\n').slice(1).map(line => JSON.parse(line));
 const only = (cli: Cli, event: string, where: (item: Observation) => boolean = () => true) => cli.observations.filter(item => item.event === event && where(item));
 
+test('an oversized owner entry is rejected before writing and leaves prior Info readable', () => {
+  const sandbox = createSandbox();
+  const probe = openProbe(sandbox);
+  try {
+    const remembered = probe.store.rememberMemory(probe.activity, {
+      input: probe.archive.append(randomUUID(), '记住偏好：使用 pnpm'), hostInfo: 'durable' });
+    const batch = probe.store.readActivationBatch(probe.activity, remembered.batchId!);
+    const log = new OwnerInfoLog(sandbox);
+    const entry = log.append(batch);
+    const before = readFileSync(log.path);
+    const payload = 'x'.repeat(4_194_304);
+    assert.throws(() => log.append({ ...batch, batchId: randomUUID(), payload, digest: sha256(payload) }), /owner-info-limit/);
+    assert.deepEqual(readFileSync(log.path), before);
+    assert.deepEqual(new OwnerInfoLog(sandbox).entries(), [entry]);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('an owner remembers, agrees and reads Info in the actual CLI without Info identities reaching the model', async () => {
   const sandbox = createSandbox();
   try {
-    const cli = startCli(['remember', '--sandbox', sandbox.root]);
+    const cli = startCli(['remember', '--sandbox', sandbox.root, '--synthetic-proposals']);
     const ready = await cli.waitFor('remember-ready');
     assert.deepEqual([ready.hostInfo, ready.pending, ready.unread], ['durable', 0, 0]);
     const preference = await send(cli, '记住偏好：包管理器使用 pnpm', 'remember-result');
-    assert.deepEqual([preference.status, preference.stage, preference.type, preference.content, preference.verifier, preference.presentation, preference.level],
+    assert.deepEqual([preference.status, preference.stage, preference.type, preference.content, preference.verifier, preference.info, preference.level],
       ['activated', 'active', 'preference', '包管理器使用 pnpm', 'owner-fast-lane@1', 'delivered', 'info']);
     const [notice] = only(cli, 'info-notice', item => item.batchId === preference.batchId);
     assert.deepEqual([notice?.authoritative, notice?.read, notice?.delivery], [false, 'unread', 'delivered']);
@@ -50,9 +70,11 @@ test('an owner remembers, agrees and reads Info in the actual CLI without Info i
     const listed = await send(cli, 'info', 'info-list');
     assert.deepEqual([listed.pending, listed.unread], [0, 2]);
     const view = await send(cli, `info ${preference.batchId}`, 'info-view');
-    const frozen = view.frozen as { content: string }[];
-    const current = view.current as { lifecycle: string; changed: boolean }[];
-    assert.deepEqual([frozen[0]!.content, current[0]!.lifecycle, current[0]!.changed], ['包管理器使用 pnpm', 'active', false]);
+    type Snapshot = { content: string; lifecycle: string } | null;
+    const [member] = view.members as { eventId: string; recordId: string; outcome: string; before: Snapshot; after: Snapshot; current: Snapshot; changed: boolean }[];
+    assert.deepEqual([member!.recordId, member!.outcome, member!.before?.lifecycle, member!.after?.lifecycle, member!.after?.content,
+      member!.current?.lifecycle, member!.changed], [preference.recordId, 'activate', 'candidate', 'active', '包管理器使用 pnpm', 'active', false]);
+    assert.equal(member!.eventId, (notice?.members as { eventId: string }[])[0]!.eventId);
     assert.equal((await nth(cli, 'info-read', 0)).read, 'read');
     assert.equal((await send(cli, 'ask 记住偏好：包管理器使用 npm', 'ask-refused')).reason, 'owner-statement-not-question');
     const answer = await send(cli, 'ask 包管理器', 'ask-result');
@@ -155,9 +177,9 @@ test('a committed activation whose Info write fails is reported, blocks the next
     chmodSync(infoPath, 0o444);
     assert.throws(() => closeSync(openSync(infoPath, 'a')), /EACCES|EPERM/); // the carrier really rejects writes
     const failed = await send(cli, '记住偏好：包管理器使用 pnpm', 'remember-result');
-    assert.deepEqual([failed.status, failed.stage, failed.presentation, failed.level], ['activated', 'active', 'pending-redelivery', 'error']);
+    assert.deepEqual([failed.status, failed.stage, failed.info, failed.level], ['activated', 'active', 'pending-redelivery', 'error']);
     const [error] = only(cli, 'info-error');
-    assert.deepEqual([error?.batchId, error?.committed, error?.delivery], [failed.batchId, true, 'pending-redelivery']);
+    assert.deepEqual([error?.batchId, error?.delivery, error?.level], [failed.batchId, 'pending-redelivery', 'error']);
     assert.equal((await send(cli, 'ask 包管理器', 'ask-refused')).reason, 'host-info-recovery-required');
     assert.equal(only(cli, 'ask-result').length, 0);
     chmodSync(infoPath, 0o644);
@@ -169,20 +191,88 @@ test('a committed activation whose Info write fails is reported, blocks the next
   } finally { chmodSync(infoPath, 0o644); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('an Info registration failure after commit is a known outcome that blocks dispatch until recovered once', async () => {
+  const sandbox = createSandbox();
+  try {
+    const cli = startCli(['remember', '--sandbox', sandbox.root]);
+    await cli.waitFor('remember-ready');
+    const db = new DatabaseSync(join(sandbox.root, 'probe.sqlite'));
+    try {
+      db.exec(`CREATE TRIGGER t12_register_failure BEFORE INSERT ON host_info_batches
+        BEGIN SELECT RAISE(ABORT,'injected-register-failure'); END;`);
+      const failed = await send(cli, '记住偏好：包管理器使用 pnpm', 'remember-result');
+      assert.deepEqual([failed.status, failed.stage, failed.info, failed.level], ['activated', 'active', 'pending-redelivery', 'error']);
+      const [error] = only(cli, 'info-error');
+      assert.deepEqual([error?.batchId, error?.delivery], [null, 'pending-redelivery']);
+      assert.match(String(error?.reason), /injected-register-failure/);
+      assert.deepEqual(only(cli, 'command-error'), []);
+      assert.equal((await send(cli, 'ask 包管理器', 'ask-refused')).reason, 'host-info-recovery-required');
+      db.exec('DROP TRIGGER t12_register_failure');
+    } finally { db.close(); }
+    const answer = await send(cli, 'ask 包管理器', 'ask-result');
+    assert.equal(only(cli, 'info-notice').length, 1);
+    assert.equal(only(cli, 'ask-result').length, 1);
+    assert.ok(answer.receipt);
+    await stop(cli);
+    assert.equal(entries(sandbox.root).length, 1);
+  } finally { rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('a restart after a later rollback or correction neither re-activates nor reports a false error', async () => {
+  const sandbox = createSandbox();
+  try {
+    const cli = startCli(['remember', '--sandbox', sandbox.root]);
+    await cli.waitFor('remember-ready');
+    const preference = await send(cli, '记住偏好：包管理器使用 pnpm', 'remember-result');
+    const decision = await send(cli, '记住决定：运行时固定为 Node 24', 'remember-result');
+    await stop(cli);
+    const probe = openProbe(sandbox);
+    try {
+      const rolled = probe.store.readMemory(probe.activity, String(preference.recordId));
+      const activation = probe.store.inspectMemory(probe.activity, rolled.recordId).history.find(event => event.kind === 'activate')!;
+      probe.store.rollbackMemory(probe.activity, rolled.recordId, rolled, activation.eventId);
+      const current = probe.store.readMemory(probe.activity, String(decision.recordId));
+      probe.store.correctMemory(probe.activity, current.recordId, current, probe.archive.append(randomUUID(), '更正：运行时固定为 Node 22'),
+        '运行时固定为 Node 22');
+    } finally { probe.close(); }
+    const restarted = startCli(['remember', '--sandbox', sandbox.root]);
+    const ready = await restarted.waitFor('remember-ready');
+    assert.equal((await restarted.waitFor('owner-backfill')).actionable, 2);
+    assert.deepEqual(only(restarted, 'remember-result'), []);
+    assert.deepEqual(only(restarted, 'info-notice'), []);
+    assert.deepEqual([ready.pending, ready.unread], [0, 2]);
+    const view = await send(restarted, `info ${preference.batchId}`, 'info-view');
+    const [member] = view.members as { after: { lifecycle: string }; current: { lifecycle: string }; changed: boolean }[];
+    assert.deepEqual([member!.after.lifecycle, member!.current.lifecycle, member!.changed], ['active', 'candidate', true]);
+    await stop(restarted);
+    const check = openProbe(sandbox);
+    try {
+      assert.deepEqual(check.store.inspectMemory(check.activity, String(preference.recordId)).history.map(event => event.kind),
+        ['capture', 'verify', 'activate', 'rollback']);
+      const corrected = check.store.readMemory(check.activity, String(decision.recordId));
+      assert.deepEqual([corrected.lifecycle, corrected.content], ['active', '运行时固定为 Node 22']);
+    } finally { check.close(); }
+    assert.equal(entries(sandbox.root).length, 2);
+  } finally { rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('a Host without a durable Info surface does not auto-activate; a durable Host resumes the verified candidate', async () => {
   const sandbox = createSandbox();
   try {
-    const plain = startCli(['remember', '--sandbox', sandbox.root, '--presentation', 'none']);
+    const plain = startCli(['remember', '--sandbox', sandbox.root, '--host-info', 'unavailable']);
     assert.equal((await plain.waitFor('remember-ready')).hostInfo, 'unavailable');
     const blocked = await send(plain, '记住决定：运行时固定为 Node 24', 'remember-result');
     assert.deepEqual([blocked.status, blocked.stage, blocked.reason, blocked.level, blocked.batchId],
       ['blocked', 'verified', 'host-info-unavailable', 'warning', null]);
+    // The owner input channel cannot author assistant events unless the synthetic harness is enabled.
+    assert.equal((await send(plain, 'propose 建议记住决定：数据库使用 Postgres', 'command-rejected')).reason, 'synthetic-proposals-disabled');
     await stop(plain);
     assert.deepEqual(entries(sandbox.root), []);
+    assert.equal(readFileSync(join(sandbox.root, 'session.jsonl'), 'utf8').includes('"role":"assistant"'), false);
     const durable = startCli(['remember', '--sandbox', sandbox.root]);
     const ready = await durable.waitFor('remember-ready');
     const [resumed] = only(durable, 'remember-result', item => item.via === 'backfill');
-    assert.deepEqual([resumed?.status, resumed?.recordId, resumed?.presentation], ['activated', blocked.recordId, 'delivered']);
+    assert.deepEqual([resumed?.status, resumed?.recordId, resumed?.info], ['activated', blocked.recordId, 'delivered']);
     assert.deepEqual([ready.pending, ready.unread], [0, 1]);
     await stop(durable);
   } finally { rmSync(sandbox.root, { recursive: true, force: true }); }
@@ -191,12 +281,14 @@ test('a Host without a durable Info surface does not auto-activate; a durable Ho
 test('source errors, declines, untyped statements and unresolved scope never activate', async () => {
   const sandbox = createSandbox();
   try {
-    const cli = startCli(['remember', '--sandbox', sandbox.root, '--no-active-project']);
+    const cli = startCli(['remember', '--sandbox', sandbox.root, '--no-active-project', '--synthetic-proposals']);
     await cli.waitFor('remember-ready');
     const unscoped = await send(cli, '记住偏好：包管理器使用 bun', 'remember-result');
     assert.deepEqual([unscoped.status, unscoped.stage, unscoped.reason, unscoped.level], ['blocked', 'candidate', 'scope-unresolved', 'warning']);
     const untyped = await send(cli, '记住：以后都用 bun', 'remember-result');
-    assert.deepEqual([untyped.status, untyped.reason], ['needs-input', 'memory-type-required']);
+    assert.deepEqual([untyped.status, untyped.reason, untyped.recordId], ['needs-input', 'memory-type-required', null]);
+    const loose = await send(cli, '记住以后都用 bun', 'command-rejected');
+    assert.deepEqual([loose.reason, (loose.accepted as string[]).length], ['owner-memory-command-required', 3]);
     await send(cli, 'propose 建议记住决定：数据库使用 Postgres', 'assistant-proposal');
     const declined = await send(cli, '取消', 'remember-result');
     assert.deepEqual([declined.status, declined.reason], ['cancelled', 'owner-declined']);
