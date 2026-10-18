@@ -29,7 +29,7 @@ export function createCaptureWorker(path?: string, onFailure?: (error: unknown) 
     if (foregroundActive) return report(probe.store.deferCaptureJobs(probe.activity, 'foreground-run-active'));
     if (probe.store.captureDrainBlocked(probe.activity)) return report(probe.store.deferCaptureJobs(probe.activity, 'request-recovery-required'));
     if (!prerequisites) {
-      try { await verifyTransportPrerequisites(['capture','capture-run','capture-failure','capture-pump','analysis-proposal','proposal-approval'], 'capture-prerequisites', signal); }
+      try { await verifyTransportPrerequisites(['capture','capture-run','capture-failure','capture-pump','capture-http-protocol','analysis-proposal','proposal-approval'], 'capture-prerequisites', signal); }
       catch (error) { report(probe.store.deferCaptureJobs(probe.activity, signal?.aborted ? 'capture-stopped' : 'prerequisite-evidence-gap')); throw error; }
       prerequisites = true;
     }

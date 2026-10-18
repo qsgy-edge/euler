@@ -31,8 +31,8 @@ export async function verifyTransportPrerequisites(extraTests: string[] = [], ev
   const root = fileURLToPath(new URL('../../../', import.meta.url));
   const tests = ['archive', 'persistence', 'search-projection', 'request-ledger', 'request-recovery', 'request-admission', 'request-ledger-boundaries', 'agent-run', 'agent-boundaries', 'model-transport', ...extraTests]
     .map(name => `apps/cli/test/${name}.test.ts`);
-  // Preflight can run under node:test; execute the actual suite without multiplying its worker pools.
-  const command = ['--test', '--test-concurrency=1', ...tests];
+  // Keep preflight in a dedicated process while loading the shared modules only once.
+  const command = ['--test', '--test-isolation=none', '--test-concurrency=1', ...tests];
   const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
   const result = await new Promise<{ status: number | null; stdout: string; stderr: string }>(resolve => {
     execFile(process.execPath, command, { cwd: root, encoding: 'utf8', timeout: 120000, maxBuffer: 4_194_304,
@@ -84,7 +84,7 @@ export class HttpModelTransport {
     const credential = this.#credential();
     check(typeof credential === 'string' && credential.length > 0 && credential.length <= 8192 && !/[\r\n]/.test(credential), 'credential-unavailable');
     const payload = request.payload; // primitive, immutable final bytes
-    const received = await new Promise<{ body: string; status: number }>((resolve, reject) => {
+    const received = await new Promise<{ body: Buffer; status: number }>((resolve, reject) => {
       try {
         signal.throwIfAborted();
         authorizeSend(payload); // durable started + final payload/cancellation check
@@ -100,8 +100,7 @@ export class HttpModelTransport {
           response.on('error', () => reject(new Error('response-interrupted')));
           response.on('end', () => {
             if (!response.complete) { reject(new Error('response-interrupted')); return; }
-            try { resolve({ body: new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)), status: response.statusCode ?? 0 }); }
-            catch { reject(new Error('response-encoding')); }
+            resolve({ body: Buffer.concat(chunks), status: response.statusCode ?? 0 });
           });
         });
         outgoing.on('error', () => reject(new Error('transport-unknown')));
@@ -109,32 +108,55 @@ export class HttpModelTransport {
         outgoing.end(payload);
       } catch (error) { reject(error); }
     });
+    const responseHash = sha256(received.body);
     if (received.status !== 200) {
       const failure: CaptureFailure = received.status === 429 ? 'rate-limit' : received.status === 408 ? 'timeout'
         : received.status >= 500 ? 'temporary-unavailable' : 'permanent';
-      yield { kind: 'complete', reply: { text: 'Provider request failed.', calls: [], stop: 'error' }, failure, responseHash: sha256(received.body) }; return;
+      yield { kind: 'complete', reply: { text: 'Provider request failed.', calls: [], stop: 'error' }, failure, responseHash }; return;
     }
-    check(!received.body.includes(credential), 'response-contained-credential');
-    const data = JSON.parse(received.body) as { model?: unknown; usage?: { prompt_tokens?: unknown; completion_tokens?: unknown }; choices?: { finish_reason?: string; message?: { role?: string; content?: unknown; tool_calls?: unknown } }[] };
-    check(Array.isArray(data.choices) && data.choices.length === 1, 'invalid-provider-response');
-    const choice = data.choices[0]!, message = choice.message;
-    check(message?.role === 'assistant' && (message.content === null || typeof message.content === 'string'), 'invalid-provider-message');
-    const toolCalls = message.tool_calls ?? [];
-    check(Array.isArray(toolCalls) && toolCalls.length <= 128, 'invalid-provider-tools');
-    const calls = toolCalls.map((call: { id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown } }) => {
-      check(call.type === 'function' && typeof call.id === 'string' && typeof call.function?.name === 'string' && typeof call.function.arguments === 'string', 'invalid-provider-tool');
-      const name = call.function.name;
-      // Exact fixed namespace mapping; unknown names stay unknown to Core.
-      const known = ['controlled.echo', ...CORE_TOOLS];
-      return { id: call.id, name: known.find(candidate => candidate.replaceAll('.', '_') === name) ?? name,
-        arguments: JSON.parse(call.function.arguments) as Record<string, unknown> };
-    });
-    check(['stop', 'tool_calls', 'length'].includes(choice.finish_reason ?? ''), 'unsupported-stop-reason');
-    const usage = data.usage;
-    const validUsage = usage && [usage.prompt_tokens, usage.completion_tokens].every(value => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 1_000_000);
-    yield { kind: 'complete', responseHash: sha256(received.body), reply: { text: message.content ?? '', calls,
-      ...(validUsage ? { usage: { input: Number(usage.prompt_tokens), output: Number(usage.completion_tokens) } } : {}),
-      ...(typeof data.model === 'string' && data.model.length <= 256 ? { modelHash: sha256(data.model) } : {}),
-      stop: choice.finish_reason === 'tool_calls' ? 'tools' : choice.finish_reason === 'length' ? 'length' : 'end' } };
+    let body: string;
+    try { body = new TextDecoder('utf-8', { fatal: true }).decode(received.body); }
+    catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+      yield { kind: 'complete', reply: { text: 'Provider response violated the configured protocol.', calls: [], stop: 'error' }, failure: 'protocol', responseHash }; return;
+    }
+    check(!body.includes(credential), 'response-contained-credential');
+    let reply: ModelReply, failure: CaptureFailure | undefined;
+    let usage: ModelReply['usage'], modelHash: string | undefined;
+    try {
+      const data = JSON.parse(body) as { model?: unknown; usage?: { prompt_tokens?: unknown; completion_tokens?: unknown }; choices?: { finish_reason?: string; message?: { role?: string; content?: unknown; tool_calls?: unknown } }[] };
+      check(data && typeof data === 'object', 'invalid-provider-response');
+      const observedUsage = data.usage;
+      if (observedUsage && [observedUsage.prompt_tokens, observedUsage.completion_tokens].every(value => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 1_000_000))
+        usage = { input: Number(observedUsage.prompt_tokens), output: Number(observedUsage.completion_tokens) };
+      if (typeof data.model === 'string' && data.model.length <= 256) modelHash = sha256(data.model);
+      check(Array.isArray(data.choices) && data.choices.length === 1 && data.choices[0], 'invalid-provider-response');
+      const choice = data.choices[0]!, message = choice.message;
+      check(message?.role === 'assistant' && (message.content === null || typeof message.content === 'string'), 'invalid-provider-message');
+      const toolCalls = message.tool_calls ?? [];
+      check(Array.isArray(toolCalls) && toolCalls.length <= 128, 'invalid-provider-tools');
+      const calls = toolCalls.map((call: { id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown } }) => {
+        check(call && call.type === 'function' && typeof call.id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(call.id)
+          && typeof call.function?.name === 'string' && typeof call.function.arguments === 'string', 'invalid-provider-tool');
+        const name = call.function.name, argumentsValue: unknown = JSON.parse(call.function.arguments);
+        check(argumentsValue && typeof argumentsValue === 'object' && !Array.isArray(argumentsValue), 'invalid-provider-tool');
+        // Exact fixed namespace mapping; unknown names stay unknown to Core.
+        const known = ['controlled.echo', ...CORE_TOOLS];
+        return { id: call.id, name: known.find(candidate => candidate.replaceAll('.', '_') === name) ?? name,
+          arguments: argumentsValue as Record<string, unknown> };
+      });
+      check(new Set(calls.map(call => call.id)).size === calls.length, 'invalid-provider-tools');
+      check(['stop', 'tool_calls', 'length'].includes(choice.finish_reason ?? '')
+        && (calls.length > 0) === (choice.finish_reason === 'tool_calls'), 'unsupported-stop-reason');
+      reply = { text: message.content ?? '', calls,
+        stop: choice.finish_reason === 'tool_calls' ? 'tools' : choice.finish_reason === 'length' ? 'length' : 'end' };
+    } catch (error) {
+      if (!(error instanceof SyntaxError) && !(error instanceof Error &&
+        ['invalid-provider-response','invalid-provider-message','invalid-provider-tools','invalid-provider-tool','unsupported-stop-reason'].includes(error.message))) throw error;
+      failure = 'protocol';
+      reply = { text: 'Provider response violated the configured protocol.', calls: [], stop: 'error' };
+    }
+    yield { kind: 'complete', responseHash, ...(failure ? { failure } : {}),
+      reply: { ...reply, ...(usage ? { usage } : {}), ...(modelHash ? { modelHash } : {}) } };
   }
 }

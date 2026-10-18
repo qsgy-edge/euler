@@ -66,5 +66,9 @@ test('a legacy proposal export includes its approved raw evidence and immutable 
     assert(exported.markdown.includes(source.hash));
     assert(exported.markdown.includes(source.contentHash));
     assert(exported.markdown.includes(source.binding.projectId));
+    assert(exported.markdown.includes(`范围：project/${saved.scope.id}（resolved=true）`));
+    assert(exported.markdown.includes(`目标类型：${saved.targetType}`));
+    assert(exported.markdown.includes(`风险：${saved.risk}`));
+    assert(exported.markdown.includes(`评估等级：${saved.evaluation.level}`));
   });
 });

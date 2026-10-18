@@ -187,8 +187,12 @@ export class CaptureRun {
     const inflight = this.#inflight;
     check(inflight?.attempt.attemptId === attemptId && this.#sent, 'attempt-owner-mismatch');
     this.#store.captureRuntime(this.#lease);
-    check(reply && typeof reply.text === 'string' && Array.isArray(reply.calls) && reply.calls.length <= 16
+    check(reply && typeof reply.text === 'string' && Array.isArray(reply.calls)
       && ['end','tools','length','error'].includes(reply.stop) && (reply.calls.length > 0) === (reply.stop === 'tools'), 'invalid-model-response');
+    if (reply.calls.length > 16) {
+      reply = { ...reply, text: 'Capture response exceeded the tool-call limit.', calls: [], stop: 'error' };
+      transport = { ...transport, failure: 'protocol' };
+    }
     const calls = reply.calls.map(call => {
       check(call && typeof call.id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(call.id)
         && typeof call.name === 'string' && call.arguments && typeof call.arguments === 'object', 'invalid-tool-call');

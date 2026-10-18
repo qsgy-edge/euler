@@ -98,6 +98,7 @@ export interface CaptureSourcePage {
   status: 'ready' | 'dirty' | 'unavailable'; results: { ref: SourceAck; preview: string; offset: number; end: number; unitId?: string }[];
   truncated: boolean; nextCursor: string | null; coverage: { rawEvents: number; published: SourceSearchPage['coverage'] };
 }
+type InspectedCaptureSource = SourceAck & { unitId?: string };
 export interface CaptureVerification { result: 'pass' | 'block' | 'evidence-gap'; evidence: SourceAck[]; reason?: string }
 // Fast lane (I05-I07): Core derives type/content/range from durable owner bytes;
 // the request carries no model hint, owner, scope, source or verification field.
@@ -1099,7 +1100,7 @@ export class ProbeStore {
           ...(proposal.sourceUnits ?? []).map(id => renderUnit(id).markdown),
           ...proposal.evidenceRefs.map(ref => `### 获准证据\n\n${this.#archiveRef(ref).text}\n\n来源：${ref.locator}\n\n来源 owner/project：${ref.binding.ownerId}/${ref.binding.projectId}\n\n版本事件：${ref.eventId}\n\n归档 SHA-256：${ref.hash}；正文 SHA-256：${ref.contentHash}`),
         ].join('\n\n');
-        return `## 待验证提案 · v${proposal.version}\n\n目标：${proposal.target}\n\n${proposal.expectedChange}\n\n验收方法：\n\n${proposal.evaluation.assertions.map(text => `- ${text}`).join('\n')}\n\n提案：${proposal.proposalId}\n\nSHA-256：${proposal.hash}\n\n${context}`;
+        return `## 待验证提案 · v${proposal.version}\n\n目标：${proposal.target}\n\n范围：${proposal.scope.kind}/${proposal.scope.id}（resolved=${proposal.scope.resolved}）\n\n目标类型：${proposal.targetType}\n\n风险：${proposal.risk}\n\n评估等级：${proposal.evaluation.level}\n\n${proposal.expectedChange}\n\n验收方法：\n\n${proposal.evaluation.assertions.map(text => `- ${text}`).join('\n')}\n\n提案：${proposal.proposalId}\n\nSHA-256：${proposal.hash}\n\n${context}`;
       });
       const output = '# Euler 分析交接\n\n状态：分析资料与待验证建议；采纳、发布和实施需当前授权。\n\n' + sections.join('\n\n---\n\n') + '\n';
       check(Buffer.byteLength(output) <= 49152, 'analysis-export-budget');
@@ -2364,7 +2365,7 @@ export class ProbeStore {
         return { ref, preview: points.slice(0, 160).join(''), offset: 0, end: points.length }; });
       const published = this.searchSources(lease.activity, { query, limit: 16, byteBudget: 16384, ...(cursor ? { cursor } : {}) });
       const hits = [...raw];
-      for (const hit of published.results) if (hit.kind !== 'proposal' && hit.sourceProjectId === job.scope.id) {
+      for (const hit of published.results) if (hit.kind !== 'proposal' && hit.projectId === job.scope.id) {
         const { unit, text } = this.#sourceUnit(hit.unitId);
         if (!hits.some(item => sameSourceAck(item.ref, unit.ref))) hits.push({ ref: unit.ref, unitId: unit.unitId,
           preview: Array.from(text).slice(0, 160).join(''), offset: unit.offset, end: unit.offset + unit.length });
@@ -2407,8 +2408,9 @@ export class ProbeStore {
       check(input.offset < points.length, 'invalid-range');
       const text = points.slice(input.offset, Math.min(input.offset + input.limit, discovered.end)).join('');
       this.#captureSourceBudget(job.jobId, Buffer.byteLength(text));
-      const refs = JSON.parse(String(row.expanded_refs)) as SourceAck[];
-      if (!refs.some(ref => sameSourceAck(ref, input.ref))) refs.push(input.ref);
+      const refs = JSON.parse(String(row.expanded_refs)) as InspectedCaptureSource[];
+      if (!refs.some(ref => sameSourceAck(ref, input.ref) && ref.unitId === discovered.unitId))
+        refs.push({ ...discovered.ref, ...(discovered.unitId ? { unitId: discovered.unitId } : {}) });
       this.#db.prepare('UPDATE capture_work SET expanded_refs=? WHERE job_id=?').run(JSON.stringify(refs), job.jobId);
       const end = Math.min(input.offset + input.limit, discovered.end, points.length);
       return { ref: structuredClone(input.ref), text, offset: input.offset, end, total: points.length,
@@ -2431,7 +2433,7 @@ export class ProbeStore {
         && ['pass','block','evidence-gap'].includes(result.result) && Array.isArray(result.evidence)
         && result.evidence.length <= 16, 'invalid-verification');
       const row = this.#db.prepare('SELECT expanded_refs FROM capture_work WHERE job_id=?').get(job.jobId)!;
-      const expanded = JSON.parse(String(row.expanded_refs)) as SourceAck[];
+      const expanded = JSON.parse(String(row.expanded_refs)) as InspectedCaptureSource[];
       check(result.evidence.every(ref => expanded.some(actual => sameSourceAck(ref, actual)))
         && (result.result !== 'pass' || result.evidence.length > 0), 'verification-independent-evidence-required');
       let verdict = result.result;
@@ -2466,13 +2468,16 @@ export class ProbeStore {
         if (reason) verdict = 'evidence-gap';
       }
       const current = job.record;
-      const runId = this.#saveVerification(current, verdict, result.evidence, 'independent-verifier@1', reason);
+      const sourceUnits = [...new Set(expanded.filter(item => item.unitId && result.evidence.some(ref => sameSourceAck(ref, item)))
+        .map(item => item.unitId!))];
+      const runId = this.#saveVerification(current, verdict, result.evidence, 'independent-verifier@1', reason, sourceUnits);
       const after = this.#withMemoryHash({ ...current, verificationRunId: runId,
         lifecycle: verdict === 'block' && current.lifecycle !== 'tombstoned' ? 'rejected' : current.lifecycle,
         verification: verdict === 'pass' ? 'verified' : 'unverified', headEventId: randomUUID() });
       this.#appendMemoryEvent(current, after, 'verify', current.source.eventId,
-        { runId, result: verdict, evidence: result.evidence, lane: 'normal-capture', jobId: job.jobId },
-        this.#requestDigest('verify', current, { jobId: job.jobId, verdict, evidence: result.evidence }));
+        { runId, result: verdict, evidence: result.evidence, lane: 'normal-capture', jobId: job.jobId,
+          ...(sourceUnits.length ? { sourceUnits } : {}) },
+        this.#requestDigest('verify', current, { jobId: job.jobId, verdict, evidence: result.evidence, sourceUnits }));
       this.#db.prepare(`UPDATE capture_work SET stage=?,reason=?,expected_head_id=?,lease_token=NULL,lease_activity=NULL WHERE job_id=?`)
         .run(verdict === 'pass' ? 'complete' : 'blocked', reason, after.headEventId, job.jobId);
       return this.#captureJob(job.jobId);
@@ -4087,7 +4092,7 @@ export class ProbeStore {
   }
 
   #saveVerification(record: MemoryRecord, result: 'pass' | 'block' | 'evidence-gap', evidence: SourceAck[],
-    verifier: RememberVerification['verifier'], reason: string | null): string {
+    verifier: RememberVerification['verifier'], reason: string | null, sourceUnits: string[] = []): string {
     check(result !== 'pass' || evidence.length > 0, 'verification-evidence-required');
     check((result === 'pass') === (reason === null), 'verification-reason-required');
     const runId = randomUUID();
@@ -4095,7 +4100,7 @@ export class ProbeStore {
     this.#db.prepare('INSERT INTO verification_runs VALUES (?,?,?,?,?,?,?,?,?)')
       .run(runId, record.recordId, record.revisionId, result, bytes, sha256(bytes), new Date().toISOString(), verifier, reason);
     for (const [ordinal, ref] of evidence.entries()) {
-      this.#validateSource(ref, undefined, record.scope);
+      this.#validateVerificationSource(ref, record.scope, sourceUnits);
       this.#db.prepare('INSERT INTO verification_evidence VALUES (?,?,?,?,?,?,?)')
         .run(runId, ordinal, ref.binding.sessionId, ref.eventId, ref.locator, ref.hash, ref.contentHash);
     }
@@ -4288,7 +4293,20 @@ export class ProbeStore {
       && (record.verification !== 'verified' || row.result === 'pass'), 'verification-evidence-gap');
     const evidence = JSON.parse(String(row.evidence_json)) as SourceAck[];
     this.#checkEvidenceRows('verification_evidence', 'run_id', record.verificationRunId, evidence);
-    if (readSources) for (const ref of evidence) this.#validateSource(ref, undefined, record.scope, projects);
+    if (readSources) {
+      const event = this.#db.prepare(`SELECT payload,payload_hash FROM memory_events WHERE record_id=? AND kind='verify'
+        AND json_extract(payload,'$.runId')=?`).get(record.recordId, record.verificationRunId);
+      if (event) check(sha256(String(event.payload)) === event.payload_hash, 'verification-evidence-gap');
+      const sourceUnits: string[] = event ? JSON.parse(String(event.payload)).sourceUnits ?? [] : [];
+      for (const ref of evidence) this.#validateVerificationSource(ref, record.scope, sourceUnits, projects);
+    }
+  }
+  #validateVerificationSource(ref: SourceAck, scope: MemoryScope, sourceUnits: string[], projects: readonly string[] = [this.#binding.projectId]): void {
+    if (this.#sourceAllowedForScope(ref.binding, scope)) { this.#validateSource(ref, undefined, scope, projects); return; }
+    this.#validateScope(scope, projects);
+    const units = sourceUnits.map(id => this.#sourceUnit(id).unit);
+    check(scope.kind === 'project' && ref.binding.ownerId === this.#binding.ownerId && ref.binding.hostId === this.#binding.hostId
+      && units.every(unit => unit.projectId === scope.id) && units.some(unit => sameSourceAck(unit.ref, ref)), 'source-scope-mismatch');
   }
   #withMemoryHash(record: Omit<MemoryRecord, 'hash'> & { hash?: string }): MemoryRecord {
     const { hash: _hash, ...snapshot } = record;

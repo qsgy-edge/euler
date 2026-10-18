@@ -1,10 +1,51 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { rmSync } from 'node:fs';
+import { rmSync, writeFileSync } from 'node:fs';
 import test from 'node:test';
 import { DEFAULT_BUDGET } from '@euler/core';
-import { createSandbox } from '../src/sandbox.ts';
+import { createSandbox, createSandboxSession, bindingOf, resourcesOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
+import { approvedSourceUnit } from './support/source-publication.ts';
+
+test('a verifier can use only the section published to its project, retaining the original source across restart', () => {
+  const sandbox = createSandbox(), origin = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  const targetBinding = { ...bindingOf(sandbox), sessionId: randomUUID(), projectId: randomUUID() };
+  createSandboxSession(sandbox, targetBinding);
+  let target = openProbe(sandbox, undefined, undefined, targetBinding, undefined, true);
+  try {
+    const section = 'APPROVED_SHARED_EVIDENCE';
+    const prefix = 'PRIVATE_PREFIX\n';
+    const source = origin.archive.append(randomUUID(), `${prefix}${section}\nPRIVATE_SUFFIX`, 'assistant');
+    const unpublished = origin.archive.append(randomUUID(), 'PRIVATEUNPUBLISHEDONLY', 'assistant');
+    const unit = origin.store.publishSourceUnit(origin.activity, approvedSourceUnit(origin, { ref: source, projectId: targetBinding.projectId,
+      kind: 'report-section', offset: Array.from(prefix).length, length: Array.from(section).length }));
+    origin.store.drainSourceProjection(origin.activity);
+    const job = target.store.queueOwnerCapture(target.activity, target.archive.append(randomUUID(), '记住：需要独立核对共享证据'));
+    let lease = target.store.claimCaptureJob(target.activity, job.jobId, DEFAULT_BUDGET, 30000)!;
+    target.store.captureProposedMemory(lease, { type: 'insight', content: '获准的共享区段可作为验证证据' });
+    lease = target.store.claimCaptureJob(target.activity, job.jobId, DEFAULT_BUDGET, 30000)!;
+    const page = target.store.searchCaptureSources(lease, section);
+    assert.equal(page.results.length, 1);
+    assert.equal(page.results[0]!.unitId, unit.unitId);
+    assert.equal(page.results[0]!.ref.binding.projectId, sandbox.fixture.projectId);
+    assert.doesNotMatch(JSON.stringify(page), /PRIVATE_PREFIX|PRIVATE_SUFFIX/);
+    assert.equal(target.store.searchCaptureSources(lease, 'PRIVATEUNPUBLISHEDONLY').results.length, 0);
+    assert.throws(() => target.store.expandCaptureSource(lease, { ref: source, offset: 0, limit: 4096 }), /verification-source-not-discovered/);
+    assert.throws(() => target.store.completeCaptureVerification(lease, { result: 'pass', evidence: [unpublished] }), /independent-evidence/);
+    const expanded = target.store.expandCaptureSource(lease, { ref: source, offset: unit.offset, limit: 4096 });
+    assert.equal(expanded.text, section);
+    const verified = target.store.completeCaptureVerification(lease, { result: 'pass', evidence: [expanded.ref] });
+    assert.equal(verified.record!.verification, 'verified');
+    assert.equal(verified.record!.lifecycle, 'candidate');
+    assert.equal(verified.record!.scope.id, targetBinding.projectId);
+    target.close(); target = openProbe(sandbox, undefined, undefined, targetBinding, undefined, true);
+    const inspection = target.store.inspectMemory(target.activity, verified.record!.recordId);
+    assert.equal(inspection.record.verification, 'verified');
+    assert.equal(target.store.readCaptureJob(target.activity, job.jobId).stage, 'complete');
+    writeFileSync(resourcesOf(sandbox).source.path, 'corrupted original archive\n');
+    assert.throws(() => target.store.inspectMemory(target.activity, verified.record!.recordId), /archive-integrity|source-evidence-gap/);
+  } finally { target.close(); origin.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
 
 test('an untyped owner capture keeps its durable identity and scope across restart', () => {
   const sandbox = createSandbox();
