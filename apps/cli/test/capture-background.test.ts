@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -81,6 +82,38 @@ test('agent emits its foreground response and handles controls before the backgr
     assert.equal(f.bodies.length, 1);
     cli.command('cancel'); assert.equal((await cli.exit).code, 0, cli.stderr());
   } finally { if (cli.child.exitCode === null) cli.child.kill('SIGKILL'); await cli.exit; await f.close(); }
+});
+
+test('owner agreement retains its displayed proposal across a background reply and restart', async () => {
+  const f = await fixture(true);
+  let cli = f.start('remember', '--synthetic-proposals');
+  try {
+    await cli.waitFor('remember-ready');
+    await Promise.race([f.requestReceived, cli.waitFor('capture-error').then(error => { throw new Error(JSON.stringify(error)); })]);
+    cli.command('propose 建议记住决定：可见的合成提议');
+    const proposal = await cli.waitFor('assistant-proposal');
+    f.release();
+    await cli.waitFor('capture-queue');
+    cli.command('stop'); assert.equal((await cli.exit).code, 0, cli.stderr());
+    cli = f.start('remember', '--synthetic-proposals'); await cli.waitFor('remember-ready');
+    const send = async (text: string, event = 'remember-result') => {
+      const count = cli.observations.filter(item => item.event === event).length;
+      cli.command(text);
+      while (cli.observations.filter(item => item.event === event).length === count)
+        await once(cli.child.stdout, 'data', { signal: AbortSignal.timeout(15000) });
+      return cli.observations.filter(item => item.event === event)[count]!;
+    };
+    const agreed = await send('同意');
+    assert.equal(agreed.status, 'activated');
+    assert.equal((agreed.range as string[])[0], proposal.eventId);
+    assert.equal((await send('同意')).reason, 'agreement-target-missing');
+    await send('propose 建议记住决定：另一项可见提议', 'assistant-proposal');
+    // A foreground JSON lookalike has no worker ownership and still invalidates its predecessor.
+    await send('propose {"text":"null","calls":[],"stop":"end"}', 'assistant-proposal');
+    assert.equal((await send('同意')).reason, 'agreement-target-missing');
+    cli.command('stop'); assert.equal((await cli.exit).code, 0, cli.stderr());
+    assert.equal(f.bodies.length, 1);
+  } finally { if (cli.child.exitCode === null && cli.child.signalCode === null) cli.child.kill('SIGKILL'); await cli.exit; await f.close(); }
 });
 
 test('remember answers and stops while its background HTTP reply is withheld', async () => {

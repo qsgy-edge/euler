@@ -117,7 +117,7 @@ export class CaptureRun {
     const phase: Phase = runtime.job.stage === 'proposing' ? 'proposer' : 'verifier';
     if (phase === 'verifier') for (const response of this.#steps().filter(step => step.phase === phase && step.kind === 'response' && step.outcome === 'response')) {
       const reply = JSON.parse(this.#store.readCaptureOutput(this.#lease, response.source).text) as ModelReply;
-      this.#sourceTools(response, reply.calls);
+      if (!this.#store.withActivity(this.#lease.activity, () => this.#sourceTools(response, reply.calls))) return null;
     }
     const steps = this.#steps().filter(step => step.phase === phase);
     const ordinal = steps.filter(step => step.kind === 'response' && step.outcome !== 'response').length;
@@ -220,14 +220,14 @@ export class CaptureRun {
       }
     }
     const source = this.#source.append(attemptId, JSON.stringify(clean), 'assistant');
-    this.#store.withActivity(this.#lease.activity, () => {
+    const applied = this.#store.withActivity(this.#lease.activity, () => {
       this.#store.finishRequestAttempt(this.#lease.activity, { attemptId, outcome: 'received', usage: { count: 1,
         ...(reply.usage ? { inputTokens: reply.usage.input, outputTokens: reply.usage.output } : {}),
         ...(reply.modelHash ? { modelHash: reply.modelHash } : {}), finishReason: reply.stop } });
       this.#store.recordCaptureStep(this.#lease, { phase: inflight.phase, kind: 'response', source, attemptId, route: inflight.route,
         fallbackOrdinal: inflight.ordinal, configHash: this.#configHash, inputHash: inflight.attempt.payloadHash, outcome,
         failureClass: transport.failure ?? (outcome === 'protocol' ? 'structured-output' : null), responseHash: transport.responseHash ?? null });
-      if (outcome !== 'response') return;
+      if (!this.#acceptResult() || outcome !== 'response') return false;
       if (reply.stop === 'error' || reply.stop === 'length') {
         this.#store.stopCapture(this.#lease, 'blocked', reply.stop === 'length' ? 'output-incomplete' : 'provider-unavailable'); return;
       }
@@ -248,14 +248,24 @@ export class CaptureRun {
           this.#store.sealRequestRun(this.#lease.activity, this.runId);
         }
       }
+      return true;
     });
     this.#inflight = null;
     // A complete, durably archived response is required before any source tool executes.
-    if (calls.length) this.#sourceTools({ phase: inflight.phase, route: inflight.route, kind: 'response', source, attemptId,
-      fallbackOrdinal: inflight.ordinal, outcome, callId: null }, calls);
+    if (applied && calls.length) this.#store.withActivity(this.#lease.activity, () => this.#sourceTools({
+      phase: inflight.phase, route: inflight.route, kind: 'response', source, attemptId,
+      fallbackOrdinal: inflight.ordinal, outcome, callId: null }, calls));
   }
 
-  #sourceTools(step: Step, calls: ToolCall[]): void {
+  #acceptResult(): boolean {
+    const ledger = this.#store.requestStatus(this.#lease.activity, this.runId);
+    if (ledger.run.state === 'authorized' && !ledger.events.some(event => event.kind === 'run-recovery-gap')) return true;
+    this.#store.stopCapture(this.#lease, 'blocked', 'late-model-result');
+    return false;
+  }
+
+  #sourceTools(step: Step, calls: ToolCall[]): boolean {
+    if (!this.#acceptResult()) return false;
     check(step.phase === 'verifier' || calls.length === 0, 'capture-tools-unavailable');
     const completed = new Set(this.#steps().filter(item => item.kind === 'tool' && item.attemptId === step.attemptId).map(item => item.callId));
     for (const call of calls) {
@@ -294,6 +304,7 @@ export class CaptureRun {
       this.#store.recordCaptureStep(this.#lease, { phase: step.phase, kind: 'tool', source, attemptId: step.attemptId, route: step.route,
         fallbackOrdinal: step.fallbackOrdinal, configHash: this.#configHash, inputHash, outcome: 'response', callId: call.id });
     }
+    return true;
   }
 
   fail(error?: unknown): CaptureJob {

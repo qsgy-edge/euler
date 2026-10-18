@@ -372,7 +372,7 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
           continue;
         }
         if (isOwnerAgreement(line) || isOwnerDecline(line)) {
-          const previous = probe.archive.events().at(-1);
+          const previous = probe.archive.events().findLast(event => !probe.store.isCaptureOutput(probe.activity, event.ack));
           const target = previous?.role === 'assistant' && parseMemoryProposal(previous.text) ? previous.ack : null;
           const ack = archive(target && isOwnerAgreement(line) ? encodeOwnerAgreement(line, target) : line);
           if (!ack) continue;

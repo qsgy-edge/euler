@@ -2183,13 +2183,17 @@ export class ProbeStore {
     });
   }
 
-  #captureLease(lease: CaptureLease): CaptureJob {
+  #captureLease(lease: CaptureLease, applyResult = false): CaptureJob {
     const row = this.#db.prepare('SELECT * FROM capture_work WHERE job_id=?').get(lease.jobId);
     check(row && row.lease_token === lease.token && row.lease_activity === lease.activity.id
       && row.generation === lease.generation && Number(row.lease_until) > Date.now()
       && Number(row.deadline) > Date.now(), 'capture-lease-stale');
     const stream = this.#readStream(lease.activity.streamId);
     check(stream.ownerKind === 'job' && stream.ownerId === lease.jobId, 'capture-lease-stale');
+    if (applyResult && row.run_id) {
+      const ledger = this.requestStatus(lease.activity, String(row.run_id));
+      check(ledger.run.state === 'authorized' && !ledger.events.some(event => event.kind === 'run-recovery-gap'), 'late-model-result');
+    }
     const job = this.#captureJob(lease.jobId);
     for (const ref of job.range) this.#validateSource(ref, undefined, job.scope);
     if (job.record) check(job.record.headEventId === row.expected_head_id, 'memory-stale');
@@ -2198,7 +2202,7 @@ export class ProbeStore {
 
   captureProposedMemory(lease: CaptureLease, proposal: ProposedMemory, capability: 'basic' | 'standard' | 'high' = 'standard'): CaptureJob {
     return this.withActivity(lease.activity, () => {
-      const job = this.#captureLease(lease);
+      const job = this.#captureLease(lease, true);
       check(job.stage === 'proposing' && job.record === null, 'capture-stage-mismatch');
       check(proposal && Object.keys(proposal).sort().join(',') === 'content,type'
         && ['fact','preference','decision','insight','episode'].includes(proposal.type), 'invalid-capture-proposal');
@@ -2229,6 +2233,26 @@ export class ProbeStore {
       const job = this.#captureLease(lease);
       check(job.stage === 'proposing', 'capture-stage-mismatch');
       return job.range.map(ref => ({ ref, ...this.#archiveRef(ref) }));
+    });
+  }
+
+  /** Distinguishes background archive entries by durable job ownership, including an unrecorded response append. */
+  isCaptureOutput(activity: Activity, ref: SourceAck): boolean {
+    return this.withActivity(activity, () => {
+      check(sameBinding(ref.binding, this.#binding), 'source-scope-mismatch');
+      if (this.#archiveRef(ref).role === 'user') return false;
+      const response = this.#db.prepare(`SELECT 1 FROM request_attempts a
+        JOIN capture_work w ON w.run_id=a.run_id JOIN capture_jobs j ON j.job_id=w.job_id
+        WHERE a.attempt_id=? AND j.source_owner=?`).get(ref.eventId, ref.binding.sessionId);
+      if (response) return true;
+      const steps = this.#db.prepare(`SELECT e.payload,e.hash FROM request_events e
+        JOIN capture_work w ON w.run_id=e.run_id JOIN capture_jobs j ON j.job_id=w.job_id
+        WHERE e.kind='capture/step@v1' AND json_extract(e.payload,'$.source.eventId')=? AND j.source_owner=?`)
+        .all(ref.eventId, ref.binding.sessionId);
+      return steps.some(row => {
+        check(sha256(String(row.payload)) === row.hash, 'capture-evidence-gap');
+        return sameSourceAck(JSON.parse(String(row.payload)).source, ref);
+      });
     });
   }
 
@@ -2272,7 +2296,7 @@ export class ProbeStore {
     source: SourceAck; attemptId: string; route: string; fallbackOrdinal: number; configHash: string; inputHash: string;
     outcome: 'response' | 'protocol' | 'temporary-unavailable'; callId?: string; failureClass?: string | null; responseHash?: string | null }): void {
     this.withActivity(lease.activity, () => {
-      const job = this.#captureLease(lease);
+      const job = this.#captureLease(lease, input.kind === 'tool');
       check(input.phase === (job.stage === 'proposing' ? 'proposer' : 'verifier')
         && ['response','tool'].includes(input.kind) && ['response','protocol','temporary-unavailable'].includes(input.outcome)
         && Number.isSafeInteger(input.fallbackOrdinal) && input.fallbackOrdinal >= 0 && input.fallbackOrdinal <= 2
@@ -2326,7 +2350,7 @@ export class ProbeStore {
 
   searchCaptureSources(lease: CaptureLease, query: string, cursor?: string): CaptureSourcePage {
     return this.withActivity(lease.activity, () => {
-      const job = this.#captureLease(lease);
+      const job = this.#captureLease(lease, true);
       check(job.stage === 'verifying', 'capture-stage-mismatch');
       check(typeof query === 'string' && query.trim().length > 0 && Buffer.byteLength(query) <= 512, 'invalid-source-query');
       const terms = query.normalize('NFC').toLocaleLowerCase().trim().split(/\s+/u);
@@ -2357,7 +2381,7 @@ export class ProbeStore {
 
   captureSourceReference(lease: CaptureLease, eventId: string): SourceAck {
     return this.withActivity(lease.activity, () => {
-      this.#captureLease(lease); uuid(eventId);
+      this.#captureLease(lease, true); uuid(eventId);
       const row = this.#db.prepare('SELECT searched_refs FROM capture_work WHERE job_id=?').get(lease.jobId)!;
       const hits = (JSON.parse(String(row.searched_refs)) as CaptureSourcePage['results']).filter(item => item.ref.eventId === eventId);
       check(hits.length > 0 && hits.every(item => sameSourceAck(item.ref, hits[0]!.ref)), 'verification-source-not-discovered');
@@ -2367,7 +2391,7 @@ export class ProbeStore {
 
   expandCaptureSource(lease: CaptureLease, input: { ref: SourceAck; offset: number; limit: number }): SourceExcerpt {
     return this.withActivity(lease.activity, () => {
-      const job = this.#captureLease(lease);
+      const job = this.#captureLease(lease, true);
       check(job.stage === 'verifying' && input && Object.keys(input).sort().join(',') === 'limit,offset,ref', 'invalid-source-request');
       const row = this.#db.prepare('SELECT searched_refs,expanded_refs FROM capture_work WHERE job_id=?').get(job.jobId)!;
       const discovered = (JSON.parse(String(row.searched_refs)) as CaptureSourcePage['results'])
@@ -2398,7 +2422,7 @@ export class ProbeStore {
 
   completeCaptureVerification(lease: CaptureLease, result: CaptureVerification): CaptureJob {
     return this.withActivity(lease.activity, () => {
-      const job = this.#captureLease(lease);
+      const job = this.#captureLease(lease, true);
       check(job.stage === 'verifying' && job.record, 'capture-stage-mismatch');
       check(result && Object.keys(result).every(key => ['result','evidence','reason'].includes(key))
         && ['pass','block','evidence-gap'].includes(result.result) && Array.isArray(result.evidence)
