@@ -44,6 +44,10 @@ test('a complete tool call in a provisional stream cannot execute before the ful
     assert.equal(executions, 1);
     assert.equal(requests, 2);
     assert.equal(run.status().tools[0]!.result!.outcome, 'success');
+    const captures = probe.store.listCaptureJobs(probe.activity);
+    assert.equal(captures.length, 2);
+    assert(captures.every(job => job.stage === 'pending'));
+    assert.deepEqual(captures.at(-1)!.range.map(ref => ref.eventId), probe.archive.events().map(event => event.ack.eventId));
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 

@@ -1,10 +1,10 @@
 import { check } from '@euler/core';
 import { FileOperationRejected } from './windows-files.ts';
-import type { AgentRun, AgentStatus, ModelReply, ModelRequest, ToolCall, RequestAttempt, FileTarget, FileCapability, FileReceipt, FilePresentation, FileDecision } from '@euler/core';
+import type { CaptureFailure, CaptureRun, CaptureJob, AgentRun, AgentStatus, ModelReply, ModelRequest, ToolCall, RequestAttempt, FileTarget, FileCapability, FileReceipt, FilePresentation, FileDecision } from '@euler/core';
 export type AuthorizeSend = (payload: string) => RequestAttempt;
 
 export interface AgentPump {
-  stream(request: ModelRequest, signal: AbortSignal, authorizeSend: AuthorizeSend): AsyncIterable<{ kind: 'partial' | 'complete'; reply: ModelReply }>;
+  stream(request: ModelRequest, signal: AbortSignal, authorizeSend: AuthorizeSend): AsyncIterable<{ kind: 'partial' | 'complete'; reply: ModelReply; failure?: CaptureFailure; responseHash?: string }>;
   execute(call: ToolCall, signal: AbortSignal): Promise<string>;
   prepareFile?(call: ToolCall, capability: FileCapability, signal: AbortSignal): Promise<{ target: FileTarget; execute(): Promise<FileReceipt>; close(): void }>;
   requestFileApproval?(presentation: FilePresentation, signal: AbortSignal): Promise<FileDecision>;
@@ -100,6 +100,43 @@ export async function pumpAgent(run: AgentRun, host: AgentPump): Promise<AgentSt
     }
   } catch {
     if (!run.status().terminal) run.fail();
+  } finally { clearTimeout(deadline); }
+  return run.status();
+}
+
+/** Background I/O pump; all job, source and fallback transitions stay in Core. */
+export async function pumpCapture(run: CaptureRun, host: Pick<AgentPump, 'stream'>): Promise<CaptureJob> {
+  const abort = new AbortController();
+  const deadline = setTimeout(() => abort.abort(), run.remainingMs());
+  try {
+    for (;;) {
+      const request = run.nextModel();
+      if (!request) break;
+      let attempt: RequestAttempt | undefined;
+      let reply: ModelReply | undefined;
+      let transport: { failure?: CaptureFailure; responseHash?: string } = {};
+      const stream = host.stream(request, abort.signal, payload => {
+        check(!attempt, 'hidden-retry-denied');
+        attempt = run.startModel(request, payload);
+        check(run.maySend(attempt.attemptId, payload), 'send-cancelled');
+        return attempt;
+      })[Symbol.asyncIterator]();
+      try {
+        for (;;) {
+          const item = await untilStopped(stream.next(), abort.signal);
+          if (item.done) break;
+          if (item.value.kind === 'complete') {
+            check(!reply, 'duplicate-model-completion'); reply = item.value.reply;
+            transport = { ...(item.value.failure ? { failure: item.value.failure } : {}),
+              ...(item.value.responseHash ? { responseHash: item.value.responseHash } : {}) };
+          }
+        }
+      } finally { void stream.return?.().catch(() => {}); }
+      check(attempt && reply, 'incomplete-model-response');
+      run.finishModel(attempt.attemptId, reply, transport);
+    }
+  } catch {
+    if (['proposing','verifying'].includes(run.status().stage)) run.fail();
   } finally { clearTimeout(deadline); }
   return run.status();
 }

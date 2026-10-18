@@ -364,13 +364,19 @@ export class AgentRun {
       archivedErrorClass = 'tool-result-truncated';
     }
     const source = this.#host.source.append(randomUUID(), encode(archivedResult, archivedOutcome), 'tool');
-    this.#event({ kind: 'tool-result', result: { callId, executionState: tool.started ? 'started' : 'not_started',
-      outcome: archivedOutcome, argumentsHash: tool.argumentsHash, errorClass: archivedErrorClass, source, ...(file ? { file: structuredClone(file) } : {}) } });
+    this.#store.withActivity(this.#activity, () => {
+      this.#event({ kind: 'tool-result', result: { callId, executionState: tool.started ? 'started' : 'not_started',
+        outcome: archivedOutcome, argumentsHash: tool.argumentsHash, errorClass: archivedErrorClass, source, ...(file ? { file: structuredClone(file) } : {}) } });
+      if (this.status().tools.filter(item => item.attemptId === tool.attemptId).every(item => item.result && item.result.outcome !== 'unknown')) {
+        this.#store.queueCaptureBoundary(this.#activity, this.runId, tool.attemptId);
+      }
+    });
   }
   #terminal(terminal: RunTerminal): void {
     this.#store.withActivity(this.#activity, () => {
       this.#event({ kind: 'terminal', terminal });
       this.#store.sealRequestRun(this.#activity, this.runId);
+      if (terminal === 'completed') this.#store.queueCaptureBoundary(this.#activity, this.runId);
     });
   }
 }

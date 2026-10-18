@@ -1,0 +1,17 @@
+{
+  "schema": "t13-capture-cases@1",
+  "input": "记住：项目验证需要保留原始日志",
+  "claim": { "type": "decision", "content": "项目验证需要保留原始日志" },
+  "sourceQuery": "原始日志",
+  "cases": [
+    { "id": "C01", "scenario": "synthetic", "stage": "complete", "verification": "verified", "attempts": 4 },
+    { "id": "C02", "scenario": "protocol", "stage": "complete", "verification": "verified", "attempts": 5 },
+    { "id": "C03", "scenario": "block", "stage": "blocked", "verification": "unverified", "attempts": 2 },
+    { "id": "C04", "scenario": "evidence-gap", "stage": "blocked", "verification": "unverified", "attempts": 2 },
+    { "id": "C05", "scenario": "unknown", "stage": "unknown", "verification": null, "attempts": 1 }
+  ],
+  "handoff": {
+    "section": "Atlas 日志改进\n\n背景：测试日志缺少环境字段。\n预期改动：记录测试环境。\n范围：日志输出。\n非目标：改变运行策略。\n验收：合成日志包含环境字段。",
+    "privateText": "未交付的其他项目背景。"
+  }
+}

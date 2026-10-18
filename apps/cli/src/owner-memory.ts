@@ -262,7 +262,8 @@ class OwnerMemoryHost {
       if (event.role !== 'user') continue;
       if (isUntypedRemember(event.text)) {
         const queued = this.probe.store.queueOwnerCapture(this.probe.activity, event.ack, this.#noActiveProject);
-        report('backfill', 'needs-input', 'warning', { ...queued, input: event.ack.eventId });
+        report('backfill', queued.stage === 'pending' ? 'needs-input' : 'capture-status', queued.stage === 'complete' ? 'info' : 'warning',
+          { ...queued, input: event.ack.eventId });
         actionable++;
       } else if (fastLaneInput(event.text)) {
         actionable++;

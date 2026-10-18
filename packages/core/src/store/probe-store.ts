@@ -1,3 +1,5 @@
+import { parseAnalysisArtifact } from '../context/analysis-artifacts.ts';
+import type { ExportSelection } from '../context/analysis-artifacts.ts';
 import { replayAgent } from '../context/agent-state.ts';
 import type { AgentEvent, AgentStatus } from '../context/agent-state.ts';
 import { isUntypedRemember, parseMemoryProposal, parseOwnerAgreement, parseOwnerStatement } from '../context/owner-memory.ts';
@@ -86,10 +88,21 @@ export interface ActivationBatch {
   payload: string; digest: string;
 }
 export interface MemoryOperation { status: 'committed' | 'no_op'; record: MemoryRecord; eventId: string | null }
+export interface CaptureJob {
+  jobId: string; ownerId: string; scope: MemoryScope; source: SourceAck; range: SourceAck[];
+  stage: 'pending' | 'captured' | 'proposing' | 'verifying' | 'complete' | 'blocked' | 'unknown'; reason: string | null; record: MemoryRecord | null;
+}
+export interface CaptureLease { jobId: string; activity: Activity; token: string; generation: number; expiresAt: number }
+export interface ProposedMemory { type: MemoryType; content: string }
+export interface CaptureSourcePage {
+  status: 'ready' | 'dirty' | 'unavailable'; results: { ref: SourceAck; preview: string; offset: number; end: number; unitId?: string }[];
+  truncated: boolean; nextCursor: string | null; coverage: { rawEvents: number; published: SourceSearchPage['coverage'] };
+}
+export interface CaptureVerification { result: 'pass' | 'block' | 'evidence-gap'; evidence: SourceAck[]; reason?: string }
 // Fast lane (I05-I07): Core derives type/content/range from durable owner bytes;
 // the request carries no model hint, owner, scope, source or verification field.
 export interface RememberRequest { input: SourceAck; hostInfo: 'durable' | 'unavailable'; noActiveProject?: true }
-export interface RememberVerification { runId: string; verifier: 'synthetic-harness@1' | 'owner-fast-lane@1';
+export interface RememberVerification { runId: string; verifier: 'synthetic-harness@1' | 'owner-fast-lane@1' | 'independent-verifier@1';
   result: 'pass' | 'block' | 'evidence-gap'; reason: string | null; evidence: SourceAck[] }
 export interface RememberResult {
   status: 'activated' | 'blocked' | 'no_op'; stage: 'candidate' | 'verified' | MemoryLifecycle; reason: string | null;
@@ -151,7 +164,7 @@ export interface SearchPage { status: 'ready' | 'dirty' | 'unavailable'; results
 export interface SearchProjectionReceipt { jobId: string; eventId: string; status: 'done' | 'failed'; generation: number; reason: string | null }
 export interface ConflictOperation { status: 'committed' | 'no_op'; left: MemoryOperation; right: MemoryOperation; conflictSetId: string | null }
 export interface EvolutionProposalInput {
-  target: string; expectedChange: string; owner: string; scope: MemoryScope; evidenceRefs: SourceAck[];
+  target: string; expectedChange: string; owner: string; scope: MemoryScope; evidenceRefs: SourceAck[]; sourceUnits?: string[];
   evaluation: { schema: 'evaluation-contract@1'; level: 'L0' | 'L1' | 'L2' | 'L3'; assertions: string[] };
   supersedes?: string;
   targetType?: 'guidance' | 'skill' | 'code' | 'policy';
@@ -159,7 +172,7 @@ export interface EvolutionProposalInput {
 }
 export interface EvolutionProposal {
   schema: 'evolution-proposal@1'; proposalId: string; version: number; target: string;
-  expectedChange: string; owner: string; scope: MemoryScope; evidenceRefs: SourceAck[]; input: SourceAck;
+  expectedChange: string; owner: string; scope: MemoryScope; evidenceRefs: SourceAck[]; sourceUnits?: string[]; input: SourceAck;
   targetType: 'guidance' | 'skill' | 'code' | 'policy'; risk: 'low' | 'high';
   evaluation: EvolutionProposalInput['evaluation']; supersedes: string | null; inert: true; hash: string;
 }
@@ -194,7 +207,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=14), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=15), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -285,7 +298,7 @@ CREATE TABLE request_runs (
 CREATE TABLE request_events (
   event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES request_runs(run_id),
   seq INTEGER NOT NULL CHECK(seq>0),
-  kind TEXT NOT NULL CHECK(kind IN ('agent/event@v1','run-authorized','run-revoked','run-sealed','run-recovery-gap','model/request-attempt-reconciled@v1','context/assembly@v1','model/request-attempt-started@v1','model/request-attempt-finished@v1')),
+  kind TEXT NOT NULL CHECK(kind IN ('capture/step@v1','agent/event@v1','run-authorized','run-revoked','run-sealed','run-recovery-gap','model/request-attempt-reconciled@v1','context/assembly@v1','model/request-attempt-started@v1','model/request-attempt-finished@v1')),
   attempt_id TEXT REFERENCES request_attempts(attempt_id), activity_id TEXT NOT NULL REFERENCES owner_activities(id),
   created_at TEXT NOT NULL, payload TEXT NOT NULL, hash TEXT NOT NULL, UNIQUE(run_id,seq)
 ) STRICT;
@@ -297,6 +310,7 @@ CREATE TABLE request_assemblies (
   used_memories TEXT NOT NULL,
   intent_event_id TEXT, intent_hash TEXT, zones TEXT NOT NULL, selection TEXT NOT NULL, degradation TEXT NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('not-dispatched','unknown-sent','finished')),
+  claim_head_event_id TEXT REFERENCES memory_events(event_id),
   UNIQUE(run_id,identity_hash)
 ) STRICT;
 CREATE TABLE request_attempts (
@@ -387,6 +401,16 @@ CREATE TABLE capture_jobs (
   status TEXT NOT NULL CHECK(status IN ('pending','captured','complete')), payload TEXT NOT NULL, payload_hash TEXT NOT NULL, created_at TEXT NOT NULL,
   source_owner TEXT NOT NULL REFERENCES sessions(session_id), UNIQUE(source_owner,source_event_id),
   CHECK((status='pending')=(record_id IS NULL))
+) STRICT;
+CREATE TABLE capture_work (
+  job_id TEXT PRIMARY KEY REFERENCES capture_jobs(job_id), stage TEXT NOT NULL CHECK(stage IN ('proposing','verifying','complete','blocked','unknown')),
+  reason TEXT, record_id TEXT REFERENCES memory_records(record_id), expected_head_id TEXT REFERENCES memory_events(event_id),
+  lease_token TEXT, lease_activity TEXT REFERENCES owner_activities(id), lease_until INTEGER NOT NULL,
+  generation INTEGER NOT NULL CHECK(generation>0), budget TEXT NOT NULL, deadline INTEGER NOT NULL,
+  searched_refs TEXT NOT NULL DEFAULT '[]', expanded_refs TEXT NOT NULL DEFAULT '[]',
+  source_calls INTEGER NOT NULL DEFAULT 0 CHECK(source_calls>=0), source_bytes INTEGER NOT NULL DEFAULT 0 CHECK(source_bytes>=0),
+  run_id TEXT UNIQUE REFERENCES request_runs(run_id), config_hash TEXT,
+  CHECK((lease_token IS NULL)=(lease_activity IS NULL))
 ) STRICT;
 CREATE TABLE provenance_refs (
   ref_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), revision_id TEXT NOT NULL REFERENCES memory_revisions(revision_id),
@@ -569,7 +593,7 @@ CREATE TABLE feedback_events (
 CREATE TABLE verification_runs (
   run_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), revision_id TEXT NOT NULL REFERENCES memory_revisions(revision_id),
   result TEXT NOT NULL CHECK(result IN ('pass','block','evidence-gap')), evidence_json TEXT NOT NULL, evidence_hash TEXT NOT NULL, created_at TEXT NOT NULL,
-  verifier TEXT NOT NULL CHECK(verifier IN ('synthetic-harness@1','owner-fast-lane@1')),
+  verifier TEXT NOT NULL CHECK(verifier IN ('synthetic-harness@1','owner-fast-lane@1','independent-verifier@1')),
   reason TEXT CHECK((result='pass')=(reason IS NULL) AND (reason IS NULL OR length(reason) BETWEEN 1 AND 128)),
   UNIQUE(record_id,revision_id,run_id),
   FOREIGN KEY(record_id,revision_id) REFERENCES memory_revisions(record_id,revision_id)
@@ -598,6 +622,10 @@ CREATE TABLE proposal_evidence (
   source_owner TEXT NOT NULL, source_event_id TEXT NOT NULL, locator TEXT NOT NULL, hash TEXT NOT NULL, content_hash TEXT NOT NULL,
   PRIMARY KEY(proposal_id,ordinal)
 ) STRICT;
+CREATE TABLE proposal_source_units (
+  proposal_id TEXT NOT NULL REFERENCES evolution_proposals(proposal_id), ordinal INTEGER NOT NULL,
+  unit_id TEXT NOT NULL REFERENCES source_units(unit_id), PRIMARY KEY(proposal_id,ordinal), UNIQUE(proposal_id,unit_id)
+) STRICT;
 CREATE INDEX verification_source ON verification_evidence(source_owner,source_event_id);
 CREATE INDEX proposal_source ON proposal_evidence(source_owner,source_event_id);
 CREATE TRIGGER immutable_memory_records_update BEFORE UPDATE ON memory_records BEGIN SELECT RAISE(ABORT, 'append-only'); END;
@@ -617,15 +645,15 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=14;
-` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events','source_query_receipts'].map(table => `
+PRAGMA user_version=15;
+` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 `).join('') + ['memory_heads','intent_heads','owner_fences','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
-  'verification_runs','verification_evidence','proposal_evidence','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts','host_info_batches'].map(table => `
+  'verification_runs','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts','host_info_batches','capture_work'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
-`).join('') + ['memory_heads','intent_heads','owner_fences','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts','source_projection_jobs','host_info_batches'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
+`).join('') + ['memory_heads','intent_heads','owner_fences','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts','source_projection_jobs','host_info_batches','capture_work'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
 CREATE TRIGGER owned_${table}_${operation.toLowerCase()} BEFORE ${operation} ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
 `)).join('') + `
@@ -687,15 +715,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,14,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,15,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 14, 'unsupported-probe-schema');
+        check(version === 15, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 14 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 15 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -980,11 +1008,97 @@ export class ProbeStore {
     const project = this.#db.prepare('SELECT owner_id FROM projects WHERE project_id=?').get(unit.projectId);
     check(project?.owner_id === this.#binding.ownerId, 'source-evidence-gap');
     this.#publicationApproval(unit);
-    const points = Array.from(this.#archiveRef(unit.ref).text);
+    const raw = this.#archiveRef(unit.ref).text;
+    this.#analysisReferences(raw);
+    const points = Array.from(raw);
     check(unit.offset + unit.length <= points.length, 'source-evidence-gap');
     const text = points.slice(unit.offset, unit.offset + unit.length).join('');
     check(sha256(text) === unit.contentHash && Buffer.byteLength(text) <= 16384, 'source-evidence-gap');
     return { unit, text };
+  }
+
+  readonly #checkingAnalysis = new Set<string>();
+  #analysisReferences(text: string): void {
+    const parsed = parseAnalysisArtifact(text);
+    if (!parsed) return;
+    const key = sha256(text);
+    check(!this.#checkingAnalysis.has(key) && this.#checkingAnalysis.size < 16, 'analysis-reference-cycle');
+    this.#checkingAnalysis.add(key);
+    try {
+      this.#archiveRef(parsed.header.task);
+      for (const evidence of parsed.header.evidence) {
+        const request = evidence.request;
+        check(request && Number.isSafeInteger(request.offset) && request.offset >= 0
+          && Number.isSafeInteger(request.limit) && request.limit > 0 && request.limit <= 4096, 'analysis-evidence-gap');
+        let source: string;
+        if ('ref' in request) source = this.#archiveRef(request.ref).text;
+        else if (this.#db.prepare('SELECT 1 FROM source_units WHERE unit_id=?').get(request.unitId)) source = this.#sourceUnit(request.unitId).text;
+        else {
+          this.#proposalForProjects(request.unitId, this.#registeredProjects());
+          source = String(this.#db.prepare('SELECT payload FROM evolution_proposals WHERE proposal_id=?').get(request.unitId)!.payload);
+        }
+        const excerpt = Array.from(source).slice(request.offset, request.offset + request.limit).join('');
+        check(sha256(excerpt) === evidence.hash, 'analysis-evidence-gap');
+      }
+      if (parsed.header.exportInputs) {
+        const exported = parsed.header.exportInputs;
+        this.#archiveRef(exported.approval);
+        for (const item of exported.selection) {
+          const unit = this.#db.prepare('SELECT unit_id FROM source_units WHERE unit_id=?').get(item.unitId);
+          if (unit) check(this.#sourceUnit(item.unitId).unit.contentHash === item.hash, 'analysis-evidence-gap');
+          else check(this.#proposalForProjects(item.unitId, this.#registeredProjects()).hash === item.hash, 'analysis-evidence-gap');
+        }
+      }
+      if (parsed.header.supersedes) {
+        const prior = parseAnalysisArtifact(this.#archiveRef(parsed.header.supersedes).text);
+        check(prior && prior.header.artifactId === parsed.header.artifactId
+          && prior.header.version + 1 === parsed.header.version, 'analysis-version-mismatch');
+      }
+    } finally { this.#checkingAnalysis.delete(key); }
+  }
+
+  validateAnalysisSource(activity: Activity, ref: SourceAck): void {
+    this.withActivity(activity, () => {
+      check(sameBinding(ref.binding, this.#binding), 'source-scope-mismatch');
+      this.#analysisReferences(this.#archiveRef(ref).text);
+    });
+  }
+
+  renderAnalysisExport(activity: Activity, selection: ExportSelection[], approval: SourceAck): string {
+    return this.withActivity(activity, () => {
+      check(Array.isArray(selection) && selection.length > 0 && selection.length <= 16
+        && new Set(selection.map(item => item.unitId)).size === selection.length, 'invalid-export-selection');
+      check(sameBinding(approval?.binding, this.#binding), 'export-approval-required');
+      const decision = this.#archiveRef(approval);
+      check(decision.role === 'user', 'export-approval-required');
+      let value: { schema?: string; selection?: ExportSelection[] };
+      try { value = JSON.parse(decision.text) as typeof value; }
+      catch { throw new Error('export-approval-required'); }
+      check(value && Object.keys(value).sort().join(',') === 'schema,selection'
+        && value.schema === 'analysis-export-approval@1' && JSON.stringify(value.selection) === JSON.stringify(selection), 'export-approval-mismatch');
+      const sections = selection.map(item => {
+        check(item && Object.keys(item).sort().join(',') === 'hash,unitId', 'invalid-export-selection');
+        const source = this.#db.prepare('SELECT project_id FROM source_units WHERE unit_id=?').get(item.unitId);
+        if (source) {
+          check(source.project_id === this.#binding.projectId, 'source-scope-mismatch');
+          const { unit, text } = this.#sourceUnit(item.unitId);
+          check(unit.contentHash === item.hash, 'source-version-stale');
+          const report = parseAnalysisArtifact(this.#archiveRef(unit.ref).text);
+          return `## ${unit.kind} · v${unit.version}\n\n${text}\n\n来源：${unit.ref.locator}\n\n来源 owner/project：${unit.ref.binding.ownerId}/${unit.ref.binding.projectId}\n\n归档 SHA-256：${unit.ref.hash}\n\n区段：${unit.offset}–${unit.offset + unit.length}；区段 SHA-256：${unit.contentHash}`
+            + (report ? `\n\n报告版本：${report.header.version}；版本事件：${unit.ref.eventId}` : '');
+        }
+        const proposal = this.#proposalForProjects(item.unitId, [this.#binding.projectId]);
+        check(proposal.scope.kind === 'project' && proposal.scope.id === this.#binding.projectId && proposal.hash === item.hash, 'source-version-stale');
+        const context = (proposal.sourceUnits ?? []).map(id => {
+          const { unit, text } = this.#sourceUnit(id);
+          return `### 获准背景 · v${unit.version}\n\n${text}\n\n来源：${unit.ref.locator}；区段：${unit.offset}–${unit.offset + unit.length}；SHA-256：${unit.contentHash}`;
+        }).join('\n\n');
+        return `## 待验证提案 · v${proposal.version}\n\n目标：${proposal.target}\n\n${proposal.expectedChange}\n\n验收方法：\n\n${proposal.evaluation.assertions.map(text => `- ${text}`).join('\n')}\n\n提案：${proposal.proposalId}\n\nSHA-256：${proposal.hash}\n\n${context}`;
+      });
+      const output = '# Euler 分析交接\n\n状态：分析资料与待验证建议；采纳、发布和实施需当前授权。\n\n' + sections.join('\n\n---\n\n') + '\n';
+      check(Buffer.byteLength(output) <= 49152, 'analysis-export-budget');
+      return output;
+    });
   }
 
   bindWorkspace(activity: Activity, workspaceId: string, projectIds: string[]): void {
@@ -1185,6 +1299,7 @@ export class ProbeStore {
       payloadHash: String(row.payload_hash), byteLength: Number(row.byte_length),
       estimatedTokens: Number(row.estimated_tokens), budget: JSON.parse(String(row.budget)),
       sources: JSON.parse(String(row.sources)), usedMemories: JSON.parse(String(row.used_memories)),
+      ...(row.claim_head_event_id ? { claimHeadEventId: String(row.claim_head_event_id) } : {}),
       intent: row.intent_event_id ? { eventId: String(row.intent_event_id), hash: String(row.intent_hash) } : null,
       zones: JSON.parse(String(row.zones)), selection: JSON.parse(String(row.selection)),
       degradation: String(row.degradation) as RequestAssembly['degradation'],
@@ -1275,6 +1390,11 @@ export class ProbeStore {
       check(input.epoch === run.epoch, 'assembly-epoch-mismatch');
       check(input.selection.every((item, index) => item.ordinal === index && item.hash === input.sources[index]?.hash
         && item.reason === 'mandatory-source'), 'invalid-assembly-selection');
+      if (input.claimHeadEventId !== undefined) {
+        uuid(input.claimHeadEventId);
+        check(run.ownerKind === 'job' && this.#db.prepare('SELECT 1 FROM capture_work WHERE job_id=? AND run_id=? AND expected_head_id=?')
+          .get(run.ownerId, run.runId, input.claimHeadEventId), 'capture-claim-mismatch');
+      }
       const usedMemories = input.usedMemories ?? [];
       check(Array.isArray(usedMemories) && usedMemories.length <= 16
         && new Set(usedMemories.map(item => item.recordId)).size === usedMemories.length, 'invalid-assembly-selection');
@@ -1304,6 +1424,7 @@ export class ProbeStore {
           && existing.estimated_tokens === input.estimatedTokens && existing.budget === JSON.stringify(input.budget)
           && existing.sources === JSON.stringify(input.sources)
           && existing.used_memories === JSON.stringify(usedMemories)
+          && existing.claim_head_event_id === (input.claimHeadEventId ?? null)
           && existing.intent_event_id === (input.intent?.eventId ?? null)
           && existing.intent_hash === (input.intent?.hash ?? null)
           && existing.zones === JSON.stringify(input.zones) && existing.selection === JSON.stringify(input.selection)
@@ -1311,18 +1432,18 @@ export class ProbeStore {
         return this.#requestAssembly(existing);
       }
       const assemblyId = randomUUID();
-      this.#db.prepare('INSERT INTO request_assemblies VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      this.#db.prepare('INSERT INTO request_assemblies VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
         .run(assemblyId, input.runId, input.epoch, input.route, input.model, input.policyHash, input.estimator,
           identityHash, input.payloadHash, input.byteLength, input.estimatedTokens, JSON.stringify(input.budget),
           JSON.stringify(input.sources), JSON.stringify(usedMemories), input.intent?.eventId ?? null, input.intent?.hash ?? null,
-          JSON.stringify(input.zones), JSON.stringify(input.selection), input.degradation, 'not-dispatched');
+          JSON.stringify(input.zones), JSON.stringify(input.selection), input.degradation, 'not-dispatched', input.claimHeadEventId ?? null);
       this.#requestEvent(input.runId, 'context/assembly@v1', null, JSON.stringify({
         schema: 'context/assembly@v1', assemblyId, runId: input.runId, epoch: input.epoch, route: input.route,
         model: input.model, policyHash: input.policyHash, estimator: input.estimator, payloadHash: input.payloadHash,
         byteLength: input.byteLength, estimatedTokens: input.estimatedTokens, budget: input.budget,
         zones: input.zones, selection: input.selection,
         sources: input.sources.map(source => ({ eventId: source.eventId, hash: source.hash })),
-        usedMemories,
+        usedMemories, ...(input.claimHeadEventId ? { claimHeadEventId: input.claimHeadEventId } : {}),
         intent: input.intent, degradation: input.degradation,
       }), activity.id);
       return this.#requestAssembly(this.#db.prepare('SELECT * FROM request_assemblies WHERE assembly_id=?').get(assemblyId)!);
@@ -1360,10 +1481,8 @@ export class ProbeStore {
       check(input.payloadHash.length === 64 && input.byteLength > 0 && input.adapterVersion.length > 0, 'invalid-attempt');
       const status = this.requestStatus(activity, input.runId);
       this.#requestRecoveryGate(activity, status.run.relatedRunId, input.runId);
-      const currentIntent = this.readIntent(activity);
       const frozenAssembly = status.assemblies.find(item => item.assemblyId === input.assemblyId);
-      check(frozenAssembly && currentIntent?.eventId === frozenAssembly.intent?.eventId
-        && currentIntent?.hash === frozenAssembly.intent?.hash && currentIntent?.status === 'active', 'intent-stale');
+      check(frozenAssembly && this.#requestIntentCurrent(activity, run, frozenAssembly), 'intent-stale');
       this.#verifyRequestSources([frozenAssembly]);
       for (const use of frozenAssembly.usedMemories) this.#assemblyMemory(use, true);
       const assembly = this.#db.prepare('SELECT * FROM request_assemblies WHERE assembly_id=? AND run_id=?')
@@ -1408,11 +1527,26 @@ export class ProbeStore {
       const attempt = status.attempts.find(item => item.outcome === 'unknown-sent');
       const assembly = status.assemblies.find(item => item.assemblyId === attempt?.assemblyId);
       if (assembly) for (const use of assembly.usedMemories) this.#assemblyMemory(use, true);
-      const currentIntent = this.readIntent(activity);
       return status.run.state === 'authorized' && status.run.epoch === activity.epoch
-        && Boolean(assembly && currentIntent?.status === 'active'
-          && currentIntent.eventId === assembly.intent?.eventId && currentIntent.hash === assembly.intent?.hash);
+        && Boolean(assembly && this.#requestIntentCurrent(activity, status.run, assembly));
     });
+  }
+
+  #requestIntentCurrent(activity: Activity, run: RequestRun, assembly: RequestAssembly): boolean {
+    const work = run.ownerKind === 'job' ? this.#db.prepare('SELECT * FROM capture_work WHERE job_id=? AND run_id=?')
+      .get(run.ownerId, run.runId) : undefined;
+    if (work) {
+      const capture = this.#db.prepare('SELECT payload_hash,source_event_id FROM capture_jobs WHERE job_id=?').get(run.ownerId)!;
+      if (work.lease_activity !== activity.id || Number(work.lease_until) <= Date.now() || Number(work.deadline) <= Date.now()
+        || !['proposing','verifying'].includes(String(work.stage))) return false;
+      const job = this.#captureJob(run.ownerId);
+      for (const ref of job.range) this.#validateSource(ref, undefined, job.scope);
+      return job.scope.resolved && (job.record?.headEventId ?? null) === (assembly.claimHeadEventId ?? null)
+        && (!job.record || job.record.headEventId === work.expected_head_id)
+        && assembly.intent?.eventId === capture.source_event_id && assembly.intent?.hash === capture.payload_hash;
+    }
+    const current = this.readIntent(activity);
+    return current?.status === 'active' && current.eventId === assembly.intent?.eventId && current.hash === assembly.intent?.hash;
   }
 
   finishRequestAttempt(activity: Activity, input: { attemptId: string; outcome: 'received' | 'cancelled-before-send'; usage?: { count: number; inputTokens?: number; outputTokens?: number; modelHash?: string; finishReason?: string } | null }): RequestAttempt {
@@ -1566,7 +1700,7 @@ export class ProbeStore {
         check(receipt, 'ledger-evidence-gap');
         const assemblyPayload = JSON.parse(String(receipt.payload));
         for (const key of ['runId', 'epoch', 'route', 'model', 'policyHash', 'estimator', 'payloadHash', 'byteLength',
-          'estimatedTokens', 'budget', 'zones', 'selection', 'intent', 'degradation'] as const) {
+          'estimatedTokens', 'budget', 'zones', 'selection', 'intent', 'degradation', 'claimHeadEventId'] as const) {
           check(JSON.stringify(assemblyPayload[key]) === JSON.stringify(decodedAssembly[key]), 'ledger-evidence-gap');
         }
         check(JSON.stringify(assemblyPayload.sources) === JSON.stringify(decodedAssembly.sources.map(source => ({ eventId: source.eventId, hash: source.hash })))
@@ -1853,7 +1987,416 @@ export class ProbeStore {
    * the Host has a durable Info surface, activates it together with its fixed batch
    * manifest and host-info/search outbox jobs. Any failure rolls the whole call back.
    */
-  queueOwnerCapture(activity: Activity, input: SourceAck, noActiveProject = false): { jobId: string; stage: 'pending'; reason: 'memory-type-required' } {
+  queueCaptureBoundary(activity: Activity, runId: string, attemptId?: string): CaptureJob {
+    return this.withActivity(activity, () => {
+      const state = this.agentStatus(activity, runId);
+      const tools = attemptId ? state.tools.filter(tool => tool.attemptId === attemptId) : state.tools;
+      check((attemptId ? tools.length > 0 : state.terminal === 'completed')
+        && tools.every(tool => tool.result && tool.result.outcome !== 'unknown'), 'capture-boundary-incomplete');
+      const source = attemptId ? tools.at(-1)?.result?.source : state.responses.at(-1)?.source;
+      check(source, 'capture-boundary-incomplete');
+      const ledger = this.requestStatus(activity, runId);
+      const range: SourceAck[] = [];
+      for (const event of ledger.events) if (event.kind === 'agent/event@v1') {
+        const item = JSON.parse(event.payload).event as AgentEvent;
+        const ref = item.kind === 'input' && state.inputs.some(input => input.source.eventId === item.source.eventId
+          && input.state === 'bound-to-assembly') ? item.source : item.kind === 'response' ? item.source : item.kind === 'tool-result' ? item.result.source : null;
+        if (ref && !range.some(existing => sameSourceAck(existing, ref))) range.push(ref);
+      }
+      const scope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true };
+      for (const ref of range) this.#validateSource(ref, undefined, scope);
+      const existing = this.#db.prepare('SELECT job_id FROM capture_jobs WHERE source_owner=? AND source_event_id=?')
+        .get(source.binding.sessionId, source.eventId);
+      if (existing) return this.#captureJob(String(existing.job_id));
+      const jobId = randomUUID();
+      const payload = JSON.stringify({ schema: 'capture-job@1', source, range, scope, ownerId: this.#binding.ownerId,
+        recordId: null, lane: 'normal-capture', boundary: attemptId ? 'react-complete' : 'task-complete', runId, reason: 'proposer-required' });
+      this.#db.prepare('INSERT INTO capture_jobs VALUES (?,?,?,?,?,?,?,?)').run(jobId, source.eventId, null, 'pending',
+        payload, sha256(payload), new Date().toISOString(), source.binding.sessionId);
+      return this.#captureJob(jobId);
+    });
+  }
+
+  queueMemoryVerification(activity: Activity, recordId: string, expected: MemoryRecord, approval?: SourceAck): CaptureJob {
+    return this.withActivity(activity, () => {
+      const record = this.#assertMemoryExpected(recordId, expected);
+      check(!['tombstoned','superseded'].includes(record.lifecycle), 'memory-not-eligible');
+      const event = this.#db.prepare('SELECT kind FROM memory_events WHERE event_id=?').get(record.headEventId);
+      let source = record.source;
+      if (approval) {
+        this.#validateSource(approval, undefined, record.scope);
+        const decision = this.#archiveRef(approval);
+        check(decision.role === 'user', 'reverification-approval-required');
+        let value: Record<string, unknown>;
+        try { value = JSON.parse(decision.text) as Record<string, unknown>; }
+        catch { throw new Error('reverification-approval-required'); }
+        check(Object.keys(value).sort().join(',') === 'headEventId,recordId,revisionId,schema,sourceHash'
+          && value.schema === 'memory-reverification-approval@1' && value.recordId === recordId
+          && value.revisionId === record.revisionId && value.headEventId === record.headEventId
+          && value.sourceHash === record.source.hash, 'reverification-approval-required');
+        source = approval;
+      } else check(event?.kind === 'correct' && record.verification === 'unverified', 'reverification-trigger-required');
+      const existing = this.#db.prepare('SELECT job_id,payload FROM capture_jobs WHERE source_owner=? AND source_event_id=?')
+        .get(source.binding.sessionId, source.eventId);
+      if (existing) {
+        check(JSON.parse(String(existing.payload)).expectedHead === record.headEventId, 'capture-identity-conflict');
+        return this.#captureJob(String(existing.job_id));
+      }
+      const jobId = randomUUID();
+      const payload = JSON.stringify({ schema: 'capture-job@1', source,
+        range: sameSourceAck(source, record.source) ? [source] : [record.source, source], scope: record.scope,
+        ownerId: this.#binding.ownerId, recordId, lane: 'reverification', expectedHead: record.headEventId, reason: 'reverification-required' });
+      this.#db.prepare('INSERT INTO capture_jobs VALUES (?,?,?,?,?,?,?,?)').run(jobId, source.eventId, null, 'pending', payload,
+        sha256(payload), new Date().toISOString(), source.binding.sessionId);
+      return this.#captureJob(jobId);
+    });
+  }
+
+  readCaptureJob(activity: Activity, jobId: string): CaptureJob {
+    return this.withActivity(activity, () => this.#captureJob(jobId));
+  }
+
+  listCaptureJobs(activity: Activity, limit = 16, pendingOnly = false): CaptureJob[] {
+    return this.withActivity(activity, () => {
+      check(Number.isSafeInteger(limit) && limit > 0 && limit <= 32, 'invalid-capture-limit');
+      return this.#db.prepare(`SELECT j.job_id FROM capture_jobs j JOIN sessions s ON s.session_id=j.source_owner
+        LEFT JOIN capture_work w ON w.job_id=j.job_id
+        WHERE s.owner_id=? AND s.project_id=? AND (?=0 OR (j.status='pending' AND (w.stage IS NULL OR w.stage IN ('proposing','verifying'))))
+          AND (json_extract(j.payload,'$.scope.kind') IS NOT 'session' OR j.source_owner=?)
+        ORDER BY j.rowid LIMIT ?`)
+        .all(this.#binding.ownerId, this.#binding.projectId, pendingOnly ? 1 : 0, this.#binding.sessionId, limit).map(row => this.#captureJob(String(row.job_id)));
+    });
+  }
+
+  #captureJob(jobId: string): CaptureJob {
+    uuid(jobId);
+    const row = this.#db.prepare('SELECT * FROM capture_jobs WHERE job_id=?').get(jobId);
+    check(row && sha256(String(row.payload)) === row.payload_hash, 'capture-evidence-gap');
+    const payload = JSON.parse(String(row.payload));
+    check(payload.schema === 'capture-job@1' && payload.source?.binding?.ownerId === this.#binding.ownerId
+      && payload.source.binding.projectId === this.#binding.projectId && payload.source.eventId === row.source_event_id
+      && payload.source.binding.sessionId === row.source_owner, 'capture-evidence-gap');
+    const work = this.#db.prepare('SELECT * FROM capture_work WHERE job_id=?').get(jobId);
+    const recordId = work?.record_id ?? row.record_id ?? payload.recordId;
+    let record: MemoryRecord | null = null, unavailable: string | null = null;
+    if (recordId !== null) {
+      try { record = this.#readMemoryUnsafe(String(recordId)); }
+      catch (error) {
+        const reason = error instanceof Error ? error.message : '';
+        if (/^(source-|archive-|memory-evidence-gap|verification-evidence-gap|evidence-reference-gap)/.test(reason)
+          || ['ENOENT','EACCES','EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) unavailable = 'memory-evidence-gap';
+        else throw error;
+      }
+    }
+    const head = !payload.scope && !record && recordId !== null
+      ? this.#db.prepare('SELECT scope_kind,scope_id,scope_resolved FROM memory_heads WHERE record_id=?').get(String(recordId)) : null;
+    const scope: MemoryScope = payload.scope ?? record?.scope ?? (head ? {
+      kind: head.scope_kind as MemoryScopeKind, id: String(head.scope_id), resolved: Boolean(head.scope_resolved) } : null);
+    this.#validateScope(scope);
+    return { jobId, ownerId: this.#binding.ownerId, scope: structuredClone(scope), source: payload.source,
+      range: payload.range ?? [payload.source], stage: unavailable ? 'blocked' : (work?.stage ?? row.status) as CaptureJob['stage'],
+      reason: unavailable ?? (work ? work.reason as string | null : payload.reason ?? null), record };
+  }
+
+  claimCaptureJob(activity: Activity, jobId: string, budget: ProbeBudget, leaseMs: number): CaptureLease | null {
+    return this.withActivity(activity, () => {
+      validateBudget(budget);
+      check(Number.isSafeInteger(leaseMs) && leaseMs > 0 && leaseMs <= 30000, 'invalid-capture-lease');
+      const job = this.#captureJob(jobId);
+      const previous = this.#db.prepare('SELECT * FROM capture_work WHERE job_id=?').get(jobId);
+      if (['complete','blocked','unknown'].includes(job.stage) || previous && Number(previous.lease_until) > Date.now()) return null;
+      if (previous) check(previous.budget === JSON.stringify(budget), 'capture-budget-mismatch');
+      const now = Date.now(), deadline = previous ? Number(previous.deadline) : now + budget.wallClockMs;
+      const generation = previous ? Number(previous.generation) + 1 : 1;
+      let reason: string | null = !job.scope.resolved ? 'scope-unresolved' : job.scope.kind !== 'project'
+        ? 'additional-scope-evidence-required' : deadline <= now ? 'capture-deadline' : null;
+      const capture = JSON.parse(String(this.#db.prepare('SELECT payload FROM capture_jobs WHERE job_id=?').get(jobId)!.payload));
+      if (capture.expectedHead && job.record?.headEventId !== capture.expectedHead) reason = 'memory-stale';
+      try { for (const ref of job.range) this.#validateSource(ref, undefined, job.scope); }
+      catch { reason = 'source-evidence-gap'; }
+      const holder = reason ? null : this.register({ kind: 'job', id: jobId, authorizationId: job.source.eventId });
+      const token = holder ? randomUUID() : null;
+      const until = Math.min(now + leaseMs, deadline);
+      this.#db.prepare(`INSERT INTO capture_work(job_id,stage,reason,record_id,expected_head_id,lease_token,lease_activity,lease_until,generation,budget,deadline) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(job_id) DO UPDATE SET stage=excluded.stage,reason=excluded.reason,lease_token=excluded.lease_token,
+          lease_activity=excluded.lease_activity,lease_until=excluded.lease_until,generation=excluded.generation`)
+        .run(jobId, reason ? 'blocked' : job.record ? 'verifying' : 'proposing', reason,
+          job.record?.recordId ?? null, previous?.expected_head_id ?? job.record?.headEventId ?? null,
+          token, holder?.id ?? null, until, generation, JSON.stringify(budget), deadline);
+      return holder ? { jobId, activity: holder, token: token!, generation, expiresAt: until } : null;
+    });
+  }
+
+  #captureLease(lease: CaptureLease): CaptureJob {
+    const row = this.#db.prepare('SELECT * FROM capture_work WHERE job_id=?').get(lease.jobId);
+    check(row && row.lease_token === lease.token && row.lease_activity === lease.activity.id
+      && row.generation === lease.generation && Number(row.lease_until) > Date.now()
+      && Number(row.deadline) > Date.now(), 'capture-lease-stale');
+    const stream = this.#readStream(lease.activity.streamId);
+    check(stream.ownerKind === 'job' && stream.ownerId === lease.jobId, 'capture-lease-stale');
+    const job = this.#captureJob(lease.jobId);
+    for (const ref of job.range) this.#validateSource(ref, undefined, job.scope);
+    if (job.record) check(job.record.headEventId === row.expected_head_id, 'memory-stale');
+    return job;
+  }
+
+  captureProposedMemory(lease: CaptureLease, proposal: ProposedMemory, capability: 'basic' | 'standard' | 'high' = 'standard'): CaptureJob {
+    return this.withActivity(lease.activity, () => {
+      const job = this.#captureLease(lease);
+      check(job.stage === 'proposing' && job.record === null, 'capture-stage-mismatch');
+      check(proposal && Object.keys(proposal).sort().join(',') === 'content,type'
+        && ['fact','preference','decision','insight','episode'].includes(proposal.type), 'invalid-capture-proposal');
+      this.#validateSource(job.source, proposal.content, job.scope);
+      const claimKey = proposal.content.trim().normalize('NFC');
+      check(claimKey.length > 0, 'invalid-capture-proposal');
+      const suppressed = this.#suppressed(claimKey, job.source.binding.sessionId, job.scope, []);
+      if (suppressed) {
+        this.#db.prepare("UPDATE capture_work SET stage='blocked',reason='memory-suppressed',lease_token=NULL,lease_activity=NULL WHERE job_id=?").run(job.jobId);
+        return this.#captureJob(job.jobId);
+      }
+      const record = this.#withMemoryHash({ schema: 'memory-record@1', recordId: randomUUID(), revisionId: randomUUID(),
+        revision: 1, claimKey, content: proposal.content, contentHash: sha256(proposal.content), type: proposal.type,
+        lifecycle: 'candidate', verification: 'unverified', scope: job.scope, appliesTo: [], source: job.source,
+        validFrom: null, validUntil: null, conflictSetId: null, verificationRunId: null, headEventId: randomUUID() });
+      this.#insertCandidate(record, { lane: 'normal-capture', jobId: job.jobId },
+        this.#requestDigest('capture', null, { jobId: job.jobId, proposal }), job.range.filter(ref => !sameSourceAck(ref, job.source)), job.jobId);
+      check(['basic','standard','high'].includes(capability), 'invalid-capture-capability');
+      const insufficient = capability === 'basic' && !['preference','decision'].includes(proposal.type);
+      this.#db.prepare("UPDATE capture_work SET stage=?,reason=?,record_id=?,expected_head_id=?,lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?")
+        .run(insufficient ? 'blocked' : 'verifying', insufficient ? 'proposer-capability-insufficient' : null, record.recordId, record.headEventId, job.jobId);
+      return this.#captureJob(job.jobId);
+    });
+  }
+
+  captureInputs(lease: CaptureLease): { ref: SourceAck; role?: 'user' | 'assistant' | 'tool'; text: string }[] {
+    return this.withActivity(lease.activity, () => {
+      const job = this.#captureLease(lease);
+      check(job.stage === 'proposing', 'capture-stage-mismatch');
+      return job.range.map(ref => ({ ref, ...this.#archiveRef(ref) }));
+    });
+  }
+
+  readCaptureOutput(lease: CaptureLease, ref: SourceAck): { text: string; role?: 'user' | 'assistant' | 'tool' } {
+    return this.withActivity(lease.activity, () => {
+      const runtime = this.captureRuntime(lease);
+      check(runtime.runId, 'capture-run-unavailable');
+      const ledger = this.requestStatus(lease.activity, runtime.runId);
+      check(ledger.events.some(event => event.kind === 'capture/step@v1'
+        && sameSourceAck(JSON.parse(event.payload).source, ref)), 'capture-output-not-recorded');
+      return this.#archiveRef(ref);
+    });
+  }
+
+  captureRuntime(lease: CaptureLease): { job: CaptureJob; budget: ProbeBudget; deadline: number; runId: string | null } {
+    return this.withActivity(lease.activity, () => {
+      const job = this.#captureLease(lease);
+      const row = this.#db.prepare('SELECT budget,deadline,run_id FROM capture_work WHERE job_id=?').get(job.jobId)!;
+      return { job, budget: JSON.parse(String(row.budget)), deadline: Number(row.deadline), runId: row.run_id as string | null };
+    });
+  }
+
+  startCaptureRun(lease: CaptureLease, configHash: string): RequestRun {
+    return this.withActivity(lease.activity, () => {
+      const job = this.#captureLease(lease);
+      check(/^[a-f0-9]{64}$/.test(configHash), 'invalid-capture-config');
+      const row = this.#db.prepare('SELECT * FROM capture_work WHERE job_id=?').get(job.jobId)!;
+      if (row.run_id !== null) {
+        check(row.config_hash === configHash, 'capture-config-mismatch');
+        return this.#requestRun(lease.activity, String(row.run_id));
+      }
+      const capture = this.#db.prepare('SELECT payload_hash FROM capture_jobs WHERE job_id=?').get(job.jobId)!;
+      const run = this.authorizeRequestRun(lease.activity, randomUUID(), { budget: JSON.parse(String(row.budget)),
+        intent: { eventId: job.source.eventId, hash: String(capture.payload_hash) }, relatedRunId: null });
+      this.#db.prepare('UPDATE capture_work SET run_id=?,config_hash=? WHERE job_id=?').run(run.runId, configHash, job.jobId);
+      return run;
+    });
+  }
+
+  recordCaptureStep(lease: CaptureLease, input: { phase: 'proposer' | 'verifier'; kind: 'response' | 'tool';
+    source: SourceAck; attemptId: string; route: string; fallbackOrdinal: number; configHash: string; inputHash: string;
+    outcome: 'response' | 'protocol' | 'temporary-unavailable'; callId?: string; failureClass?: string | null; responseHash?: string | null }): void {
+    this.withActivity(lease.activity, () => {
+      const job = this.#captureLease(lease);
+      check(input.phase === (job.stage === 'proposing' ? 'proposer' : 'verifier')
+        && ['response','tool'].includes(input.kind) && ['response','protocol','temporary-unavailable'].includes(input.outcome)
+        && Number.isSafeInteger(input.fallbackOrdinal) && input.fallbackOrdinal >= 0 && input.fallbackOrdinal <= 2
+        && /^[a-f0-9]{64}$/.test(input.configHash) && /^[a-f0-9]{64}$/.test(input.inputHash), 'invalid-capture-step');
+      const work = this.#db.prepare('SELECT run_id,config_hash FROM capture_work WHERE job_id=?').get(job.jobId)!;
+      check(work.run_id && work.config_hash === input.configHash, 'capture-config-mismatch');
+      const ledger = this.requestStatus(lease.activity, String(work.run_id));
+      const attempt = ledger.attempts.find(item => item.attemptId === input.attemptId);
+      check(attempt?.outcome === 'received', 'response-not-received');
+      const assembly = ledger.assemblies.find(item => item.assemblyId === attempt.assemblyId)!;
+      check(input.route === assembly.route && input.inputHash === attempt.payloadHash, 'capture-route-mismatch');
+      check(this.#archiveRef(input.source).role === (input.kind === 'response' ? 'assistant' : 'tool'), 'capture-output-role-mismatch');
+      check((input.failureClass == null || ['temporary-unavailable','timeout','rate-limit','protocol','permanent','structured-output'].includes(input.failureClass))
+        && (input.responseHash == null || /^[a-f0-9]{64}$/.test(input.responseHash)), 'invalid-capture-transport');
+      const callId = input.callId ?? null;
+      check(callId === null || typeof callId === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(callId), 'invalid-tool-call');
+      this.#requestEvent(ledger.run.runId, 'capture/step@v1', null, JSON.stringify({ schema: 'capture/step@v1', runId: ledger.run.runId,
+        jobId: job.jobId, phase: input.phase, kind: input.kind, source: input.source, attemptId: input.attemptId,
+        route: input.route, fallbackOrdinal: input.fallbackOrdinal, configHash: input.configHash, inputHash: input.inputHash,
+        outputHash: input.source.contentHash, outcome: input.outcome, callId, failureClass: input.failureClass ?? null,
+        transportResponseHash: input.responseHash ?? null, ttftMs: null, cache: null,
+        promptVersion: 'capture-prompts@1', schemaVersion: 'capture-output@1', adapterVersion: 'capture-adapter@1', modelVersion: 'unknown' }), lease.activity.id);
+    });
+  }
+
+  reconcileCaptureJob(activity: Activity, jobId: string): RequestStatus {
+    const job = this.readCaptureJob(activity, jobId);
+    const row = this.withActivity(activity, () => this.#db.prepare('SELECT run_id FROM capture_work WHERE job_id=?').get(jobId));
+    check(row?.run_id, 'capture-run-unavailable');
+    const holder = this.register({ kind: 'job', id: jobId, authorizationId: job.source.eventId });
+    let status = this.requestStatus(holder, String(row.run_id));
+    for (const attempt of status.attempts) if (attempt.outcome === 'unknown-sent'
+      && !status.events.some(event => event.kind === 'model/request-attempt-reconciled@v1' && event.attemptId === attempt.attemptId)) {
+      status = this.reconcileRequestAttempt(holder, attempt.attemptId);
+    }
+    return status;
+  }
+
+  stopCapture(lease: CaptureLease, stage: 'complete' | 'blocked' | 'unknown', reason: string): CaptureJob {
+    return this.withActivity(lease.activity, () => {
+      const row = this.#db.prepare('SELECT * FROM capture_work WHERE job_id=?').get(lease.jobId);
+      check(row && row.lease_token === lease.token && row.lease_activity === lease.activity.id
+        && row.generation === lease.generation, 'capture-lease-stale');
+      check(['complete','blocked','unknown'].includes(stage) && /^[a-z0-9-]{1,128}$/.test(reason), 'invalid-capture-result');
+      this.#db.prepare('UPDATE capture_work SET stage=?,reason=?,lease_token=NULL,lease_activity=NULL WHERE job_id=?')
+        .run(stage, reason, lease.jobId);
+      if (row.run_id && stage !== 'unknown') this.sealRequestRun(lease.activity, String(row.run_id));
+      return this.#captureJob(lease.jobId);
+    });
+  }
+
+  searchCaptureSources(lease: CaptureLease, query: string, cursor?: string): CaptureSourcePage {
+    return this.withActivity(lease.activity, () => {
+      const job = this.#captureLease(lease);
+      check(job.stage === 'verifying', 'capture-stage-mismatch');
+      check(typeof query === 'string' && query.trim().length > 0 && Buffer.byteLength(query) <= 512, 'invalid-source-query');
+      const terms = query.normalize('NFC').toLocaleLowerCase().trim().split(/\s+/u);
+      const raw: CaptureSourcePage['results'] = cursor ? [] : job.range.filter(ref => {
+        const text = this.#archiveRef(ref).text.normalize('NFC').toLocaleLowerCase();
+        return terms.some(term => text.includes(term));
+      }).map(ref => { const points = Array.from(this.#archiveRef(ref).text);
+        return { ref, preview: points.slice(0, 160).join(''), offset: 0, end: points.length }; });
+      const published = this.searchSources(lease.activity, { query, limit: 16, byteBudget: 16384, ...(cursor ? { cursor } : {}) });
+      const hits = [...raw];
+      for (const hit of published.results) if (hit.kind !== 'proposal' && hit.sourceProjectId === job.scope.id) {
+        const { unit, text } = this.#sourceUnit(hit.unitId);
+        if (!hits.some(item => sameSourceAck(item.ref, unit.ref))) hits.push({ ref: unit.ref, unitId: unit.unitId,
+          preview: Array.from(text).slice(0, 160).join(''), offset: unit.offset, end: unit.offset + unit.length });
+      }
+      const page: CaptureSourcePage = { status: published.status, results: hits.slice(0, 16),
+        truncated: hits.length > 16 || published.truncated, nextCursor: published.nextCursor,
+        coverage: { rawEvents: job.range.length, published: published.coverage } };
+      this.#captureSourceBudget(job.jobId, Buffer.byteLength(JSON.stringify(page)));
+      const row = this.#db.prepare('SELECT searched_refs FROM capture_work WHERE job_id=?').get(job.jobId)!;
+      const refs = JSON.parse(String(row.searched_refs)) as CaptureSourcePage['results'];
+      for (const hit of page.results) if (!refs.some(item => sameSourceAck(item.ref, hit.ref) && item.offset === hit.offset && item.end === hit.end)) refs.push(hit);
+      this.#db.prepare('UPDATE capture_work SET searched_refs=? WHERE job_id=?')
+        .run(JSON.stringify(refs.map(({ preview: _preview, ...ref }) => ref)), job.jobId);
+      return page;
+    });
+  }
+
+  captureSourceReference(lease: CaptureLease, eventId: string): SourceAck {
+    return this.withActivity(lease.activity, () => {
+      this.#captureLease(lease); uuid(eventId);
+      const row = this.#db.prepare('SELECT searched_refs FROM capture_work WHERE job_id=?').get(lease.jobId)!;
+      const hits = (JSON.parse(String(row.searched_refs)) as CaptureSourcePage['results']).filter(item => item.ref.eventId === eventId);
+      check(hits.length > 0 && hits.every(item => sameSourceAck(item.ref, hits[0]!.ref)), 'verification-source-not-discovered');
+      return structuredClone(hits[0]!.ref);
+    });
+  }
+
+  expandCaptureSource(lease: CaptureLease, input: { ref: SourceAck; offset: number; limit: number }): SourceExcerpt {
+    return this.withActivity(lease.activity, () => {
+      const job = this.#captureLease(lease);
+      check(job.stage === 'verifying' && input && Object.keys(input).sort().join(',') === 'limit,offset,ref', 'invalid-source-request');
+      const row = this.#db.prepare('SELECT searched_refs,expanded_refs FROM capture_work WHERE job_id=?').get(job.jobId)!;
+      const discovered = (JSON.parse(String(row.searched_refs)) as CaptureSourcePage['results'])
+        .find(item => sameSourceAck(item.ref, input.ref) && input.offset >= item.offset && input.offset < item.end);
+      check(discovered, 'verification-source-not-discovered');
+      if (discovered.unitId) this.#sourceUnit(discovered.unitId);
+      check(Number.isSafeInteger(input.offset) && input.offset >= 0 && Number.isSafeInteger(input.limit)
+        && input.limit > 0 && input.limit <= 4096, 'invalid-range');
+      const points = Array.from(this.#archiveRef(input.ref).text);
+      check(input.offset < points.length, 'invalid-range');
+      const text = points.slice(input.offset, Math.min(input.offset + input.limit, discovered.end)).join('');
+      this.#captureSourceBudget(job.jobId, Buffer.byteLength(text));
+      const refs = JSON.parse(String(row.expanded_refs)) as SourceAck[];
+      if (!refs.some(ref => sameSourceAck(ref, input.ref))) refs.push(input.ref);
+      this.#db.prepare('UPDATE capture_work SET expanded_refs=? WHERE job_id=?').run(JSON.stringify(refs), job.jobId);
+      const end = Math.min(input.offset + input.limit, discovered.end, points.length);
+      return { ref: structuredClone(input.ref), text, offset: input.offset, end, total: points.length,
+        truncated: input.offset > 0 || end < points.length, excerptHash: sha256(text) };
+    });
+  }
+
+  #captureSourceBudget(jobId: string, bytes: number): void {
+    const row = this.#db.prepare('SELECT budget,source_calls,source_bytes FROM capture_work WHERE job_id=?').get(jobId)!;
+    const budget = JSON.parse(String(row.budget)) as ProbeBudget;
+    check(Number(row.source_calls) < budget.maxToolCalls && Number(row.source_bytes) + bytes <= budget.maxTotalTokens, 'capture-source-budget');
+    this.#db.prepare('UPDATE capture_work SET source_calls=source_calls+1,source_bytes=source_bytes+? WHERE job_id=?').run(bytes, jobId);
+  }
+
+  completeCaptureVerification(lease: CaptureLease, result: CaptureVerification): CaptureJob {
+    return this.withActivity(lease.activity, () => {
+      const job = this.#captureLease(lease);
+      check(job.stage === 'verifying' && job.record, 'capture-stage-mismatch');
+      check(result && Object.keys(result).every(key => ['result','evidence','reason'].includes(key))
+        && ['pass','block','evidence-gap'].includes(result.result) && Array.isArray(result.evidence)
+        && result.evidence.length <= 16, 'invalid-verification');
+      const row = this.#db.prepare('SELECT expanded_refs FROM capture_work WHERE job_id=?').get(job.jobId)!;
+      const expanded = JSON.parse(String(row.expanded_refs)) as SourceAck[];
+      check(result.evidence.every(ref => expanded.some(actual => sameSourceAck(ref, actual)))
+        && (result.result !== 'pass' || result.evidence.length > 0), 'verification-independent-evidence-required');
+      let verdict = result.result;
+      let reason = verdict === 'pass' ? null : result.reason ?? `verifier-${verdict}`;
+      check(reason === null || typeof reason === 'string' && /^[a-z0-9-]{1,128}$/.test(reason), 'invalid-verification-reason');
+      if (verdict === 'pass') {
+        const roles = result.evidence.map(ref => this.#archiveRef(ref).role);
+        if (['preference','decision'].includes(job.record.type) && !roles.includes('user')) reason = 'owner-evidence-required';
+        const payload = JSON.parse(String(this.#db.prepare('SELECT payload FROM capture_jobs WHERE job_id=?').get(job.jobId)!.payload));
+        let task: AgentStatus | null = null;
+        if (payload.runId) {
+          const rows = this.#db.prepare("SELECT payload,hash FROM request_events WHERE run_id=? AND kind='agent/event@v1' ORDER BY seq").all(payload.runId);
+          check(rows.every(row => sha256(String(row.payload)) === row.hash), 'capture-evidence-gap');
+          task = replayAgent(rows.map(row => JSON.parse(String(row.payload)).event as AgentEvent),
+            Number(this.#db.prepare('SELECT count(*) AS n FROM request_attempts WHERE run_id=?').get(payload.runId)!.n));
+        }
+        const observed = task?.tools.filter(tool => tool.result?.outcome === 'success'
+          && result.evidence.some(ref => sameSourceAck(ref, tool.result?.source))) ?? [];
+        const fileObservation = result.evidence.some(ref => this.#db.prepare(`SELECT e.payload,e.hash FROM request_events e
+          JOIN request_runs r ON r.run_id=e.run_id JOIN execution_streams s ON s.stream_id=r.stream_id
+          WHERE s.principal_id=? AND s.project_id=? AND e.kind='agent/event@v1'
+            AND json_extract(e.payload,'$.event.kind')='tool-result'
+            AND json_extract(e.payload,'$.event.result.source.eventId')=?
+            AND json_extract(e.payload,'$.event.result.source.binding.sessionId')=?`)
+          .all(this.#binding.ownerId, this.#binding.projectId, ref.eventId, ref.binding.sessionId).some(row => {
+            check(sha256(String(row.payload)) === row.hash, 'capture-evidence-gap');
+            const tool = JSON.parse(String(row.payload)).event.result;
+            return tool.outcome === 'success' && typeof tool.file?.text === 'string' && sameSourceAck(tool.source, ref);
+          }));
+        if (job.record.type === 'fact' && !fileObservation) reason = 'objective-fact-authority-required';
+        if (job.record.type === 'episode' && !(task?.terminal === 'completed' && observed.length > 0)) reason = 'task-outcome-required';
+        if (reason) verdict = 'evidence-gap';
+      }
+      const current = job.record;
+      const runId = this.#saveVerification(current, verdict, result.evidence, 'independent-verifier@1', reason);
+      const after = this.#withMemoryHash({ ...current, verificationRunId: runId,
+        lifecycle: verdict === 'block' && current.lifecycle !== 'tombstoned' ? 'rejected' : current.lifecycle,
+        verification: verdict === 'pass' ? 'verified' : 'unverified', headEventId: randomUUID() });
+      this.#appendMemoryEvent(current, after, 'verify', current.source.eventId,
+        { runId, result: verdict, evidence: result.evidence, lane: 'normal-capture', jobId: job.jobId },
+        this.#requestDigest('verify', current, { jobId: job.jobId, verdict, evidence: result.evidence }));
+      this.#db.prepare(`UPDATE capture_work SET stage=?,reason=?,expected_head_id=?,lease_token=NULL,lease_activity=NULL WHERE job_id=?`)
+        .run(verdict === 'pass' ? 'complete' : 'blocked', reason, after.headEventId, job.jobId);
+      return this.#captureJob(job.jobId);
+    });
+  }
+
+  queueOwnerCapture(activity: Activity, input: SourceAck, noActiveProject = false): { jobId: string; stage: CaptureJob['stage']; reason: string | null } {
     return this.withActivity(activity, () => {
       check(typeof noActiveProject === 'boolean' && input?.binding && sameBinding(input.binding, this.#binding), 'source-scope-mismatch');
       const owner = this.#archiveRef(input);
@@ -1866,7 +2409,8 @@ export class ProbeStore {
         check(sha256(String(existing.payload)) === existing.payload_hash && payload.schema === 'capture-job@1'
           && JSON.stringify(payload.source) === JSON.stringify(input) && existing.status === 'pending'
           && payload.reason === 'memory-type-required', 'capture-evidence-gap');
-        return { jobId: String(existing.job_id), stage: 'pending', reason: 'memory-type-required' };
+        const status = this.#captureJob(String(existing.job_id));
+        return { jobId: status.jobId, stage: status.stage, reason: status.reason };
       }
       const scope: MemoryScope = noActiveProject ? { kind: 'session', id: this.#binding.sessionId, resolved: false }
         : { kind: 'project', id: this.#binding.projectId, resolved: true };
@@ -3267,13 +3811,20 @@ export class ProbeStore {
 
   saveEvolutionProposal(activity: Activity, input: SourceAck, proposal: EvolutionProposalInput): EvolutionProposal {
     return this.withActivity(activity, () => {
-      check(Object.keys(proposal).every(key => ['target','expectedChange','owner','scope','evidenceRefs','evaluation','supersedes','targetType','risk'].includes(key)), 'invalid-proposal');
+      check(Object.keys(proposal).every(key => ['target','expectedChange','owner','scope','evidenceRefs','sourceUnits','evaluation','supersedes','targetType','risk'].includes(key)), 'invalid-proposal');
       check(typeof proposal.target === 'string' && proposal.target.length > 0 && Buffer.byteLength(proposal.target) <= 4096
         && typeof proposal.expectedChange === 'string' && proposal.expectedChange.length > 0 && Buffer.byteLength(proposal.expectedChange) <= 65536
         && proposal.owner === this.#binding.ownerId, 'invalid-proposal');
       const scope = this.#validateScope(proposal.scope);
       this.#validateSource(input, undefined, scope);
-      check(scope.resolved && Array.isArray(proposal.evidenceRefs) && proposal.evidenceRefs.length > 0 && proposal.evidenceRefs.length <= 32, 'invalid-proposal');
+      const sourceUnits = proposal.sourceUnits ?? [];
+      check(scope.resolved && Array.isArray(proposal.evidenceRefs) && Array.isArray(sourceUnits)
+        && proposal.evidenceRefs.length + sourceUnits.length > 0 && proposal.evidenceRefs.length + sourceUnits.length <= 32
+        && new Set(sourceUnits).size === sourceUnits.length, 'invalid-proposal');
+      for (const unitId of sourceUnits) {
+        const { unit } = this.#sourceUnit(unitId);
+        check(scope.kind === 'project' && unit.projectId === scope.id, 'source-scope-mismatch');
+      }
       for (const ref of proposal.evidenceRefs) this.#validateSource(ref, undefined, scope);
       const evaluation = proposal.evaluation;
       check(evaluation?.schema === 'evaluation-contract@1' && ['L0','L1','L2','L3'].includes(evaluation.level)
@@ -3298,6 +3849,7 @@ export class ProbeStore {
       const value: Omit<EvolutionProposal, 'hash'> = { schema: 'evolution-proposal@1', proposalId, version, target: proposal.target,
         expectedChange: proposal.expectedChange, owner: proposal.owner, scope, input: structuredClone(input),
         targetType, risk, evidenceRefs: structuredClone(proposal.evidenceRefs), evaluation: structuredClone(evaluation),
+        ...(sourceUnits.length ? { sourceUnits: [...sourceUnits] } : {}),
         supersedes: proposal.supersedes ?? null, inert: true };
       const payload = JSON.stringify(value);
       const result = { ...value, hash: sha256(payload) };
@@ -3309,6 +3861,7 @@ export class ProbeStore {
         this.#db.prepare('INSERT INTO proposal_evidence VALUES (?,?,?,?,?,?,?)')
           .run(proposalId, ordinal, ref.binding.sessionId, ref.eventId, ref.locator, ref.hash, ref.contentHash);
       }
+      for (const [ordinal, unitId] of sourceUnits.entries()) this.#db.prepare('INSERT INTO proposal_source_units VALUES (?,?,?)').run(proposalId, ordinal, unitId);
       if (scope.kind === 'project') this.#enqueueSourceProjection('proposal', proposalId, proposalId, scope.id, version, result.hash);
       return result;
     });
@@ -3340,6 +3893,10 @@ export class ProbeStore {
       const refs = [value.input, ...value.evidenceRefs];
       this.#checkEvidenceRows('proposal_evidence', 'proposal_id', proposalId, refs);
       for (const ref of refs) this.#validateSource(ref, undefined, value.scope, projects);
+      const units = this.#db.prepare('SELECT ordinal,unit_id FROM proposal_source_units WHERE proposal_id=? ORDER BY ordinal').all(proposalId);
+      check(Array.isArray(value.sourceUnits ?? []) && units.length === (value.sourceUnits?.length ?? 0)
+        && units.every((row, i) => row.ordinal === i && row.unit_id === value.sourceUnits![i]), 'proposal-evidence-gap');
+      for (const id of value.sourceUnits ?? []) check(value.scope.kind === 'project' && this.#sourceUnit(id).unit.projectId === value.scope.id, 'source-scope-mismatch');
       return { ...value, hash: String(row.payload_hash) };
   }
 
@@ -3353,12 +3910,12 @@ export class ProbeStore {
     }
   }
 
-  #insertCandidate(record: MemoryRecord, job: Record<string, unknown>, request: string, context: SourceAck[] = []): void {
+  #insertCandidate(record: MemoryRecord, job: Record<string, unknown>, request: string, context: SourceAck[] = [], captureJobId?: string): void {
     this.#db.prepare('INSERT INTO memory_records VALUES (?, ?, ?, ?, ?)')
       .run(record.recordId, this.#binding.ownerId, record.claimKey, record.source.binding.sessionId, new Date().toISOString());
     this.#insertRevision(record, context);
     const capturePayload = JSON.stringify({ schema: 'capture-job@1', source: record.source, recordId: record.recordId, ...job });
-    this.#db.prepare('INSERT INTO capture_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    if (!captureJobId) this.#db.prepare('INSERT INTO capture_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
       .run(randomUUID(), record.source.eventId, record.recordId, 'complete', capturePayload, sha256(capturePayload),
         new Date().toISOString(), record.source.binding.sessionId);
     this.#appendMemoryEvent(null, record, 'capture', record.source.eventId, { automatic: true, ...job }, request);
@@ -3465,7 +4022,18 @@ export class ProbeStore {
       const { ref } = request;
       check(sameBinding(ref?.binding, this.#binding), 'source-scope-mismatch');
       this.#validateSource(ref);
-      const points = Array.from(this.#readSource!(ref).text);
+      const raw = this.#readSource!(ref).text;
+      const artifact = parseAnalysisArtifact(raw);
+      if (artifact) {
+        const intent = this.readIntent(activity);
+        check(intent?.status === 'active' && intent.intentId === artifact.header.intentId, 'analysis-task-not-active');
+        for (const evidence of artifact.header.evidence) if ('unitId' in evidence.request && evidence.request.grantId) {
+          const grant = this.#db.prepare("SELECT state,intent_id,session_id FROM memory_discovery_grants WHERE grant_id=?").get(evidence.request.grantId);
+          check(grant?.state === 'active' && grant.intent_id === intent.intentId && grant.session_id === this.#binding.sessionId, 'discovery-not-authorized');
+        }
+        this.#analysisReferences(raw);
+      }
+      const points = Array.from(raw);
       check(offset <= points.length, 'invalid-range');
       const text = points.slice(offset, offset + limit).join('');
       const end = Math.min(offset + limit, points.length);

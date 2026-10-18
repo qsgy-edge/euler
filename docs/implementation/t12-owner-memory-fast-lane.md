@@ -1,6 +1,6 @@
 # T12: explicit owner memory fast lane and durable Host Info (synthetic)
 
-Issue: [#12](https://github.com/qsgy-edge/euler/issues/12). This slice uses only disposable SQLite, synthetic CLI archives and the local counting transport. The disposable schema is version 14; there is no production migration or live owner switch.
+Issue: [#12](https://github.com/qsgy-edge/euler/issues/12). This slice uses only disposable SQLite, synthetic CLI archives and the local counting transport. The disposable schema is version 15; there is no production migration or live owner switch.
 
 ## Owner statement grammar
 

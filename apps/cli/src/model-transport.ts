@@ -2,7 +2,7 @@ import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import type { Model } from '@earendil-works/pi-ai';
 import { check, CORE_TOOLS, sha256 } from '@euler/core';
-import type { ModelReply, ModelRequest, NeutralRequest, ProbeBudget } from '@euler/core';
+import type { CaptureFailure, ModelReply, ModelRequest, NeutralRequest, ProbeBudget } from '@euler/core';
 import type { AuthorizeSend } from './agent-pump.ts';
 
 // A single text/tool protocol using the pi-ai Model interface. No SDK auth
@@ -41,7 +41,7 @@ export class HttpModelTransport {
     return JSON.stringify({ model: this.#model.id, stream: false, max_tokens: this.#budget.outputReserve, messages,
       tools: request.p0.tools.map(tool => ({ type: 'function', function: { name: tool.name.replaceAll('.', '_'), description: tool.description, parameters: tool.parameters } })) });
   }
-  async *stream(request: ModelRequest, signal: AbortSignal, authorizeSend: AuthorizeSend): AsyncIterable<{ kind: 'complete'; reply: ModelReply }> {
+  async *stream(request: ModelRequest, signal: AbortSignal, authorizeSend: AuthorizeSend): AsyncIterable<{ kind: 'complete'; reply: ModelReply; failure?: CaptureFailure; responseHash?: string }> {
     const credential = this.#credential();
     check(typeof credential === 'string' && credential.length > 0 && credential.length <= 8192 && !/[\r\n]/.test(credential), 'credential-unavailable');
     const payload = request.payload; // primitive, immutable final bytes
@@ -71,7 +71,9 @@ export class HttpModelTransport {
       } catch (error) { reject(error); }
     });
     if (received.status !== 200) {
-      yield { kind: 'complete', reply: { text: 'Provider request failed.', calls: [], stop: 'error' } }; return;
+      const failure: CaptureFailure = received.status === 429 ? 'rate-limit' : received.status === 408 ? 'timeout'
+        : received.status >= 500 ? 'temporary-unavailable' : 'permanent';
+      yield { kind: 'complete', reply: { text: 'Provider request failed.', calls: [], stop: 'error' }, failure, responseHash: sha256(received.body) }; return;
     }
     check(!received.body.includes(credential), 'response-contained-credential');
     const data = JSON.parse(received.body) as { model?: unknown; usage?: { prompt_tokens?: unknown; completion_tokens?: unknown }; choices?: { finish_reason?: string; message?: { role?: string; content?: unknown; tool_calls?: unknown } }[] };
@@ -91,7 +93,7 @@ export class HttpModelTransport {
     check(['stop', 'tool_calls', 'length'].includes(choice.finish_reason ?? ''), 'unsupported-stop-reason');
     const usage = data.usage;
     const validUsage = usage && [usage.prompt_tokens, usage.completion_tokens].every(value => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 1_000_000);
-    yield { kind: 'complete', reply: { text: message.content ?? '', calls,
+    yield { kind: 'complete', responseHash: sha256(received.body), reply: { text: message.content ?? '', calls,
       ...(validUsage ? { usage: { input: Number(usage.prompt_tokens), output: Number(usage.completion_tokens) } } : {}),
       ...(typeof data.model === 'string' && data.model.length <= 256 ? { modelHash: sha256(data.model) } : {}),
       stop: choice.finish_reason === 'tool_calls' ? 'tools' : choice.finish_reason === 'length' ? 'length' : 'end' } };

@@ -12,6 +12,8 @@ import { openProbe } from './probe.ts';
 import { startCli } from './process-driver.ts';
 import { AGENT_BUDGET, runAgentDemo } from './agent-cli.ts';
 import { runInfoQuery, runRememberSession } from './owner-memory.ts';
+import { runHandoffDemo } from './analysis-handoff.ts';
+import { runCaptureDemo } from './capture.ts';
 import { killPoint } from './kill-point.ts';
 import memoryFixture from '../../../fixtures/scoped-memory.json' with { type: 'json' };
 
@@ -221,7 +223,7 @@ async function memoryWorker(sandbox: Sandbox, scenario: string) {
 async function main() {
   const args = parseArgs({ allowPositionals: true, options: {
     sandbox: { type: 'string' }, scenario: { type: 'string', default: 'success' }, budget: { type: 'string' },
-    request: { type: 'string' }, record: { type: 'string' }, reservation: { type: 'string' },
+    request: { type: 'string' }, job: { type: 'string' }, record: { type: 'string' }, reservation: { type: 'string' },
     'transport-config': { type: 'string' }, interactive: { type: 'boolean', default: false },
     attempt: { type: 'string' },
     'accept-duplicate-risk': { type: 'boolean', default: false },
@@ -232,17 +234,30 @@ async function main() {
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
   const requestCommands = ['request-status', 'request-seal', 'request-reconcile', 'request-resume', 'request-gap'];
-  check([...requestCommands, 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
+  check([...requestCommands, 'capture-status', 'capture-reconcile', 'handoff', 'capture', 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
   const options = args.values.budget ? JSON.parse(args.values.budget) as Partial<ProbeBudget> : {};
   check(!args.values['wait-child-launch'] || command === 'hold', 'hold-only-option');
   check(Object.keys(options).every(key => key in DEFAULT_BUDGET), 'invalid-budget');
   const budget = { ...DEFAULT_BUDGET, ...options };
   if (['run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'remember', 'info', 'hold', 'task', 'maintain', 'maintenance-status'].includes(command)) check(args.values.sandbox, 'sandbox-required');
+  if (['capture-status','capture-reconcile'].includes(command)) check(args.values.sandbox, 'sandbox-required');
+  if (command === 'capture-reconcile') check(args.values.job, 'capture-identity-required');
+  if (['capture','handoff'].includes(command)) check(!args.values['transport-config'], 'capture-real-route-unavailable');
   if (requestCommands.includes(command)) check(args.values.sandbox && args.values.request, 'request-identity-required');
   // Fault injection never modifies a caller-selected existing sandbox.
   if (command === 'archive-failure' || args.values.scenario === 'archive-failure') check(!args.values.sandbox, 'fault-requires-fresh-sandbox');
   const sandbox = args.values.sandbox ? openSandbox(args.values.sandbox) : createSandbox();
   emit('sandbox', { root: sandbox.root, storeId: sandbox.storeId, fixtureDigest: sandbox.fixtureDigest, mode: 'synthetic-only' });
+  if (command === 'capture-status' || command === 'capture-reconcile') {
+    const probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
+    try {
+      if (command === 'capture-reconcile') emit('capture-reconciliation', { ledger: probe.store.reconcileCaptureJob(probe.activity, args.values.job!) });
+      emit('capture-status', { jobs: args.values.job ? [probe.store.readCaptureJob(probe.activity, args.values.job)] : probe.store.listCaptureJobs(probe.activity) });
+    } finally { probe.close(); }
+    return;
+  }
+  if (command === 'handoff') return runHandoffDemo(sandbox, args.values.scenario);
+  if (command === 'capture') return runCaptureDemo(sandbox, args.values.scenario);
   if (command === 'agent') return runAgentDemo(sandbox, args.values.scenario === 'success' ? 'tool' : args.values.scenario,
     { ...AGENT_BUDGET, ...options }, { interactive: args.values.interactive,
       ...(args.values['transport-config'] ? { transportConfig: args.values['transport-config'] } : {}),
