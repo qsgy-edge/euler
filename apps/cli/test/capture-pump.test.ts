@@ -19,7 +19,7 @@ test('a capture archive failure remains observable with its original code after 
     const run = new CaptureRun(probe.store, lease, {
       lookup: probe.archive.lookup.bind(probe.archive), read: probe.archive.read.bind(probe.archive), expand: probe.archive.expand.bind(probe.archive),
       append() { throw new Error('archive-limit'); },
-    }, { proposer: [route], verifier: [route] });
+    }, { proposer: [route], verifier: [route] }, undefined, 'capture-counting@1');
     await assert.rejects(pumpCapture(run, { async *stream(request, _signal, send) {
       const attempt = send(request.payload); probe.transport.send(request.payload, attempt);
       yield { kind: 'complete', reply: { text: 'null', calls: [], stop: 'end' } };

@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
@@ -27,13 +27,20 @@ export function configuredTransport(path: string) {
     transport: new HttpModelTransport(model, config.budget, () => process.env[config.credentialEnv] ?? '') };
 }
 
-export function verifyTransportPrerequisites(extraTests: string[] = [], event = 'agent-prerequisites'): void {
+export async function verifyTransportPrerequisites(extraTests: string[] = [], event = 'agent-prerequisites', signal?: AbortSignal): Promise<void> {
   const root = fileURLToPath(new URL('../../../', import.meta.url));
   const tests = ['archive', 'persistence', 'search-projection', 'request-ledger', 'request-recovery', 'request-admission', 'request-ledger-boundaries', 'agent-run', 'agent-boundaries', 'model-transport', ...extraTests]
     .map(name => `apps/cli/test/${name}.test.ts`);
-  const result = spawnSync(process.execPath, ['--test', ...tests], { cwd: root, encoding: 'utf8', timeout: 120000, maxBuffer: 4_194_304 });
-  process.stdout.write(JSON.stringify({ event, command: ['node', '--test', ...tests], exitCode: result.status,
+  // Preflight can run under node:test; execute the actual suite without multiplying its worker pools.
+  const command = ['--test', '--test-concurrency=1', ...tests];
+  const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
+  const result = await new Promise<{ status: number | null; stdout: string; stderr: string }>(resolve => {
+    execFile(process.execPath, command, { cwd: root, encoding: 'utf8', timeout: 120000, maxBuffer: 4_194_304,
+      env, ...(signal ? { signal } : {}) }, (error, stdout, stderr) => resolve({ status: error ? typeof error.code === 'number' ? error.code : null : 0, stdout, stderr }));
+  });
+  process.stdout.write(JSON.stringify({ event, command: ['node', ...command], exitCode: result.status,
     outputHash: sha256((result.stdout ?? '') + (result.stderr ?? '')), passed: result.status === 0 }) + '\n');
+  signal?.throwIfAborted();
   check(result.status === 0, 'prerequisite-evidence-gap');
 }
 

@@ -9,7 +9,7 @@ const job = probe.store.queueOwnerCapture(probe.activity, source);
 const budget = { ...DEFAULT_BUDGET, contextLimit: 20000, maxTotalTokens: 100000, maxModelAttempts: 8 };
 const route = { provider: 'synthetic', model: 'crash-fixture', route: 'synthetic-capture', authNamespace: 'synthetic', capability: 'standard' as const };
 const lease = probe.store.claimCaptureJob(probe.activity, job.jobId, budget, 1000)!;
-const run = new CaptureRun(probe.store, lease, probe.archive, { proposer: [route], verifier: [route] });
+const run = new CaptureRun(probe.store, lease, probe.archive, { proposer: [route], verifier: [route] }, undefined, 'capture-counting@1');
 const request = run.nextModel()!;
 const attempt = run.startModel(request, request.payload);
 if (point !== 'before-send') {

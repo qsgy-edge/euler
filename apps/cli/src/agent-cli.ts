@@ -14,7 +14,7 @@ import { openProbe } from './probe.ts';
 import { pumpAgent } from './agent-pump.ts';
 import type { AgentPump } from './agent-pump.ts';
 import { configuredTransport, verifyTransportPrerequisites } from './model-transport.ts';
-import { createCaptureWorker, reportCaptureFailure } from './capture.ts';
+import { scheduleCaptures } from './capture.ts';
 import fixture from '../../../fixtures/controlled-agent.json' with { type: 'json' };
 
 export const AGENT_BUDGET: ProbeBudget = { version: 'probe-budget@1', contextLimit: 32000, outputReserve: 1024,
@@ -29,12 +29,11 @@ export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: P
     emit('agent-evidence-gap', { reason: 'explicit-route-model-auth-budget-required', sends: 0 }); process.exitCode = 1; return;
   }
   const configured = scenario === 'real' ? configuredTransport(options.transportConfig!) : null;
-  if (configured) { budget = configured.budget; verifyTransportPrerequisites(); }
+  if (configured) { budget = configured.budget; await verifyTransportPrerequisites(); }
   if (scenario === 'budget') budget = { ...budget, maxModelAttempts: 1 };
   const probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
-  const capture = createCaptureWorker(options.captureConfig, reportCaptureFailure);
-  try { await capture(probe); }
-  catch (error) { probe.close(); throw error; }
+  const capture = scheduleCaptures(probe, options.captureConfig);
+  capture.kick(true);
   const transport = configured?.transport;
   const route = configured ? { provider: configured.model.provider, model: configured.model.id, route: configured.model.baseUrl, authNamespace: configured.authNamespace }
     : { provider: 'fake', model: 'controlled', route: 'fixture', authNamespace: 'synthetic' };
@@ -77,14 +76,14 @@ export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: P
       yield { kind: 'partial', reply };
       yield { kind: 'complete', reply };
     },
-    async cooperate() { await capture(probe, true); },
+    async cooperate() { capture.kick(true); },
     async execute(call) { return String(call.arguments.text); },
   };
-  const cancel = () => run.cancel();
+  const cancel = () => { run.cancel(); void capture.close(); };
   process.on('SIGINT', cancel);
   try {
     run.receive(randomUUID(), scenario === 'files' ? filesFixture.input : scenario === 'plain' ? fixture.plain : fixture.tool);
-    await capture(probe, true);
+    capture.kick(true);
     if (options.interactive) {
       emit('agent-controls', { commands: ['steer', 'follow-up', 'queue', 'cancel', 'status'], syntheticInputsOnly: true });
       lines = createInterface({ input: process.stdin });
@@ -92,7 +91,7 @@ export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: P
         try {
           if (pendingApproval && line === `approve ${pendingApproval.token}`) pendingApproval.decide('approved');
           else if (pendingApproval && line === `reject ${pendingApproval.token}`) pendingApproval.decide('rejected');
-          else if (line === 'cancel') run.cancel();
+          else if (line === 'cancel') cancel();
           else if (line === 'status') emit('agent-status', { runId: run.runId, ...run.status() });
           else if (['steer', 'follow-up', 'queue'].includes(line)) {
             const mode = line as 'steer' | 'follow-up' | 'queue';
@@ -112,10 +111,10 @@ export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: P
           fileCapability: files ? 'windows-handles' : 'unavailable' } : {}), networkCount: transport?.count ?? 0, fixtureProviderCount: requests,
         sourceMechanism: 'CLI JSONL + SQLite WAL FULL', realProvider: Boolean(transport) });
       if (status.terminal !== 'completed') process.exitCode = 1;
-      await capture(probe);
       const next = run.followUp();
-      if (!next) break;
+      if (!next) { await capture.flush(); break; }
       run = next;
+      capture.kick(true);
     }
-  } finally { lines?.close(); process.off('SIGINT', cancel); probe.close(); }
+  } finally { lines?.close(); process.off('SIGINT', cancel); await capture.close(); probe.close(); }
 }

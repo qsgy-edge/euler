@@ -18,13 +18,13 @@ function scenario(action: (value: { probe: ReturnType<typeof openProbe>; run: Ca
     const job = probe.store.queueOwnerCapture(probe.activity, source);
     const lease = probe.store.claimCaptureJob(probe.activity, job.jobId,
       { ...DEFAULT_BUDGET, maxModelAttempts: 8, contextLimit: 20000, maxTotalTokens: 100000 }, 30000)!;
-    let run = new CaptureRun(probe.store, lease, probe.archive, { proposer: [primary, fallback], verifier: [primary, fallback] });
+    let run = new CaptureRun(probe.store, lease, probe.archive, { proposer: [primary, fallback], verifier: [primary, fallback] }, undefined, 'capture-counting@1');
     action({ probe, run, jobId: job.jobId, source, deliver(reply, failure) {
       let request = run.nextModel();
       if (!request && run.status().stage === 'verifying') {
         const next = probe.store.claimCaptureJob(probe.activity, job.jobId,
           { ...DEFAULT_BUDGET, maxModelAttempts: 8, contextLimit: 20000, maxTotalTokens: 100000 }, 30000)!;
-        run = new CaptureRun(probe.store, next, probe.archive, { proposer: [primary, fallback], verifier: [primary, fallback] });
+        run = new CaptureRun(probe.store, next, probe.archive, { proposer: [primary, fallback], verifier: [primary, fallback] }, undefined, 'capture-counting@1');
         request = run.nextModel();
       }
       assert(request);

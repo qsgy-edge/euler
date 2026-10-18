@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import type { SourceUnitInput } from '@euler/core';
+import type { EvolutionProposalInput, SourceUnitInput } from '@euler/core';
 import { openProbe } from '../../src/probe.ts';
+
+export function saveApprovedProposal(probe: ReturnType<typeof openProbe>, proposal: EvolutionProposalInput) {
+  const input = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'analysis-proposal-approval@1', proposal }), 'user');
+  return probe.store.saveEvolutionProposal(probe.activity, input, proposal);
+}
 
 export function approvedSourceUnit(probe: ReturnType<typeof openProbe>, input: Omit<SourceUnitInput, 'approval'>): SourceUnitInput {
   const current = probe.store.readIntent(probe.activity);

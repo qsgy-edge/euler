@@ -182,9 +182,11 @@ async function memoryDemo(sandbox: Sandbox) {
     const activated = probe.store.activateMemory(probe.activity, verified.record.recordId, verified.record);
     const proposalInput = { target: 'synthetic/AGENTS.md', expectedChange: 'Explain the synthetic receipt rule', owner: sandbox.fixture.ownerId,
       scope: options.scope, evidenceRefs: [input], evaluation: { schema: 'evaluation-contract@1' as const, level: 'L0' as const, assertions: ['Check synthetic source bytes'] } };
-    const proposal = probe.store.saveEvolutionProposal(probe.activity, input, proposalInput);
-    const revision = probe.store.saveEvolutionProposal(probe.activity, input, { ...proposalInput,
-      expectedChange: 'Explain the synthetic receipt rule and scope', supersedes: proposal.proposalId });
+    const proposalApproval = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'analysis-proposal-approval@1', proposal: proposalInput }));
+    const proposal = probe.store.saveEvolutionProposal(probe.activity, proposalApproval, proposalInput);
+    const revisionInput = { ...proposalInput, expectedChange: 'Explain the synthetic receipt rule and scope', supersedes: proposal.proposalId };
+    const revisionApproval = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'analysis-proposal-approval@1', proposal: revisionInput }));
+    const revision = probe.store.saveEvolutionProposal(probe.activity, revisionApproval, revisionInput);
     emit('memory-result', { synthetic: true, intent, captured, verified, activated, proposals: [proposal, revision],
       eligible: probe.store.listEligibleMemories(probe.activity), inspection: probe.store.inspectMemory(probe.activity, activated.record.recordId),
       outbox: probe.store.pendingMemoryProjections(probe.activity) });

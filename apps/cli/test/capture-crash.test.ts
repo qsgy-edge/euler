@@ -22,7 +22,7 @@ for (const point of ['before-send', 'after-send', 'after-proposal']) test(`a rea
       const job = probe.store.listCaptureJobs(probe.activity)[0]!;
       const lease = probe.store.claimCaptureJob(probe.activity, job.jobId, budget, 10000)!;
       assert(lease);
-      const run = new CaptureRun(probe.store, lease, probe.archive, { proposer: [route], verifier: [route] });
+      const run = new CaptureRun(probe.store, lease, probe.archive, { proposer: [route], verifier: [route] }, undefined, 'capture-counting@1');
       const ledger = probe.store.requestStatus(lease.activity, run.runId);
       assert.equal(ledger.run.ownerId, job.jobId);
       assert.equal(ledger.attempts.length, 1);

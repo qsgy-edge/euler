@@ -682,6 +682,7 @@ const HOST_INFO_SELECT = `SELECT b.*, a.payload AS batch_payload, a.payload_hash
 
 // P0 disposable schema; not migrations/001-initial.sql and not the execution ledger.
 export class ProbeStore {
+  readonly #liveCapturePumps = new Map<string, { lease: CaptureLease; runId: string }>();
   readonly #db: DatabaseSync;
   readonly #storeId: string;
   readonly #binding: Binding;
@@ -1339,7 +1340,7 @@ export class ProbeStore {
             OR EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='agent/event@v1' AND json_extract(e.payload,'$.event.result.outcome')='unknown'))))
       AND NOT EXISTS(SELECT 1 FROM request_runs child WHERE child.related_run_id=r.run_id)`)
       .all(stream.projectId, stream.principalId, currentRunId ?? '');
-    check(blockers.every(row => row.run_id === relatedRunId), 'request-recovery-required');
+    check(blockers.every(row => row.run_id === relatedRunId || this.#liveCapture(String(row.run_id))), 'request-recovery-required');
   }
 
   authorizeRequestRun(activity: Activity, runId: string, input: { budget: ProbeBudget; intent: { eventId: string; hash: string } | null; relatedRunId: string | null; acceptDuplicateRisk?: boolean }): RequestRun {
@@ -2104,7 +2105,7 @@ export class ProbeStore {
       reason: unavailable ?? (work ? work.reason as string | null : payload.reason ?? null), record };
   }
 
-  deferCaptureJobs(activity: Activity, reason: 'capture-route-unavailable' | 'capture-configuration-unavailable' | 'foreground-run-active' | 'request-recovery-required' | 'prerequisite-evidence-gap'): CaptureJob[] {
+  deferCaptureJobs(activity: Activity, reason: 'capture-route-unavailable' | 'capture-configuration-unavailable' | 'foreground-run-active' | 'request-recovery-required' | 'prerequisite-evidence-gap' | 'capture-stopped'): CaptureJob[] {
     return this.withActivity(activity, () => this.listCaptureJobs(activity, 16, true).map(job => {
       this.#db.prepare(`INSERT INTO capture_work(job_id,stage,reason,record_id,expected_head_id,lease_until,generation,budget,deadline)
         VALUES (?,'pending',?,?,?,0,1,NULL,0) ON CONFLICT(job_id) DO UPDATE SET reason=excluded.reason
@@ -2114,13 +2115,41 @@ export class ProbeStore {
     }));
   }
 
-  captureDrainBlocked(activity: Activity): boolean {
+  captureDrainBlocked(activity: Activity, currentRunId?: string): boolean {
     return this.withActivity(activity, () => {
-      try { this.#requestRecoveryGate(activity, null); return false; }
+      try { this.#requestRecoveryGate(activity, null, currentRunId); return false; }
       catch (error) {
         if (error instanceof Error && error.message === 'request-recovery-required') return true;
         throw error;
       }
+    });
+  }
+
+  /** Volatile pump lifetime is local to this Store; a restart or another Store has no live exemption. */
+  observeCapturePump(lease: CaptureLease, runId: string): () => void {
+    this.withActivity(lease.activity, () => {
+      this.#captureLease(lease);
+      check(this.captureRuntime(lease).runId === runId && !this.#liveCapturePumps.has(lease.token), 'capture-runtime-mismatch');
+      this.#liveCapturePumps.set(lease.token, { lease, runId });
+    });
+    return () => { this.#liveCapturePumps.delete(lease.token); };
+  }
+
+  #liveCapture(runId: string): boolean {
+    const row = this.#db.prepare(`SELECT w.* FROM capture_work w JOIN request_runs r ON r.run_id=w.run_id
+      WHERE w.run_id=? AND r.state='authorized' AND w.stage IN ('proposing','verifying')
+        AND NOT EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='run-recovery-gap')`).get(runId);
+    const observed = row && this.#liveCapturePumps.get(String(row.lease_token));
+    return !!observed && observed.runId === runId && observed.lease.jobId === row!.job_id
+      && observed.lease.activity.id === row!.lease_activity && observed.lease.generation === row!.generation
+      && Number(row!.lease_until) > Date.now() && Number(row!.deadline) > Date.now();
+  }
+
+  pauseCapture(lease: CaptureLease): void {
+    this.withActivity(lease.activity, () => {
+      const job = this.#captureLease(lease), runtime = this.captureRuntime(lease);
+      check(!runtime.runId || this.requestStatus(lease.activity, runtime.runId).attempts.every(attempt => attempt.outcome !== 'unknown-sent'), 'attempt-reconciliation-required');
+      this.#db.prepare("UPDATE capture_work SET reason='foreground-run-active',lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?").run(job.jobId);
     });
   }
 
@@ -2265,7 +2294,7 @@ export class ProbeStore {
         route: input.route, fallbackOrdinal: input.fallbackOrdinal, configHash: input.configHash, inputHash: input.inputHash,
         outputHash: input.source.contentHash, outcome: input.outcome, callId, failureClass: input.failureClass ?? null,
         transportResponseHash: input.responseHash ?? null, ttftMs: null, cache: null,
-        promptVersion: 'capture-prompts@1', schemaVersion: 'capture-output@1', adapterVersion: 'capture-adapter@1', modelVersion: 'unknown' }), lease.activity.id);
+        promptVersion: 'capture-prompts@1', schemaVersion: 'capture-output@1', adapterVersion: attempt.adapterVersion, modelVersion: 'unknown' }), lease.activity.id);
     });
   }
 
@@ -3906,7 +3935,6 @@ export class ProbeStore {
 
   #assertProposalPublication(input: SourceAck, proposal: EvolutionProposalInput | Omit<EvolutionProposal, 'hash'>): void {
     for (const ref of [input, ...proposal.evidenceRefs]) check(!parseAnalysisArtifact(this.#archiveRef(ref).text), 'report-evidence-requires-approved-unit');
-    if (!(proposal.sourceUnits?.length)) return;
     const approval = this.#archiveRef(input);
     check(approval.role === 'user', 'proposal-publication-approval-required');
     let decision: { schema?: string; proposal?: EvolutionProposalInput };

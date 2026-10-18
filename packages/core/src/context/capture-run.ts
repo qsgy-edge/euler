@@ -63,10 +63,14 @@ export class CaptureRun {
   readonly #encode: ((request: NeutralRequest) => string) | undefined;
   #prepared: { request: ModelRequest; route: string; phase: Phase; ordinal: number } | null = null;
   #inflight: { attempt: RequestAttempt; route: string; phase: Phase; ordinal: number } | null = null;
+  readonly #adapterVersion: string;
+  #paused = false;
   #sent = false;
 
   constructor(store: ProbeStore, lease: CaptureLease, source: CaptureSource, config: CaptureConfig,
-    encode?: (request: NeutralRequest) => string) {
+    encode?: (request: NeutralRequest) => string, adapterVersion = 'capture-adapter@1') {
+    check(/^capture-[a-z0-9-]+@1$/.test(adapterVersion), 'invalid-capture-adapter');
+    this.#adapterVersion = adapterVersion;
     check(config && Object.keys(config).sort().join(',') === 'proposer,verifier', 'invalid-capture-config');
     for (const routes of [config.proposer, config.verifier]) {
       check(Array.isArray(routes) && routes.length > 0 && routes.length <= 3, 'invalid-capture-config');
@@ -78,7 +82,7 @@ export class CaptureRun {
       }
     }
     this.#store = store; this.#lease = lease; this.#source = source; this.#config = structuredClone(config);
-    this.#configHash = sha256(JSON.stringify(this.#config)); this.#encode = encode;
+    this.#configHash = sha256(JSON.stringify({ config: this.#config, adapterVersion })); this.#encode = encode;
     const runtime = store.captureRuntime(lease);
     this.#budget = runtime.budget; this.#deadline = runtime.deadline;
     this.#phase = runtime.job.stage === 'proposing' ? 'proposer' : 'verifier';
@@ -92,6 +96,7 @@ export class CaptureRun {
     }
   }
 
+  observeExecution(): () => void { return this.#store.observeCapturePump(this.#lease, this.runId); }
   status(): CaptureJob { return this.#store.readCaptureJob(this.#lease.activity, this.#lease.jobId); }
   remainingMs(): number { return Math.max(0, Math.min(this.#deadline, this.#lease.expiresAt) - Date.now()); }
   #steps(): Step[] {
@@ -100,10 +105,13 @@ export class CaptureRun {
   }
   nextModel(): ModelRequest | null {
     const status = this.status();
-    if (!['proposing','verifying'].includes(status.stage)
+    if (this.#paused || !['proposing','verifying'].includes(status.stage)
       || status.stage !== (this.#phase === 'proposer' ? 'proposing' : 'verifying')) return null;
     if (this.remainingMs() <= 0) { this.#store.stopCapture(this.#lease, 'blocked', 'capture-deadline'); return null; }
     check(!this.#inflight, 'model-in-flight');
+    if (this.#store.captureDrainBlocked(this.#lease.activity, this.runId)) {
+      this.#store.pauseCapture(this.#lease); this.#paused = true; return null;
+    }
     if (this.#prepared) return this.#prepared.request;
     const runtime = this.#store.captureRuntime(this.#lease);
     const phase: Phase = runtime.job.stage === 'proposing' ? 'proposer' : 'verifier';
@@ -164,7 +172,7 @@ export class CaptureRun {
     check(this.#prepared?.request === request && request.payload === payload && request.payloadHash === sha256(payload), 'payload-mismatch');
     this.#store.captureRuntime(this.#lease);
     const attempt = this.#store.startRequestAttempt(this.#lease.activity, { runId: this.runId, assemblyId: request.assemblyId,
-      payloadHash: sha256(payload), byteLength: Buffer.byteLength(payload), adapterVersion: 'capture-adapter@1' });
+      payloadHash: sha256(payload), byteLength: Buffer.byteLength(payload), adapterVersion: this.#adapterVersion });
     this.#inflight = { attempt, route: this.#prepared.route, phase: this.#prepared.phase, ordinal: this.#prepared.ordinal };
     this.#prepared = null; this.#sent = false;
     return attempt;

@@ -6,7 +6,7 @@ import { AnalysisArtifacts } from '@euler/core';
 import type { EvolutionProposalInput } from '@euler/core';
 import { createSandbox } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
-import { approvedSourceUnit } from './support/source-publication.ts';
+import { approvedSourceUnit, saveApprovedProposal } from './support/source-publication.ts';
 
 function scenario(run: (probe: ReturnType<typeof openProbe>, artifacts: AnalysisArtifacts) => void) {
   const sandbox = createSandbox(), probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
@@ -57,8 +57,7 @@ test('approved report background does not authorize unapproved proposal text', (
 test('a legacy proposal export includes its approved raw evidence and immutable provenance', () => {
   scenario((probe, artifacts) => {
     const source = probe.archive.append(randomUUID(), '合成观察：日志缺少环境字段。');
-    const input = probe.archive.append(randomUUID(), '保存待验证建议');
-    const saved = probe.store.saveEvolutionProposal(probe.activity, input, { ...proposal(probe), evidenceRefs: [source] });
+    const saved = saveApprovedProposal(probe, { ...proposal(probe), evidenceRefs: [source] });
     const selection = [{ unitId: saved.proposalId, hash: saved.hash }];
     const approval = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'analysis-export-approval@1', selection }));
     const exported = artifacts.exportMarkdown({ eventId: randomUUID(), selection, approval });

@@ -15,7 +15,7 @@ export interface AgentPump {
 async function untilStopped<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   let listener: () => void = () => {};
   const stopped = new Promise<never>((_, reject) => {
-    listener = () => reject(new Error('run-stopped'));
+    listener = () => reject(signal.reason ?? new Error('run-stopped'));
     if (signal.aborted) listener(); else signal.addEventListener('abort', listener, { once: true });
   });
   try { return await Promise.race([promise, stopped]); }
@@ -113,19 +113,23 @@ export async function pumpAgent(run: AgentRun, host: AgentPump): Promise<AgentSt
 }
 
 /** Background I/O pump; all job, source and fallback transitions stay in Core. */
-export async function pumpCapture(run: CaptureRun, host: Pick<AgentPump, 'stream'>): Promise<CaptureJob> {
+export async function pumpCapture(run: CaptureRun, host: Pick<AgentPump, 'stream'>, signal?: AbortSignal): Promise<CaptureJob> {
+  if (!['proposing','verifying'].includes(run.status().stage)) return run.status();
+  const release = run.observeExecution();
   const abort = new AbortController();
-  const deadline = setTimeout(() => abort.abort(), run.remainingMs());
+  const stopped = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
+  const deadline = setTimeout(() => abort.abort(new Error('capture-deadline')), run.remainingMs());
   try {
     for (;;) {
+      stopped.throwIfAborted();
       const request = run.nextModel();
       if (!request) break;
-      const { attempt, reply, transport } = await receiveModel(run, request, host, abort.signal);
+      const { attempt, reply, transport } = await receiveModel(run, request, host, stopped);
       run.finishModel(attempt.attemptId, reply, transport);
     }
   } catch (error) {
     if (['proposing','verifying'].includes(run.status().stage)) run.fail(error);
     throw error;
-  } finally { clearTimeout(deadline); }
+  } finally { release(); clearTimeout(deadline); }
   return run.status();
 }

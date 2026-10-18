@@ -7,7 +7,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "tsc",
-    "test": "node --test apps/cli/test/*.test.ts",
+    "test": "node --test --test-concurrency=4 apps/cli/test/*.test.ts",
     "check": "npm run typecheck && npm run build && npm test",
     "demo": "node apps/cli/src/main.ts",
     "evidence": "node scripts/evidence.ts",
