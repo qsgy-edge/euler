@@ -11,7 +11,7 @@ import { userInfo } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { check, sameBinding, sha256, uuid, validateBudget } from '../contracts.ts';
 import type { Binding, ProbeBudget, SourceAck, SourceExcerpt } from '../contracts.ts';
-import { REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, assemblyIdentityHash, deriveAssemblyState, freezeRequestPayload } from './request-ledger.ts';
+import { REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, assemblyIdentityHash, chargedRequestTokens, deriveAssemblyState, freezeRequestPayload } from './request-ledger.ts';
 import type { RequestAssembly, RequestAssemblyInput, RequestAssemblyState, AssemblyMemoryUse, RequestAttempt, RequestEvent, RequestEventKind, RequestRun, RequestStatus, RequestReconciliation } from './request-ledger.ts';
 
 export interface FileIdentity { dev: string; ino: string }
@@ -207,7 +207,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=15), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=16), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -403,10 +403,10 @@ CREATE TABLE capture_jobs (
   CHECK((status='pending')=(record_id IS NULL))
 ) STRICT;
 CREATE TABLE capture_work (
-  job_id TEXT PRIMARY KEY REFERENCES capture_jobs(job_id), stage TEXT NOT NULL CHECK(stage IN ('proposing','verifying','complete','blocked','unknown')),
+  job_id TEXT PRIMARY KEY REFERENCES capture_jobs(job_id), stage TEXT NOT NULL CHECK(stage IN ('pending','proposing','verifying','complete','blocked','unknown')),
   reason TEXT, record_id TEXT REFERENCES memory_records(record_id), expected_head_id TEXT REFERENCES memory_events(event_id),
   lease_token TEXT, lease_activity TEXT REFERENCES owner_activities(id), lease_until INTEGER NOT NULL,
-  generation INTEGER NOT NULL CHECK(generation>0), budget TEXT NOT NULL, deadline INTEGER NOT NULL,
+  generation INTEGER NOT NULL CHECK(generation>0), budget TEXT, deadline INTEGER NOT NULL,
   searched_refs TEXT NOT NULL DEFAULT '[]', expanded_refs TEXT NOT NULL DEFAULT '[]',
   source_calls INTEGER NOT NULL DEFAULT 0 CHECK(source_calls>=0), source_bytes INTEGER NOT NULL DEFAULT 0 CHECK(source_bytes>=0),
   run_id TEXT UNIQUE REFERENCES request_runs(run_id), config_hash TEXT,
@@ -645,7 +645,7 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=15;
+PRAGMA user_version=16;
 ` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
@@ -715,15 +715,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,15,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,16,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 15, 'unsupported-probe-schema');
+        check(version === 16, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 15 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 16 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -1076,23 +1076,28 @@ export class ProbeStore {
       catch { throw new Error('export-approval-required'); }
       check(value && Object.keys(value).sort().join(',') === 'schema,selection'
         && value.schema === 'analysis-export-approval@1' && JSON.stringify(value.selection) === JSON.stringify(selection), 'export-approval-mismatch');
+      const renderUnit = (id: string): { hash: string; markdown: string } => {
+        const { unit, text } = this.#sourceUnit(id);
+        check(unit.projectId === this.#binding.projectId, 'source-scope-mismatch');
+        const report = parseAnalysisArtifact(this.#archiveRef(unit.ref).text);
+        return { hash: unit.contentHash, markdown: `## ${unit.kind} · v${unit.version}\n\n${text}\n\n来源：${unit.ref.locator}\n\n来源 owner/project：${unit.ref.binding.ownerId}/${unit.ref.binding.projectId}\n\n归档 SHA-256：${unit.ref.hash}\n\n区段：${unit.offset}–${unit.offset + unit.length}；区段 SHA-256：${unit.contentHash}`
+          + (report ? `\n\n报告版本：${report.header.version}；版本事件：${unit.ref.eventId}` : '') };
+      };
       const sections = selection.map(item => {
         check(item && Object.keys(item).sort().join(',') === 'hash,unitId', 'invalid-export-selection');
         const source = this.#db.prepare('SELECT project_id FROM source_units WHERE unit_id=?').get(item.unitId);
         if (source) {
           check(source.project_id === this.#binding.projectId, 'source-scope-mismatch');
-          const { unit, text } = this.#sourceUnit(item.unitId);
-          check(unit.contentHash === item.hash, 'source-version-stale');
-          const report = parseAnalysisArtifact(this.#archiveRef(unit.ref).text);
-          return `## ${unit.kind} · v${unit.version}\n\n${text}\n\n来源：${unit.ref.locator}\n\n来源 owner/project：${unit.ref.binding.ownerId}/${unit.ref.binding.projectId}\n\n归档 SHA-256：${unit.ref.hash}\n\n区段：${unit.offset}–${unit.offset + unit.length}；区段 SHA-256：${unit.contentHash}`
-            + (report ? `\n\n报告版本：${report.header.version}；版本事件：${unit.ref.eventId}` : '');
+          const rendered = renderUnit(item.unitId);
+          check(rendered.hash === item.hash, 'source-version-stale');
+          return rendered.markdown;
         }
         const proposal = this.#proposalForProjects(item.unitId, [this.#binding.projectId]);
         check(proposal.scope.kind === 'project' && proposal.scope.id === this.#binding.projectId && proposal.hash === item.hash, 'source-version-stale');
-        const context = (proposal.sourceUnits ?? []).map(id => {
-          const { unit, text } = this.#sourceUnit(id);
-          return `### 获准背景 · v${unit.version}\n\n${text}\n\n来源：${unit.ref.locator}；区段：${unit.offset}–${unit.offset + unit.length}；SHA-256：${unit.contentHash}`;
-        }).join('\n\n');
+        const context = [
+          ...(proposal.sourceUnits ?? []).map(id => renderUnit(id).markdown),
+          ...proposal.evidenceRefs.map(ref => `### 获准证据\n\n${this.#archiveRef(ref).text}\n\n来源：${ref.locator}\n\n来源 owner/project：${ref.binding.ownerId}/${ref.binding.projectId}\n\n版本事件：${ref.eventId}\n\n归档 SHA-256：${ref.hash}；正文 SHA-256：${ref.contentHash}`),
+        ].join('\n\n');
         return `## 待验证提案 · v${proposal.version}\n\n目标：${proposal.target}\n\n${proposal.expectedChange}\n\n验收方法：\n\n${proposal.evaluation.assertions.map(text => `- ${text}`).join('\n')}\n\n提案：${proposal.proposalId}\n\nSHA-256：${proposal.hash}\n\n${context}`;
       });
       const output = '# Euler 分析交接\n\n状态：分析资料与待验证建议；采纳、发布和实施需当前授权。\n\n' + sections.join('\n\n---\n\n') + '\n';
@@ -1490,10 +1495,10 @@ export class ProbeStore {
       check(assembly, 'unknown-assembly');
       const attempts = Number(this.#db.prepare('SELECT COUNT(*) AS n FROM request_attempts WHERE run_id=?').get(input.runId)!.n);
       check(attempts < run.budget.maxModelAttempts, 'attempt-budget-exhausted');
-      const usedTokens = Number(this.#db.prepare('SELECT COALESCE(SUM(byte_length),0) AS n FROM request_attempts WHERE run_id=?').get(input.runId)!.n);
+      const usedTokens = chargedRequestTokens(status);
       const reserved = input.byteLength + run.budget.outputReserve + run.budget.safetyMargin;
       check(reserved <= run.budget.contextLimit, 'context-budget-exhausted');
-      check(usedTokens + attempts * (run.budget.outputReserve + run.budget.safetyMargin) + reserved <= run.budget.maxTotalTokens, 'token-budget-exhausted');
+      check(usedTokens + reserved <= run.budget.maxTotalTokens, 'token-budget-exhausted');
       check(!this.#db.prepare("SELECT 1 FROM request_attempts WHERE run_id=? AND outcome='unknown-sent'").get(input.runId), 'unknown-attempt-requires-reconciliation');
       check(assembly.payload_hash === input.payloadHash && assembly.byte_length === input.byteLength, 'attempt-payload-mismatch');
       // Admission linearization point: the attempt/activity registration commits
@@ -1527,7 +1532,8 @@ export class ProbeStore {
       const attempt = status.attempts.find(item => item.outcome === 'unknown-sent');
       const assembly = status.assemblies.find(item => item.assemblyId === attempt?.assemblyId);
       if (assembly) for (const use of assembly.usedMemories) this.#assemblyMemory(use, true);
-      return status.run.state === 'authorized' && status.run.epoch === activity.epoch
+      return chargedRequestTokens(status) <= status.run.budget.maxTotalTokens
+        && status.run.state === 'authorized' && status.run.epoch === activity.epoch
         && Boolean(assembly && this.#requestIntentCurrent(activity, status.run, assembly));
     });
   }
@@ -2061,7 +2067,7 @@ export class ProbeStore {
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= 32, 'invalid-capture-limit');
       return this.#db.prepare(`SELECT j.job_id FROM capture_jobs j JOIN sessions s ON s.session_id=j.source_owner
         LEFT JOIN capture_work w ON w.job_id=j.job_id
-        WHERE s.owner_id=? AND s.project_id=? AND (?=0 OR (j.status='pending' AND (w.stage IS NULL OR w.stage IN ('proposing','verifying'))))
+        WHERE s.owner_id=? AND s.project_id=? AND (?=0 OR (j.status='pending' AND (w.stage IS NULL OR w.stage IN ('pending','proposing','verifying'))))
           AND (json_extract(j.payload,'$.scope.kind') IS NOT 'session' OR j.source_owner=?)
         ORDER BY j.rowid LIMIT ?`)
         .all(this.#binding.ownerId, this.#binding.projectId, pendingOnly ? 1 : 0, this.#binding.sessionId, limit).map(row => this.#captureJob(String(row.job_id)));
@@ -2098,6 +2104,26 @@ export class ProbeStore {
       reason: unavailable ?? (work ? work.reason as string | null : payload.reason ?? null), record };
   }
 
+  deferCaptureJobs(activity: Activity, reason: 'capture-route-unavailable' | 'capture-configuration-unavailable' | 'foreground-run-active' | 'request-recovery-required' | 'prerequisite-evidence-gap'): CaptureJob[] {
+    return this.withActivity(activity, () => this.listCaptureJobs(activity, 16, true).map(job => {
+      this.#db.prepare(`INSERT INTO capture_work(job_id,stage,reason,record_id,expected_head_id,lease_until,generation,budget,deadline)
+        VALUES (?,'pending',?,?,?,0,1,NULL,0) ON CONFLICT(job_id) DO UPDATE SET reason=excluded.reason
+        WHERE capture_work.lease_token IS NULL OR capture_work.lease_until<=?`)
+        .run(job.jobId, reason, job.record?.recordId ?? null, job.record?.headEventId ?? null, Date.now());
+      return this.#captureJob(job.jobId);
+    }));
+  }
+
+  captureDrainBlocked(activity: Activity): boolean {
+    return this.withActivity(activity, () => {
+      try { this.#requestRecoveryGate(activity, null); return false; }
+      catch (error) {
+        if (error instanceof Error && error.message === 'request-recovery-required') return true;
+        throw error;
+      }
+    });
+  }
+
   claimCaptureJob(activity: Activity, jobId: string, budget: ProbeBudget, leaseMs: number): CaptureLease | null {
     return this.withActivity(activity, () => {
       validateBudget(budget);
@@ -2105,8 +2131,8 @@ export class ProbeStore {
       const job = this.#captureJob(jobId);
       const previous = this.#db.prepare('SELECT * FROM capture_work WHERE job_id=?').get(jobId);
       if (['complete','blocked','unknown'].includes(job.stage) || previous && Number(previous.lease_until) > Date.now()) return null;
-      if (previous) check(previous.budget === JSON.stringify(budget), 'capture-budget-mismatch');
-      const now = Date.now(), deadline = previous ? Number(previous.deadline) : now + budget.wallClockMs;
+      if (previous?.budget != null) check(previous.budget === JSON.stringify(budget), 'capture-budget-mismatch');
+      const now = Date.now(), deadline = previous?.budget != null ? Number(previous.deadline) : now + budget.wallClockMs;
       const generation = previous ? Number(previous.generation) + 1 : 1;
       let reason: string | null = !job.scope.resolved ? 'scope-unresolved' : job.scope.kind !== 'project'
         ? 'additional-scope-evidence-required' : deadline <= now ? 'capture-deadline' : null;
@@ -2119,7 +2145,8 @@ export class ProbeStore {
       const until = Math.min(now + leaseMs, deadline);
       this.#db.prepare(`INSERT INTO capture_work(job_id,stage,reason,record_id,expected_head_id,lease_token,lease_activity,lease_until,generation,budget,deadline) VALUES (?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(job_id) DO UPDATE SET stage=excluded.stage,reason=excluded.reason,lease_token=excluded.lease_token,
-          lease_activity=excluded.lease_activity,lease_until=excluded.lease_until,generation=excluded.generation`)
+          lease_activity=excluded.lease_activity,lease_until=excluded.lease_until,generation=excluded.generation,
+          budget=excluded.budget,deadline=excluded.deadline`)
         .run(jobId, reason ? 'blocked' : job.record ? 'verifying' : 'proposing', reason,
           job.record?.recordId ?? null, previous?.expected_head_id ?? job.record?.headEventId ?? null,
           token, holder?.id ?? null, until, generation, JSON.stringify(budget), deadline);
@@ -3826,6 +3853,7 @@ export class ProbeStore {
         check(scope.kind === 'project' && unit.projectId === scope.id, 'source-scope-mismatch');
       }
       for (const ref of proposal.evidenceRefs) this.#validateSource(ref, undefined, scope);
+      this.#assertProposalPublication(input, proposal);
       const evaluation = proposal.evaluation;
       check(evaluation?.schema === 'evaluation-contract@1' && ['L0','L1','L2','L3'].includes(evaluation.level)
         && Object.keys(evaluation).every(key => ['schema','level','assertions'].includes(key))
@@ -3876,6 +3904,23 @@ export class ProbeStore {
       .map(row => String(row.project_id));
   }
 
+  #assertProposalPublication(input: SourceAck, proposal: EvolutionProposalInput | Omit<EvolutionProposal, 'hash'>): void {
+    for (const ref of [input, ...proposal.evidenceRefs]) check(!parseAnalysisArtifact(this.#archiveRef(ref).text), 'report-evidence-requires-approved-unit');
+    if (!(proposal.sourceUnits?.length)) return;
+    const approval = this.#archiveRef(input);
+    check(approval.role === 'user', 'proposal-publication-approval-required');
+    let decision: { schema?: string; proposal?: EvolutionProposalInput };
+    try { decision = JSON.parse(approval.text) as typeof decision; }
+    catch { throw new Error('proposal-publication-approval-required'); }
+    check(decision && Object.keys(decision).sort().join(',') === 'proposal,schema'
+      && decision.schema === 'analysis-proposal-approval@1' && decision.proposal && typeof decision.proposal === 'object'
+      && !Array.isArray(decision.proposal), 'proposal-publication-approval-required');
+    const payload = (value: typeof proposal) => JSON.stringify({ target: value.target, expectedChange: value.expectedChange,
+      owner: value.owner, scope: value.scope, evidenceRefs: value.evidenceRefs, sourceUnits: value.sourceUnits ?? [],
+      evaluation: value.evaluation, supersedes: value.supersedes ?? null, targetType: value.targetType ?? 'guidance', risk: value.risk ?? 'low' });
+    check(payload(decision.proposal) === payload(proposal), 'proposal-publication-approval-mismatch');
+  }
+
   #proposalForProjects(proposalId: string, projects: readonly string[]): EvolutionProposal {
       uuid(proposalId);
       const row = this.#db.prepare('SELECT * FROM evolution_proposals WHERE proposal_id=? AND owner=?').get(proposalId, this.#binding.ownerId);
@@ -3897,6 +3942,7 @@ export class ProbeStore {
       check(Array.isArray(value.sourceUnits ?? []) && units.length === (value.sourceUnits?.length ?? 0)
         && units.every((row, i) => row.ordinal === i && row.unit_id === value.sourceUnits![i]), 'proposal-evidence-gap');
       for (const id of value.sourceUnits ?? []) check(value.scope.kind === 'project' && this.#sourceUnit(id).unit.projectId === value.scope.id, 'source-scope-mismatch');
+      this.#assertProposalPublication(value.input, value);
       return { ...value, hash: String(row.payload_hash) };
   }
 

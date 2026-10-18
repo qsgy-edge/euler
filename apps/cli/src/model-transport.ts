@@ -1,9 +1,41 @@
+import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import type { Model } from '@earendil-works/pi-ai';
-import { check, CORE_TOOLS, sha256 } from '@euler/core';
-import type { CaptureFailure, ModelReply, ModelRequest, NeutralRequest, ProbeBudget } from '@euler/core';
+import { check, CORE_TOOLS, sha256, validateBudget } from '@euler/core';
+import type { CaptureFailure, CaptureRoute, ModelReply, ModelRequest, NeutralRequest, ProbeBudget } from '@euler/core';
 import type { AuthorizeSend } from './agent-pump.ts';
+
+export function configuredTransport(path: string) {
+  const raw = readFileSync(path, 'utf8');
+  check(Buffer.byteLength(raw) <= 8192, 'config-too-large');
+  const config = JSON.parse(raw) as { provider: string; model: string; baseUrl: string; authNamespace: string; credentialEnv: string;
+    contextWindow: number; maxTokens: number; budget: ProbeBudget; authorization: string; captureCapability?: CaptureRoute['capability'] };
+  check(Object.keys(config).filter(key => key !== 'captureCapability').sort().join(',') === ['provider', 'model', 'baseUrl', 'authNamespace', 'credentialEnv', 'contextWindow', 'maxTokens', 'budget', 'authorization'].sort().join(','), 'invalid-transport-config');
+  check(config.authorization === 'synthetic-test-only' && /^[A-Z][A-Z0-9_]{1,100}$/.test(config.credentialEnv), 'test-authorization-required');
+  check(config.captureCapability === undefined || ['basic','standard','high'].includes(config.captureCapability), 'invalid-capture-capability');
+  validateBudget(config.budget);
+  check(Number.isSafeInteger(config.contextWindow) && Number.isSafeInteger(config.maxTokens), 'invalid-model-limits');
+  const model: Model<'openai-completions'> = { api: 'openai-completions', provider: config.provider, id: config.model, name: config.model,
+    baseUrl: config.baseUrl, reasoning: false, input: ['text'], contextWindow: config.contextWindow, maxTokens: config.maxTokens,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+  // Credentials are resolved only from the operator's explicitly selected test environment variable.
+  check(Boolean(process.env[config.credentialEnv]), 'credential-unavailable');
+  return { model, budget: config.budget, authNamespace: config.authNamespace, captureCapability: config.captureCapability ?? null,
+    transport: new HttpModelTransport(model, config.budget, () => process.env[config.credentialEnv] ?? '') };
+}
+
+export function verifyTransportPrerequisites(extraTests: string[] = [], event = 'agent-prerequisites'): void {
+  const root = fileURLToPath(new URL('../../../', import.meta.url));
+  const tests = ['archive', 'persistence', 'search-projection', 'request-ledger', 'request-recovery', 'request-admission', 'request-ledger-boundaries', 'agent-run', 'agent-boundaries', 'model-transport', ...extraTests]
+    .map(name => `apps/cli/test/${name}.test.ts`);
+  const result = spawnSync(process.execPath, ['--test', ...tests], { cwd: root, encoding: 'utf8', timeout: 120000, maxBuffer: 4_194_304 });
+  process.stdout.write(JSON.stringify({ event, command: ['node', '--test', ...tests], exitCode: result.status,
+    outputHash: sha256((result.stdout ?? '') + (result.stderr ?? '')), passed: result.status === 0 }) + '\n');
+  check(result.status === 0, 'prerequisite-evidence-gap');
+}
 
 // A single text/tool protocol using the pi-ai Model interface. No SDK auth
 // discovery, hooks, redirects or retry machinery runs on this send path.

@@ -72,13 +72,14 @@ test('a target project can discover and explicitly export only its approved repo
     assert.match(exported.markdown, /待验证/);
     assert.match(exported.markdown, new RegExp(unit.contentHash));
     assert.doesNotMatch(exported.markdown, /私有项目A|不可交付尾部/);
-    const proposalInput = target.archive.append(randomUUID(), '保存 Atlas 日志改进提案，保持待验证状态');
-    const proposal = target.store.saveEvolutionProposal(target.activity, proposalInput, {
-      target: 'src/logging.ts', targetType: 'code', owner: targetBinding.ownerId,
-      scope: { kind: 'project', id: targetBinding.projectId, resolved: true },
+    const proposalValue = {
+      target: 'src/logging.ts', targetType: 'code' as const, owner: targetBinding.ownerId,
+      scope: { kind: 'project' as const, id: targetBinding.projectId, resolved: true },
       expectedChange: '背景：日志缺少测试环境。\n预期改动：记录环境字段。\n范围：日志输出。\n非目标：改变运行策略。',
-      evidenceRefs: [], sourceUnits: [unit.unitId], evaluation: { schema: 'evaluation-contract@1', level: 'L1', assertions: ['合成日志包含环境字段'] },
-    });
+      evidenceRefs: [], sourceUnits: [unit.unitId], evaluation: { schema: 'evaluation-contract@1' as const, level: 'L1' as const, assertions: ['合成日志包含环境字段'] },
+    };
+    const proposalInput = target.archive.append(randomUUID(), JSON.stringify({ schema: 'analysis-proposal-approval@1', proposal: proposalValue }));
+    const proposal = target.store.saveEvolutionProposal(target.activity, proposalInput, proposalValue);
     assert.equal(proposal.inert, true);
     const proposalSelection = [{ unitId: proposal.proposalId, hash: proposal.hash }];
     const proposalApproval = target.archive.append(randomUUID(), JSON.stringify({ schema: 'analysis-export-approval@1', selection: proposalSelection }));

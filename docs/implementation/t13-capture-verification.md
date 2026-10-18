@@ -1,6 +1,6 @@
 # Capture, independent verification and analysis handoff
 
-Issue: [#13](https://github.com/qsgy-edge/euler/issues/13). This implementation uses disposable schema version 15, synthetic archives and controlled test transport. It has no production migration, MC access, background daemon or automatic memory activation.
+Issue: [#13](https://github.com/qsgy-edge/euler/issues/13). This implementation uses disposable schema version 16, synthetic archives and controlled test transport. It has no production migration, MC access, background daemon or automatic memory activation.
 
 ## Run and inspect
 
@@ -19,13 +19,23 @@ node apps/cli/src/main.ts capture-status --sandbox <root>
 node apps/cli/src/main.ts capture-reconcile --sandbox <root> --job <job-id>
 ```
 
-`capture --scenario protocol|block|evidence-gap|unknown` runs the corresponding fixed case from `fixtures/t13-capture-cases.json`. Repeating a case in the same sandbox preserves its job and attempt identity. A terminal block or unknown never silently starts another request. The demo drains only its own fixture job. `--transport-config` is rejected by these synthetic demo commands; real-provider acceptance needs a separately authorized Host route and remains unverified.
+`capture --scenario protocol|block|evidence-gap|unknown` runs the corresponding fixed case from `fixtures/t13-capture-cases.json`. Repeating a case in the same sandbox preserves its job and attempt identity. A terminal block or unknown never silently starts another request. The demo drains only its own fixture job. `--transport-config` is rejected by these synthetic demo commands.
+
+Ordinary jobs use the existing controlled HTTP transport and an explicitly selected background configuration:
+
+```sh
+node apps/cli/src/main.ts capture-drain --sandbox <root> --capture-config <test-transport.json>
+node apps/cli/src/main.ts agent --sandbox <root> --scenario tool --capture-config <test-transport.json>
+node apps/cli/src/main.ts remember --sandbox <root> --capture-config <test-transport.json>
+```
+
+The configuration uses the same `provider`, `model`, `baseUrl`, `authNamespace`, `credentialEnv`, `contextWindow`, `maxTokens`, `budget` and `authorization: "synthetic-test-only"` fields as the foreground transport, plus an explicit `captureCapability: "basic" | "standard" | "high"`. The CLI binds that one route to both independent role contexts; the Core/Host API also accepts ordered per-role fallback routes. Credentials come only from the named environment variable. It runs the existing transport prerequisite checks plus capture tests before its first send. Local HTTP is limited to loopback; other endpoints require HTTPS. No external provider credentials are supplied by the repository, so actual provider quality remains unverified.
 
 ## Capture ownership and execution
 
 `AgentRun` durably queues normal capture at a fully settled ReAct tool batch and at task completion. Bound input, archived full model responses and settled tool results form the source range; provisional text, unconsumed queued inputs and unknown tool effects are excluded. Typed owner preference/decision statements retain T12's deterministic parsing and owner gates; this normal pipeline supplies its complete fixed event range to the semantic Proposer. An untyped owner “remember” instruction keeps the same pending job across replay and restart. A correction or an exact owner approval tied to the current revision/head can enqueue reverification. Existing capture triggers and consumer flags continue to use `capture_jobs`.
 
-The Host's explicit `drainCaptures` call accepts a bounded batch, deadline, frozen role configuration, budget and I/O adapter. It can run at a Host's cooperative boundary; the synthetic CLI invokes it explicitly. The foreground `agent` command queues jobs but does not choose background provider credentials or routes. No timer or process is installed to drain them automatically.
+The Host's `drainCaptures` call accepts a bounded batch, deadline, frozen role configuration, budget and I/O adapter. Agent and remember sessions invoke cooperative work at startup, canonical boundaries and agent-end/idle; `capture-drain` is the explicit queue-maintenance entry. While a foreground run is active, canonical boundaries persist `foreground-run-active` and defer model work to idle, preserving the existing request-recovery gate. Missing configuration persists `capture-route-unavailable` without inventing a budget or starting a lease. Invalid configuration and prerequisite failure remain visible and durable. No timer or process is installed to drain jobs automatically.
 
 `capture_work` holds the phase, blocker, source budget, lease generation and exact candidate head. Leases belong to a real durable job. Proposer and Verifier each claim one lease for their primary/fallback chain; both use the same job-owned execution stream and cumulative budget. A candidate commit releases the Proposer lease before verification. Retired holders cannot commit another phase.
 
@@ -35,15 +45,15 @@ The Verifier starts without Proposer conversation or its answer rationale. It re
 
 A pass requires independently expanded evidence and minimum type/scope gates. Objective facts require a successful ledger-backed file observation; episodes require a completed task with supported results. User statements alone do not prove an objective fact. Failed, missing, stale or insufficient evidence remains blocked/evidence-gap. Verification freezes the exact claim head in each request assembly; a changed head fails before dispatch or settlement. A passed ordinary candidate remains inactive for T14, and produces no active-memory Info batch.
 
-Only Host-observed temporary failure, timeout, rate limiting and structured-output protocol failure can use the next configured fallback. A Verifier block/evidence-gap, permanent failure or insufficient capability does not trigger another model to seek a different verdict. Assembly and started barriers, role/request/output hashes and real job ownership reuse the request ledger. Started without finished remains unknown; receiver reconciliation records observed receipt without authorizing resend. Provider TTFT/cache remain null when the adapter has no observation.
+Only Host-observed temporary failure, timeout, rate limiting and structured-output protocol failure can use the next configured fallback. Actual usage is charged conservatively against request-byte estimates and output reserves, and rechecked at assembly, durable admission and final send. Archive/Host exceptions retain a bounded diagnostic code in the durable job and propagate to the caller after conservative settlement. Foreground integrations display `capture-error` with a diagnostic hash and stop that session's worker, keeping foreground error handling and controls available; the explicit drain command propagates failure. A Verifier block/evidence-gap, permanent failure or insufficient capability does not trigger another model to seek a different verdict. Assembly and started barriers, role/request/output hashes and real job ownership reuse the request ledger. Started without finished remains unknown; receiver reconciliation records observed receipt without authorizing resend. Provider TTFT/cache remain null when the adapter has no observation.
 
 ## Reports and project handoff
 
 `AnalysisArtifacts` saves immutable report versions as archived assistant text, separating facts, inferences, recommendations, unresolved items and evidence references. A deterministic caller-supplied event ID supports append-ack reconciliation. A repeated ID must match the original bytes. Full reports remain readable in their originating active task; a target project receives a separately approved `report-section` with exact source identity and Unicode offset/length.
 
-Project discovery reuses `publishSourceUnit`, `searchSources`, `expandSource` and their outbox projection. Cross-project proposals must reference an approved unit for the target project; source owner/project remain those of the original archive. Proposals stay inert and versioned, and never grant implementation authority or become verified memory.
+Project discovery reuses `publishSourceUnit`, `searchSources`, `expandSource` and their outbox projection. Full analysis artifacts cannot be used as raw proposal input/evidence to publish mixed reports through an originating project. Report-derived proposals use approved source units, plus an independently archived user input `{ "schema": "analysis-proposal-approval@1", "proposal": <exact proposal input> }` binding the complete proposed payload and destination. Changing the proposed text requires another approval even when its background unit was already published. These gates are checked again on reads. Cross-project proposals must reference an approved unit for the target project; source owner/project remain those of the original archive. Proposals stay inert and versioned, and never grant implementation authority or become verified memory.
 
-Explicit Markdown export freezes the selected unit identities/hashes and an archived user approval. It embeds the selected material, source owner/project, locator, archive hash, section hash and report version, and saves the export itself in the archive. Private unselected report text is excluded. Proposal exports include their stored scope, non-goals, acceptance and provenance. Export does not contact another agent or publish externally.
+Explicit Markdown export freezes the selected unit identities/hashes and an archived user approval. It embeds the selected material, source owner/project, locator, archive hash, section hash and report version, and saves the export itself in the archive. Private unselected report text is excluded. Proposal exports include their stored scope, non-goals, acceptance and provenance, approved unit background and legacy raw evidence text with immutable event/hash references. Unavailable evidence fails explicitly rather than silently omitting it. Export does not contact another agent or publish externally.
 
 Selected temporary handoff Markdown is saved as complete UTF-8 text with its content hash; deleting the temporary file does not remove the archived copy. The same archive/discovery path works without a handoff Skill. Suggested skill text is inert. Selection, publication, export and reads use existing task/owner/project authorization; task completion revokes full report access without deleting approved project units.
 
@@ -67,7 +77,7 @@ The actual carrier/reference inventory for those owners is:
 
 ## Validation and evidence boundaries
 
-Focused tests cover job identity, phase lease handoff, independent source tools, configured fallback, source loss, same-identity report append reconciliation, old report/proposal versions, cross-project section isolation, standalone export and temporary-file recovery. Real child-process kill probes cover started-before-send, received-before-finished and committed-candidate recovery. Existing agent, request-ledger, source, owner-memory and maintenance tests protect integration boundaries.
+Focused tests cover job identity, phase lease handoff, independent source tools, configured fallback, source loss, same-identity report append reconciliation, old report/proposal versions, cross-project section isolation, standalone export and temporary-file recovery. Real child-process kill probes cover started-before-send, received-before-finished and committed-candidate recovery. Existing agent, request-ledger, source, owner-memory and maintenance tests protect integration boundaries. A local HTTP receiver test drains ordinary remember and Agent jobs at startup and agent-end, independently matches transmitted payload hashes to job-owned attempts, and verifies zero resend on a repeated drain.
 
 `npm run evidence:capture` writes a receipt under `artifacts/t13-<timestamp>/`, retains synthetic sandbox copies, captures actual child stdout/stderr and records command/exit/environment/commit/fixture/file digests. Its raw checker opens the persisted SQLite and JSONL, recomputes source/output/request hashes, checks the receiver, job stream, candidate lifecycle, verification evidence and export section. Receipt metadata never embeds report/proposal/memory bodies. Exact outputs remain in hashed raw artifacts.
 

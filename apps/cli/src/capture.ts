@@ -1,12 +1,67 @@
 import fixture from '../../../fixtures/t13-capture-cases.json' with { type: 'json' };
-import { CaptureRun, check, DEFAULT_BUDGET } from '@euler/core';
+import { CaptureRun, check, DEFAULT_BUDGET, sha256 } from '@euler/core';
 import type { CaptureConfig, CaptureJob, ProbeBudget, SourceAck } from '@euler/core';
 import type { AgentPump } from './agent-pump.ts';
 import { pumpCapture } from './agent-pump.ts';
+import { configuredTransport, verifyTransportPrerequisites } from './model-transport.ts';
 import { openProbe } from './probe.ts';
 import type { Sandbox } from './sandbox.ts';
 
 type Probe = ReturnType<typeof openProbe>;
+
+/** One explicitly configured test route, with independent role contexts and no ambient credential discovery. */
+export function createCaptureWorker(path?: string, onFailure?: (error: unknown) => void) {
+  let configured: ReturnType<typeof configuredTransport> | null = null, setupError: unknown;
+  if (path) {
+    try { configured = configuredTransport(path); check(configured.captureCapability, 'capture-capability-required'); }
+    catch (error) { setupError = error; }
+  }
+  let prerequisites = false;
+  const run = async (probe: Probe, foregroundActive = false): Promise<CaptureJob[]> => {
+    const report = (jobs: CaptureJob[]) => {
+      console.log(JSON.stringify({ event: 'capture-queue', jobs: jobs.map(job => ({ jobId: job.jobId, stage: job.stage,
+        reason: job.reason, recordId: job.record?.recordId ?? null, verification: job.record?.verification ?? null })) }));
+      return jobs;
+    };
+    if (!probe.store.listCaptureJobs(probe.activity, 1, true).length) return [];
+    if (!path) return report(probe.store.deferCaptureJobs(probe.activity, 'capture-route-unavailable'));
+    if (setupError) { report(probe.store.deferCaptureJobs(probe.activity, 'capture-configuration-unavailable')); throw setupError; }
+    if (foregroundActive) return report(probe.store.deferCaptureJobs(probe.activity, 'foreground-run-active'));
+    if (probe.store.captureDrainBlocked(probe.activity)) return report(probe.store.deferCaptureJobs(probe.activity, 'request-recovery-required'));
+    if (!prerequisites) {
+      try { verifyTransportPrerequisites(['capture','capture-run','capture-failure','capture-pump','analysis-proposal'], 'capture-prerequisites'); }
+      catch (error) { report(probe.store.deferCaptureJobs(probe.activity, 'prerequisite-evidence-gap')); throw error; }
+      prerequisites = true;
+    }
+    const selected = configured!, capability = selected.captureCapability!;
+    const route = { provider: selected.model.provider, model: selected.model.id, route: selected.model.baseUrl,
+      authNamespace: selected.authNamespace, capability };
+    return report(await drainCaptures(probe, { batch: 16, deadlineMs: Math.min(30000, selected.budget.wallClockMs), budget: selected.budget,
+      config: { proposer: [route], verifier: [route] }, encode: selected.transport.encode.bind(selected.transport),
+      host: { stream: selected.transport.stream.bind(selected.transport) } }));
+  };
+  let halted = false;
+  return async (probe: Probe, foregroundActive = false): Promise<CaptureJob[]> => {
+    if (halted) return [];
+    try { return await run(probe, foregroundActive); }
+    catch (error) {
+      if (!onFailure) throw error;
+      halted = true; onFailure(error); return [];
+    }
+  };
+}
+
+export function reportCaptureFailure(error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  console.log(JSON.stringify({ event: 'capture-error', reason: /^[a-z][a-z0-9-]{1,80}$/.test(message) ? message : 'capture-unavailable',
+    diagnosticHash: sha256(message), halted: true }));
+}
+
+export async function runCaptureDrain(sandbox: Sandbox, path?: string): Promise<void> {
+  const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try { console.log(JSON.stringify({ event: 'capture-drained', jobs: (await createCaptureWorker(path)(probe)).length })); }
+  finally { probe.close(); }
+}
 export async function drainCaptures(probe: Probe, options: { batch: number; deadlineMs: number; budget: ProbeBudget;
   config: CaptureConfig; host: Pick<AgentPump, 'stream'>; jobId?: string;
   encode?: ConstructorParameters<typeof CaptureRun>[4] }): Promise<CaptureJob[]> {
@@ -64,7 +119,10 @@ export async function runCaptureDemo(sandbox: Sandbox, scenario: string): Promis
         }
         yield { kind: 'complete' as const, reply: { text, calls, stop: calls.length ? 'tools' as const : 'end' as const } };
       },
-    } });
+    } }).catch(error => {
+      if (scenario !== 'unknown' || !(error instanceof Error) || error.message !== 'synthetic-receiver-ack-lost') throw error;
+      console.log(JSON.stringify({ event: 'capture-unknown', reason: error.message }));
+    });
     console.log(JSON.stringify({ event: 'capture-result', mode: 'synthetic-only', realModelEvidence: 'evidence-gap',
       sends: probe.transport.count, status: probe.store.readCaptureJob(probe.activity, job.jobId) }));
   } finally { probe.close(); }

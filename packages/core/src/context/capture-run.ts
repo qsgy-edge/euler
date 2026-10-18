@@ -1,6 +1,7 @@
 import { check, sha256 } from '../contracts.ts';
 import type { HostAdapter, ProbeBudget, SourceAck } from '../contracts.ts';
 import type { CaptureLease, CaptureJob, CaptureVerification, ProposedMemory, ProbeStore } from '../store/probe-store.ts';
+import { chargedRequestTokens } from '../store/request-ledger.ts';
 import type { RequestAttempt } from '../store/request-ledger.ts';
 import type { ModelReply, ModelRoute, ToolCall } from './agent-state.ts';
 import type { ModelRequest, NeutralRequest } from './agent-run.ts';
@@ -140,8 +141,7 @@ export class CaptureRun {
     const bytes = Buffer.byteLength(payload);
     const ledger = this.#store.requestStatus(this.#lease.activity, this.runId);
     if (ledger.attempts.length >= this.#budget.maxModelAttempts
-      || ledger.attempts.reduce((total, attempt) => total + attempt.byteLength + this.#budget.outputReserve + this.#budget.safetyMargin, 0)
-        + bytes + this.#budget.outputReserve + this.#budget.safetyMargin > this.#budget.maxTotalTokens
+      || chargedRequestTokens(ledger) + bytes + this.#budget.outputReserve + this.#budget.safetyMargin > this.#budget.maxTotalTokens
       || bytes + this.#budget.outputReserve + this.#budget.safetyMargin > this.#budget.contextLimit) {
       this.#store.stopCapture(this.#lease, 'blocked', 'capture-budget-exhausted'); return null;
     }
@@ -288,7 +288,9 @@ export class CaptureRun {
     }
   }
 
-  fail(): CaptureJob {
-    return this.#store.stopCapture(this.#lease, this.#inflight ? 'unknown' : 'blocked', this.#inflight ? 'attempt-reconciliation-required' : 'capture-protocol-failed');
+  fail(error?: unknown): CaptureJob {
+    const reason = error instanceof Error && /^[a-z][a-z0-9-]{1,80}$/.test(error.message) ? error.message
+      : this.#inflight ? 'attempt-reconciliation-required' : 'capture-protocol-failed';
+    return this.#store.stopCapture(this.#lease, this.#inflight ? 'unknown' : 'blocked', reason);
   }
 }

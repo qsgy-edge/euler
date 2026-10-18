@@ -450,6 +450,8 @@ test('source errors, declines, untyped statements and unresolved scope never act
     renameSync(`${archive}.copy`, archive);
     const broken = await send(cli, '记住偏好：包管理器使用 pnpm', 'remember-result');
     assert.deepEqual([broken.status, broken.committed, broken.level, broken.reason], ['error', false, 'error', 'file-identity-changed']);
+    const background = await cli.waitFor('capture-error');
+    assert.deepEqual([background.reason, background.halted], ['file-identity-changed', true]);
     await stop(cli);
     assert.deepEqual(entries(sandbox.root), []);
     const db = new DatabaseSync(join(sandbox.root, 'probe.sqlite'));

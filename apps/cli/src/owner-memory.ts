@@ -7,6 +7,7 @@ import { DEFAULT_BUDGET, OWNER_MEMORY_FORMS, check, encodeOwnerAgreement, isOwne
 import type { ActivationBatch, HostInfo, MemoryRecord, MemoryScope, ProbeBudget, RememberResult, SourceAck } from '@euler/core';
 import { appendDurably } from './archive.ts';
 import { killPoint } from './kill-point.ts';
+import { createCaptureWorker, reportCaptureFailure } from './capture.ts';
 import { openProbe } from './probe.ts';
 import { OWNER_INFO_FILE } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
@@ -333,18 +334,20 @@ function fastLaneInput(text: string): boolean {
   try { return Boolean(parseOwnerAgreement(text)); } catch { return true; }
 }
 
-export interface RememberOptions { hostInfo: 'durable' | 'unavailable'; noActiveProject: boolean; scenario: string; syntheticProposals: boolean }
+export interface RememberOptions { hostInfo: 'durable' | 'unavailable'; noActiveProject: boolean; scenario: string; syntheticProposals: boolean; captureConfig?: string }
 
 export async function runRememberSession(sandbox: Sandbox, options: RememberOptions): Promise<void> {
   check((OWNER_SCENARIOS as readonly string[]).includes(options.scenario), 'invalid-owner-scenario');
   const probe = openProbe(sandbox, OWNER_BUDGET, undefined, undefined, undefined, true);
   const lines = createInterface({ input: process.stdin });
+  const capture = createCaptureWorker(options.captureConfig, reportCaptureFailure);
   try {
     const log = options.hostInfo === 'durable' ? openOwnerInfo(sandbox, probe) : null;
     const host = new OwnerMemoryHost(probe, log, options.scenario as OwnerScenario, options.noActiveProject);
     host.backfill();
     host.drain();
     host.deliver();
+    await capture(probe);
     emit('remember-ready', { pid: process.pid, hostInfo: log ? 'durable' : 'unavailable', infoPath: log?.path ?? null,
       ...counts(probe.store.listHostInfo(probe.activity)), syntheticProposals: options.syntheticProposals,
       commands: [...OWNER_MEMORY_FORMS, ...(options.syntheticProposals ? ['propose <text>'] : []), '同意', '取消', 'info', 'info <batchId>', 'ask <question>', 'stop'] });
@@ -388,6 +391,7 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
         }
         emit('command-rejected', { reason: 'owner-memory-command-required', accepted: OWNER_MEMORY_FORMS });
       } catch (error) { emit('command-error', { reason: (error as Error).message }); }
+      finally { await capture(probe); }
     }
   } finally { lines.close(); probe.close(); }
 }
