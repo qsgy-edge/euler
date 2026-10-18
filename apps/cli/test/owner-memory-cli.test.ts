@@ -343,12 +343,14 @@ test('no-active-project questions exclude previously active project memories', a
 
 test('an Info registration failure after commit is a known outcome that blocks dispatch until recovered once', async () => {
   const sandbox = createSandbox();
+  const cli = startCli(['remember', '--sandbox', sandbox.root]);
   try {
-    const cli = startCli(['remember', '--sandbox', sandbox.root]);
     await cli.waitFor('remember-ready');
     const db = new DatabaseSync(join(sandbox.root, 'probe.sqlite'));
     try {
-      db.exec(`CREATE TRIGGER t12_register_failure BEFORE INSERT ON host_info_batches
+      // Share Core's contention policy with the background queue's short transactions.
+      db.exec(`PRAGMA busy_timeout=2000;
+        CREATE TRIGGER t12_register_failure BEFORE INSERT ON host_info_batches
         BEGIN SELECT RAISE(ABORT,'injected-register-failure'); END;`);
       const failed = await send(cli, '记住偏好：包管理器使用 pnpm', 'remember-result');
       assert.deepEqual([failed.status, failed.stage, failed.info, failed.level], ['activated', 'active', 'pending-redelivery', 'error']);
@@ -365,7 +367,10 @@ test('an Info registration failure after commit is a known outcome that blocks d
     assert.ok(answer.receipt);
     await stop(cli);
     assert.equal(entries(sandbox.root).length, 1);
-  } finally { rmSync(sandbox.root, { recursive: true, force: true }); }
+  } finally {
+    if (!cli.observations.some(row => row.event === 'process-exit')) { cli.child.kill('SIGKILL'); await cli.exit; }
+    rmSync(sandbox.root, { recursive: true, force: true });
+  }
 });
 
 test('a restart after a later rollback or correction neither re-activates nor reports a false error', async () => {

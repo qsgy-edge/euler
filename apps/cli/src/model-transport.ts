@@ -31,8 +31,8 @@ export async function verifyTransportPrerequisites(extraTests: string[] = [], ev
   const root = fileURLToPath(new URL('../../../', import.meta.url));
   const tests = ['archive', 'persistence', 'search-projection', 'request-ledger', 'request-recovery', 'request-admission', 'request-ledger-boundaries', 'agent-run', 'agent-boundaries', 'model-transport', ...extraTests]
     .map(name => `apps/cli/test/${name}.test.ts`);
-  // Keep preflight in a dedicated process while loading the shared modules only once.
-  const command = ['--test', '--test-isolation=none', '--test-concurrency=1', ...tests];
+  // Bound the nested file pool while allowing independent durable I/O to overlap.
+  const command = ['--test', '--test-concurrency=4', ...tests];
   const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
   const result = await new Promise<{ status: number | null; stdout: string; stderr: string }>(resolve => {
     execFile(process.execPath, command, { cwd: root, encoding: 'utf8', timeout: 120000, maxBuffer: 4_194_304,
