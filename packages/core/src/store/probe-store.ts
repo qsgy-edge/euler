@@ -1,5 +1,7 @@
 import { replayAgent } from '../context/agent-state.ts';
 import type { AgentEvent, AgentStatus } from '../context/agent-state.ts';
+import { isUntypedRemember, parseMemoryProposal, parseOwnerAgreement, parseOwnerStatement } from '../context/owner-memory.ts';
+import type { OwnerMemoryStatement } from '../context/owner-memory.ts';
 import { randomUUID } from 'node:crypto';
 import { lstatSync, readdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -80,10 +82,31 @@ export interface OwnerReceipt {
 }
 export interface ActivationBatch {
   schema: 'activation-batch@1'; batchId: string; ownerId: string; scope: MemoryScope;
-  events: { eventId: string; recordId: string; before: MemoryRecord; after: MemoryRecord }[];
+  events: { eventId: string; recordId: string; kind: 'activate' | 'auto-revise'; before: MemoryRecord; after: MemoryRecord }[];
   payload: string; digest: string;
 }
 export interface MemoryOperation { status: 'committed' | 'no_op'; record: MemoryRecord; eventId: string | null }
+// Fast lane (I05-I07): Core derives type/content/range from durable owner bytes;
+// the request carries no model hint, owner, scope, source or verification field.
+export interface RememberRequest { input: SourceAck; hostInfo: 'durable' | 'unavailable'; noActiveProject?: true }
+export interface RememberVerification { runId: string; verifier: 'synthetic-harness@1' | 'owner-fast-lane@1';
+  result: 'pass' | 'block' | 'evidence-gap'; reason: string | null; evidence: SourceAck[] }
+export interface RememberResult {
+  status: 'activated' | 'blocked' | 'no_op'; stage: 'candidate' | 'verified' | MemoryLifecycle; reason: string | null;
+  record: MemoryRecord; batchId: string | null; range: SourceAck[]; verification: RememberVerification | null;
+}
+// Host-owned durable Info state (Ticket 14): the frozen batch digest is copied from
+// activation_batches; delivery and read only move forward.
+export interface HostInfo {
+  schema: 'host-info@1'; batchId: string; digest: string; scope: MemoryScope; memberCount: number;
+  delivery: 'pending' | 'delivered'; entryId: string | null; entryHash: string | null; deliveredAt: string | null;
+  read: 'unread' | 'read'; readAt: string | null;
+}
+export interface HostInfoDelivery { batchId: string; digest: string; entryId: string; entryHash: string }
+export interface HostInfoView {
+  info: HostInfo; batch: ActivationBatch;
+  members: { recordId: string; eventId: string; current: MemoryRecord | null; changed: boolean; unavailable: string | null }[];
+}
 export interface SearchTarget { agent?: string; platform?: string; component?: string }
 export interface MemoryDiscoveryApproval {
   schema: 'memory-discovery-approval@1'; intentId: string; goalEventId: string;
@@ -171,7 +194,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=13), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=14), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -360,9 +383,10 @@ CREATE TABLE memory_applicability (
   PRIMARY KEY(revision_id,ordinal), UNIQUE(revision_id,value)
 ) STRICT;
 CREATE TABLE capture_jobs (
-  job_id TEXT PRIMARY KEY, source_event_id TEXT NOT NULL, record_id TEXT NOT NULL UNIQUE REFERENCES memory_records(record_id),
-  status TEXT NOT NULL CHECK(status IN ('captured','complete')), payload TEXT NOT NULL, payload_hash TEXT NOT NULL, created_at TEXT NOT NULL,
-  source_owner TEXT NOT NULL REFERENCES sessions(session_id), UNIQUE(source_owner,source_event_id)
+  job_id TEXT PRIMARY KEY, source_event_id TEXT NOT NULL, record_id TEXT UNIQUE REFERENCES memory_records(record_id),
+  status TEXT NOT NULL CHECK(status IN ('pending','captured','complete')), payload TEXT NOT NULL, payload_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+  source_owner TEXT NOT NULL REFERENCES sessions(session_id), UNIQUE(source_owner,source_event_id),
+  CHECK((status='pending')=(record_id IS NULL))
 ) STRICT;
 CREATE TABLE provenance_refs (
   ref_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), revision_id TEXT NOT NULL REFERENCES memory_revisions(revision_id),
@@ -464,6 +488,16 @@ CREATE TABLE projection_jobs (
   owner_id TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL, batch_id TEXT,
   payload TEXT NOT NULL, payload_hash TEXT NOT NULL, UNIQUE(kind,event_id)
 ) STRICT;
+CREATE TABLE host_info_batches (
+  batch_id TEXT PRIMARY KEY REFERENCES activation_batches(batch_id), job_id TEXT NOT NULL UNIQUE REFERENCES projection_jobs(job_id),
+  owner_id TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL, digest TEXT NOT NULL,
+  member_count INTEGER NOT NULL CHECK(member_count>0 AND member_count<=32),
+  delivery TEXT NOT NULL CHECK(delivery IN ('pending','delivered')), entry_id TEXT, entry_hash TEXT, delivered_at TEXT,
+  read_state TEXT NOT NULL CHECK(read_state IN ('unread','read')), read_at TEXT, registered_at TEXT NOT NULL,
+  CHECK((delivery='pending' AND entry_id IS NULL AND entry_hash IS NULL AND delivered_at IS NULL)
+    OR (delivery='delivered' AND entry_id IS NOT NULL AND entry_hash IS NOT NULL AND delivered_at IS NOT NULL)),
+  CHECK((read_state='unread' AND read_at IS NULL) OR (read_state='read' AND read_at IS NOT NULL AND delivery='delivered'))
+) STRICT;
 CREATE TABLE source_units (
   unit_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(project_id),
   source_owner TEXT NOT NULL REFERENCES sessions(session_id), source_event_id TEXT NOT NULL,
@@ -535,6 +569,8 @@ CREATE TABLE feedback_events (
 CREATE TABLE verification_runs (
   run_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), revision_id TEXT NOT NULL REFERENCES memory_revisions(revision_id),
   result TEXT NOT NULL CHECK(result IN ('pass','block','evidence-gap')), evidence_json TEXT NOT NULL, evidence_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+  verifier TEXT NOT NULL CHECK(verifier IN ('synthetic-harness@1','owner-fast-lane@1')),
+  reason TEXT CHECK((result='pass')=(reason IS NULL) AND (reason IS NULL OR length(reason) BETWEEN 1 AND 128)),
   UNIQUE(record_id,revision_id,run_id),
   FOREIGN KEY(record_id,revision_id) REFERENCES memory_revisions(record_id,revision_id)
 ) STRICT;
@@ -581,19 +617,28 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=13;
+PRAGMA user_version=14;
 ` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','projection_jobs','feedback_events','source_query_receipts'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 `).join('') + ['memory_heads','intent_heads','owner_fences','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
-  'verification_runs','verification_evidence','proposal_evidence','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts'].map(table => `
+  'verification_runs','verification_evidence','proposal_evidence','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts','host_info_batches'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
-`).join('') + ['memory_heads','intent_heads','owner_fences','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts','source_projection_jobs'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
+`).join('') + ['memory_heads','intent_heads','owner_fences','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts','source_projection_jobs','host_info_batches'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
 CREATE TRIGGER owned_${table}_${operation.toLowerCase()} BEFORE ${operation} ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
 `)).join('') + `
 CREATE TRIGGER immutable_presentation_delete BEFORE DELETE ON host_presentations BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_host_info_delete BEFORE DELETE ON host_info_batches BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER guarded_host_info_update BEFORE UPDATE ON host_info_batches
+WHEN NEW.batch_id IS NOT OLD.batch_id OR NEW.job_id IS NOT OLD.job_id OR NEW.owner_id IS NOT OLD.owner_id
+  OR NEW.scope_kind IS NOT OLD.scope_kind OR NEW.scope_id IS NOT OLD.scope_id OR NEW.digest IS NOT OLD.digest
+  OR NEW.member_count IS NOT OLD.member_count OR NEW.registered_at IS NOT OLD.registered_at
+  OR (OLD.delivery='delivered' AND (NEW.delivery IS NOT OLD.delivery OR NEW.entry_id IS NOT OLD.entry_id
+    OR NEW.entry_hash IS NOT OLD.entry_hash OR NEW.delivered_at IS NOT OLD.delivered_at))
+  OR (OLD.read_state='read' AND (NEW.read_state IS NOT OLD.read_state OR NEW.read_at IS NOT OLD.read_at))
+BEGIN SELECT RAISE(ABORT,'host-info-state-monotonic'); END;
 CREATE TRIGGER immutable_pending_delete BEFORE DELETE ON pending_operations BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_presentation_update BEFORE UPDATE ON host_presentations
 WHEN NEW.acknowledged<OLD.acknowledged OR ${['presentation_id','session_id','branch_id','ordinal','epoch','token','kind','operation_id',
@@ -601,6 +646,11 @@ WHEN NEW.acknowledged<OLD.acknowledged OR ${['presentation_id','session_id','bra
 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 `;
 export const probeSchemaDigest = sha256(DDL);
+// Fixed bounds (Ticket 08/14): the pinned next-turn delta and one Info registration chunk.
+const PINNED_DELTA_LIMIT = 16;
+const HOST_INFO_REGISTER_LIMIT = 32;
+const HOST_INFO_SELECT = `SELECT b.*, a.payload AS batch_payload, a.payload_hash AS batch_hash FROM host_info_batches b
+  JOIN activation_batches a ON a.batch_id=b.batch_id`;
 
 // P0 disposable schema; not migrations/001-initial.sql and not the execution ledger.
 export class ProbeStore {
@@ -637,15 +687,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,13,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,14,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 13, 'unsupported-probe-schema');
+        check(version === 14, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 13 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 14 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -1791,15 +1841,136 @@ export class ProbeStore {
         verification: 'unverified' as const, scope, appliesTo, source: structuredClone(input), validFrom, validUntil,
         conflictSetId: null, verificationRunId: null, headEventId: eventId };
       const record = this.#withMemoryHash(base);
-      this.#db.prepare('INSERT INTO memory_records VALUES (?, ?, ?, ?, ?)')
-        .run(recordId, this.#binding.ownerId, claimKey, input.binding.sessionId, new Date().toISOString());
-      this.#insertRevision(record);
-      const capturePayload = JSON.stringify({ schema: 'capture-job@1', source: input, recordId });
-      this.#db.prepare('INSERT INTO capture_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(randomUUID(), input.eventId, recordId, 'complete', capturePayload, sha256(capturePayload), new Date().toISOString(), input.binding.sessionId);
-      this.#appendMemoryEvent(null, record, 'capture', input.eventId, { automatic: true },
+      this.#insertCandidate(record, {},
         this.#requestDigest('capture', null, { input, content, scope, type: options.type, appliesTo, claimKey, validFrom, validUntil }));
       return { status: 'committed', record, eventId };
+    });
+  }
+
+  /**
+   * Explicit owner fast lane (Ticket 08 §12, I05-I07). One transaction captures an
+   * idempotent candidate, records the deterministic verification fact and, only when
+   * the Host has a durable Info surface, activates it together with its fixed batch
+   * manifest and host-info/search outbox jobs. Any failure rolls the whole call back.
+   */
+  queueOwnerCapture(activity: Activity, input: SourceAck, noActiveProject = false): { jobId: string; stage: 'pending'; reason: 'memory-type-required' } {
+    return this.withActivity(activity, () => {
+      check(typeof noActiveProject === 'boolean' && input?.binding && sameBinding(input.binding, this.#binding), 'source-scope-mismatch');
+      const owner = this.#archiveRef(input);
+      check(owner.role === 'user', 'memory-owner-source-required');
+      check(isUntypedRemember(owner.text), 'memory-statement-not-explicit');
+      const existing = this.#db.prepare('SELECT * FROM capture_jobs WHERE source_owner=? AND source_event_id=?')
+        .get(input.binding.sessionId, input.eventId);
+      if (existing) {
+        const payload = JSON.parse(String(existing.payload));
+        check(sha256(String(existing.payload)) === existing.payload_hash && payload.schema === 'capture-job@1'
+          && JSON.stringify(payload.source) === JSON.stringify(input) && existing.status === 'pending'
+          && payload.reason === 'memory-type-required', 'capture-evidence-gap');
+        return { jobId: String(existing.job_id), stage: 'pending', reason: 'memory-type-required' };
+      }
+      const scope: MemoryScope = noActiveProject ? { kind: 'session', id: this.#binding.sessionId, resolved: false }
+        : { kind: 'project', id: this.#binding.projectId, resolved: true };
+      this.#validateScope(scope);
+      const jobId = randomUUID();
+      // No guessed type, claim or verified memory: the normal lane owns extraction from this durable job.
+      const payload = JSON.stringify({ schema: 'capture-job@1', source: input, range: [input], scope,
+        ownerId: this.#binding.ownerId, recordId: null, lane: 'owner-untyped', reason: 'memory-type-required' });
+      this.#db.prepare('INSERT INTO capture_jobs VALUES (?,?,?,?,?,?,?,?)')
+        .run(jobId, input.eventId, null, 'pending', payload, sha256(payload), new Date().toISOString(), input.binding.sessionId);
+      return { jobId, stage: 'pending', reason: 'memory-type-required' };
+    });
+  }
+
+  rememberMemory(activity: Activity, request: RememberRequest): RememberResult {
+    return this.withActivity(activity, () => {
+      check(request && typeof request === 'object' && Object.keys(request).every(key => ['input', 'hostInfo', 'noActiveProject'].includes(key))
+        && ['durable', 'unavailable'].includes(request.hostInfo)
+        && (request.noActiveProject === undefined || request.noActiveProject === true), 'invalid-remember-request');
+      const { input } = request;
+      check(input && typeof input === 'object' && input.binding && sameBinding(input.binding, this.#binding), 'source-scope-mismatch');
+      const owner = this.#archiveRef(input);
+      check(owner.role === 'user', 'memory-owner-source-required');
+      let statement: OwnerMemoryStatement | null = parseOwnerStatement(owner.text);
+      let range: SourceAck[] = [input];
+      if (!statement) {
+        const agreement = parseOwnerAgreement(owner.text);
+        check(agreement, 'memory-statement-not-explicit');
+        const proposal = agreement.proposal;
+        check(proposal.binding && sameBinding(proposal.binding, this.#binding) && proposal.eventId !== input.eventId, 'memory-proposal-scope-mismatch');
+        const proposed = this.#archiveRef(proposal);
+        check(proposed.role === 'assistant', 'memory-proposal-role-required');
+        statement = parseMemoryProposal(proposed.text);
+        check(statement, 'memory-proposal-not-explicit');
+        range = [proposal, input];
+      }
+      const scope: MemoryScope = request.noActiveProject
+        ? { kind: 'session', id: this.#binding.sessionId, resolved: false }
+        : { kind: 'project', id: this.#binding.projectId, resolved: true };
+      this.#validateScope(scope);
+      const existing = this.#db.prepare('SELECT record_id,payload,payload_hash FROM capture_jobs WHERE source_owner=? AND source_event_id=?')
+        .get(input.binding.sessionId, input.eventId);
+      let record: MemoryRecord;
+      if (existing) {
+        const job = JSON.parse(String(existing.payload));
+        check(sha256(String(existing.payload)) === existing.payload_hash && job.schema === 'capture-job@1'
+          && job.recordId === existing.record_id, 'capture-evidence-gap');
+        check(job.lane === 'owner-fast-lane' && JSON.stringify(job.range) === JSON.stringify(range), 'identity-conflict');
+        // Identity is the captured claim; a later correct/revise legitimately changes the current content.
+        const captured = this.#capturedSnapshot(String(existing.record_id));
+        check(captured.content === statement.content && captured.type === statement.type, 'identity-conflict');
+        record = this.#readMemoryUnsafe(String(existing.record_id));
+      } else {
+        const claimKey = statement.content.normalize('NFC');
+        const corroborated = this.#corroboratedRecord(input);
+        if (corroborated) {
+          return this.#rememberResult('no_op', corroborated, range, corroborated.lifecycle === 'active' ? 'claim-already-active' : 'later-memory-change');
+        }
+        const duplicate = this.#activeClaim(claimKey, statement, scope, null);
+        if (duplicate) {
+          this.#corroborate(duplicate, range); // Ticket 08 §10: new evidence for the same claim only appends provenance.
+          return this.#rememberResult('no_op', duplicate, range, 'claim-already-active');
+        }
+        const suppressed = this.#suppressed(claimKey, input.binding.sessionId, scope, []);
+        if (suppressed) return this.#rememberResult('no_op', suppressed, range, 'memory-suppressed');
+        record = this.#withMemoryHash({ schema: 'memory-record@1', recordId: randomUUID(), revisionId: randomUUID(), revision: 1,
+          claimKey, content: statement.content, contentHash: sha256(statement.content), type: statement.type,
+          lifecycle: 'candidate', verification: 'unverified', scope, appliesTo: [], source: structuredClone(input),
+          validFrom: null, validUntil: null, conflictSetId: null, verificationRunId: null, headEventId: randomUUID() });
+        this.#insertCandidate(record, { lane: 'owner-fast-lane', range },
+          this.#requestDigest('remember-capture', null, { input, statement, range }), range.slice(0, -1));
+      }
+      // Only the fast lane's own capture/verify head may resume; any later event (rollback, correct,
+      // forget, conflict, another lane) is the owner's current state and a replay must not undo it.
+      const head = this.#fastLaneHead(record);
+      if (!head) return this.#rememberResult('no_op', record, range, 'later-memory-change');
+      if (head === 'activate') return this.#rememberResult('no_op', record, range, null);
+      if (!record.scope.resolved) return this.#rememberResult('blocked', record, range, 'scope-unresolved');
+      if (record.verification === 'unverified') {
+        const prior = record.verificationRunId ? this.#verificationOf(record) : null;
+        if (prior?.verifier === 'owner-fast-lane@1') return this.#rememberResult('blocked', record, range, prior.reason);
+        const result = statement.type === 'fact' ? 'evidence-gap' : 'pass';
+        const reason = result === 'pass' ? null : 'objective-fact-authority-required';
+        const runId = this.#saveVerification(record, result, range, 'owner-fast-lane@1', reason);
+        const verified = this.#withMemoryHash({ ...record, verificationRunId: runId,
+          verification: result === 'pass' ? 'verified' : 'unverified', headEventId: randomUUID() });
+        this.#appendMemoryEvent(record, verified, 'verify', record.source.eventId,
+          { runId, result, evidence: structuredClone(range), verifier: 'owner-fast-lane@1', reason, lane: 'owner-fast-lane' },
+          this.#requestDigest('remember-verify', record, { runId }));
+        record = verified;
+        if (result !== 'pass') return this.#rememberResult('blocked', record, range, reason);
+      }
+      if (request.hostInfo !== 'durable') return this.#rememberResult('blocked', record, range, 'host-info-unavailable');
+      if (this.#suppressed(record.claimKey, record.source.binding.sessionId, record.scope, record.appliesTo)) {
+        return this.#rememberResult('blocked', record, range, 'memory-suppressed');
+      }
+      if (this.#activeClaim(record.claimKey, statement, record.scope, record.recordId)) {
+        return this.#rememberResult('blocked', record, range, 'claim-already-active');
+      }
+      const active = this.#withMemoryHash({ ...record, lifecycle: 'active', headEventId: randomUUID() });
+      this.#eligible(active);
+      this.#appendMemoryEvent(record, active, 'activate', record.source.eventId, { automatic: true, lane: 'owner-fast-lane' },
+        this.#requestDigest('remember-activate', record, { recordId: record.recordId }));
+      return this.#rememberResult('activated', active, range, null);
     });
   }
 
@@ -2698,7 +2869,7 @@ export class ProbeStore {
     return [...projects, this.#binding.ownerId, ...projects];
   }
 
-  #visibleScopeSql(alias: 'projection_jobs' | 'memory_heads' | 'v' | 'd' | 'j' | 'search_documents' | 'h'): string {
+  #visibleScopeSql(alias: 'projection_jobs' | 'memory_heads' | 'v' | 'd' | 'j' | 'search_documents' | 'h' | 'b'): string {
     return `((${alias}.scope_kind='project' AND ${alias}.scope_id=?) OR (${alias}.scope_kind='personal' AND ${alias}.scope_id=?)
       OR (${alias}.scope_kind='session' AND ${alias}.scope_id=?) OR (${alias}.scope_kind='workspace' AND EXISTS
         (SELECT 1 FROM workspace_projects w WHERE w.workspace_id=${alias}.scope_id AND w.project_id=?)))`;
@@ -2712,6 +2883,30 @@ export class ProbeStore {
     return this.withActivity(activity, () => this.#db.prepare(`SELECT r.record_id FROM memory_records r WHERE r.owner_id=?
       AND EXISTS(SELECT 1 FROM memory_revisions v WHERE v.record_id=r.record_id AND ${this.#visibleScopeSql('v')}) ORDER BY r.rowid`)
       .all(this.#binding.ownerId, ...this.#scopeParameters()).map(row => this.recoverMemory(activity, String(row.record_id))));
+  }
+
+  /**
+   * Pinned delta (Ticket 10 #16): eligible records whose current head has not reached
+   * the search projection yet, bounded like one assembly selection. Search keeps
+   * reporting its own lag; this only lets the next turn use a just-activated memory.
+   */
+  pinnedMemoryDelta(activity: Activity, boundary: Pick<SearchRequest, 'noActiveProject'> = {}): { records: MemoryRecord[]; truncated: boolean } {
+    return this.withActivity(activity, () => {
+      check(boundary && Object.keys(boundary).every(key => key === 'noActiveProject')
+        && (boundary.noActiveProject === undefined || boundary.noActiveProject === true), 'invalid-search-request');
+      if (boundary.noActiveProject) return { records: [], truncated: false };
+      const limit = PINNED_DELTA_LIMIT;
+      const rows = this.#db.prepare(`SELECT h.record_id FROM memory_heads h
+        JOIN projection_jobs j ON j.kind='search' AND j.event_id=h.head_event_id
+        LEFT JOIN search_projection_jobs p ON p.job_id=j.job_id
+        WHERE p.job_id IS NULL AND h.lifecycle='active' AND h.verification='verified' AND h.scope_resolved=1
+        AND h.conflict_set_id IS NULL AND ${this.#visibleScopeSql('h')} ORDER BY j.rowid LIMIT ?`)
+        .all(...this.#scopeParameters(), limit + 1);
+      const records = rows.slice(0, limit).map(row => this.#readMemoryUnsafe(String(row.record_id)))
+        .filter(record => memoryProjectionExposure(record) === 'normal' && !memoryTemporalStatus(record, Date.now())
+          && memoryApplicability(record.appliesTo, { agent: 'cli', platform: process.platform }) === 'applicable');
+      return { records, truncated: rows.length > limit };
+    });
   }
 
   listEligibleMemories(activity: Activity): MemoryRecord[] {
@@ -2745,7 +2940,7 @@ export class ProbeStore {
       const prior = this.#db.prepare('SELECT 1 FROM verification_runs WHERE run_id=? AND record_id=? AND revision_id=? AND result=? AND evidence_hash=?')
         .get(current.verificationRunId, recordId, current.revisionId, result, evidenceHash);
       if (prior && current.verification === (result === 'pass' ? 'verified' : 'unverified')) return { status: 'no_op', record: current, eventId: null };
-      const runId = this.#saveVerification(current, result, evidence);
+      const runId = this.#saveVerification(current, result, evidence, 'synthetic-harness@1', result === 'pass' ? null : `synthetic-${result}`);
       const after = this.#withMemoryHash({ ...current, verificationRunId: runId,
         lifecycle: result === 'block' && current.lifecycle !== 'tombstoned' ? 'rejected' : current.lifecycle,
         verification: result === 'pass' ? 'verified' : 'unverified', headEventId: randomUUID() });
@@ -2797,6 +2992,117 @@ export class ProbeStore {
     return this.withActivity(activity, () => this.#readActivationBatch(batchId));
   }
 
+  /**
+   * Idempotent Info consumer: one durable row per host-info batch, keyed by batch ID. Registers at
+   * most a fixed chunk per call; `more` tells the Host to call again before the next dispatch.
+   */
+  registerHostInfo(activity: Activity): { pending: HostInfo[]; more: boolean } {
+    return this.withActivity(activity, () => {
+      const jobs = this.#db.prepare(`SELECT j.* FROM projection_jobs j LEFT JOIN host_info_batches b ON b.batch_id=j.batch_id
+        WHERE j.kind='host-info' AND b.batch_id IS NULL AND j.owner_id=? AND ${this.#visibleScopeSql('j')}
+        ORDER BY j.rowid LIMIT ?`).all(this.#binding.ownerId, ...this.#scopeParameters(), HOST_INFO_REGISTER_LIMIT + 1);
+      for (const job of jobs.slice(0, HOST_INFO_REGISTER_LIMIT)) {
+        check(sha256(String(job.payload)) === job.payload_hash, 'outbox-evidence-gap');
+        const manifest = JSON.parse(String(job.payload)) as { schema: string; kind: string; batchId: string; events: unknown[] };
+        const batch = this.#readActivationBatch(String(job.batch_id));
+        check(manifest.schema === 'memory-outbox@1' && manifest.kind === 'host-info' && manifest.batchId === job.batch_id
+          && JSON.stringify(manifest.events) === JSON.stringify(JSON.parse(batch.payload).events)
+          && batch.events[0]?.eventId === job.event_id, 'outbox-evidence-gap');
+        this.#db.prepare(`INSERT INTO host_info_batches(batch_id,job_id,owner_id,scope_kind,scope_id,digest,member_count,delivery,read_state,registered_at)
+          VALUES (?,?,?,?,?,?,?,'pending','unread',?)`).run(batch.batchId, String(job.job_id), this.#binding.ownerId,
+          batch.scope.kind, batch.scope.id, batch.digest, batch.events.length, new Date().toISOString());
+      }
+      return { pending: this.#listHostInfo("AND b.delivery='pending'"), more: jobs.length > HOST_INFO_REGISTER_LIMIT };
+    });
+  }
+
+  listHostInfo(activity: Activity): HostInfo[] {
+    return this.withActivity(activity, () => this.#listHostInfo(''));
+  }
+
+  /** Frozen manifest plus each member's current canonical state; never re-selects members. */
+  readHostInfo(activity: Activity, batchId: string): HostInfoView {
+    return this.withActivity(activity, () => {
+      const info = this.#hostInfoRow(batchId);
+      const batch = this.#readActivationBatch(batchId);
+      check(batch.digest === info.digest && batch.events.length === info.memberCount, 'host-info-evidence-gap');
+      const members = batch.events.map(event => {
+        try {
+          const current = this.#readMemoryUnsafe(event.recordId);
+          return { recordId: event.recordId, eventId: event.eventId, current, changed: current.headEventId !== event.eventId, unavailable: null };
+        } catch (error) {
+          return { recordId: event.recordId, eventId: event.eventId, current: null, changed: true,
+            unavailable: error instanceof Error ? error.message : 'memory-unavailable' };
+        }
+      });
+      return { info, batch, members };
+    });
+  }
+
+  /** Recovery proof for the shared physical Info carrier, not a scope-filtered owner query.
+   * Never discard a torn tail if ANY delivered identity would be lost, even outside the current scope.
+   */
+  assertHostInfoCarrier(activity: Activity, entries: HostInfoDelivery[]): void {
+    this.withActivity(activity, () => {
+      const prefix = new Map(entries.map(entry => [entry.batchId, entry]));
+      for (const row of this.#db.prepare("SELECT batch_id,digest,entry_id,entry_hash FROM host_info_batches WHERE delivery='delivered'").all()) {
+        const entry = prefix.get(String(row.batch_id));
+        check(entry && entry.digest === row.digest && entry.entryId === row.entry_id && entry.entryHash === row.entry_hash,
+          'owner-info-evidence-gap');
+      }
+    });
+  }
+
+  /** Records the Host's durable owner entry; repeating the same entry is a no-op. */
+  recordHostInfoDelivery(activity: Activity, delivery: HostInfoDelivery): HostInfo {
+    return this.withActivity(activity, () => {
+      check(delivery && typeof delivery === 'object'
+        && Object.keys(delivery).sort().join(',') === 'batchId,digest,entryHash,entryId', 'invalid-host-info-delivery');
+      uuid(delivery.entryId);
+      check(/^[0-9a-f]{64}$/.test(delivery.digest) && /^[0-9a-f]{64}$/.test(delivery.entryHash), 'invalid-host-info-delivery');
+      const info = this.#hostInfoRow(delivery.batchId);
+      check(info.digest === delivery.digest, 'host-info-digest-mismatch');
+      if (info.delivery === 'delivered') {
+        check(info.entryId === delivery.entryId && info.entryHash === delivery.entryHash, 'host-info-delivery-conflict');
+        return info;
+      }
+      this.#db.prepare("UPDATE host_info_batches SET delivery='delivered', entry_id=?, entry_hash=?, delivered_at=? WHERE batch_id=?")
+        .run(delivery.entryId, delivery.entryHash, new Date().toISOString(), delivery.batchId);
+      return this.#hostInfoRow(delivery.batchId);
+    });
+  }
+
+  /** Settles unread only after the full batch presentation is durable. */
+  acknowledgeHostInfo(activity: Activity, batchId: string): HostInfo {
+    return this.withActivity(activity, () => {
+      const info = this.#hostInfoRow(batchId);
+      check(info.delivery === 'delivered', 'host-info-not-delivered');
+      if (info.read === 'read') return info;
+      this.#db.prepare("UPDATE host_info_batches SET read_state='read', read_at=? WHERE batch_id=?").run(new Date().toISOString(), batchId);
+      return this.#hostInfoRow(batchId);
+    });
+  }
+
+  #listHostInfo(filter: string): HostInfo[] {
+    return this.#db.prepare(`${HOST_INFO_SELECT} WHERE b.owner_id=? AND ${this.#visibleScopeSql('b')} ${filter} ORDER BY b.rowid`)
+      .all(this.#binding.ownerId, ...this.#scopeParameters()).map(row => this.#hostInfo(row));
+  }
+  #hostInfoRow(batchId: string): HostInfo {
+    uuid(batchId);
+    const row = this.#db.prepare(`${HOST_INFO_SELECT} WHERE b.batch_id=? AND b.owner_id=? AND ${this.#visibleScopeSql('b')}`)
+      .get(batchId, this.#binding.ownerId, ...this.#scopeParameters());
+    check(row, 'host-info-not-found');
+    return this.#hostInfo(row);
+  }
+  #hostInfo(row: Record<string, unknown>): HostInfo {
+    check(row.batch_hash === row.digest && sha256(String(row.batch_payload)) === row.digest, 'host-info-evidence-gap');
+    const text = (value: unknown) => value === null ? null : String(value);
+    return { schema: 'host-info@1', batchId: String(row.batch_id), digest: String(row.digest),
+      scope: { kind: row.scope_kind as MemoryScopeKind, id: String(row.scope_id), resolved: true }, memberCount: Number(row.member_count),
+      delivery: row.delivery as HostInfo['delivery'], entryId: text(row.entry_id), entryHash: text(row.entry_hash),
+      deliveredAt: text(row.delivered_at), read: row.read_state as HostInfo['read'], readAt: text(row.read_at) };
+  }
+
   #readActivationBatch(batchId: string): ActivationBatch {
     uuid(batchId);
     const row = this.#db.prepare('SELECT * FROM activation_batches WHERE batch_id=? AND owner_id=?').get(batchId, this.#binding.ownerId);
@@ -2815,7 +3121,8 @@ export class ProbeStore {
       const before = this.#parseMemorySnapshot(String(event.before_snapshot));
       const after = this.#parseMemorySnapshot(String(event.after_snapshot));
       check(JSON.stringify(after.scope) === JSON.stringify(manifest.scope), 'batch-evidence-gap');
-      return { eventId: String(event.event_id), recordId: String(event.record_id), before, after };
+      return { eventId: String(event.event_id), recordId: String(event.record_id),
+        kind: String(event.kind) as 'activate' | 'auto-revise', before, after };
     });
     return { schema: 'activation-batch@1', batchId, ownerId: String(row.owner_id), scope: manifest.scope,
       events: members, payload: String(row.payload), digest: String(row.payload_hash) };
@@ -2907,7 +3214,7 @@ export class ProbeStore {
       let after = this.#withMemoryHash({ ...current, revisionId: randomUUID(), revision: this.#nextRevision(recordId),
         content, contentHash: sha256(content), source: structuredClone(input), headEventId: randomUUID(), verificationRunId: null });
       this.#insertRevision(after);
-      const verificationRunId = this.#saveVerification(after, 'pass', evidence);
+      const verificationRunId = this.#saveVerification(after, 'pass', evidence, 'synthetic-harness@1', null);
       after = this.#withMemoryHash({ ...after, verificationRunId });
       this.#appendMemoryEvent(current, after, 'auto-revise', input.eventId, { automatic: true, synthetic: true, evidence }, request);
       return { status: 'committed', record: after, eventId: after.headEventId };
@@ -3046,12 +3353,89 @@ export class ProbeStore {
     }
   }
 
-  #saveVerification(record: MemoryRecord, result: 'pass' | 'block' | 'evidence-gap', evidence: SourceAck[]): string {
+  #insertCandidate(record: MemoryRecord, job: Record<string, unknown>, request: string, context: SourceAck[] = []): void {
+    this.#db.prepare('INSERT INTO memory_records VALUES (?, ?, ?, ?, ?)')
+      .run(record.recordId, this.#binding.ownerId, record.claimKey, record.source.binding.sessionId, new Date().toISOString());
+    this.#insertRevision(record, context);
+    const capturePayload = JSON.stringify({ schema: 'capture-job@1', source: record.source, recordId: record.recordId, ...job });
+    this.#db.prepare('INSERT INTO capture_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(randomUUID(), record.source.eventId, record.recordId, 'complete', capturePayload, sha256(capturePayload),
+        new Date().toISOString(), record.source.binding.sessionId);
+    this.#appendMemoryEvent(null, record, 'capture', record.source.eventId, { automatic: true, ...job }, request);
+  }
+  #rememberResult(status: RememberResult['status'], record: MemoryRecord, range: SourceAck[], reason: string | null): RememberResult {
+    const stage: RememberResult['stage'] = record.lifecycle !== 'candidate' ? record.lifecycle
+      : record.verification === 'verified' ? 'verified' : 'candidate';
+    const batch = this.#db.prepare(`SELECT batch_id FROM memory_events WHERE record_id=? AND kind='activate'
+      ORDER BY seq DESC LIMIT 1`).get(record.recordId);
+    return { status, stage, reason, record: structuredClone(record), batchId: batch ? String(batch.batch_id) : null,
+      range: structuredClone(range), verification: record.verificationRunId ? this.#verificationOf(record) : null };
+  }
+  #verificationOf(record: MemoryRecord): RememberVerification {
+    const row = this.#db.prepare('SELECT * FROM verification_runs WHERE run_id=?').get(record.verificationRunId);
+    check(row && row.record_id === record.recordId && sha256(String(row.evidence_json)) === row.evidence_hash, 'verification-evidence-gap');
+    return { runId: String(row.run_id), verifier: row.verifier as RememberVerification['verifier'],
+      result: row.result as RememberVerification['result'], reason: row.reason === null ? null : String(row.reason),
+      evidence: JSON.parse(String(row.evidence_json)) as SourceAck[] };
+  }
+  #activeClaim(claimKey: string, statement: OwnerMemoryStatement, scope: MemoryScope, exclude: string | null): MemoryRecord | null {
+    const rows = this.#db.prepare(`SELECT h.record_id FROM memory_heads h JOIN memory_records r ON r.record_id=h.record_id
+      WHERE r.owner_id=? AND r.claim_key=? AND h.lifecycle='active' AND h.scope_kind=? AND h.scope_id=? AND h.record_id IS NOT ?`)
+      .all(this.#binding.ownerId, claimKey, scope.kind, scope.id, exclude);
+    for (const row of rows) {
+      const record = this.#readMemoryUnsafe(String(row.record_id));
+      if (record.type === statement.type && record.content === statement.content && record.appliesTo.length === 0) return record;
+    }
+    return null;
+  }
+  /** Which fast-lane step owns the current head, or null when a later event (any lane) does. */
+  #fastLaneHead(record: MemoryRecord): 'capture' | 'verify' | 'activate' | null {
+    const row = this.#db.prepare('SELECT kind,payload,payload_hash FROM memory_events WHERE event_id=? AND record_id=?')
+      .get(record.headEventId, record.recordId);
+    check(row && sha256(String(row.payload)) === row.payload_hash, 'memory-evidence-gap');
+    const kind = String(row.kind);
+    return ['capture', 'verify', 'activate'].includes(kind) && JSON.parse(String(row.payload)).lane === 'owner-fast-lane'
+      ? kind as 'capture' | 'verify' | 'activate' : null;
+  }
+  #capturedSnapshot(recordId: string): MemoryRecord {
+    const row = this.#db.prepare("SELECT after_snapshot FROM memory_events WHERE record_id=? AND kind='capture' ORDER BY seq LIMIT 1").get(recordId);
+    check(row, 'capture-evidence-gap');
+    return this.#parseMemorySnapshot(String(row.after_snapshot));
+  }
+  /** A later owner input already attached to an existing claim resolves to that claim on replay. */
+  #corroboratedRecord(input: SourceAck): MemoryRecord | null {
+    const row = this.#db.prepare(`SELECT record_id,payload,payload_hash FROM provenance_refs WHERE owner_id=? AND source_event_id=?
+      AND json_extract(payload,'$.role')='corroboration' ORDER BY rowid LIMIT 1`).get(input.binding.sessionId, input.eventId);
+    if (!row) return null;
+    const ref = JSON.parse(String(row.payload)) as { source: SourceAck };
+    check(sha256(String(row.payload)) === row.payload_hash && ref.source.hash === input.hash
+      && ref.source.contentHash === input.contentHash, 'capture-evidence-gap');
+    return this.#readMemoryUnsafe(String(row.record_id));
+  }
+  #corroborate(record: MemoryRecord, range: SourceAck[]): void {
+    const attached = new Set(this.#db.prepare('SELECT source_event_id FROM provenance_refs WHERE record_id=? AND revision_id=?')
+      .all(record.recordId, record.revisionId).map(row => String(row.source_event_id)));
+    for (const [index, source] of range.entries()) {
+      if (!attached.has(source.eventId)) this.#insertProvenance(record, source, index === range.length - 1 ? 'corroboration' : 'context');
+    }
+  }
+  #insertProvenance(record: MemoryRecord, source: SourceAck, role: 'source' | 'context' | 'corroboration'): void {
+    const provenance = { schema: 'provenance-ref@1', recordId: record.recordId, revisionId: record.revisionId,
+      ownerKind: 'session', ownerId: source.binding.sessionId, source, ...(role === 'source' ? {} : { role }) };
+    const payload = JSON.stringify(provenance);
+    this.#db.prepare('INSERT INTO provenance_refs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(randomUUID(), record.recordId, record.revisionId, 'session', source.binding.sessionId, JSON.stringify(source),
+        source.eventId, source.locator, source.contentHash, payload, sha256(payload));
+  }
+
+  #saveVerification(record: MemoryRecord, result: 'pass' | 'block' | 'evidence-gap', evidence: SourceAck[],
+    verifier: RememberVerification['verifier'], reason: string | null): string {
     check(result !== 'pass' || evidence.length > 0, 'verification-evidence-required');
+    check((result === 'pass') === (reason === null), 'verification-reason-required');
     const runId = randomUUID();
     const bytes = JSON.stringify(evidence);
-    this.#db.prepare('INSERT INTO verification_runs VALUES (?,?,?,?,?,?,?)')
-      .run(runId, record.recordId, record.revisionId, result, bytes, sha256(bytes), new Date().toISOString());
+    this.#db.prepare('INSERT INTO verification_runs VALUES (?,?,?,?,?,?,?,?,?)')
+      .run(runId, record.recordId, record.revisionId, result, bytes, sha256(bytes), new Date().toISOString(), verifier, reason);
     for (const [ordinal, ref] of evidence.entries()) {
       this.#validateSource(ref, undefined, record.scope);
       this.#db.prepare('INSERT INTO verification_evidence VALUES (?,?,?,?,?,?,?)')
@@ -3324,7 +3708,7 @@ export class ProbeStore {
     return this.#db.prepare('SELECT value FROM memory_applicability WHERE revision_id=? ORDER BY ordinal').all(revisionId)
       .map(row => String(row.value));
   }
-  #insertRevision(record: MemoryRecord): void {
+  #insertRevision(record: MemoryRecord, context: SourceAck[] = []): void {
     this.#db.prepare('INSERT INTO memory_revisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(record.revisionId, record.recordId, record.revision, record.content, record.contentHash, record.type,
         record.validFrom, record.validUntil, record.source.binding.projectId,
@@ -3333,12 +3717,9 @@ export class ProbeStore {
     for (const [ordinal, value] of record.appliesTo.entries()) {
       this.#db.prepare('INSERT INTO memory_applicability VALUES (?,?,?)').run(record.revisionId, ordinal, value);
     }
-    const provenance = { schema: 'provenance-ref@1', recordId: record.recordId, revisionId: record.revisionId,
-      ownerKind: 'session', ownerId: record.source.binding.sessionId, source: record.source };
-    const payload = JSON.stringify(provenance);
-    this.#db.prepare('INSERT INTO provenance_refs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(randomUUID(), record.recordId, record.revisionId, 'session', record.source.binding.sessionId, JSON.stringify(record.source),
-        record.source.eventId, record.source.locator, record.source.contentHash, payload, sha256(payload));
+    // The first ref is the record source; later refs are the rest of its durable source range.
+    this.#insertProvenance(record, record.source, 'source');
+    for (const source of context) this.#insertProvenance(record, source, 'context');
   }
   #requestDigest(kind: string, expected: MemoryRecord | null, args: unknown): string {
     return sha256(JSON.stringify({ schema: 'memory-request@1', kind, expected, args }));
@@ -3506,7 +3887,7 @@ export class ProbeStore {
     // These are the existing disposable adapter's carriers, not a cleanup allowlist.
     const sources = this.#db.prepare('SELECT source_path,source_dev,source_ino FROM sessions WHERE store_id=?').all(this.#storeId);
     const sourceNames = sources.map(row => basename(String(row.source_path)));
-    const known = new Set(['sandbox.json', 'counting-receiver.jsonl', ...sourceNames, basename(this.#resources.store.path),
+    const known = new Set(['sandbox.json', 'counting-receiver.jsonl', 'owner-info.jsonl', ...sourceNames, basename(this.#resources.store.path),
       `${basename(this.#resources.store.path)}-wal`, `${basename(this.#resources.store.path)}-shm`]);
     try {
       const names = readdirSync(this.#resources.root.path).sort();

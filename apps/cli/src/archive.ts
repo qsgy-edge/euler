@@ -8,6 +8,22 @@ import type { Sandbox } from './sandbox.ts';
 type Gate = <T>(action: () => T) => T;
 interface RawEvent { schema: 'cli-input@1'; eventId: string; role: 'user' | 'assistant' | 'tool'; text: string }
 
+/** Appends one line to a CLI-owned JSONL carrier under a size cap and fsyncs it before returning. */
+export function appendDurably(path: string, line: string, maxBytes: number, carrier: string): void {
+  const fd = openSync(path, 'a');
+  try {
+    check(fstatSync(fd).size + Buffer.byteLength(line) <= maxBytes, `${carrier}-limit`);
+    const bytes = Buffer.from(line);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const written = writeSync(fd, bytes, offset, bytes.length - offset);
+      check(written > 0, `${carrier}-write-failed`);
+      offset += written;
+    }
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
+}
+
 // The CLI owns this carrier. Core sees acknowledgements and bounded source operations.
 export class CliArchive {
   readonly #sandbox: Sandbox;
@@ -61,20 +77,7 @@ export class CliArchive {
       const line = JSON.stringify({ schema: 'cli-input@1', eventId, role, text }) + '\n';
       if (previous) {
         check(previous.event.text === text && previous.event.role === role, 'identity-conflict');
-      } else {
-        const fd = openSync(this.#path, 'a');
-        try {
-          check(fstatSync(fd).size + Buffer.byteLength(line) <= 1_048_576, 'archive-limit');
-          const bytes = Buffer.from(line);
-          let offset = 0;
-          while (offset < bytes.length) {
-            const written = writeSync(fd, bytes, offset, bytes.length - offset);
-            check(written > 0, 'archive-write-failed');
-            offset += written;
-          }
-          fsyncSync(fd);
-        } finally { closeSync(fd); }
-      }
+      } else appendDurably(this.#path, line, 1_048_576, 'archive');
       // Also sync a prior append whose acknowledgement may have been lost.
       const fd = openSync(this.#path, 'r+');
       try { fsyncSync(fd); } finally { closeSync(fd); }
@@ -115,5 +118,10 @@ export class CliArchive {
 
   inspect(): { eventCount: number } {
     return this.#gate(() => ({ eventCount: this.#scan().length }));
+  }
+
+  /** Durable events in archive order, for Host backfill and referent resolution. */
+  events(): { role: RawEvent['role']; text: string; ack: SourceAck }[] {
+    return this.#gate(() => this.#scan().map(({ event, ack }) => ({ role: event.role, text: event.text, ack })));
   }
 }

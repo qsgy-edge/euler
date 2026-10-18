@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
-import { openSync, closeSync, ftruncateSync, fsyncSync, writeSync } from 'node:fs';
+import { openSync, closeSync, ftruncateSync, fsyncSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
@@ -11,6 +11,8 @@ import type { Sandbox } from './sandbox.ts';
 import { openProbe } from './probe.ts';
 import { startCli } from './process-driver.ts';
 import { AGENT_BUDGET, runAgentDemo } from './agent-cli.ts';
+import { runInfoQuery, runRememberSession } from './owner-memory.ts';
+import { killPoint } from './kill-point.ts';
 import memoryFixture from '../../../fixtures/scoped-memory.json' with { type: 'json' };
 
 function emit(event: string, fields: Record<string, unknown> = {}) {
@@ -202,12 +204,8 @@ async function memoryWorker(sandbox: Sandbox, scenario: string) {
     for await (const line of lines) {
       if (line !== 'commit') break;
       const change = () => probe.store.correctMemory(probe.activity, expected.recordId, expected, source, request.args.content);
-      const checkpoint = (stage: string) => {
-        writeSync(1, JSON.stringify({ event: 'memory-checkpoint', stage, pid: process.pid }) + '\n');
-        // Deliberately leave the transaction/process open for the parent kill probe.
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);
-        throw new Error('checkpoint-was-not-killed');
-      };
+      // Deliberately leave the transaction/process open for the parent kill probe.
+      const checkpoint = (stage: string) => killPoint('memory-checkpoint', stage, 5000);
       if (scenario === 'crash-in-transaction') {
         probe.store.withActivity(probe.activity, () => { change(); checkpoint('uncommitted'); });
       } else {
@@ -228,16 +226,18 @@ async function main() {
     attempt: { type: 'string' },
     'accept-duplicate-risk': { type: 'boolean', default: false },
     'wait-child-launch': { type: 'boolean', default: false },
+    'host-info': { type: 'string', default: 'durable' }, 'no-active-project': { type: 'boolean', default: false },
+    'synthetic-proposals': { type: 'boolean', default: false }, batch: { type: 'string' },
   } });
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
   const requestCommands = ['request-status', 'request-seal', 'request-reconcile', 'request-resume', 'request-gap'];
-  check([...requestCommands, 'agent', 'agent-status', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
+  check([...requestCommands, 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
   const options = args.values.budget ? JSON.parse(args.values.budget) as Partial<ProbeBudget> : {};
   check(!args.values['wait-child-launch'] || command === 'hold', 'hold-only-option');
   check(Object.keys(options).every(key => key in DEFAULT_BUDGET), 'invalid-budget');
   const budget = { ...DEFAULT_BUDGET, ...options };
-  if (['run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status'].includes(command)) check(args.values.sandbox, 'sandbox-required');
+  if (['run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'remember', 'info', 'hold', 'task', 'maintain', 'maintenance-status'].includes(command)) check(args.values.sandbox, 'sandbox-required');
   if (requestCommands.includes(command)) check(args.values.sandbox && args.values.request, 'request-identity-required');
   // Fault injection never modifies a caller-selected existing sandbox.
   if (command === 'archive-failure' || args.values.scenario === 'archive-failure') check(!args.values.sandbox, 'fault-requires-fresh-sandbox');
@@ -254,6 +254,13 @@ async function main() {
     finally { probe.close(); }
     return;
   }
+  if (command === 'remember') {
+    check(['durable', 'unavailable'].includes(args.values['host-info']), 'invalid-host-info');
+    return runRememberSession(sandbox, { hostInfo: args.values['host-info'] as 'durable' | 'unavailable',
+      noActiveProject: args.values['no-active-project'], scenario: args.values.scenario,
+      syntheticProposals: args.values['synthetic-proposals'] });
+  }
+  if (command === 'info') return runInfoQuery(sandbox, args.values.batch);
   if (requestCommands.includes(command)) {
     const probe = openProbe(sandbox, budget, undefined, undefined, command === 'request-resume'
       ? { relatedRunId: args.values.request!, acceptDuplicateRisk: args.values['accept-duplicate-risk'] } : undefined, true);
