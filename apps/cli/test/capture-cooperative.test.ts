@@ -75,7 +75,9 @@ test('the configured worker consumes ordinary jobs at startup and agent_end over
     assert.equal(receiverError, undefined);
     const events = result.stdout.trim().split('\n').map(line => JSON.parse(line));
     assert(events.findIndex(item => item.event === 'agent-result') < events.findIndex(item => item.event === 'capture-prerequisites'));
-    assert.match(result.stdout, /capture-prerequisites/);
+    const prerequisites = events.find(item => item.event === 'capture-prerequisites');
+    assert.equal(prerequisites?.passed, true); assert.equal(prerequisites?.exitCode, 0);
+    assert.equal(prerequisites?.command[1], '--test');
     assert.equal(payloads.length, 6);
     await promisify(execFile)(process.execPath, ['apps/cli/src/main.ts', 'capture-drain', '--sandbox', sandbox.root, '--capture-config', configPath],
       { encoding: 'utf8', env, timeout: 20000 });

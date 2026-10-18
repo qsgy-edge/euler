@@ -12,7 +12,10 @@ import { startCli } from '../src/process-driver.ts';
 import { createSandbox, createSandboxSession, bindingOf, resourcesOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 
-async function fixture(hold = false, otherSession = false) {
+// Complete prerequisite execution is covered by capture-cooperative.test.ts.
+// These cases control its outcome while exercising the actual CLI, HTTP and durable state.
+const prerequisiteFixture = new URL('./support/capture-prerequisite-fixture.mjs', import.meta.url).href;
+async function fixture(hold = false, otherSession = false, rejectPrerequisites = false) {
   const sandbox = createSandbox(), root = mkdtempSync(join(tmpdir(), 'capture-background-'));
   const origin = otherSession ? { ...bindingOf(sandbox), sessionId: randomUUID() } : bindingOf(sandbox);
   if (otherSession) createSandboxSession(sandbox, origin);
@@ -39,11 +42,31 @@ async function fixture(hold = false, otherSession = false) {
     contextWindow: 32000, maxTokens: 1024, budget: { ...AGENT_BUDGET, maxModelAttempts: 8 }, authorization: 'synthetic-test-only', captureCapability: 'standard' }));
   return { sandbox, job, bodies, requestReceived, release: () => release(),
     start: (command: string, ...args: string[]) => startCli([command, '--sandbox', sandbox.root, '--capture-config', path, ...args], 60000, undefined,
-      { ...process.env, T13_BACKGROUND_TOKEN: 'SYNTHETIC-BACKGROUND-TOKEN' }),
+      { ...process.env, T13_BACKGROUND_TOKEN: 'SYNTHETIC-BACKGROUND-TOKEN',
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${prerequisiteFixture}`,
+        T13_PREREQUISITE_FIXTURE: rejectPrerequisites ? 'reject' : 'accept' }),
     async close() { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
       rmSync(sandbox.root, { recursive: true, force: true }); rmSync(root, { recursive: true, force: true }); },
   };
 }
+
+test('a rejected prerequisite blocks the background HTTP request and persists its reason', async () => {
+  const f = await fixture(false, false, true), cli = f.start('remember');
+  try {
+    await cli.waitFor('remember-ready');
+    const error = await Promise.race([cli.waitFor('capture-error'),
+      f.requestReceived.then(() => { throw new Error('sent-after-prerequisite-failure'); })]);
+    assert.equal(error.reason, 'prerequisite-evidence-gap');
+    const gate = cli.observations.find(row => row.event === 'capture-prerequisites');
+    assert.equal(gate?.passed, false); assert.equal(gate?.exitCode, 1);
+    assert.match((gate?.command as string[]).join(' '), /capture-prerequisite-fixture/);
+    cli.command('stop'); assert.equal((await cli.exit).code, 0, cli.stderr());
+    assert.equal(f.bodies.length, 0);
+    const probe = openProbe(f.sandbox, undefined, undefined, undefined, undefined, true);
+    try { assert.equal(probe.store.readCaptureJob(probe.activity, f.job.jobId).reason, 'prerequisite-evidence-gap'); }
+    finally { probe.close(); }
+  } finally { if (cli.child.exitCode === null) cli.child.kill('SIGKILL'); await cli.exit; await f.close(); }
+});
 
 test('an HTTP delivery killed before reply never reconciles against the empty local counting file', async () => {
   const f = await fixture(true), cli = f.start('capture-drain');
