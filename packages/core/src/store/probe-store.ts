@@ -2240,19 +2240,22 @@ export class ProbeStore {
   isCaptureOutput(activity: Activity, ref: SourceAck): boolean {
     return this.withActivity(activity, () => {
       check(sameBinding(ref.binding, this.#binding), 'source-scope-mismatch');
-      if (this.#archiveRef(ref).role === 'user') return false;
-      const response = this.#db.prepare(`SELECT 1 FROM request_attempts a
-        JOIN capture_work w ON w.run_id=a.run_id JOIN capture_jobs j ON j.job_id=w.job_id
-        WHERE a.attempt_id=? AND j.source_owner=?`).get(ref.eventId, ref.binding.sessionId);
-      if (response) return true;
+      const role = this.#archiveRef(ref).role;
+      if (role === 'user') return false;
       const steps = this.#db.prepare(`SELECT e.payload,e.hash FROM request_events e
         JOIN capture_work w ON w.run_id=e.run_id JOIN capture_jobs j ON j.job_id=w.job_id
-        WHERE e.kind='capture/step@v1' AND json_extract(e.payload,'$.source.eventId')=? AND j.source_owner=?`)
-        .all(ref.eventId, ref.binding.sessionId);
-      return steps.some(row => {
+        JOIN sessions s ON s.session_id=j.source_owner
+        WHERE e.kind='capture/step@v1' AND json_extract(e.payload,'$.source.eventId')=? AND s.owner_id=? AND s.project_id=?`)
+        .all(ref.eventId, this.#binding.ownerId, this.#binding.projectId);
+      if (steps.length) return steps.some(row => {
         check(sha256(String(row.payload)) === row.hash, 'capture-evidence-gap');
         return sameSourceAck(JSON.parse(String(row.payload)).source, ref);
       });
+      // Before the step is recorded, a response uses its already-owned attempt identity.
+      return role === 'assistant' && !!this.#db.prepare(`SELECT 1 FROM request_attempts a
+        JOIN capture_work w ON w.run_id=a.run_id JOIN capture_jobs j ON j.job_id=w.job_id
+        JOIN sessions s ON s.session_id=j.source_owner
+        WHERE a.attempt_id=? AND s.owner_id=? AND s.project_id=?`).get(ref.eventId, this.#binding.ownerId, this.#binding.projectId);
     });
   }
 

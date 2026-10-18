@@ -9,12 +9,14 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { AGENT_BUDGET } from '../src/agent-cli.ts';
 import { startCli } from '../src/process-driver.ts';
-import { createSandbox, resourcesOf } from '../src/sandbox.ts';
+import { createSandbox, createSandboxSession, bindingOf, resourcesOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 
-async function fixture(hold = false) {
+async function fixture(hold = false, otherSession = false) {
   const sandbox = createSandbox(), root = mkdtempSync(join(tmpdir(), 'capture-background-'));
-  const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  const origin = otherSession ? { ...bindingOf(sandbox), sessionId: randomUUID() } : bindingOf(sandbox);
+  if (otherSession) createSandboxSession(sandbox, origin);
+  const probe = openProbe(sandbox, undefined, undefined, origin, undefined, true);
   const job = probe.store.queueOwnerCapture(probe.activity, probe.archive.append(randomUUID(), '记住：只使用合成证据'));
   probe.close();
   const bodies: string[] = [];
@@ -84,8 +86,8 @@ test('agent emits its foreground response and handles controls before the backgr
   } finally { if (cli.child.exitCode === null) cli.child.kill('SIGKILL'); await cli.exit; await f.close(); }
 });
 
-test('owner agreement retains its displayed proposal across a background reply and restart', async () => {
-  const f = await fixture(true);
+for (const otherSession of [false, true]) test(`owner agreement retains its displayed proposal across a ${otherSession ? 'cross-session' : 'same-session'} background reply and restart`, async () => {
+  const f = await fixture(true, otherSession);
   let cli = f.start('remember', '--synthetic-proposals');
   try {
     await cli.waitFor('remember-ready');
