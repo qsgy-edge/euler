@@ -22,7 +22,8 @@ if (runner) {
     };
   }
 }
-if (cli && String(process.ppid) === process.env.T12_FAULT_PARENT && process.env.T12_FAULT === 'stdout') {
+// Receipt rejection needs retained raw output and the final writer, not successful intervening scenarios.
+if (cli && String(process.ppid) === process.env.T12_FAULT_PARENT && ['stdout', 'receipt'].includes(process.env.T12_FAULT)) {
   const write = process.stdout.write.bind(process.stdout);
   let injected = false;
   process.stdout.write = function(chunk, ...args) {

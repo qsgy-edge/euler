@@ -11,6 +11,7 @@ export type RequestRunState = 'authorized' | 'revoked' | 'sealed';
 export type RequestAssemblyState = 'not-dispatched' | 'unknown-sent' | 'finished';
 export type RequestAttemptOutcome = 'unknown-sent' | 'received' | 'cancelled-before-send';
 export type RequestEventKind =
+  | 'capture/step@v1'
   | 'agent/event@v1'
   | 'run-authorized' | 'run-revoked' | 'run-sealed' | 'run-recovery-gap'
   | 'model/request-attempt-reconciled@v1'
@@ -44,7 +45,7 @@ export interface AssemblyMemoryUse {
 export interface RequestAssemblyInput {
   runId: string; epoch: number; route: string; model: string; policyHash: string;
   estimator: 'utf8-bytes-upper-bound@1';
-  sources: SourceAck[]; usedMemories?: AssemblyMemoryUse[]; intent: { eventId: string; hash: string } | null;
+  sources: SourceAck[]; usedMemories?: AssemblyMemoryUse[]; claimHeadEventId?: string; intent: { eventId: string; hash: string } | null;
   payload: string; payloadHash: string; byteLength: number; estimatedTokens: number;
   budget: ProbeBudget; zones: { p0: number; p1: number; p2: number; p3: number };
   selection: { ordinal: number; hash: string; reason: 'mandatory-source' }[];
@@ -71,6 +72,16 @@ export interface RequestStatus {
   revoked: boolean; sealed: boolean;
 }
 
+export function chargedRequestTokens(status: Pick<RequestStatus, 'run' | 'events' | 'attempts'>): number {
+  const usage = new Map(status.events.filter(event => event.kind === 'model/request-attempt-finished@v1')
+    .map(event => [event.attemptId, JSON.parse(event.payload).usage as { inputTokens?: number; outputTokens?: number } | null]));
+  return status.attempts.reduce((total, attempt) => {
+    const actual = usage.get(attempt.attemptId);
+    return total + Math.max(attempt.byteLength, actual?.inputTokens ?? 0)
+      + Math.max(status.run.budget.outputReserve, actual?.outputTokens ?? 0) + status.run.budget.safetyMargin;
+  }, 0);
+}
+
 // Standing synthetic Host policy frozen into every assembly identity.
 export const REQUEST_POLICY_HASH = sha256(JSON.stringify({
   coreTools: CORE_TOOLS, estimator: 'utf8-bytes-upper-bound@1',
@@ -91,7 +102,7 @@ export function assemblyIdentityHash(input: Omit<RequestAssemblyInput, 'payload'
   return sha256(JSON.stringify({
     runId: input.runId, epoch: input.epoch, route: input.route, model: input.model,
     policyHash: input.policyHash, estimator: input.estimator, sources: input.sources,
-    usedMemories: input.usedMemories ?? [],
+    usedMemories: input.usedMemories ?? [], claimHeadEventId: input.claimHeadEventId ?? null,
     intent: input.intent, payloadHash: input.payloadHash, byteLength: input.byteLength,
     estimatedTokens: input.estimatedTokens, budget: input.budget, zones: input.zones,
     selection: input.selection, degradation: input.degradation,

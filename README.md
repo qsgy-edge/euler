@@ -14,6 +14,8 @@ Issue #3 adds durable synthetic session/job/maintenance/migration stream ownersh
 
 Issue #4 adds the synthetic X-01 persistence foundation: app/store identity, multiple logical sessions, durable preview/pending settlement, immutable owner receipts, fixed activation batches and statement-by-statement crash recovery. See [commands, ownership and evidence boundaries](docs/implementation/t04-persistence.md). Its app identity fixtures use disposable test app-ids under the OS user data directory; real approval and Info delivery remain later work.
 
+Issue #13 adds job-owned capture and independent verification, immutable reports, approved project excerpts and Markdown handoff. See [commands, ownership and evidence boundaries](docs/implementation/t13-capture-verification.md). Ordinary candidates remain inactive; real-provider quality and complete X-04 acceptance remain evidence gaps.
+
 Full X-card acceptance, real provider dispatch, production schema/host acceptance, migration, and MC cutover remain unverified. CI and host results must be read from the artifact for the specific implementation and platform; this repository is not production-ready.
 
 - [Euler v1 implementation specification](docs/architecture/issues/15-euler-v1-spec.md)

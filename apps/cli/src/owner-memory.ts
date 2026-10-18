@@ -7,6 +7,7 @@ import { DEFAULT_BUDGET, OWNER_MEMORY_FORMS, check, encodeOwnerAgreement, isOwne
 import type { ActivationBatch, HostInfo, MemoryRecord, MemoryScope, ProbeBudget, RememberResult, SourceAck } from '@euler/core';
 import { appendDurably } from './archive.ts';
 import { killPoint } from './kill-point.ts';
+import { scheduleCaptures } from './capture.ts';
 import { openProbe } from './probe.ts';
 import { OWNER_INFO_FILE } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
@@ -262,7 +263,8 @@ class OwnerMemoryHost {
       if (event.role !== 'user') continue;
       if (isUntypedRemember(event.text)) {
         const queued = this.probe.store.queueOwnerCapture(this.probe.activity, event.ack, this.#noActiveProject);
-        report('backfill', 'needs-input', 'warning', { ...queued, input: event.ack.eventId });
+        report('backfill', queued.stage === 'pending' ? 'needs-input' : 'capture-status', queued.stage === 'complete' ? 'info' : 'warning',
+          { ...queued, input: event.ack.eventId });
         actionable++;
       } else if (fastLaneInput(event.text)) {
         actionable++;
@@ -332,18 +334,21 @@ function fastLaneInput(text: string): boolean {
   try { return Boolean(parseOwnerAgreement(text)); } catch { return true; }
 }
 
-export interface RememberOptions { hostInfo: 'durable' | 'unavailable'; noActiveProject: boolean; scenario: string; syntheticProposals: boolean }
+export interface RememberOptions { hostInfo: 'durable' | 'unavailable'; noActiveProject: boolean; scenario: string; syntheticProposals: boolean; captureConfig?: string }
 
 export async function runRememberSession(sandbox: Sandbox, options: RememberOptions): Promise<void> {
   check((OWNER_SCENARIOS as readonly string[]).includes(options.scenario), 'invalid-owner-scenario');
   const probe = openProbe(sandbox, OWNER_BUDGET, undefined, undefined, undefined, true);
   const lines = createInterface({ input: process.stdin });
+  const commands = lines[Symbol.asyncIterator]();
+  const capture = scheduleCaptures(probe, options.captureConfig);
   try {
     const log = options.hostInfo === 'durable' ? openOwnerInfo(sandbox, probe) : null;
     const host = new OwnerMemoryHost(probe, log, options.scenario as OwnerScenario, options.noActiveProject);
     host.backfill();
     host.drain();
     host.deliver();
+    capture.kick();
     emit('remember-ready', { pid: process.pid, hostInfo: log ? 'durable' : 'unavailable', infoPath: log?.path ?? null,
       ...counts(probe.store.listHostInfo(probe.activity)), syntheticProposals: options.syntheticProposals,
       commands: [...OWNER_MEMORY_FORMS, ...(options.syntheticProposals ? ['propose <text>'] : []), '同意', '取消', 'info', 'info <batchId>', 'ask <question>', 'stop'] });
@@ -351,7 +356,7 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
       try { return probe.archive.append(randomUUID(), text); }
       catch (error) { report('live', 'error', 'error', { committed: false, reason: (error as Error).message }); return null; }
     };
-    for await (const raw of lines) {
+    for await (const raw of commands) {
       const line = raw.trim();
       try {
         if (line === 'stop') break;
@@ -367,7 +372,7 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
           continue;
         }
         if (isOwnerAgreement(line) || isOwnerDecline(line)) {
-          const previous = probe.archive.events().at(-1);
+          const previous = probe.archive.events().findLast(event => !probe.store.isCaptureOutput(probe.activity, event.ack));
           const target = previous?.role === 'assistant' && parseMemoryProposal(previous.text) ? previous.ack : null;
           const ack = archive(target && isOwnerAgreement(line) ? encodeOwnerAgreement(line, target) : line);
           if (!ack) continue;
@@ -387,8 +392,9 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
         }
         emit('command-rejected', { reason: 'owner-memory-command-required', accepted: OWNER_MEMORY_FORMS });
       } catch (error) { emit('command-error', { reason: (error as Error).message }); }
+      finally { capture.kick(); }
     }
-  } finally { lines.close(); probe.close(); }
+  } finally { lines.close(); await capture.close(); probe.close(); }
 }
 
 /** Queries Info without an agent session; listing never settles unread, opening a batch does. */

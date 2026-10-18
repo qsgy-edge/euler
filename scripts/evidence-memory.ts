@@ -46,8 +46,10 @@ function verifySnapshot(snapshot: string, corrected: boolean, reported: Record<s
   try {
     for (const file of readdirSync(snapshot)) copyFileSync(join(snapshot, file), join(temp, file));
     const lines = readFileSync(join(temp, 'session.jsonl'), 'utf8').trimEnd().split('\n');
+    const rawSources = new Map<string, { role: string; text: string }>();
     const refs = new Map(lines.slice(1).map(line => {
       const source = JSON.parse(line);
+      rawSources.set(source.eventId, source);
       return [source.eventId, { schema: 'cli-source-ack@1', status: 'durable', binding, eventId: source.eventId,
         locator: `cli-jsonl@1/${sessionId}/${source.eventId}`, hash: digest(line), byteLength: Buffer.byteLength(line), contentHash: digest(source.text) }];
     }));
@@ -115,7 +117,16 @@ function verifySnapshot(snapshot: string, corrected: boolean, reported: Record<s
         assert.equal(payload.inert, true);
         assert.equal(payload.supersedes, index === 0 ? null : proposals[0]!.proposal_id);
         assert.equal(db.prepare('SELECT count(*) AS n FROM proposal_evidence WHERE proposal_id=?').get(String(row.proposal_id))!.n, 2);
-        assert.deepEqual(payload.input, refs.get(fixture.sourceEventId));
+        assert.deepEqual(payload.input, refs.get(payload.input.eventId));
+        const approval = rawSources.get(payload.input.eventId)!;
+        assert.equal(approval.role, 'user');
+        const expected = { target: 'synthetic/AGENTS.md', expectedChange: index === 0
+          ? 'Explain the synthetic receipt rule' : 'Explain the synthetic receipt rule and scope', owner: ownerId,
+          scope: { kind: 'project', id: projectId, resolved: true }, evidenceRefs: [refs.get(fixture.sourceEventId)],
+          evaluation: { schema: 'evaluation-contract@1', level: 'L0', assertions: ['Check synthetic source bytes'] },
+          ...(index ? { supersedes: proposals[0]!.proposal_id } : {}) };
+        assert.deepEqual(JSON.parse(approval.text), { schema: 'analysis-proposal-approval@1', proposal: expected });
+        for (const [key, value] of Object.entries(expected)) assert.deepEqual(payload[key], value);
       }
       assert.equal(db.prepare('SELECT count(*) AS n FROM intent_events').get()!.n, 1);
       assert.equal(db.prepare('SELECT count(*) AS n FROM projects').get()!.n, 1);

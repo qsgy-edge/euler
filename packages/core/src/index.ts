@@ -1,3 +1,7 @@
+export { AnalysisArtifacts, parseAnalysisArtifact } from './context/analysis-artifacts.ts';
+export type { AnalysisArtifact, AnalysisHeader, ArtifactEvidence, ReportInput, HandoffInput, ExportSelection } from './context/analysis-artifacts.ts';
+export { CaptureRun } from './context/capture-run.ts';
+export type { CaptureConfig, CaptureRoute, CaptureFailure } from './context/capture-run.ts';
 export { GuidanceSession } from './context/guidance-session.ts';
 export type { GuidanceConfig, GuidanceTarget, GuidanceAssembly, InstructionSnapshot, GuidanceBlock, GuidanceScope, SkillReference } from './context/guidance-session.ts';
 export type { SkillRef, SkillEntry, SkillCatalog, SkillActivation } from './context/skill-catalog.ts';
@@ -20,7 +24,7 @@ export { REQUEST_POLICY_HASH, REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, assembly
 export type { RequestAssembly, RequestAssemblyInput, RequestAttempt, RequestAttemptOutcome, RequestAssemblyState, RequestEvent, RequestEventKind, RequestOwnerKind, RequestRun, RequestRunState, RequestStatus, RequestRecovery, RequestReconciliation } from './store/request-ledger.ts';
 export type {
   Activity, ExecutionOwner, ExecutionStream, AttemptOwnership, Intent, IntentTransition, MemoryType, MemoryLifecycle, MemoryVerification, MemoryScopeKind,
-  MemoryScope, MemoryCaptureOptions, MemoryRecord, MemoryOperation, ConflictOperation, RememberRequest, RememberVerification, RememberResult, HostInfo, HostInfoDelivery, HostInfoView,
+  MemoryScope, MemoryCaptureOptions, MemoryRecord, MemoryOperation, CaptureJob, CaptureLease, ProposedMemory, CaptureVerification, ConflictOperation, RememberRequest, RememberVerification, RememberResult, HostInfo, HostInfoDelivery, HostInfoView,
   MemoryChange, MemoryPresentation, MemoryOperationResult, OwnerReceipt, ActivationBatch,
   EvolutionProposalInput, EvolutionProposal, SearchTarget, MemoryDiscoveryApproval, SearchRequest, SearchResult, SearchPage, SearchProjectionReceipt,
   SourceUnitInput, SourceUnit, SourceSearchRequest, SourceSearchHit, SourceSearchPage, SourceExpandRequest, SourceUnitExcerpt,

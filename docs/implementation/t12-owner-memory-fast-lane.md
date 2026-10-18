@@ -1,6 +1,6 @@
 # T12: explicit owner memory fast lane and durable Host Info (synthetic)
 
-Issue: [#12](https://github.com/qsgy-edge/euler/issues/12). This slice uses only disposable SQLite, synthetic CLI archives and the local counting transport. The disposable schema is version 14; there is no production migration or live owner switch.
+Issue: [#12](https://github.com/qsgy-edge/euler/issues/12). This slice uses only disposable SQLite, synthetic CLI archives and the local counting transport. The disposable schema is version 16; there is no production migration or live owner switch.
 
 ## Owner statement grammar
 
@@ -8,7 +8,7 @@ The fast lane accepts only explicit, typed owner wording. Core re-parses the dur
 
 - Owner statement (`user` event): the whole event text is `记住偏好：<content>`, `记住决定：<content>` or `记住事实：<content>` (ASCII `:` is also accepted). The content is the verbatim remainder.
 - Assistant proposal (`assistant` event): exactly one line of the text is `建议记住偏好：<content>` / `建议记住决定：<content>` / `建议记住事实：<content>`. Other lines are free text and never become memory fields.
-- Owner agreement (`user` event): `{"schema":"owner-agreement@1","text":"同意","proposal":<assistant SourceAck>}`. The Host resolves the proposal as the event immediately preceding the owner's `同意`/`agree` in the same session archive; Core re-reads the referenced assistant event and uses `[proposal, agreement]` as the durable source range.
+- Owner agreement (`user` event): `{"schema":"owner-agreement@1","text":"同意","proposal":<assistant SourceAck>}`. The Host resolves the proposal as the last foreground event preceding the owner's `同意`/`agree` in the same session archive, skipping only background outputs identified by durable capture job/attempt ownership. This survives restart; a foreground replacement, prior agreement or decline still invalidates the previous proposal; Core re-reads the referenced assistant event and uses `[proposal, agreement]` as the durable source range.
 
 An untyped `记住：…` is archived and immediately gets an idempotent `pending` capture job (`needs-input`, `memory-type-required`). The job retains source range, owner and scope without inventing a typed memory record. Restart backfills missing jobs and surfaces the same pending reason; semantic extraction/processing belongs to the normal Proposer lane (T13). Other text is rejected as command syntax, with the accepted forms displayed; this carrier is not a free-text chat interface.
 

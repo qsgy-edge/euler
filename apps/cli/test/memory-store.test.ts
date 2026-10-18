@@ -5,6 +5,7 @@ import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import test from 'node:test';
 import { createSandbox, createSandboxSession, openSandbox, bindingOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
+import { saveApprovedProposal } from './support/source-publication.ts';
 import { startCli } from '../src/process-driver.ts';
 
 test('a losing correction cannot reconcile another request as its own commit', () => {
@@ -433,14 +434,14 @@ test('unresolved candidates stay out of eligibility and proposals remain version
         type: 'insight', scope: { kind: 'session', id: sandbox.fixture.sessionId, resolved: false }, appliesTo: [] });
       assert.equal(candidate.record.scope.resolved, false);
       assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
-      const proposal = probe.store.saveEvolutionProposal(probe.activity, input, {
+      const proposal = saveApprovedProposal(probe, {
         target: 'AGENTS.md', expectedChange: 'Document the local rule', owner: sandbox.fixture.ownerId,
         scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, evidenceRefs: [input],
         evaluation: { schema: 'evaluation-contract@1', level: 'L0', assertions: ['source hash matches'] },
       });
       assert.equal(proposal.inert, true);
       assert.equal(proposal.supersedes, null);
-      const revised = probe.store.saveEvolutionProposal(probe.activity, input, {
+      const revised = saveApprovedProposal(probe, {
         target: 'AGENTS.md', expectedChange: 'Document the revised local rule', owner: sandbox.fixture.ownerId,
         scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, evidenceRefs: [input],
         evaluation: { schema: 'evaluation-contract@1', level: 'L1', assertions: ['source hash matches', 'scope matches'] },

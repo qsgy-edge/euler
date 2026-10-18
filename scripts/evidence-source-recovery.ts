@@ -83,9 +83,12 @@ try {
   const scope = { kind: 'project' as const, id: sandbox.fixture.projectId, resolved: true };
   const base = { target: fixture.proposal.target, owner: sandbox.fixture.ownerId, scope, evidenceRefs: [source],
     evaluation: { schema: 'evaluation-contract@1' as const, level: 'L0' as const, assertions: ['Check source digest'] } };
-  const first = origin.store.saveEvolutionProposal(origin.activity, source, { ...base, expectedChange: fixture.proposal.first });
-  const second = origin.store.saveEvolutionProposal(origin.activity, source, {
-    ...base, expectedChange: fixture.proposal.second, supersedes: first.proposalId });
+  const firstInput = { ...base, expectedChange: fixture.proposal.first };
+  const firstApproval = origin.archive.append(randomUUID(), JSON.stringify({ schema: 'analysis-proposal-approval@1', proposal: firstInput }));
+  const first = origin.store.saveEvolutionProposal(origin.activity, firstApproval, firstInput);
+  const secondInput = { ...base, expectedChange: fixture.proposal.second, supersedes: first.proposalId };
+  const secondApproval = origin.archive.append(randomUUID(), JSON.stringify({ schema: 'analysis-proposal-approval@1', proposal: secondInput }));
+  const second = origin.store.saveEvolutionProposal(origin.activity, secondApproval, secondInput);
   origin.store.drainSourceProjection(origin.activity);
   const local = target.store.searchSources(target.activity, { query: 'Atlas' });
   const hidden = target.store.searchSources(target.activity, { query: 'private' });

@@ -7,7 +7,7 @@ import test from 'node:test';
 import { sha256, type SourceUnitInput } from '@euler/core';
 import { createSandbox, createSandboxSession, bindingOf, resourcesOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
-import { approvedSourceUnit } from './support/source-publication.ts';
+import { approvedSourceUnit, saveApprovedProposal } from './support/source-publication.ts';
 
 test('an unknown cross-project source query can reconcile its stable identity without spending budget twice', () => {
   const sandbox = createSandbox();
@@ -187,8 +187,8 @@ test('pre-stored inert proposal versions are searchable and restore their own hi
     const scope = { kind: 'project' as const, id: sandbox.fixture.projectId, resolved: true };
     const base = { target: 'Atlas config', owner: sandbox.fixture.ownerId, scope, evidenceRefs: [source],
       evaluation: { schema: 'evaluation-contract@1' as const, level: 'L0' as const, assertions: ['No behavior change'] } };
-    const first = probe.store.saveEvolutionProposal(probe.activity, source, { ...base, expectedChange: 'Atlas plan alpha' });
-    const second = probe.store.saveEvolutionProposal(probe.activity, source, { ...base,
+    const first = saveApprovedProposal(probe, { ...base, expectedChange: 'Atlas plan alpha' });
+    const second = saveApprovedProposal(probe, { ...base,
       expectedChange: 'Atlas plan beta', supersedes: first.proposalId });
     assert.equal(probe.store.searchSources(probe.activity, { query: 'Atlas' }).status, 'dirty');
     probe.store.drainSourceProjection(probe.activity);
@@ -221,7 +221,7 @@ test('a proposal from another project needs a task grant even when its locator i
   const target = openProbe(sandbox, undefined, undefined, targetBinding);
   try {
     const source = origin.archive.append(randomUUID(), 'Atlas scoped proposal evidence');
-    const proposal = origin.store.saveEvolutionProposal(origin.activity, source, {
+    const proposal = saveApprovedProposal(origin, {
       target: 'Atlas runtime', expectedChange: 'Atlas plan remains inert', owner: sandbox.fixture.ownerId,
       scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, evidenceRefs: [source],
       evaluation: { schema: 'evaluation-contract@1', level: 'L0', assertions: ['Synthetic check'] },
@@ -420,7 +420,7 @@ test('non-project inert proposals stay canonical without entering project projec
   const db = new DatabaseSync(resourcesOf(sandbox).store.path);
   try {
     const source = probe.archive.append(randomUUID(), 'Personal Atlas evidence');
-    const proposal = probe.store.saveEvolutionProposal(probe.activity, source, {
+    const proposal = saveApprovedProposal(probe, {
       target: 'Personal Atlas guidance', expectedChange: 'Keep the proposal inert', owner: sandbox.fixture.ownerId,
       scope: { kind: 'personal', id: sandbox.fixture.ownerId, resolved: true }, evidenceRefs: [source],
       evaluation: { schema: 'evaluation-contract@1', level: 'L0', assertions: ['Synthetic check'] },
@@ -430,7 +430,7 @@ test('non-project inert proposals stay canonical without entering project projec
     assert.equal(probe.store.drainSourceProjection(probe.activity), 0);
     const restored = probe.store.readEvolutionProposal(probe.activity, proposal.proposalId);
     assert.equal(restored.scope.kind, 'personal');
-    const revised = probe.store.saveEvolutionProposal(probe.activity, source, {
+    const revised = saveApprovedProposal(probe, {
       target: 'Personal Atlas guidance', expectedChange: 'Keep the revised proposal inert', owner: sandbox.fixture.ownerId,
       scope: { kind: 'personal', id: sandbox.fixture.ownerId, resolved: true }, evidenceRefs: [source],
       supersedes: proposal.proposalId,
