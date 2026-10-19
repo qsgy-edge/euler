@@ -119,15 +119,28 @@ function validate(root: string, entry: typeof fixture.cases[number], output: str
       refs.forEach(ref => source(ref));
       assert.deepEqual(manifest.sources, refs.map(ref => ({ eventId: ref.eventId, hash: ref.hash })));
     }
+    const trace: { attemptId: string; runId: string; payload: string }[] = entry.id.startsWith('transport-')
+      ? readFileSync(join(output, 'stdout.txt'), 'utf8').trimEnd().split('\n').map(line => JSON.parse(line))
+        .filter(event => event.event === 'capture-request') : [];
     const receiver = readFileSync(join(root, 'counting-receiver.jsonl'), 'utf8').trimEnd().split('\n');
     assert.equal(JSON.parse(receiver.shift()!).schema, 'counting-receiver@1');
+    if (entry.id.startsWith('transport-')) {
+      assert.equal(trace.length, receiver.length);
+      assert.equal(new Set(trace.map(request => request.attemptId)).size, trace.length);
+    }
     assert.equal(new Set(receiver.map(line => JSON.parse(line).record.attemptId)).size, receiver.length);
     for (const line of receiver) {
       const received = JSON.parse(line); assert.equal(received.hash, digest(JSON.stringify(received.record)));
       const attempt = attempts.find(row => row.attempt_id === received.record.attemptId)!; assert.ok(attempt);
       assert.equal(attempt.outcome, 'received'); assert.equal(attempt.run_id, received.record.runId); assert.equal(attempt.payload_hash, received.record.payloadHash);
       const assembly = assemblies.find(row => row.assembly_id === attempt.assembly_id)!;
-      const payload = currentEvents.find(event => digest(event.text) === assembly.payload_hash)?.text; assert.ok(payload);
+      const recorded = trace.find(request => request.attemptId === attempt.attempt_id);
+      if (entry.id.startsWith('transport-')) {
+        assert.ok(recorded); assert.equal(recorded.runId, attempt.run_id); assert.equal(typeof recorded.payload, 'string');
+      }
+      const payload = entry.id.startsWith('transport-') ? recorded!.payload
+        : currentEvents.find(event => digest(event.text) === assembly.payload_hash)?.text;
+      assert.ok(payload); assert.equal(digest(payload), assembly.payload_hash);
       assert.equal(Buffer.byteLength(payload), assembly.byte_length); assert.equal(received.record.byteLength, assembly.byte_length);
     }
     assert.equal(receiver.length, attempts.filter(attempt => attempt.outcome === 'received').length);

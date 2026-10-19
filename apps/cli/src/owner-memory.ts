@@ -363,7 +363,7 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
   try {
     const log = options.hostInfo === 'durable' ? openOwnerInfo(sandbox, probe) : null;
     const host = new OwnerMemoryHost(probe, log, options.scenario as OwnerScenario, options.noActiveProject);
-    capture = scheduleCaptures(probe, options.captureConfig, () => { host.drain(); host.deliver(); });
+    capture = scheduleCaptures(probe, options.captureConfig, () => { host.drain(); return host.deliver(); });
     host.backfill();
     host.drain();
     host.deliver();

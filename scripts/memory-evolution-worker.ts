@@ -50,7 +50,7 @@ try {
       await drainCaptures(probe, { jobId: job.jobId, batch: 1, deadlineMs: 30000, budget, config: { proposer: [route], verifier: [route] },
         adapterVersion: 'capture-counting@1', host: { async *stream(request, _signal, send) {
           const attempt = send(request.payload); probe.transport.send(request.payload, attempt);
-          probe.archive.append(randomUUID(), request.payload, 'tool');
+          console.log(JSON.stringify({ event: 'capture-request', attemptId: attempt.attemptId, runId: attempt.runId, payload: request.payload }));
           const payload = JSON.parse(request.payload), fixed = JSON.parse(payload.p3.messages[0].content);
           let text = '';
           let calls: { id: string; name: string; arguments: Record<string, unknown> }[] = [];

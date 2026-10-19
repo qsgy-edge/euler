@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile, execFileSync, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -11,6 +12,7 @@ import { sha256 } from '@euler/core';
 import { AGENT_BUDGET } from '../src/agent-cli.ts';
 import { createSandbox, resourcesOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
+import { startCli } from '../src/process-driver.ts';
 import { verifiedCandidate } from './support/memory-evolution.ts';
 
 const cli = (...args: string[]) => execFileSync(process.execPath, ['apps/cli/src/main.ts', ...args], { encoding: 'utf8', timeout: 20000 });
@@ -124,6 +126,83 @@ test('ordinary Agent and remember jobs persist the missing route reason without 
       assert(jobs.every(job => job.source.eventId !== 'ca710000-0000-4000-8000-000000000001'));
     } finally { probe.close(); }
   } finally { rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+for (const command of ['capture-drain', 'agent', 'remember']) test(`${command} worker waits for Info recovery before HTTP and resumes the queued job`, async () => {
+  const sandbox = createSandbox(), configRoot = mkdtempSync(join(tmpdir(), 'euler-capture-info-'));
+  const payloads: string[] = [];
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on('data', chunk => chunks.push(chunk));
+    request.on('end', () => {
+      payloads.push(Buffer.concat(chunks).toString('utf8'));
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ model: 'capture-info-test', choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'null' } }] }));
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  let jobId: string;
+  try {
+    const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    try {
+      const record = verifiedCandidate(probe, '本项目合成验证使用 TypeScript').record!;
+      probe.store.promoteMemory(probe.activity, record.recordId, record);
+      const source = probe.archive.append(randomUUID(), '记住：一条等待独立验证的合成事实');
+      jobId = probe.store.queueOwnerCapture(probe.activity, source).jobId;
+    } finally { probe.close(); }
+    const configPath = join(configRoot, 'transport.json');
+    writeFileSync(configPath, JSON.stringify({ provider: 'synthetic-http', model: 'capture-info-test',
+      baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}`, authNamespace: 'synthetic-http', credentialEnv: 'T14_CAPTURE_INFO_TOKEN',
+      contextWindow: 32000, maxTokens: 1024, budget: AGENT_BUDGET, authorization: 'synthetic-test-only', captureCapability: 'standard' }));
+    const mutate = (sql: string) => {
+      const db = new DatabaseSync(resourcesOf(sandbox).store.path);
+      try { db.exec(sql); } finally { db.close(); }
+    };
+    const run = async () => {
+      const child = startCli([command, '--sandbox', sandbox.root, '--capture-config', configPath,
+        ...(command === 'agent' ? ['--scenario', 'plain'] : [])], 150000, undefined,
+      { ...process.env, T14_CAPTURE_INFO_TOKEN: 'SYNTHETIC-CAPTURE-INFO-TOKEN' });
+      try {
+        await child.waitFor('capture-queue');
+        if (command === 'remember') child.command('stop');
+        await child.waitFor('process-exit');
+        return child.observations;
+      } finally {
+        if (child.child.exitCode === null && child.child.signalCode === null) child.child.kill();
+        await child.exit;
+      }
+    };
+    mutate("CREATE TRIGGER fail_info BEFORE INSERT ON host_info_batches BEGIN SELECT RAISE(ABORT,'injected-worker-info-failure'); END");
+    const waiting = await run();
+    assert.ok(waiting.some(event => event.event === 'info-error'));
+    assert.equal(payloads.length, 0);
+    const queue = waiting.find(event => event.event === 'capture-queue')!.jobs as { jobId: string; stage: string; reason: string }[];
+    assert.equal(queue.find(job => job.jobId === jobId)!.reason, 'host-info-recovery-required');
+    const failedDb = new DatabaseSync(resourcesOf(sandbox).store.path, { readOnly: true });
+    try {
+      assert.equal(failedDb.prepare("SELECT count(*) AS n FROM request_attempts a JOIN request_runs r ON r.run_id=a.run_id JOIN execution_streams s ON s.stream_id=r.stream_id WHERE s.owner_kind='job'").get()!.n, 0);
+      assert.equal(failedDb.prepare('SELECT count(*) AS n FROM host_info_batches').get()!.n, 0);
+    } finally { failedDb.close(); }
+    mutate('DROP TRIGGER fail_info');
+    const resumed = await run();
+    assert.ok(resumed.some(event => event.event === 'info-notice'));
+    assert.ok(payloads.length > 0);
+    const reopened = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    try {
+      assert.equal(reopened.store.readCaptureJob(reopened.activity, jobId).stage, 'complete');
+      assert.deepEqual(reopened.store.listHostInfo(reopened.activity).map(info => info.delivery), ['delivered']);
+    } finally { reopened.close(); }
+    const db = new DatabaseSync(resourcesOf(sandbox).store.path, { readOnly: true });
+    try {
+      const attempts = db.prepare("SELECT a.payload_hash,a.outcome FROM request_attempts a JOIN request_runs r ON r.run_id=a.run_id JOIN execution_streams s ON s.stream_id=r.stream_id WHERE s.owner_kind='job'").all();
+      assert.equal(attempts.length, payloads.length);
+      assert.ok(attempts.every(attempt => attempt.outcome === 'received'));
+      for (const payload of payloads) assert.ok(attempts.some(attempt => attempt.payload_hash === sha256(payload)));
+    } finally { db.close(); }
+  } finally {
+    server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(sandbox.root, { recursive: true, force: true }); rmSync(configRoot, { recursive: true, force: true });
+  }
 });
 
 test('the configured worker consumes ordinary jobs at startup and agent_end over the real HTTP boundary', async () => {

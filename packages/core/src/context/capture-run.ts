@@ -336,6 +336,15 @@ export class CaptureRun {
     return true;
   }
 
+  pauseForHostInfo(): CaptureJob {
+    check(!this.#inflight, 'model-in-flight');
+    if (this.#paused) return this.status();
+    if (this.remainingMs() <= 0) return this.#store.stopCapture(this.#lease, 'blocked', 'capture-deadline');
+    this.#store.pauseCapture(this.#lease, 'host-info-recovery-required');
+    this.#paused = true;
+    return this.status();
+  }
+
   fail(error?: unknown): CaptureJob {
     const reason = error instanceof Error && /^[a-z][a-z0-9-]{1,80}$/.test(error.message) ? error.message
       : this.#inflight ? 'attempt-reconciliation-required' : 'capture-protocol-failed';

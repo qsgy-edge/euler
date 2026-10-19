@@ -2147,7 +2147,7 @@ export class ProbeStore {
       reason: unavailable ?? (work ? work.reason as string | null : payload.reason ?? null), record };
   }
 
-  deferCaptureJobs(activity: Activity, reason: 'capture-route-unavailable' | 'capture-configuration-unavailable' | 'foreground-run-active' | 'request-recovery-required' | 'prerequisite-evidence-gap' | 'capture-stopped'): CaptureJob[] {
+  deferCaptureJobs(activity: Activity, reason: 'capture-route-unavailable' | 'capture-configuration-unavailable' | 'foreground-run-active' | 'request-recovery-required' | 'prerequisite-evidence-gap' | 'capture-stopped' | 'host-info-recovery-required'): CaptureJob[] {
     return this.withActivity(activity, () => this.listCaptureJobs(activity, 16, true).map(job => {
       this.#db.prepare(`INSERT INTO capture_work(job_id,stage,reason,record_id,expected_head_id,lease_until,generation,budget,deadline)
         VALUES (?,'pending',?,?,?,0,1,NULL,0) ON CONFLICT(job_id) DO UPDATE SET reason=excluded.reason
@@ -2187,11 +2187,11 @@ export class ProbeStore {
       && Number(row!.lease_until) > Date.now() && Number(row!.deadline) > Date.now();
   }
 
-  pauseCapture(lease: CaptureLease): void {
+  pauseCapture(lease: CaptureLease, reason: 'foreground-run-active' | 'host-info-recovery-required' = 'foreground-run-active'): void {
     this.withActivity(lease.activity, () => {
       const job = this.#captureLease(lease), runtime = this.captureRuntime(lease);
       check(!runtime.runId || this.requestStatus(lease.activity, runtime.runId).attempts.every(attempt => attempt.outcome !== 'unknown-sent'), 'attempt-reconciliation-required');
-      this.#db.prepare("UPDATE capture_work SET reason='foreground-run-active',lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?").run(job.jobId);
+      this.#db.prepare('UPDATE capture_work SET reason=?,lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?').run(reason, job.jobId);
     });
   }
 
@@ -4024,16 +4024,8 @@ export class ProbeStore {
         .run(current.headEventId, current.headEventId, lease.jobId);
       return this.#captureJob(lease.jobId);
     }
-    if (result.result !== 'pass') {
-      this.#db.prepare(`UPDATE capture_work SET stage='blocked',reason=?,expected_head_id=?,lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?`)
-        .run(reason, current.headEventId, lease.jobId);
-      return this.#captureJob(lease.jobId);
-    }
-    if (state.conflicts.length) {
-      this.#db.prepare(`UPDATE capture_work SET stage='blocked',reason='credible-conflict',expected_head_id=?,lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?`)
-        .run(current.headEventId, lease.jobId);
-      return this.#captureJob(lease.jobId);
-    }
+    if (result.result !== 'pass') return this.#finishMemoryComparison(lease.jobId, current.headEventId, 'blocked', reason);
+    if (state.conflicts.length) return this.#finishMemoryComparison(lease.jobId, current.headEventId, 'blocked', 'credible-conflict');
     if (['distinct','supersedes'].includes(comparison.relation)) {
       this.#eligible(current);
       const previous = state.peers.filter(peer => state.replacements.includes(peer.recordId) && peer.lifecycle !== 'tombstoned').map(peer => {
@@ -4050,27 +4042,27 @@ export class ProbeStore {
         && state.replacements.includes(suppressed.recordId), 'memory-suppressed');
       this.#appendMemoryEvent(current, active, 'activate', current.source.eventId,
         { automatic: true, previous, comparisonEventId: current.headEventId });
-      this.#db.prepare(`UPDATE capture_work SET stage='complete',reason=NULL,expected_head_id=?,lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?`)
-        .run(active.headEventId, lease.jobId);
-      return this.#captureJob(lease.jobId);
+      return this.#finishMemoryComparison(lease.jobId, active.headEventId, 'complete', null);
     }
     if (comparison.relation === 'superseded-by') {
       check(comparison.peer.lifecycle === 'active' && comparison.peer.verification === 'verified' && !comparison.peer.conflictSetId, 'comparison-ineligible');
       const after = this.#withMemoryHash({ ...current, lifecycle: 'superseded', headEventId: randomUUID() });
       this.#appendMemoryEvent(current, after, 'supersede', current.source.eventId,
         { supersededBy: comparison.peer.recordId, comparisonEventId: current.headEventId });
-      this.#db.prepare(`UPDATE capture_work SET stage='complete',reason='superseded-claim',expected_head_id=?,lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?`)
-        .run(after.headEventId, lease.jobId);
-      return this.#captureJob(lease.jobId);
+      return this.#finishMemoryComparison(lease.jobId, after.headEventId, 'complete', 'superseded-claim');
     }
     check(comparison.relation === 'same-claim', 'comparison-evidence-required');
     const peer = comparison.peer;
     const after = this.#withMemoryHash({ ...current, lifecycle: 'rejected', headEventId: randomUUID() });
     this.#appendMemoryEvent(current, after, 'reject', current.source.eventId,
       { reason: 'duplicate-claim', corroborates: peer.recordId, comparisonEventId: current.headEventId });
-    this.#db.prepare(`UPDATE capture_work SET stage='complete',reason='claim-corroborated',expected_head_id=?,lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?`)
-      .run(after.headEventId, lease.jobId);
-    return this.#captureJob(lease.jobId);
+    return this.#finishMemoryComparison(lease.jobId, after.headEventId, 'complete', 'claim-corroborated');
+  }
+
+  #finishMemoryComparison(jobId: string, headEventId: string, stage: 'complete' | 'blocked', reason: string | null): CaptureJob {
+    this.#db.prepare('UPDATE capture_work SET stage=?,reason=?,expected_head_id=?,lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?')
+      .run(stage, reason, headEventId, jobId);
+    return this.#captureJob(jobId);
   }
 
   promoteMemory(activity: Activity, recordId: string, expected: MemoryRecord): MemoryPromotion {

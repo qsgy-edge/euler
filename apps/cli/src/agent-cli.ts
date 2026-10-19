@@ -33,7 +33,7 @@ export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: P
   if (configured) { budget = configured.budget; await verifyTransportPrerequisites(); }
   if (scenario === 'budget') budget = { ...budget, maxModelAttempts: 1 };
   const probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
-  const capture = scheduleCaptures(probe, options.captureConfig, () => { deliverMemoryInfo(sandbox, probe); });
+  const capture = scheduleCaptures(probe, options.captureConfig, () => deliverMemoryInfo(sandbox, probe));
   deliverMemoryInfo(sandbox, probe);
   capture.kick(true);
   const transport = configured?.transport;
@@ -64,12 +64,8 @@ export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: P
           cwd: files?.root.path ?? null, privileges: 'current Windows user; fixed file API only; no elevation or shell' });
       });
     }) : {}),
-    stream: async function* (request, signal, authorizeSend) {
-      const send: typeof authorizeSend = payload => {
-        check(deliverMemoryInfo(sandbox, probe), 'host-info-recovery-required');
-        return authorizeSend(payload);
-      };
-      if (transport) { yield* transport.stream(request, signal, send); return; }
+    recoverInfo: () => deliverMemoryInfo(sandbox, probe),
+    stream: transport ? transport.stream.bind(transport) : async function* (request, _signal, send) {
       if (scenario === 'failure') throw new Error('synthetic-before-send-failure');
       send(request.payload); requests++;
       if (scenario === 'unknown') throw new Error('synthetic-disconnection');
