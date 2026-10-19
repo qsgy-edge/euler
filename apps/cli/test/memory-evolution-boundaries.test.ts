@@ -63,6 +63,132 @@ for (const mutation of ['none','wrong','forget','correct']) test('duplicate evid
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+for (const loss of ['delete','change']) test('a lost canonical source does not block duplicate projection recovery: ' + loss, () => {
+  const sandbox = createSandbox();
+  const firstBinding = { ...bindingOf(sandbox), sessionId: randomUUID() };
+  createSandboxSession(sandbox, firstBinding);
+  let probe = openProbe(sandbox, undefined, undefined, firstBinding, undefined, true);
+  try {
+    const first = verifiedCandidate(probe, '本项目保存原始日志').record!;
+    probe.store.promoteMemory(probe.activity, first.recordId, first);
+    const next = { ...firstBinding, sessionId: randomUUID() };
+    createSandboxSession(sandbox, next); probe.close();
+    probe = openProbe(sandbox, undefined, undefined, next, undefined, true);
+    const duplicate = verifiedCandidate(probe, '本项目保留原始日志');
+    probe.store.promoteMemory(probe.activity, duplicate.record!.recordId, duplicate.record!);
+    assert.equal(compareCandidate(probe, duplicate.jobId, 'same-claim').reason, 'claim-corroborated');
+    const path = sandbox.root + '/session-' + firstBinding.sessionId + '.jsonl';
+    if (loss === 'delete') rmSync(path);
+    else writeFileSync(path, readFileSync(path, 'utf8').replace('本项目保存原始日志', '本项目不留原始日志'));
+    assert.equal(probe.store.revalidateMemory(probe.activity, first.recordId).reason, 'source-invalidated');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      probe.store.drainSearchProjection(probe.activity, 128);
+      probe.store.rebuildSearchProjection(probe.activity);
+      const page = probe.store.searchMemories(probe.activity, { query: '本项目' });
+      assert.equal(page.status, 'ready');
+      assert.deepEqual(page.results.map(hit => [hit.unitId, hit.kind]), [[first.recordId, 'status']]);
+      probe.close(); probe = openProbe(sandbox, undefined, undefined, next, undefined, true);
+    }
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+for (const duplicate of ['none','present','source-lost']) test('successive owner updates remain promotable with duplicate history: ' + duplicate, () => {
+  const sandbox = createSandbox();
+  let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const first = verifiedCandidate(probe, '本项目保存原始日志').record!;
+    probe.store.promoteMemory(probe.activity, first.recordId, first);
+    const duplicateBinding = { ...bindingOf(sandbox), sessionId: randomUUID() };
+    if (duplicate !== 'none') {
+      createSandboxSession(sandbox, duplicateBinding); probe.close();
+      probe = openProbe(sandbox, undefined, undefined, duplicateBinding, undefined, true);
+      const corroboration = verifiedCandidate(probe, '本项目保留原始日志');
+      probe.store.promoteMemory(probe.activity, corroboration.record!.recordId, corroboration.record!);
+      assert.equal(compareCandidate(probe, corroboration.jobId, 'same-claim').reason, 'claim-corroborated');
+      probe.close(); probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    }
+    for (const [index, content] of ['本项目现决定保存详细原始日志','本项目现决定保存完整原始日志及诊断信息'].entries()) {
+      const next = verifiedCandidate(probe, content);
+      probe.store.promoteMemory(probe.activity, next.record!.recordId, next.record!);
+      let compared = compareCandidate(probe, next.jobId, 'supersedes');
+      if (compared.stage === 'comparing') compared = compareCandidate(probe, next.jobId, 'supersedes');
+      assert.equal(compared.record!.lifecycle, 'active');
+      assert.deepEqual(probe.store.listEligibleMemories(probe.activity).map(record => record.recordId), [next.record!.recordId]);
+      if (duplicate === 'source-lost' && index === 0) rmSync(sandbox.root + '/session-' + duplicateBinding.sessionId + '.jsonl');
+    }
+    assert.equal(probe.store.registerHostInfo(probe.activity).pending.length, 3);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+for (const operation of ['dispatch','restore']) test('complete current-revision provenance qualifies ' + operation, () => {
+  const sandbox = createSandbox();
+  let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const input = probe.archive.append(randomUUID(), '记住决定：本项目保存原始日志');
+    const first = probe.store.rememberMemory(probe.activity, { input, hostInfo: 'durable' }).record!;
+    const extraBinding = { ...bindingOf(sandbox), sessionId: randomUUID() };
+    createSandboxSession(sandbox, extraBinding); probe.close();
+    probe = openProbe(sandbox, undefined, undefined, extraBinding, undefined, true);
+    probe.store.rememberMemory(probe.activity, {
+      input: probe.archive.append(randomUUID(), '记住决定：本项目保存原始日志'), hostInfo: 'durable' });
+    const third = { ...extraBinding, sessionId: randomUUID() };
+    createSandboxSession(sandbox, third); probe.close();
+    probe = openProbe(sandbox, undefined, undefined, third, undefined, true);
+    if (operation === 'dispatch') {
+      const selected = probe.store.readMemory(probe.activity, first.recordId);
+      const prepared = probe.session.prepare(randomUUID(), '本项目如何保存日志？', [selected]);
+      rmSync(sandbox.root + '/session-' + extraBinding.sessionId + '.jsonl');
+      assert.throws(() => probe.session.dispatch(prepared), /source-evidence-gap|ENOENT/);
+      assert.equal(probe.transport.count, 0);
+    } else {
+      const next = verifiedCandidate(probe, '本项目现决定保存详细原始日志');
+      probe.store.promoteMemory(probe.activity, next.record!.recordId, next.record!);
+      const current = compareCandidate(probe, next.jobId, 'supersedes').record!;
+      rmSync(sandbox.root + '/session-' + extraBinding.sessionId + '.jsonl');
+      const feedback = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-feedback@1', kind: 'user_wrong',
+        recordId: current.recordId, revisionId: current.revisionId, headEventId: current.headEventId }), 'user');
+      probe.store.recordMemoryFeedback(probe.activity, current.recordId, current, feedback);
+      assert.equal(probe.store.readMemory(probe.activity, first.recordId).lifecycle, 'superseded');
+      assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
+      assert.equal(probe.store.registerHostInfo(probe.activity).pending.length, 2);
+    }
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('memory feedback preserves prior session injection history without widening request authority', () => {
+  const sandbox = createSandbox();
+  let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const first = verifiedCandidate(probe, '本项目保存原始日志').record!;
+    const active = probe.store.promoteMemory(probe.activity, first.recordId, first).record;
+    const sent = probe.session.dispatch(probe.session.prepare(randomUUID(), '本项目如何保存日志？', [active]));
+    const next = { ...bindingOf(sandbox), sessionId: randomUUID() };
+    createSandboxSession(sandbox, next); probe.close();
+    probe = openProbe(sandbox, undefined, undefined, next, undefined, true);
+    assert.deepEqual(probe.store.readMemoryFeedback(probe.activity, active.recordId).injected.map(use => [use.runId, use.recordId, use.payloadHash]),
+      [[sent.runId, active.recordId, sent.payloadHash]]);
+    assert.throws(() => probe.store.requestStatus(probe.activity, sent.runId), /request-scope-mismatch/);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('owner-attributed negative transfer can verify archived canary pairs from a prior session', () => {
+  const sandbox = createSandbox();
+  let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const first = verifiedCandidate(probe, '本项目保存原始日志').record!;
+    const active = probe.store.promoteMemory(probe.activity, first.recordId, first).record;
+    const pairs = pairedCanary(probe, sandbox, active, bindingOf(sandbox));
+    const next = { ...bindingOf(sandbox), sessionId: randomUUID() };
+    createSandboxSession(sandbox, next); probe.close();
+    probe = openProbe(sandbox, undefined, undefined, next, undefined, true);
+    const feedback = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-feedback@1', kind: 'negative_transfer',
+      recordId: active.recordId, revisionId: active.revisionId, headEventId: active.headEventId, pairs }), 'user');
+    const result = probe.store.recordMemoryFeedback(probe.activity, active.recordId, active, feedback);
+    assert.deepEqual([result.record.lifecycle, result.record.verification], ['rejected', 'verified']);
+    assert.throws(() => probe.store.agentStatus(probe.activity, pairs[0]!.baselineRunId), /request-scope-mismatch/);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('an independently established older claim remains superseded without replacing the active claim', () => {
   const sandbox = createSandbox(), probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
   try {

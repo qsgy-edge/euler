@@ -338,6 +338,7 @@ class OwnerMemoryHost {
     for (const hit of page.results) if (hit.kind === 'status') emit('memory-warning', { level: 'warning',
       reason: hit.reason, claimRef: hit.claimRef, verification: hit.verification });
     const records = [...selected.values()].slice(0, 16);
+    if (!this.deliver()) { emit('ask-refused', { reason: 'host-info-recovery-required' }); return; }
     const turn = session.prepare(randomUUID(), question, records);
     const receipt = session.dispatch(turn);
     emit('ask-result', { searchStatus: page.status, searchReason: page.coverage.reason, pinned: delta.records.map(record => record.recordId),

@@ -1295,11 +1295,11 @@ export class ProbeStore {
     return { eventId, runId, seq, kind, attemptId, activityId, createdAt, payload, hash };
   }
 
-  #requestRun(activity: Activity, runId: string): RequestRun {
+  #requestRun(stream: Pick<Activity, 'streamId'>, runId: string): RequestRun {
     uuid(runId);
     const row = this.#db.prepare('SELECT * FROM request_runs WHERE run_id=?').get(runId);
     check(row, 'unknown-run');
-    check(row.stream_id === activity.streamId, 'request-scope-mismatch');
+    check(row.stream_id === stream.streamId, 'request-scope-mismatch');
     const budget = JSON.parse(String(row.budget)) as ProbeBudget;
     validateBudget(budget);
     return {
@@ -1686,77 +1686,88 @@ export class ProbeStore {
   }
 
   requestStatus(activity: Activity, runId: string): RequestStatus {
-    return this.withActivity(activity, () => {
-      const run = this.#requestRun(activity, runId);
-      const events = this.#db.prepare('SELECT * FROM request_events WHERE run_id=? ORDER BY seq').all(runId);
-      const assemblies = this.#db.prepare('SELECT * FROM request_assemblies WHERE run_id=? ORDER BY rowid').all(runId);
-      const attempts = this.#db.prepare('SELECT * FROM request_attempts WHERE run_id=? ORDER BY rowid').all(runId);
-      check(events.length > 0 && events[0]!.kind === 'run-authorized', 'ledger-evidence-gap');
-      const authorization = JSON.parse(String(events[0]!.payload));
-      check(authorization.runId === run.runId && authorization.streamId === run.streamId
-        && authorization.epoch === run.epoch && JSON.stringify(authorization.budget) === JSON.stringify(run.budget)
-        && authorization.relatedRunId === run.relatedRunId, 'ledger-evidence-gap');
-      for (const [index, row] of events.entries()) {
-        check(row.seq === index + 1 && sha256(String(row.payload)) === row.hash, 'ledger-evidence-gap');
-        const payload = JSON.parse(String(row.payload)) as Record<string, unknown>;
-        check(payload.runId === runId, 'ledger-evidence-gap');
-        if (row.kind === 'context/assembly@v1') {
-          check(row.attempt_id === null && assemblies.some(assembly => assembly.assembly_id === payload.assemblyId), 'ledger-evidence-gap');
-        } else if (row.kind === 'model/request-attempt-started@v1' || row.kind === 'model/request-attempt-finished@v1' || row.kind === 'model/request-attempt-reconciled@v1') {
-          check(row.attempt_id === payload.attemptId && attempts.some(attempt => attempt.attempt_id === row.attempt_id), 'ledger-evidence-gap');
-        } else check(row.attempt_id === null, 'ledger-evidence-gap');
+    return this.withActivity(activity, () => this.#readRequestLedger(this.#requestRun(activity, runId)));
+  }
+
+  #readProjectRequestLedger(runId: string): RequestStatus {
+    const row = this.#db.prepare(`SELECT r.stream_id FROM request_runs r
+      JOIN execution_streams s ON s.stream_id=r.stream_id
+      WHERE r.run_id=? AND s.principal_id=? AND s.project_id=?`)
+      .get(runId, this.#binding.ownerId, this.#binding.projectId);
+    check(row, 'request-scope-mismatch');
+    return this.#readRequestLedger(this.#requestRun({ streamId: String(row.stream_id) }, runId));
+  }
+
+  #readRequestLedger(run: RequestRun): RequestStatus {
+    const runId = run.runId;
+    const events = this.#db.prepare('SELECT * FROM request_events WHERE run_id=? ORDER BY seq').all(runId);
+    const assemblies = this.#db.prepare('SELECT * FROM request_assemblies WHERE run_id=? ORDER BY rowid').all(runId);
+    const attempts = this.#db.prepare('SELECT * FROM request_attempts WHERE run_id=? ORDER BY rowid').all(runId);
+    check(events.length > 0 && events[0]!.kind === 'run-authorized', 'ledger-evidence-gap');
+    const authorization = JSON.parse(String(events[0]!.payload));
+    check(authorization.runId === run.runId && authorization.streamId === run.streamId
+      && authorization.epoch === run.epoch && JSON.stringify(authorization.budget) === JSON.stringify(run.budget)
+      && authorization.relatedRunId === run.relatedRunId, 'ledger-evidence-gap');
+    for (const [index, row] of events.entries()) {
+      check(row.seq === index + 1 && sha256(String(row.payload)) === row.hash, 'ledger-evidence-gap');
+      const payload = JSON.parse(String(row.payload)) as Record<string, unknown>;
+      check(payload.runId === runId, 'ledger-evidence-gap');
+      if (row.kind === 'context/assembly@v1') {
+        check(row.attempt_id === null && assemblies.some(assembly => assembly.assembly_id === payload.assemblyId), 'ledger-evidence-gap');
+      } else if (row.kind === 'model/request-attempt-started@v1' || row.kind === 'model/request-attempt-finished@v1' || row.kind === 'model/request-attempt-reconciled@v1') {
+        check(row.attempt_id === payload.attemptId && attempts.some(attempt => attempt.attempt_id === row.attempt_id), 'ledger-evidence-gap');
+      } else check(row.attempt_id === null, 'ledger-evidence-gap');
+    }
+    const startedEvents = new Set(events.filter(row => row.kind === 'model/request-attempt-started@v1').map(row => String(row.attempt_id)));
+    const finishedEvents = new Set(events.filter(row => row.kind === 'model/request-attempt-finished@v1').map(row => String(row.attempt_id)));
+    const assemblyEvents = new Set(events.filter(row => row.kind === 'context/assembly@v1')
+      .map(row => (JSON.parse(String(row.payload)) as { assemblyId: string }).assemblyId));
+    check(assemblyEvents.size === assemblies.length
+      && assemblies.every(assembly => assemblyEvents.has(String(assembly.assembly_id))), 'ledger-evidence-gap');
+    check((run.state === 'authorized') === !events.some(row => row.kind === 'run-revoked' || row.kind === 'run-sealed'), 'ledger-evidence-gap');
+    check(run.state !== 'revoked' || events.some(row => row.kind === 'run-revoked'), 'ledger-evidence-gap');
+    check(run.state !== 'sealed' || events.some(row => row.kind === 'run-sealed'), 'ledger-evidence-gap');
+    for (const assembly of assemblies) {
+      const decodedAssembly = this.#requestAssembly(assembly);
+      check(assemblyIdentityHash(decodedAssembly) === assembly.identity_hash, 'ledger-evidence-gap');
+      const receipt = events.find(event => event.kind === 'context/assembly@v1'
+        && (JSON.parse(String(event.payload)) as { assemblyId: string }).assemblyId === assembly.assembly_id);
+      check(receipt, 'ledger-evidence-gap');
+      const assemblyPayload = JSON.parse(String(receipt.payload));
+      for (const key of ['runId', 'epoch', 'route', 'model', 'policyHash', 'estimator', 'payloadHash', 'byteLength',
+        'estimatedTokens', 'budget', 'zones', 'selection', 'intent', 'degradation', 'claimHeadEventId'] as const) {
+        check(JSON.stringify(assemblyPayload[key]) === JSON.stringify(decodedAssembly[key]), 'ledger-evidence-gap');
       }
-      const startedEvents = new Set(events.filter(row => row.kind === 'model/request-attempt-started@v1').map(row => String(row.attempt_id)));
-      const finishedEvents = new Set(events.filter(row => row.kind === 'model/request-attempt-finished@v1').map(row => String(row.attempt_id)));
-      const assemblyEvents = new Set(events.filter(row => row.kind === 'context/assembly@v1')
-        .map(row => (JSON.parse(String(row.payload)) as { assemblyId: string }).assemblyId));
-      check(assemblyEvents.size === assemblies.length
-        && assemblies.every(assembly => assemblyEvents.has(String(assembly.assembly_id))), 'ledger-evidence-gap');
-      check((run.state === 'authorized') === !events.some(row => row.kind === 'run-revoked' || row.kind === 'run-sealed'), 'ledger-evidence-gap');
-      check(run.state !== 'revoked' || events.some(row => row.kind === 'run-revoked'), 'ledger-evidence-gap');
-      check(run.state !== 'sealed' || events.some(row => row.kind === 'run-sealed'), 'ledger-evidence-gap');
-      for (const assembly of assemblies) {
-        const decodedAssembly = this.#requestAssembly(assembly);
-        check(assemblyIdentityHash(decodedAssembly) === assembly.identity_hash, 'ledger-evidence-gap');
-        const receipt = events.find(event => event.kind === 'context/assembly@v1'
-          && (JSON.parse(String(event.payload)) as { assemblyId: string }).assemblyId === assembly.assembly_id);
-        check(receipt, 'ledger-evidence-gap');
-        const assemblyPayload = JSON.parse(String(receipt.payload));
-        for (const key of ['runId', 'epoch', 'route', 'model', 'policyHash', 'estimator', 'payloadHash', 'byteLength',
-          'estimatedTokens', 'budget', 'zones', 'selection', 'intent', 'degradation', 'claimHeadEventId'] as const) {
-          check(JSON.stringify(assemblyPayload[key]) === JSON.stringify(decodedAssembly[key]), 'ledger-evidence-gap');
-        }
-        check(JSON.stringify(assemblyPayload.sources) === JSON.stringify(decodedAssembly.sources.map(source => ({ eventId: source.eventId, hash: source.hash })))
-          && JSON.stringify(assemblyPayload.usedMemories) === JSON.stringify(decodedAssembly.usedMemories), 'ledger-evidence-gap');
-        const assemblyAttempts = attempts.filter(attempt => attempt.assembly_id === assembly.assembly_id);
-        for (const [index, attempt] of assemblyAttempts.entries()) {
-          check(attempt.ordinal === index + 1 && attempt.payload_hash === assembly.payload_hash
-            && attempt.byte_length === assembly.byte_length, 'ledger-evidence-gap');
-          check(startedEvents.has(String(attempt.attempt_id)), 'ledger-evidence-gap');
-          const startedPayload = JSON.parse(String(events.find(event => event.kind === 'model/request-attempt-started@v1'
-            && event.attempt_id === attempt.attempt_id)!.payload));
-          check(startedPayload.payloadHash === attempt.payload_hash && startedPayload.byteLength === attempt.byte_length
-            && startedPayload.assemblyId === assembly.assembly_id && startedPayload.ordinal === attempt.ordinal
-            && startedPayload.route === assembly.route && startedPayload.model === assembly.model, 'ledger-evidence-gap');
-          const finished = events.find(event => event.kind === 'model/request-attempt-finished@v1' && event.attempt_id === attempt.attempt_id);
-          if (finished) check(JSON.parse(String(finished.payload)).outcome === attempt.outcome, 'ledger-evidence-gap');
-          check((attempt.outcome === 'unknown-sent') === !finishedEvents.has(String(attempt.attempt_id)), 'ledger-evidence-gap');
-        }
-        check(assembly.state === deriveAssemblyState(assemblyAttempts
-          .map(attempt => ({ outcome: String(attempt.outcome) as RequestAttempt['outcome'] }))), 'ledger-evidence-gap');
+      check(JSON.stringify(assemblyPayload.sources) === JSON.stringify(decodedAssembly.sources.map(source => ({ eventId: source.eventId, hash: source.hash })))
+        && JSON.stringify(assemblyPayload.usedMemories) === JSON.stringify(decodedAssembly.usedMemories), 'ledger-evidence-gap');
+      const assemblyAttempts = attempts.filter(attempt => attempt.assembly_id === assembly.assembly_id);
+      for (const [index, attempt] of assemblyAttempts.entries()) {
+        check(attempt.ordinal === index + 1 && attempt.payload_hash === assembly.payload_hash
+          && attempt.byte_length === assembly.byte_length, 'ledger-evidence-gap');
+        check(startedEvents.has(String(attempt.attempt_id)), 'ledger-evidence-gap');
+        const startedPayload = JSON.parse(String(events.find(event => event.kind === 'model/request-attempt-started@v1'
+          && event.attempt_id === attempt.attempt_id)!.payload));
+        check(startedPayload.payloadHash === attempt.payload_hash && startedPayload.byteLength === attempt.byte_length
+          && startedPayload.assemblyId === assembly.assembly_id && startedPayload.ordinal === attempt.ordinal
+          && startedPayload.route === assembly.route && startedPayload.model === assembly.model, 'ledger-evidence-gap');
+        const finished = events.find(event => event.kind === 'model/request-attempt-finished@v1' && event.attempt_id === attempt.attempt_id);
+        if (finished) check(JSON.parse(String(finished.payload)).outcome === attempt.outcome, 'ledger-evidence-gap');
+        check((attempt.outcome === 'unknown-sent') === !finishedEvents.has(String(attempt.attempt_id)), 'ledger-evidence-gap');
       }
-      for (const attempt of attempts) check(assemblies.some(assembly => assembly.assembly_id === attempt.assembly_id), 'ledger-evidence-gap');
-      return {
-        run,
-        events: events.map(row => ({ eventId: String(row.event_id), runId, seq: Number(row.seq),
-          kind: String(row.kind) as RequestEventKind, attemptId: row.attempt_id ? String(row.attempt_id) : null,
-          activityId: String(row.activity_id), createdAt: String(row.created_at),
-          payload: String(row.payload), hash: String(row.hash) })),
-        assemblies: assemblies.map(row => ({ ...this.#requestAssembly(row), state: String(row.state) as RequestStatus['assemblies'][number]['state'] })),
-        attempts: attempts.map(row => this.#requestAttempt(row, run)),
-        revoked: run.state === 'revoked', sealed: run.state === 'sealed',
-      };
-    });
+      check(assembly.state === deriveAssemblyState(assemblyAttempts
+        .map(attempt => ({ outcome: String(attempt.outcome) as RequestAttempt['outcome'] }))), 'ledger-evidence-gap');
+    }
+    for (const attempt of attempts) check(assemblies.some(assembly => assembly.assembly_id === attempt.assembly_id), 'ledger-evidence-gap');
+    return {
+      run,
+      events: events.map(row => ({ eventId: String(row.event_id), runId, seq: Number(row.seq),
+        kind: String(row.kind) as RequestEventKind, attemptId: row.attempt_id ? String(row.attempt_id) : null,
+        activityId: String(row.activity_id), createdAt: String(row.created_at),
+        payload: String(row.payload), hash: String(row.hash) })),
+      assemblies: assemblies.map(row => ({ ...this.#requestAssembly(row), state: String(row.state) as RequestStatus['assemblies'][number]['state'] })),
+      attempts: attempts.map(row => this.#requestAttempt(row, run)),
+      revoked: run.state === 'revoked', sealed: run.state === 'sealed',
+    };
   }
   inspectAssembly(activity: Activity, assemblyId: string, recordId?: string): {
     assemblyId: string; state: RequestAssemblyState; sources: { ref: SourceAck; ordinal: number; reason: string }[];
@@ -1811,7 +1822,10 @@ export class ProbeStore {
   }
 
   agentStatus(activity: Activity, runId: string): AgentStatus {
-    const ledger = this.requestStatus(activity, runId);
+    return this.#readAgentLedger(this.requestStatus(activity, runId));
+  }
+
+  #readAgentLedger(ledger: RequestStatus): AgentStatus {
     return replayAgent(ledger.events.filter(item => item.kind === 'agent/event@v1')
       .map(item => JSON.parse(item.payload).event as AgentEvent), ledger.attempts.length);
   }
@@ -2919,9 +2933,10 @@ export class ProbeStore {
         check(manifest.schema === 'memory-outbox@1' && manifest.kind === 'search' && manifest.events.length === 1, 'outbox-evidence-gap');
         const event = manifest.events[0] as { eventId?: string; recordId?: string };
         check(event.eventId === job.event_id && typeof event.recordId === 'string', 'outbox-evidence-gap');
-        const record = this.#readMemoryUnsafe(event.recordId);
+        const record = this.#readMemoryHead(event.recordId);
         const generation = Number(job.projection_rowid);
         const exposure = memoryProjectionExposure(record);
+        if (exposure === 'normal') this.#validateMemorySources(record);
         const old = this.#db.prepare('SELECT rowid FROM search_documents WHERE unit_id=?').get(record.recordId);
         if (old) this.#db.prepare('DELETE FROM search_fts WHERE rowid=?').run(Number(old.rowid));
         this.#db.prepare('DELETE FROM search_documents WHERE unit_id=?').run(record.recordId);
@@ -2952,9 +2967,10 @@ export class ProbeStore {
         .run(this.#binding.ownerId, ...this.#scopeParameters(), this.#binding.ownerId, ...this.#scopeParameters());
       const receipts: SearchProjectionReceipt[] = [];
       for (const row of canonical) {
-        const record = this.#readMemoryUnsafe(String(row.record_id));
+        const record = this.#readMemoryHead(String(row.record_id));
         const exposure = memoryProjectionExposure(record);
         if (!exposure) continue;
+        if (exposure === 'normal') this.#validateMemorySources(record);
         const indexed = `${normalizeSearchText(record.content)} ${cjkBigrams(record.content)}`.trim();
         const generation = record.revision;
         this.#db.prepare(`INSERT INTO search_documents VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(record.recordId, this.#binding.ownerId,
@@ -3536,13 +3552,7 @@ export class ProbeStore {
         return { status: 'no_op', record: current, eventId: null, reason: null };
       let reason: string | null = memoryTemporalStatus(current, Date.now()) === 'expired' ? 'expired' : null;
       try {
-        this.#validateSource(current.source, undefined, current.scope);
-        this.#checkVerification(current, true);
-        for (const row of this.#db.prepare('SELECT payload,payload_hash FROM provenance_refs WHERE record_id=? AND revision_id=?')
-          .all(current.recordId, current.revisionId)) {
-          check(sha256(String(row.payload)) === row.payload_hash, 'memory-evidence-gap');
-          this.#validateSource(JSON.parse(String(row.payload)).source as SourceAck, undefined, current.scope);
-        }
+        this.#validateMemorySources(current);
       } catch (error) {
         const diagnostic = error instanceof Error ? error.message : '';
         if (diagnostic.startsWith('source-') || diagnostic.startsWith('archive-')
@@ -3697,7 +3707,7 @@ export class ProbeStore {
     }
   }
 
-  #negativeTransferEvidence(activity: Activity, current: MemoryRecord, pairs: unknown) {
+  #negativeTransferEvidence(current: MemoryRecord, pairs: unknown) {
     check(current.lifecycle === 'active' && current.verification === 'verified'
       && Array.isArray(pairs) && pairs.length >= 2 && pairs.length <= 8, 'negative-transfer-evidence-required');
     const runIds = new Set<string>(), cases = new Set<string>();
@@ -3707,8 +3717,8 @@ export class ProbeStore {
       for (const id of [pair.baselineRunId, pair.treatmentRunId]) {
         uuid(id); check(!runIds.has(id), 'negative-transfer-evidence-required'); runIds.add(id);
       }
-      const baseline = this.requestStatus(activity, pair.baselineRunId), treatment = this.requestStatus(activity, pair.treatmentRunId);
-      const baselineState = this.agentStatus(activity, baseline.run.runId), treatmentState = this.agentStatus(activity, treatment.run.runId);
+      const baseline = this.#readProjectRequestLedger(pair.baselineRunId), treatment = this.#readProjectRequestLedger(pair.treatmentRunId);
+      const baselineState = this.#readAgentLedger(baseline), treatmentState = this.#readAgentLedger(treatment);
       check([baselineState, treatmentState].every(state => state.terminal === 'completed' && state.responses.length === 1 && state.tools.length === 0)
         && [baseline, treatment].every(ledger => ledger.assemblies.length === 1 && ledger.attempts.length === 1
           && ledger.attempts[0]!.outcome === 'received')
@@ -3825,7 +3835,7 @@ export class ProbeStore {
       }
       const current = this.#assertMemoryExpected(recordId, expected);
       const kind = String(value.kind);
-      const pairs = kind === 'negative_transfer' ? this.#negativeTransferEvidence(activity, current, value.pairs) : undefined;
+      const pairs = kind === 'negative_transfer' ? this.#negativeTransferEvidence(current, value.pairs) : undefined;
       const feedbackId = this.#recordMemoryFeedback(current, kind, { source: input, ...(pairs ? { pairs } : {}) }, identity);
       if (kind === 'user_helpful') return { status: 'recorded', feedbackId, record: current };
       check(current.lifecycle !== 'tombstoned', 'memory-not-eligible');
@@ -3841,7 +3851,7 @@ export class ProbeStore {
 
   readMemoryFeedback(activity: Activity, recordId: string) {
     return this.withActivity(activity, () => {
-      this.#readMemoryUnsafe(recordId);
+      this.#readMemoryHead(recordId);
       const events = this.#db.prepare(`SELECT * FROM feedback_events WHERE record_id=?
         AND json_extract(payload,'$.observingProjectId')=? ORDER BY rowid`).all(recordId, this.#binding.projectId).map(row => {
         check(sha256(String(row.payload)) === row.payload_hash, 'feedback-evidence-gap');
@@ -3855,7 +3865,7 @@ export class ProbeStore {
         JOIN execution_streams s ON s.stream_id=r.stream_id JOIN json_each(a.used_memories) u
         WHERE s.principal_id=? AND s.project_id=? AND json_extract(u.value,'$.recordId')=?`)
         .all(this.#binding.ownerId, this.#binding.projectId, recordId);
-      const injected = runs.flatMap(row => this.requestStatus(activity, String(row.run_id)).assemblies.flatMap(assembly =>
+      const injected = runs.flatMap(row => this.#readProjectRequestLedger(String(row.run_id)).assemblies.flatMap(assembly =>
         assembly.usedMemories.filter(use => use.recordId === recordId).map(use => ({ ...use, assemblyId: assembly.assemblyId,
           runId: assembly.runId, payloadHash: assembly.payloadHash }))));
       return { events, injected };
@@ -3886,7 +3896,7 @@ export class ProbeStore {
       ORDER BY record_id LIMIT 33`)
       .all(candidate.scope.id, candidate.recordId);
     check(rows.length <= 32, 'comparison-coverage-gap');
-    const peers = rows.map(row => this.#readMemoryUnsafe(String(row.record_id)));
+    const peers = rows.map(row => this.#readMemoryHead(String(row.record_id)));
     return peers.filter(peer => {
       const visited = new Set<string>();
       let current = peer;
@@ -3896,15 +3906,18 @@ export class ProbeStore {
         const event = this.#db.prepare('SELECT payload FROM memory_events WHERE event_id=?').get(current.headEventId)!;
         const rejection = JSON.parse(String(event.payload));
         if (rejection.kind !== 'reject' || rejection.reason !== 'duplicate-claim') return true;
+        this.#checkComparisonEvidence(current, [this.#binding.projectId], false);
         const proof = this.#db.prepare('SELECT payload FROM memory_events WHERE event_id=?').get(rejection.comparisonEventId)!;
         const compared = JSON.parse(String(proof.payload)).input as MemoryComparison;
-        const target = [candidate, ...peers].find(record => record.recordId === rejection.corroborates);
-        if (!target || target.recordId !== compared.peer.recordId || target.revisionId !== compared.peer.revisionId) return true;
+        const target = this.#readMemoryHead(rejection.corroborates);
+        if (target.recordId !== compared.peer.recordId || target.revisionId !== compared.peer.revisionId) return true;
+        if (target.lifecycle === 'superseded') return false;
+        if (target.recordId !== candidate.recordId && !peers.some(record => record.recordId === target.recordId)) return true;
         if (target.lifecycle !== 'rejected' || target.recordId === candidate.recordId) return false;
         current = target;
       }
       return true;
-    });
+    }).map(peer => this.#readMemoryUnsafe(peer.recordId));
   }
 
   #memoryComparisonState(jobId: string): MemoryComparisonState {
@@ -4779,8 +4792,16 @@ export class ProbeStore {
   #eligible(record: MemoryRecord): void {
     check(record.scope.resolved && record.verification === 'verified' && !record.conflictSetId, 'memory-not-eligible');
     check(!memoryTemporalStatus(record, Date.now()), 'memory-not-current');
+    this.#validateMemorySources(record);
+  }
+  #validateMemorySources(record: MemoryRecord): void {
     this.#validateSource(record.source, undefined, record.scope);
     this.#checkVerification(record, true);
+    for (const row of this.#db.prepare('SELECT payload,payload_hash FROM provenance_refs WHERE record_id=? AND revision_id=?')
+      .all(record.recordId, record.revisionId)) {
+      check(sha256(String(row.payload)) === row.payload_hash, 'memory-evidence-gap');
+      this.#validateSource(JSON.parse(String(row.payload)).source as SourceAck, undefined, record.scope);
+    }
   }
   #checkVerification(record: MemoryRecord, readSources = false, projects: readonly string[] = [this.#binding.projectId]): void {
     if (!record.verificationRunId) { check(record.verification !== 'verified', 'verification-evidence-gap'); return; }
@@ -4799,7 +4820,7 @@ export class ProbeStore {
       this.#checkComparisonEvidence(record, projects);
     }
   }
-  #checkComparisonEvidence(record: MemoryRecord, projects: readonly string[]): void {
+  #checkComparisonEvidence(record: MemoryRecord, projects: readonly string[], readSources = true): void {
     const links = this.#db.prepare(`SELECT e.event_id,e.kind,e.payload FROM memory_events e WHERE e.record_id=? AND e.revision_id=?
       AND e.seq <= (SELECT seq FROM memory_events WHERE event_id=?)
       AND (json_extract(e.payload,'$.comparisonEventId') IS NOT NULL OR (e.event_id=? AND e.kind='comparison'))
@@ -4826,7 +4847,8 @@ export class ProbeStore {
           && proof.result === 'pass' && sha256(String(proof.evidence_json)) === proof.evidence_hash
           && proof.evidence_json === JSON.stringify(verdict.evidence), 'comparison-evidence-gap');
         this.#checkEvidenceRows('verification_evidence', 'run_id', verdict.runId, verdict.evidence);
-        for (const ref of verdict.evidence as SourceAck[]) this.#validateVerificationSource(ref, record.scope, verdict.sourceUnits ?? [], projects);
+        if (readSources) for (const ref of verdict.evidence as SourceAck[])
+          this.#validateVerificationSource(ref, record.scope, verdict.sourceUnits ?? [], projects);
       }
     }
   }
