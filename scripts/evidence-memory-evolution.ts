@@ -194,6 +194,27 @@ function validate(root: string, entry: typeof fixture.cases[number], output: str
       const stale = events.find(event => event.kind === 'stale')!; assert.equal(JSON.parse(String(stale.payload)).reason, 'expired');
       assert.ok(Date.parse(String(stale.created_at)) >= Date.parse(heads[0]!.validUntil!));
     }
+    if (entry.id.startsWith('ordinary-negative-')) {
+      const activation = events.find(event => event.kind === 'activate' && JSON.parse(String(event.payload)).previous?.length)!;
+      assert.ok(activation);
+      const previous = JSON.parse(String(activation.payload)).previous[0];
+      const previousHead = heads.find(record => record.recordId === previous.before.recordId)!;
+      assert.ok(previousHead);
+      if (entry.id === 'ordinary-negative-restore') {
+        const rollback = events.find(event => event.kind === 'rollback' && event.record_id === previousHead.recordId)!;
+        assert.ok(rollback); assert.equal(rollback.target_event_id, previous.after.headEventId);
+        const preimage = { ...previous.before }, restored = { ...previousHead } as Partial<MemoryRecord>;
+        delete preimage.hash; delete preimage.headEventId; delete restored.headEventId;
+        assert.deepEqual(restored, preimage);
+        const rejected = events.find(event => event.kind === 'reject' && event.record_id === activation.record_id)!;
+        assert.equal(JSON.parse(String(rollback.payload)).triggeredBy, rejected.event_id);
+      } else {
+        assert.equal(previousHead.revision, 2); assert.equal(previousHead.verification, 'unverified');
+        assert.equal(previousHead.lifecycle, 'superseded');
+        assert.ok(events.some(event => event.kind === 'correct' && event.event_id === previousHead.headEventId));
+        assert.ok(!events.some(event => event.kind === 'rollback'));
+      }
+    }
     if (entry.id === 'negative-restore') { assert.equal(heads[0]!.revision, 1); assert.ok(events.some(event => event.kind === 'rollback' && event.batch_id)); }
     if (entry.id === 'negative-previous-lost') { assert.ok(before); assert.equal(existsSync(join(root, 'session.jsonl')), false); assert.ok(!events.some(event => event.kind === 'rollback')); }
     if (entry.id === 'source-invalidated') { assert.ok(before); assert.notDeepEqual(archives.find(item => item.header.binding.sessionId === before.header.binding.sessionId)!.events, before.events); }

@@ -66,6 +66,24 @@
       "batches": 1
     },
     {
+      "id": "ordinary-negative-restore",
+      "active": 1,
+      "rejected": 1,
+      "stale": 0,
+      "conflicted": 0,
+      "superseded": 0,
+      "batches": 3
+    },
+    {
+      "id": "ordinary-negative-changed",
+      "active": 0,
+      "rejected": 1,
+      "stale": 0,
+      "conflicted": 0,
+      "superseded": 1,
+      "batches": 2
+    },
+    {
       "id": "negative-first",
       "active": 0,
       "rejected": 1,

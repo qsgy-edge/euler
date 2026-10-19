@@ -1,6 +1,10 @@
+import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { API_VERSION, DEFAULT_BUDGET, ProbeSession, sha256 } from '@euler/core';
-import type { MemoryRecord } from '@euler/core';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { API_VERSION, DEFAULT_BUDGET, ProbeSession, fileIdentity, sha256 } from '@euler/core';
+import type { MemoryRecord, SourceAck } from '@euler/core';
+import { approvedSourceUnit } from './source-publication.ts';
 import { bindingOf } from '../../src/sandbox.ts';
 import type { Sandbox } from '../../src/sandbox.ts';
 import type { openProbe } from '../../src/probe.ts';
@@ -41,13 +45,42 @@ export function pairedCanary(probe: Probe, sandbox: Sandbox, record: MemoryRecor
 }
 
 export function verifiedCandidate(probe: Probe, content: string,
-  bounds: { appliesTo?: string[]; validFrom?: string; validUntil?: string } = {}) {
-  const source = probe.archive.append(randomUUID(), `记住：${content}`);
+  bounds: { appliesTo?: string[]; validFrom?: string; validUntil?: string; type?: 'fact' | 'decision'; evidence?: SourceAck[] } = {}) {
+  const { evidence = [], ...proposal } = bounds;
+  const source = probe.archive.append(randomUUID(), '记住：' + content);
   const job = probe.store.queueOwnerCapture(probe.activity, source);
   let lease = probe.store.claimCaptureJob(probe.activity, job.jobId, evolutionBudget, 30000)!;
-  probe.store.captureProposedMemory(lease, { type: 'decision', content, ...bounds });
+  assert.equal(probe.store.captureProposedMemory(lease, { type: 'decision', content, ...proposal }).stage, 'verifying');
   lease = probe.store.claimCaptureJob(probe.activity, job.jobId, evolutionBudget, 30000)!;
   probe.store.searchCaptureSources(lease, content);
-  probe.store.expandCaptureSource(lease, { ref: source, offset: 0, limit: 4096 });
-  return probe.store.completeCaptureVerification(lease, { result: 'pass', evidence: [source] });
+  for (const ref of [source, ...evidence]) probe.store.expandCaptureSource(lease, { ref, offset: 0, limit: 4096 });
+  return probe.store.completeCaptureVerification(lease, { result: 'pass', evidence: [source, ...evidence] });
+}
+
+export function observedFact(probe: Probe, sandbox: Sandbox, content: string, bounds: { validFrom: string; validUntil: string }) {
+  const path = join(sandbox.root, 'observed-resource.txt');
+  writeFileSync(path, JSON.stringify({ content, ...bounds }));
+  const session = new ProbeSession(probe.store, probe.activity,
+    { version: API_VERSION, binding: bindingOf(sandbox), source: probe.archive, transport: probe.transport }, evolutionBudget);
+  try {
+    const prepared = session.prepare(randomUUID(), '读取合成资源的当前观测');
+    const event = (value: Parameters<typeof probe.store.appendAgentEvent>[2]) => probe.store.appendAgentEvent(probe.activity, session.runId, value);
+    event({ kind: 'opened', route: { provider: 'synthetic', model: 'none', route: 'local-counting', authNamespace: 'synthetic' } });
+    event({ kind: 'input', source: prepared.input, mode: 'steer' });
+    event({ kind: 'admitted', eventIds: [prepared.input.eventId] });
+    event({ kind: 'bound', assemblyId: prepared.assemblyId, eventIds: [prepared.input.eventId] });
+    const receipt = session.dispatch(prepared), callId = randomUUID(), argumentsHash = sha256(JSON.stringify({ path }));
+    const calls = [{ callId, name: 'file.read', argumentsHash }];
+    const response = probe.archive.append(randomUUID(), JSON.stringify({ text: '', calls, stop: 'tools' }), 'assistant');
+    event({ kind: 'response', attemptId: receipt.attemptId, source: response, calls });
+    event({ kind: 'tool-started', callId });
+    const text = readFileSync(path, 'utf8'), source = probe.archive.append(randomUUID(), text, 'tool');
+    event({ kind: 'tool-result', result: { callId, argumentsHash, executionState: 'started', outcome: 'success', errorClass: null,
+      source, file: { identity: fileIdentity(path), text, byteLength: Buffer.byteLength(text) } } });
+    event({ kind: 'terminal', terminal: 'completed' });
+    probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref: source, projectId: sandbox.fixture.projectId,
+      kind: 'report-section', offset: 0, length: Array.from(text).length }));
+    probe.store.drainSourceProjection(probe.activity);
+    return source;
+  } finally { session.close(); }
 }

@@ -35,7 +35,8 @@ const COMPARISON = VERIFIER + 'Judge only the fixed comparison proposition in th
   + 'same-claim: the same assertion, subject, environment and effective period; distinct: independently established different subjects or environments that can coexist; '
   + 'supersedes: the candidate is the authoritative later observation of the same object in a nonoverlapping effective period, or an explicit update by the owner of this preference/decision; '
   + 'superseded-by: the peer is that authoritative later version; conflict: credible mutually exclusive assertions about the same normalized object and overlapping effective period. '
-  + 'Expand both source records independently. Pass only when this exact proposition is supported, block when it is disproved, evidence-gap when it cannot be decided. '
+  + 'Expand both source records and every unresolved feedback reference independently. Feedback remains a constraint until explicitly resolved by reverification. '
+  + 'Pass only when this exact proposition is supported, block when it is disproved, evidence-gap when it cannot be decided. '
   + 'Previous relation verdicts do not establish this proposition. Similar wording, timestamps of memory creation, task success or exposure are not authority.';
 
 function sourceToolSchemas() {
@@ -175,8 +176,8 @@ export class CaptureRun {
       this.#store.stopCapture(this.#lease, 'blocked', 'capture-budget-exhausted'); return null;
     }
     const sources = [...runtime.job.range];
-    if (comparison && !sources.some(ref => ref.eventId === comparison.peer.source.eventId
-      && ref.binding.sessionId === comparison.peer.source.binding.sessionId)) sources.push(comparison.peer.source);
+    if (comparison) for (const source of [comparison.peer.source, ...comparison.feedback])
+      if (!sources.some(ref => ref.eventId === source.eventId && ref.binding.sessionId === source.binding.sessionId)) sources.push(source);
     for (const step of steps) if (!sources.some(ref => ref.eventId === step.source.eventId && ref.binding.sessionId === step.source.binding.sessionId)) sources.push(step.source);
     const routeBytes = JSON.stringify({ requested: this.#config[phase][0], actual: route, role: phase, fallbackOrdinal: ordinal });
     const assembly = this.#store.appendRequestAssembly(this.#lease.activity, { runId: this.runId, epoch: this.#lease.activity.epoch,

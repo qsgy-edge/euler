@@ -93,7 +93,7 @@ export interface MemoryPromotion {
 }
 const memoryRelations = ['same-claim', 'distinct', 'supersedes', 'superseded-by', 'conflict'] as const;
 export interface MemoryComparison {
-  schema: 'memory-comparison@1'; key: string; relation: typeof memoryRelations[number]; candidate: MemoryRecord; peer: MemoryRecord;
+  schema: 'memory-comparison@1'; key: string; relation: typeof memoryRelations[number]; candidate: MemoryRecord; peer: MemoryRecord; feedback: SourceAck[];
 }
 interface MemoryComparisonState {
   schema: 'memory-comparison-state@1'; jobId: string; candidate: MemoryRecord; peers: MemoryRecord[]; peerIndex: number;
@@ -2036,6 +2036,21 @@ export class ProbeStore {
     });
   }
 
+  #unresolvedMemoryFeedback(record: MemoryRecord): SourceAck[] {
+    const sources: SourceAck[] = [];
+    const events = this.#db.prepare(`SELECT kind,payload,payload_hash FROM memory_events WHERE record_id=? AND revision_id=?
+      AND seq <= (SELECT seq FROM memory_events WHERE event_id=?) AND kind IN ('verify','stale','reject') ORDER BY seq DESC`)
+      .all(record.recordId, record.revisionId, record.headEventId);
+    for (const event of events) {
+      check(sha256(String(event.payload)) === event.payload_hash, 'feedback-evidence-gap');
+      const value = JSON.parse(String(event.payload));
+      if (event.kind === 'verify' && value.result === 'pass') break;
+      if (['user_wrong','user_stale','safety_violation','negative_transfer'].includes(value.reason)
+        && value.source && !sources.some(ref => sameSourceAck(ref, value.source))) sources.push(value.source as SourceAck);
+    }
+    return sources;
+  }
+
   queueMemoryVerification(activity: Activity, recordId: string, expected: MemoryRecord, approval?: SourceAck): CaptureJob {
     return this.withActivity(activity, () => {
       const record = this.#assertMemoryExpected(recordId, expected);
@@ -2062,8 +2077,7 @@ export class ProbeStore {
         return this.#captureJob(String(existing.job_id));
       }
       const jobId = randomUUID();
-      const trigger = event?.kind === 'stale' ? JSON.parse(String(event.payload)).source as SourceAck | undefined : undefined;
-      const range = [record.source, source, ...(trigger ? [trigger] : [])]
+      const range = [record.source, source, ...this.#unresolvedMemoryFeedback(record)]
         .filter((ref, index, refs) => refs.findIndex(other => sameSourceAck(ref, other)) === index);
       const payload = JSON.stringify({ schema: 'capture-job@1', source, range, scope: record.scope,
         ownerId: this.#binding.ownerId, recordId, lane: 'reverification', expectedHead: record.headEventId, reason: 'reverification-required' });
@@ -2225,7 +2239,7 @@ export class ProbeStore {
       const claimKey = proposal.content.trim().normalize('NFC');
       check(claimKey.length > 0, 'invalid-capture-proposal');
       const suppressed = this.#suppressed(claimKey, job.source.binding.sessionId, job.scope, appliesTo);
-      if (suppressed) {
+      if (suppressed && !(suppressed.lifecycle === 'tombstoned' && laterFactPeriod({ type: proposal.type, validFrom }, suppressed))) {
         this.#db.prepare("UPDATE capture_work SET stage='blocked',reason='memory-suppressed',lease_token=NULL,lease_activity=NULL WHERE job_id=?").run(job.jobId);
         return this.#captureJob(job.jobId);
       }
@@ -2375,7 +2389,8 @@ export class ProbeStore {
       const terms = query.normalize('NFC').toLocaleLowerCase().trim().split(/\s+/u);
       const range = [...job.range];
       const comparison = this.captureComparison(lease);
-      if (comparison && !range.some(ref => sameSourceAck(ref, comparison.peer.source))) range.push(comparison.peer.source);
+      if (comparison) for (const ref of [comparison.peer.source, ...comparison.feedback])
+        if (!range.some(other => sameSourceAck(ref, other))) range.push(ref);
       const raw: CaptureSourcePage['results'] = cursor ? [] : range.filter(ref => {
         const text = this.#archiveRef(ref).text.normalize('NFC').toLocaleLowerCase();
         return terms.some(term => text.includes(term));
@@ -2443,21 +2458,29 @@ export class ProbeStore {
     this.#db.prepare('UPDATE capture_work SET source_calls=source_calls+1,source_bytes=source_bytes+? WHERE job_id=?').run(bytes, jobId);
   }
 
+  #captureVerificationEvidence(jobId: string, result: CaptureVerification, prefix: 'verifier' | 'comparison') {
+    check(result && Object.keys(result).every(key => ['result','evidence','reason'].includes(key))
+      && ['pass','block','evidence-gap'].includes(result.result) && Array.isArray(result.evidence)
+      && result.evidence.length <= 16, 'invalid-verification');
+    const row = this.#db.prepare('SELECT expanded_refs FROM capture_work WHERE job_id=?').get(jobId)!;
+    const expanded = JSON.parse(String(row.expanded_refs)) as InspectedCaptureSource[];
+    check(result.evidence.every(ref => expanded.some(actual => sameSourceAck(ref, actual)))
+      && (result.result !== 'pass' || result.evidence.length > 0), 'verification-independent-evidence-required');
+    const reason = result.result === 'pass' ? null : result.reason ?? prefix + '-' + result.result;
+    check(reason === null || typeof reason === 'string' && /^[a-z0-9-]{1,128}$/.test(reason), 'invalid-verification-reason');
+    const sourceUnits = [...new Set(expanded.filter(item => item.unitId && result.evidence.some(ref => sameSourceAck(ref, item)))
+      .map(item => item.unitId!))];
+    return { reason, sourceUnits };
+  }
+
   completeCaptureVerification(lease: CaptureLease, result: CaptureVerification): CaptureJob {
     return this.withActivity(lease.activity, () => {
       const job = this.#captureLease(lease, true);
       if (job.stage === 'comparing') return this.#completeMemoryComparison(lease, result);
       check(job.stage === 'verifying' && job.record, 'capture-stage-mismatch');
-      check(result && Object.keys(result).every(key => ['result','evidence','reason'].includes(key))
-        && ['pass','block','evidence-gap'].includes(result.result) && Array.isArray(result.evidence)
-        && result.evidence.length <= 16, 'invalid-verification');
-      const row = this.#db.prepare('SELECT expanded_refs FROM capture_work WHERE job_id=?').get(job.jobId)!;
-      const expanded = JSON.parse(String(row.expanded_refs)) as InspectedCaptureSource[];
-      check(result.evidence.every(ref => expanded.some(actual => sameSourceAck(ref, actual)))
-        && (result.result !== 'pass' || result.evidence.length > 0), 'verification-independent-evidence-required');
+      const { reason: reportedReason, sourceUnits } = this.#captureVerificationEvidence(job.jobId, result, 'verifier');
       let verdict = result.result;
-      let reason = verdict === 'pass' ? null : result.reason ?? `verifier-${verdict}`;
-      check(reason === null || typeof reason === 'string' && /^[a-z0-9-]{1,128}$/.test(reason), 'invalid-verification-reason');
+      let reason = reportedReason;
       if (verdict === 'pass') {
         const roles = result.evidence.map(ref => this.#archiveRef(ref).role);
         if (['preference','decision'].includes(job.record.type) && !roles.includes('user')) reason = 'owner-evidence-required';
@@ -2489,8 +2512,6 @@ export class ProbeStore {
         if (reason) verdict = 'evidence-gap';
       }
       const current = job.record;
-      const sourceUnits = [...new Set(expanded.filter(item => item.unitId && result.evidence.some(ref => sameSourceAck(ref, item)))
-        .map(item => item.unitId!))];
       const runId = this.#saveVerification(current, verdict, result.evidence, 'independent-verifier@1', reason, sourceUnits);
       const after = this.#withMemoryHash({ ...current, verificationRunId: runId,
         lifecycle: verdict === 'block' && current.lifecycle !== 'tombstoned' ? 'rejected'
@@ -3536,14 +3557,9 @@ export class ProbeStore {
       const previous = this.#feedbackPrevious(current);
       const after = this.#withMemoryHash({ ...current, verification: 'stale', headEventId: randomUUID() });
       this.#appendMemoryEvent(current, after, 'stale', current.source.eventId,
-        { reason, feedbackId, trigger: 'eligibility-check', source: current.source, previousEligible: previous !== null });
-      if (previous) {
-        const restored = this.#withMemoryHash({ ...previous.record, headEventId: randomUUID() });
-        this.#appendMemoryEvent(after, restored, 'rollback', current.source.eventId,
-          { targetEventId: previous.eventId, automatic: true, feedbackId, reason });
-        return { status: 'committed', record: restored, eventId: restored.headEventId, reason };
-      }
-      return { status: 'committed', record: after, eventId: after.headEventId, reason };
+        { reason, feedbackId, trigger: 'eligibility-check', source: current.source, previousEligible: previous.length > 0 });
+      const restored = this.#restoreFeedbackPrevious(after, previous, current.source.eventId, { feedbackId, reason });
+      return { status: 'committed', record: restored, eventId: restored.headEventId, reason };
     });
   }
 
@@ -3744,23 +3760,47 @@ export class ProbeStore {
     });
   }
 
-  #feedbackPrevious(current: MemoryRecord): { record: MemoryRecord; eventId: string } | null {
-    const row = this.#db.prepare(`SELECT event_id,before_snapshot,after_snapshot FROM memory_events
-      WHERE record_id=? AND revision_id=? AND kind='auto-revise' ORDER BY seq DESC LIMIT 1`).get(current.recordId, current.revisionId);
-    if (!row || !row.before_snapshot) return null;
-    const previous = this.#parseMemorySnapshot(String(row.before_snapshot)), after = this.#parseMemorySnapshot(String(row.after_snapshot));
-    if (previous.lifecycle !== 'active' || this.#businessSnapshot(after) !== this.#businessSnapshot(current)) return null;
-    try {
-      this.#eligible(previous);
-      if (this.#suppressed(previous.claimKey, previous.source.binding.sessionId, previous.scope, previous.appliesTo)) return null;
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : '';
-      if (['memory-not-eligible','memory-not-current','file-identity-changed','unsafe-file-identity'].includes(reason)
-        || reason.startsWith('source-') || reason.startsWith('archive-integrity')
-        || ['ENOENT','EACCES','EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) return null;
-      throw error;
+  #feedbackPrevious(current: MemoryRecord): { record: MemoryRecord; head: MemoryRecord; eventId: string }[] {
+    const row = this.#db.prepare(`SELECT kind,event_id,before_snapshot,after_snapshot,payload FROM memory_events
+      WHERE record_id=? AND revision_id=? AND kind IN ('auto-revise','activate') ORDER BY seq DESC LIMIT 1`)
+      .get(current.recordId, current.revisionId);
+    if (!row || !row.before_snapshot) return [];
+    const after = this.#parseMemorySnapshot(String(row.after_snapshot));
+    if (this.#businessSnapshot(after) !== this.#businessSnapshot(current)) return [];
+    const candidates = row.kind === 'auto-revise'
+      ? [{ record: this.#parseMemorySnapshot(String(row.before_snapshot)), head: current, eventId: String(row.event_id) }]
+      : ((JSON.parse(String(row.payload)).previous ?? []) as { before: MemoryRecord; after: MemoryRecord }[])
+        .filter(item => this.#readMemoryHead(item.after.recordId).hash === item.after.hash)
+        .map(item => ({ record: item.before, head: item.after, eventId: item.after.headEventId }));
+    return candidates.filter(({ record }) => {
+      if (record.lifecycle !== 'active') return false;
+      try {
+        this.#eligible(record);
+        return !this.#suppressed(record.claimKey, record.source.binding.sessionId, record.scope, record.appliesTo);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : '';
+        if (['memory-not-eligible','memory-not-current','file-identity-changed','unsafe-file-identity'].includes(reason)
+          || reason.startsWith('source-') || reason.startsWith('archive-integrity')
+          || ['ENOENT','EACCES','EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) return false;
+        throw error;
+      }
+    });
+  }
+
+  #restoreFeedbackPrevious(current: MemoryRecord, previous: { record: MemoryRecord; head: MemoryRecord; eventId: string }[],
+    sourceEventId: string, metadata: Record<string, unknown>): MemoryRecord {
+    if (!previous.length) return current;
+    const batchId = randomUUID();
+    let result = current;
+    for (const [ordinal, item] of previous.entries()) {
+      const restored = this.#withMemoryHash({ ...item.record, headEventId: randomUUID() });
+      const before = item.record.recordId === current.recordId ? current : item.head;
+      this.#appendMemoryEvent(before, restored, 'rollback', sourceEventId,
+        { targetEventId: item.eventId, automatic: true, triggeredBy: current.headEventId, ...metadata }, undefined, { batchId, ordinal });
+      if (restored.recordId === current.recordId) result = restored;
     }
-    return { record: previous, eventId: String(row.event_id) };
+    this.#saveActivationBatch(batchId, current.scope);
+    return result;
   }
 
   recordMemoryFeedback(activity: Activity, recordId: string, expected: MemoryRecord, input: SourceAck):
@@ -3793,14 +3833,9 @@ export class ProbeStore {
         : { verification: 'stale' as const }), headEventId: randomUUID() });
       const previous = this.#feedbackPrevious(current);
       this.#appendMemoryEvent(current, after, kind === 'negative_transfer' ? 'reject' : 'stale', input.eventId,
-        { feedbackId, reason: kind, source: input, previousEligible: previous !== null });
-      if (previous) {
-        const restored = this.#withMemoryHash({ ...previous.record, headEventId: randomUUID() });
-        this.#appendMemoryEvent(after, restored, 'rollback', input.eventId,
-          { targetEventId: previous.eventId, automatic: true, feedbackId, reason: kind, source: input });
-        return { status: 'recorded', feedbackId, record: restored };
-      }
-      return { status: 'recorded', feedbackId, record: after };
+        { feedbackId, reason: kind, source: input, previousEligible: previous.length > 0 });
+      const restored = this.#restoreFeedbackPrevious(after, previous, input.eventId, { feedbackId, reason: kind, source: input });
+      return { status: 'recorded', feedbackId, record: restored };
     });
   }
 
@@ -3847,7 +3882,7 @@ export class ProbeStore {
 
   #promotionPeers(candidate: MemoryRecord): MemoryRecord[] {
     const rows = this.#db.prepare(`SELECT record_id FROM memory_heads WHERE scope_kind='project' AND scope_id=? AND record_id!=?
-      AND ((lifecycle IN ('active','candidate') AND verification IN ('verified','conflicted')) OR lifecycle IN ('tombstoned','rejected'))
+      AND (lifecycle IN ('active','tombstoned','rejected') OR (lifecycle='candidate' AND verification IN ('verified','conflicted')))
       ORDER BY record_id LIMIT 33`)
       .all(candidate.scope.id, candidate.recordId);
     check(rows.length <= 32, 'comparison-coverage-gap');
@@ -3873,32 +3908,25 @@ export class ProbeStore {
       check(JSON.stringify(peers) === JSON.stringify(state.peers), 'comparison-stale');
       const peer = peers[state.peerIndex];
       check(peer, 'comparison-evidence-gap');
-      const input = { schema: 'memory-comparison@1' as const, relation: state.relation, candidate: job.record!, peer };
+      const input = { schema: 'memory-comparison@1' as const, relation: state.relation, candidate: job.record!, peer,
+        feedback: this.#unresolvedMemoryFeedback(peer) };
       return { ...input, key: sha256(JSON.stringify(input)) };
     });
   }
 
   #completeMemoryComparison(lease: CaptureLease, result: CaptureVerification): CaptureJob {
     const comparison = this.captureComparison(lease)!;
-    check(result && Object.keys(result).every(key => ['result','evidence','reason'].includes(key))
-      && ['pass','block','evidence-gap'].includes(result.result) && Array.isArray(result.evidence)
-      && result.evidence.length <= 16, 'invalid-verification');
-    const row = this.#db.prepare('SELECT expanded_refs FROM capture_work WHERE job_id=?').get(lease.jobId)!;
-    const expanded = JSON.parse(String(row.expanded_refs)) as InspectedCaptureSource[];
-    check(result.evidence.every(ref => expanded.some(actual => sameSourceAck(ref, actual)))
-      && (result.result !== 'pass' || [comparison.candidate.source, comparison.peer.source]
-        .every(ref => result.evidence.some(actual => sameSourceAck(ref, actual)))), 'verification-independent-evidence-required');
-    const reason = result.result === 'pass' ? null : result.reason ?? `comparison-${result.result}`;
-    check(reason === null || typeof reason === 'string' && /^[a-z0-9-]{1,128}$/.test(reason), 'invalid-verification-reason');
-    const sourceUnits = [...new Set(expanded.filter(item => item.unitId && result.evidence.some(ref => sameSourceAck(ref, item)))
-      .map(item => item.unitId!))];
+    const { reason, sourceUnits } = this.#captureVerificationEvidence(lease.jobId, result, 'comparison');
+    check(result.result !== 'pass' || [comparison.candidate.source, comparison.peer.source, ...comparison.feedback]
+      .every(ref => result.evidence.some(actual => sameSourceAck(ref, actual))), 'verification-independent-evidence-required');
     const runId = this.#saveVerification(comparison.candidate, result.result, result.evidence, 'independent-verifier@1', reason, sourceUnits);
     const state = this.#memoryComparisonState(lease.jobId);
     let continuing = false;
     const nextRelation = memoryRelations[memoryRelations.indexOf(comparison.relation) + 1];
     if (result.result === 'pass' && comparison.relation === 'supersedes') {
-      check(comparison.peer.verification === 'verified' && !comparison.peer.conflictSetId
-        && ['active','candidate'].includes(comparison.peer.lifecycle)
+      const independentPeriod = comparison.peer.lifecycle === 'tombstoned' && laterFactPeriod(comparison.candidate, comparison.peer);
+      check((independentPeriod || comparison.peer.verification === 'verified' && !comparison.peer.conflictSetId
+        && ['active','candidate'].includes(comparison.peer.lifecycle))
         && JSON.stringify(comparison.peer.appliesTo) === JSON.stringify(comparison.candidate.appliesTo), 'comparison-ineligible');
       state.replacements.push(comparison.peer.recordId);
     }
@@ -3923,7 +3951,7 @@ export class ProbeStore {
     }
     if (['distinct','supersedes'].includes(comparison.relation)) {
       this.#eligible(current);
-      const previous = state.peers.filter(peer => state.replacements.includes(peer.recordId)).map(peer => {
+      const previous = state.peers.filter(peer => state.replacements.includes(peer.recordId) && peer.lifecycle !== 'tombstoned').map(peer => {
         this.#assertMemoryExpected(peer.recordId, peer);
         this.#checkVerification(peer, true);
         const after = this.#withMemoryHash({ ...peer, lifecycle: 'superseded', headEventId: randomUUID() });
@@ -3932,7 +3960,9 @@ export class ProbeStore {
         return { before: peer, after };
       });
       const active = this.#withMemoryHash({ ...current, lifecycle: 'active', headEventId: randomUUID() });
-      check(!this.#suppressed(current.claimKey, current.source.binding.sessionId, current.scope, current.appliesTo), 'memory-suppressed');
+      const suppressed = this.#suppressed(current.claimKey, current.source.binding.sessionId, current.scope, current.appliesTo);
+      check(!suppressed || suppressed.lifecycle === 'tombstoned' && laterFactPeriod(current, suppressed)
+        && state.replacements.includes(suppressed.recordId), 'memory-suppressed');
       this.#appendMemoryEvent(current, active, 'activate', current.source.eventId,
         { automatic: true, previous, comparisonEventId: current.headEventId });
       this.#db.prepare(`UPDATE capture_work SET stage='complete',reason=NULL,expected_head_id=?,lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?`)
@@ -4294,7 +4324,9 @@ export class ProbeStore {
         return { status: 'no_op', left: { status: 'no_op', record: left, eventId: null }, right: { status: 'no_op', record: right, eventId: null }, conflictSetId: null };
       }
       check(left.verification === 'verified' && right.verification === 'verified' && left.lifecycle !== 'tombstoned' && right.lifecycle !== 'tombstoned'
-        && JSON.stringify(left.scope) === JSON.stringify(right.scope) && JSON.stringify(left.appliesTo) === JSON.stringify(right.appliesTo), 'invalid-conflict');
+        && JSON.stringify(left.scope) === JSON.stringify(right.scope) && memoryApplicabilityOverlaps(left.appliesTo, right.appliesTo)
+        && !(left.validUntil && right.validFrom && left.validUntil <= right.validFrom)
+        && !(right.validUntil && left.validFrom && right.validUntil <= left.validFrom), 'invalid-conflict');
       const conflictSetId = randomUUID();
       this.#db.prepare('INSERT INTO conflict_sets VALUES (?, ?)').run(conflictSetId, new Date().toISOString());
       this.#db.prepare('INSERT INTO conflict_members VALUES (?, ?), (?, ?)').run(conflictSetId, leftId, conflictSetId, rightId);
@@ -4727,10 +4759,12 @@ export class ProbeStore {
     }
   }
   #checkComparisonEvidence(record: MemoryRecord, projects: readonly string[]): void {
-    const links = this.#db.prepare(`SELECT event_id,kind,payload FROM memory_events WHERE record_id=? AND revision_id=?
-      AND seq <= (SELECT seq FROM memory_events WHERE event_id=?)
-      AND (json_extract(payload,'$.comparisonEventId') IS NOT NULL OR (event_id=? AND kind='comparison'))`)
-      .all(record.recordId, record.revisionId, record.headEventId, record.headEventId);
+    const links = this.#db.prepare(`SELECT e.event_id,e.kind,e.payload FROM memory_events e WHERE e.record_id=? AND e.revision_id=?
+      AND e.seq <= (SELECT seq FROM memory_events WHERE event_id=?)
+      AND (json_extract(e.payload,'$.comparisonEventId') IS NOT NULL OR (e.event_id=? AND e.kind='comparison'))
+      AND NOT EXISTS (SELECT 1 FROM memory_events r WHERE r.record_id=e.record_id AND r.kind='rollback'
+        AND r.target_event_id=e.event_id AND r.seq <= (SELECT seq FROM memory_events WHERE event_id=?))`)
+      .all(record.recordId, record.revisionId, record.headEventId, record.headEventId, record.headEventId);
     const checked = new Set<string>();
     for (const link of links) {
       const id = link.kind === 'comparison' ? String(link.event_id) : JSON.parse(String(link.payload)).comparisonEventId;
@@ -5189,6 +5223,21 @@ function parseMemoryCondition(condition: string): { kind: keyof SearchTarget; va
   if (parts.length === 2 && ['agent','platform','component'].includes(parts[0]!)
     && /^[^:\s]+$/u.test(parts[1]!)) return { kind: parts[0] as keyof SearchTarget, value: parts[1]! };
   return null;
+}
+
+function laterFactPeriod(candidate: Pick<MemoryRecord, 'type' | 'validFrom'>, previous: MemoryRecord): boolean {
+  return candidate.type === 'fact' && previous.type === 'fact' && candidate.validFrom !== null
+    && previous.validUntil !== null && previous.validUntil <= candidate.validFrom;
+}
+
+function memoryApplicabilityOverlaps(left: readonly string[], right: readonly string[]): boolean {
+  const values = new Map<string, string>();
+  for (const value of [...left, ...right]) {
+    const condition = parseMemoryCondition(value)!;
+    if (values.has(condition.kind) && values.get(condition.kind) !== condition.value) return false;
+    values.set(condition.kind, condition.value);
+  }
+  return true;
 }
 
 function memoryApplicability(conditions: readonly string[], target: SearchTarget):

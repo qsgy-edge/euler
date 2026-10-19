@@ -28,7 +28,8 @@ function compare(job: CaptureJob, relation: MemoryComparison['relation']) {
     const lease = probe.store.claimCaptureJob(probe.activity, job.jobId, evolutionBudget, 30000)!;
     const input = probe.store.captureComparison(lease)!;
     probe.store.searchCaptureSources(lease, '本项目');
-    const evidence = [input.candidate.source, input.peer.source];
+    if (input.feedback.length) probe.store.searchCaptureSources(lease, 'memory-feedback');
+    const evidence = [input.candidate.source, input.peer.source, ...input.feedback];
     for (const ref of evidence) probe.store.expandCaptureSource(lease, { ref, offset: 0, limit: 4096 });
     const result = probe.store.completeCaptureVerification(lease, { result: input.relation === relation ? 'pass' : 'block', evidence });
     if (input.relation === relation) return result;
@@ -57,7 +58,7 @@ try {
           if (payload.p3.intent.step === 'proposer') text = JSON.stringify({ type: 'decision', content: `本项目在 ${platform} 使用 ${shell}`, appliesTo: [`platform:${platform}`] });
           else if (!payload.p2.length) calls = [{ id: 'search', name: 'source.search', arguments: { query: '本项目' } }];
           else if (payload.p2.length === 1) {
-            const refs: SourceAck[] = fixed.comparison ? [fixed.comparison.candidate.source, fixed.comparison.peer.source] : fixed.sourceRange;
+            const refs: SourceAck[] = fixed.comparison ? [fixed.comparison.candidate.source, fixed.comparison.peer.source, ...fixed.comparison.feedback] : fixed.sourceRange;
             calls = refs.map((ref, index) => ({ id: `expand-${index}`, name: 'source.expand', arguments: { eventId: ref.eventId, offset: 0, limit: 4096 } }));
           } else text = JSON.stringify({ result: !fixed.comparison || fixed.comparison.relation === 'distinct' ? 'pass' : 'block',
             evidence: payload.p2[1].results.map((item: { modelResult: string }) => JSON.parse(item.modelResult).ref) });
@@ -104,8 +105,16 @@ try {
       const wrong = probe.archive.append(randomUUID(), JSON.stringify({ ...value, kind: 'user_wrong' }), 'user');
       probe.store.recordMemoryFeedback(probe.activity, current.recordId, current, wrong);
       assert.throws(() => probe.session.dispatch(prepared), /memory-stale/);
-    } else if (scenario!.startsWith('negative-')) {
-      if (scenario !== 'negative-first') {
+    } else if (scenario!.startsWith('negative-') || scenario!.startsWith('ordinary-negative-')) {
+      if (scenario!.startsWith('ordinary-')) {
+        const previousId = current.recordId;
+        current = compare(verifiedCandidate(probe, '本项目现决定保存详细原始日志'), 'supersedes')!.record!;
+        if (scenario === 'ordinary-negative-changed') {
+          const previous = probe.store.readMemory(probe.activity, previousId);
+          const correction = probe.archive.append(randomUUID(), '更正：旧记录的适用对象需要重新核验');
+          probe.store.correctMemory(probe.activity, previousId, previous, correction, '本项目旧记录需要重新核验');
+        }
+      } else if (scenario !== 'negative-first') {
         nextSession();
         const source = probe.archive.append(randomUUID(), '本项目保存详细原始日志');
         current = probe.store.reviseMemory(probe.activity, current.recordId, current, source, '本项目保存详细原始日志', [source]).record;
