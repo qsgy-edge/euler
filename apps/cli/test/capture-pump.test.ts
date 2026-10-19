@@ -32,6 +32,52 @@ test('a capture archive failure remains observable with its original code after 
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('capture pauses before a send when Info recovery fails and resumes the same verification budget', async () => {
+  const sandbox = createSandbox();
+  let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const source = probe.archive.append(randomUUID(), '记住：本项目保留原始日志');
+    const job = probe.store.queueOwnerCapture(probe.activity, source);
+    const proposer = probe.store.claimCaptureJob(probe.activity, job.jobId, budget, 30000)!;
+    probe.store.captureProposedMemory(proposer, { type: 'decision', content: '本项目保留原始日志' });
+    const lease = probe.store.claimCaptureJob(probe.activity, job.jobId, budget, 30000)!;
+    const deadline = probe.store.captureRuntime(lease).deadline;
+    const run = new CaptureRun(probe.store, lease, probe.archive, { proposer: [route], verifier: [route] }, undefined, 'capture-counting@1');
+    let recovered = true;
+    const waiting = await pumpCapture(run, {
+      recoverInfo: () => recovered,
+      async *stream(request, _signal, send) {
+        const attempt = send(request.payload); probe.transport.send(request.payload, attempt);
+        recovered = false;
+        yield { kind: 'complete', reply: { text: '', calls: [{ id: 'search', name: 'source.search', arguments: { query: '原始日志' } }], stop: 'tools' } };
+      },
+    });
+    assert.equal(waiting.stage, 'verifying'); assert.equal(waiting.reason, 'host-info-recovery-required');
+    assert.equal(probe.transport.count, 1);
+    const firstAttempt = probe.store.requestStatus(lease.activity, run.runId).attempts[0]!;
+    assert.equal(firstAttempt.outcome, 'received');
+    probe.close(); probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    const nextLease = probe.store.claimCaptureJob(probe.activity, job.jobId, budget, 30000)!;
+    assert.equal(probe.store.captureRuntime(nextLease).deadline, deadline);
+    const next = new CaptureRun(probe.store, nextLease, probe.archive, { proposer: [route], verifier: [route] }, undefined, 'capture-counting@1');
+    assert.equal(next.runId, run.runId);
+    const finished = await pumpCapture(next, {
+      recoverInfo: () => true,
+      async *stream(request, _signal, send) {
+        const attempt = send(request.payload); probe.transport.send(request.payload, attempt);
+        const payload = JSON.parse(request.payload);
+        yield { kind: 'complete', reply: payload.p2.length === 1
+          ? { text: '', calls: [{ id: 'expand', name: 'source.expand', arguments: { eventId: source.eventId, offset: 0, limit: 4096 } }], stop: 'tools' }
+          : { text: JSON.stringify({ result: 'pass', evidence: [source] }), calls: [], stop: 'end' } };
+      },
+    });
+    assert.equal(finished.stage, 'complete'); assert.equal(finished.record!.lifecycle, 'active');
+    const attempts = probe.store.requestStatus(nextLease.activity, next.runId).attempts;
+    assert.equal(attempts.length, 3); assert.equal(attempts[0]!.attemptId, firstAttempt.attemptId);
+    assert.ok(attempts.every(attempt => attempt.outcome === 'received'));
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('actual provider usage blocks fallback before assembly and store admission', () => {
   const sandbox = createSandbox(), probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
   try {

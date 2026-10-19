@@ -5,6 +5,7 @@ export type AuthorizeSend = (payload: string) => RequestAttempt;
 
 export interface AgentPump {
   stream(request: ModelRequest, signal: AbortSignal, authorizeSend: AuthorizeSend): AsyncIterable<{ kind: 'partial' | 'complete'; reply: ModelReply; failure?: CaptureFailure; responseHash?: string }>;
+  recoverInfo?(): boolean;
   cooperate?(): Promise<void>;
   execute(call: ToolCall, signal: AbortSignal): Promise<string>;
   prepareFile?(call: ToolCall, capability: FileCapability, signal: AbortSignal): Promise<{ target: FileTarget; execute(): Promise<FileReceipt>; close(): void }>;
@@ -21,12 +22,17 @@ async function untilStopped<T>(promise: Promise<T>, signal: AbortSignal): Promis
   try { return await Promise.race([promise, stopped]); }
   finally { signal.removeEventListener('abort', listener); }
 }
+class HostInfoRecoveryRequired extends Error {
+  constructor() { super('host-info-recovery-required'); }
+}
+
 async function receiveModel(run: Pick<AgentRun, 'startModel' | 'maySend'>, request: ModelRequest,
-  host: Pick<AgentPump, 'stream'>, signal: AbortSignal) {
+  host: Pick<AgentPump, 'stream' | 'recoverInfo'>, signal: AbortSignal) {
   let attempt: RequestAttempt | undefined, reply: ModelReply | undefined;
   let transport: { failure?: CaptureFailure; responseHash?: string } = {};
   const iterator = host.stream(request, signal, payload => {
     check(!attempt, 'hidden-retry-denied');
+    if (host.recoverInfo?.() === false) throw new HostInfoRecoveryRequired();
     attempt = run.startModel(request, payload);
     check(run.maySend(attempt.attemptId, payload), 'send-cancelled');
     return attempt;
@@ -113,8 +119,8 @@ export async function pumpAgent(run: AgentRun, host: AgentPump): Promise<AgentSt
 }
 
 /** Background I/O pump; all job, source and fallback transitions stay in Core. */
-export async function pumpCapture(run: CaptureRun, host: Pick<AgentPump, 'stream'>, signal?: AbortSignal): Promise<CaptureJob> {
-  if (!['proposing','verifying'].includes(run.status().stage)) return run.status();
+export async function pumpCapture(run: CaptureRun, host: Pick<AgentPump, 'stream' | 'recoverInfo'>, signal?: AbortSignal): Promise<CaptureJob> {
+  if (!['proposing','verifying','comparing'].includes(run.status().stage)) return run.status();
   const release = run.observeExecution();
   const abort = new AbortController();
   const stopped = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
@@ -128,7 +134,8 @@ export async function pumpCapture(run: CaptureRun, host: Pick<AgentPump, 'stream
       run.finishModel(attempt.attemptId, reply, transport);
     }
   } catch (error) {
-    if (['proposing','verifying'].includes(run.status().stage)) run.fail(error);
+    if (error instanceof HostInfoRecoveryRequired) return run.pauseForHostInfo();
+    if (['proposing','verifying','comparing'].includes(run.status().stage)) run.fail(error);
     throw error;
   } finally { release(); clearTimeout(deadline); }
   return run.status();

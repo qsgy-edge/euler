@@ -150,9 +150,11 @@ async function scenario(name: string) {
     if (name === 'compete' || name === 'compete-unknown') {
       const mode = name === 'compete' ? 'compete' : 'crash-after-commit';
       worker = launch(`${name}/writer-a`, ['memory-worker', '--scenario', mode, '--sandbox', root]);
+      const firstReady = await worker.waitFor('memory-ready');
       competitor = launch(`${name}/writer-b`, ['memory-worker', '--scenario', mode, '--sandbox', root]);
       const writers = [worker, competitor];
-      const ready = await Promise.all(writers.map(writer => writer.waitFor('memory-ready')));
+      // Prepare both writers at the barrier, then race commits on the same frozen head.
+      const ready = [firstReady, await competitor.waitFor('memory-ready')];
       assert.deepEqual(ready[0]!.expected, ready[1]!.expected);
       assert.notEqual(ready[0]!.requestHash, ready[1]!.requestHash);
       for (const request of ready) assert.equal(request.requestHash, digest(JSON.stringify(request.request)));

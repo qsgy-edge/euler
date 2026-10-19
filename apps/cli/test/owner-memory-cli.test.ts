@@ -10,8 +10,9 @@ import { sha256 } from '@euler/core';
 import { OwnerInfoLog } from '../src/owner-memory.ts';
 import { startCli } from '../src/process-driver.ts';
 import type { Observation } from '../src/process-driver.ts';
-import { createSandbox } from '../src/sandbox.ts';
+import { bindingOf, createSandbox, createSandboxSession } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
+import { compareCandidate, verifiedCandidate } from './support/memory-evolution.ts';
 
 type Cli = ReturnType<typeof startCli>;
 async function nth(cli: Cli, event: string, index: number, timeoutMs = 20000): Promise<Observation> {
@@ -35,6 +36,52 @@ async function stop(cli: Cli): Promise<void> {
 }
 const entries = (root: string) => readFileSync(join(root, 'owner-info.jsonl'), 'utf8').trimEnd().split('\n').slice(1).map(line => JSON.parse(line));
 const only = (cli: Cli, event: string, where: (item: Observation) => boolean = () => true) => cli.observations.filter(item => item.event === event && where(item));
+
+for (const failInfo of [false, true]) test('ask delivers an eligibility-triggered rollback before sending: Info failure=' + failInfo, async () => {
+  const sandbox = createSandbox();
+  let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  let cli: Cli | undefined;
+  let probeClosed = false;
+  try {
+    const first = verifiedCandidate(probe, '本项目保存原始日志').record!;
+    probe.store.promoteMemory(probe.activity, first.recordId, first);
+    const next = { ...bindingOf(sandbox), sessionId: randomUUID() };
+    createSandboxSession(sandbox, next); probe.close();
+    probe = openProbe(sandbox, undefined, undefined, next, undefined, true);
+    const replacement = verifiedCandidate(probe, '本项目现决定保存详细原始日志');
+    probe.store.promoteMemory(probe.activity, replacement.record!.recordId, replacement.record!);
+    compareCandidate(probe, replacement.jobId, 'supersedes');
+    probe.store.drainSearchProjection(probe.activity, 128); probe.close(); probeClosed = true;
+    cli = startCli(['remember', '--sandbox', sandbox.root]);
+    await cli.waitFor('remember-ready');
+    assert.equal(entries(sandbox.root).length, 2);
+    rmSync(join(sandbox.root, 'session-' + next.sessionId + '.jsonl'));
+    if (failInfo) {
+      const db = new DatabaseSync(join(sandbox.root, 'probe.sqlite'));
+      try {
+        db.exec(`PRAGMA busy_timeout=2000;
+          CREATE TRIGGER rollback_info_failure BEFORE INSERT ON host_info_batches
+          BEGIN SELECT RAISE(ABORT,'injected-rollback-info-failure'); END;`);
+        assert.equal((await send(cli, 'ask 本项目如何保存日志？', 'ask-refused')).reason, 'host-info-recovery-required');
+        assert.equal(only(cli, 'ask-result').length, 0);
+        assert.equal(entries(sandbox.root).length, 2);
+        db.exec('DROP TRIGGER rollback_info_failure');
+      } finally { db.close(); }
+    }
+    const answer = await send(cli, 'ask 本项目如何保存日志？', 'ask-result');
+    assert.equal((answer.receipt as { count: number }).count, 1);
+    assert.deepEqual(answer.selected, [first.recordId]);
+    assert.equal(entries(sandbox.root).length, 3);
+    const notice = only(cli, 'info-notice').at(-1)!;
+    assert.equal(notice.batchId, entries(sandbox.root).at(-1)!.batchId);
+    assert.ok(cli.observations.indexOf(notice) < cli.observations.indexOf(answer));
+    await stop(cli);
+  } finally {
+    if (cli && !cli.observations.some(row => row.event === 'process-exit')) { cli.child.kill('SIGKILL'); await cli.exit; }
+    if (!probeClosed) probe.close();
+    rmSync(sandbox.root, { recursive: true, force: true });
+  }
+});
 
 test('an oversized owner entry is rejected before writing and leaves prior Info readable', () => {
   const sandbox = createSandbox();
