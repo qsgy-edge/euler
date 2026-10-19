@@ -95,6 +95,8 @@ const memoryRelations = ['same-claim', 'distinct', 'supersedes', 'superseded-by'
 export interface MemoryComparison {
   schema: 'memory-comparison@1'; key: string; relation: typeof memoryRelations[number]; candidate: MemoryRecord; peer: MemoryRecord; feedback: SourceAck[];
 }
+type MemorySourceCheck = Map<string, 'checking' | 'checked'>;
+
 interface MemoryComparisonState {
   schema: 'memory-comparison-state@1'; jobId: string; candidate: MemoryRecord; peers: MemoryRecord[]; peerIndex: number;
   relation: MemoryComparison['relation']; replacements: string[]; conflicts: string[]; originHeadId: string;
@@ -4834,16 +4836,27 @@ export class ProbeStore {
     check(!memoryTemporalStatus(record, Date.now()), 'memory-not-current');
     this.#validateMemorySources(record);
   }
-  #validateMemorySources(record: MemoryRecord): void {
-    this.#validateSource(record.source, undefined, record.scope);
-    this.#checkVerification(record, true);
-    for (const row of this.#db.prepare('SELECT payload,payload_hash FROM provenance_refs WHERE record_id=? AND revision_id=?')
-      .all(record.recordId, record.revisionId)) {
-      check(sha256(String(row.payload)) === row.payload_hash, 'memory-evidence-gap');
-      this.#validateSource(JSON.parse(String(row.payload)).source as SourceAck, undefined, record.scope);
+  #validateMemorySources(record: MemoryRecord, projects: readonly string[] = [this.#binding.projectId],
+    sourceChecks: MemorySourceCheck = new Map()): void {
+    const key = `${record.recordId}/${record.headEventId}`;
+    check(sourceChecks.get(key) !== 'checking', 'comparison-evidence-gap');
+    if (sourceChecks.get(key) === 'checked') return;
+    sourceChecks.set(key, 'checking');
+    try {
+      this.#validateSource(record.source, undefined, record.scope, projects);
+      this.#checkVerification(record, true, projects, sourceChecks);
+      for (const row of this.#db.prepare('SELECT payload,payload_hash FROM provenance_refs WHERE record_id=? AND revision_id=?')
+        .all(record.recordId, record.revisionId)) {
+        check(sha256(String(row.payload)) === row.payload_hash, 'memory-evidence-gap');
+        this.#validateSource(JSON.parse(String(row.payload)).source as SourceAck, undefined, record.scope, projects);
+      }
+      sourceChecks.set(key, 'checked');
+    } finally {
+      if (sourceChecks.get(key) === 'checking') sourceChecks.delete(key);
     }
   }
-  #checkVerification(record: MemoryRecord, readSources = false, projects: readonly string[] = [this.#binding.projectId]): void {
+  #checkVerification(record: MemoryRecord, readSources = false, projects: readonly string[] = [this.#binding.projectId],
+    sourceChecks?: MemorySourceCheck): void {
     if (!record.verificationRunId) { check(!['verified','conflicted'].includes(record.verification), 'verification-evidence-gap'); return; }
     const row = this.#db.prepare('SELECT * FROM verification_runs WHERE run_id=?').get(record.verificationRunId);
     check(row && row.record_id === record.recordId && row.revision_id === record.revisionId
@@ -4857,10 +4870,11 @@ export class ProbeStore {
       if (event) check(sha256(String(event.payload)) === event.payload_hash, 'verification-evidence-gap');
       const sourceUnits: string[] = event ? JSON.parse(String(event.payload)).sourceUnits ?? [] : [];
       for (const ref of evidence) this.#validateVerificationSource(ref, record.scope, sourceUnits, projects);
-      this.#checkComparisonEvidence(record, projects);
+      this.#checkComparisonEvidence(record, projects, true, sourceChecks);
     }
   }
-  #checkComparisonEvidence(record: MemoryRecord, projects: readonly string[], readSources = true): void {
+  #checkComparisonEvidence(record: MemoryRecord, projects: readonly string[], readSources = true,
+    sourceChecks: MemorySourceCheck = new Map()): void {
     const links = this.#db.prepare(`SELECT e.event_id,e.kind,e.payload FROM memory_events e WHERE e.record_id=? AND e.revision_id=?
       AND e.seq <= (SELECT seq FROM memory_events WHERE event_id=?)
       AND (json_extract(e.payload,'$.comparisonEventId') IS NOT NULL OR (e.event_id=? AND e.kind='comparison'))
@@ -4887,8 +4901,24 @@ export class ProbeStore {
           && proof.result === 'pass' && sha256(String(proof.evidence_json)) === proof.evidence_hash
           && proof.evidence_json === JSON.stringify(verdict.evidence), 'comparison-evidence-gap');
         this.#checkEvidenceRows('verification_evidence', 'run_id', verdict.runId, verdict.evidence);
-        if (readSources) for (const ref of verdict.evidence as SourceAck[])
-          this.#validateVerificationSource(ref, record.scope, verdict.sourceUnits ?? [], projects);
+        if (readSources) {
+          for (const ref of verdict.evidence as SourceAck[])
+            this.#validateVerificationSource(ref, record.scope, verdict.sourceUnits ?? [], projects);
+          if (verdict.input?.relation === 'same-claim') {
+            const input = verdict.input as MemoryComparison;
+            for (const endpoint of [input.candidate, input.peer]) {
+              const frozen = this.#db.prepare(`SELECT e.after_snapshot,e.payload,e.payload_hash FROM memory_events e
+                JOIN memory_records r ON r.record_id=e.record_id WHERE e.event_id=? AND e.record_id=? AND r.owner_id=?`)
+                .get(endpoint.headEventId, endpoint.recordId, this.#binding.ownerId);
+              check(frozen && sha256(String(frozen.payload)) === frozen.payload_hash
+                && frozen.after_snapshot === this.#snapshotBytes(endpoint)
+                && JSON.stringify(JSON.parse(String(frozen.payload)).after) === frozen.after_snapshot, 'comparison-evidence-gap');
+              this.#verifyRevision(endpoint);
+            }
+            const donor = input.peer.lifecycle === 'candidate' && input.peer.verification === 'verified' ? input.peer : input.candidate;
+            if (donor.recordId !== record.recordId) this.#validateMemorySources(donor, projects, sourceChecks);
+          }
+        }
       }
     }
   }

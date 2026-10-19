@@ -9,6 +9,83 @@ import { approvedSourceUnit } from './support/source-publication.ts';
 import { openProbe } from '../src/probe.ts';
 import { compareCandidate, evolutionBudget, observedFact, pairedCanary, verifiedCandidate } from './support/memory-evolution.ts';
 
+for (const scenario of [
+  { kind: 'provenance', loss: 'none' }, { kind: 'provenance', loss: 'delete' }, { kind: 'provenance', loss: 'change' },
+  { kind: 'verification', loss: 'delete' }, { kind: 'active-verification', loss: 'delete' },
+  { kind: 'nested-verification', loss: 'delete' },
+] as const) test(`same-claim qualification retains complete donor evidence: ${scenario.kind}/${scenario.loss}`, () => {
+  const sandbox = createSandbox(), initial = bindingOf(sandbox);
+  let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  const enter = (binding: typeof initial) => {
+    probe.close(); probe = openProbe(sandbox, undefined, undefined, binding, undefined, true);
+  };
+  try {
+    const auxiliaryBinding = { ...initial, sessionId: randomUUID() };
+    createSandboxSession(sandbox, auxiliaryBinding); enter(auxiliaryBinding);
+    const auxiliaryText = '本项目保留原始日志；本项目保存原始日志；本项目留存原始日志的独立佐证';
+    const auxiliary = probe.archive.append(randomUUID(), auxiliaryText);
+    probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref: auxiliary, projectId: initial.projectId,
+      kind: 'report-section', offset: 0, length: Array.from(auxiliaryText).length }));
+    probe.store.drainSourceProjection(probe.activity);
+    enter(initial);
+    const first = verifiedCandidate(probe, '本项目保留原始日志', { evidence: scenario.kind === 'verification' ? [auxiliary] : [] });
+    if (scenario.kind !== 'verification') probe.store.promoteMemory(probe.activity, first.record!.recordId, first.record!);
+    let lostSource = auxiliary;
+    if (scenario.kind === 'provenance' || scenario.kind === 'nested-verification') {
+      const secondBinding = { ...initial, sessionId: randomUUID() };
+      createSandboxSession(sandbox, secondBinding); enter(secondBinding);
+      const second = verifiedCandidate(probe, '本项目保存原始日志', { evidence: scenario.kind === 'nested-verification' ? [auxiliary] : [] });
+      probe.store.promoteMemory(probe.activity, second.record!.recordId, second.record!);
+      assert.equal(compareCandidate(probe, second.jobId, 'same-claim').reason, 'claim-corroborated');
+      if (scenario.kind === 'provenance') lostSource = second.source;
+      enter(initial);
+      const before = probe.store.readMemory(probe.activity, first.record!.recordId);
+      const feedback = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-feedback@1', kind: 'user_wrong',
+        recordId: before.recordId, revisionId: before.revisionId, headEventId: before.headEventId }), 'user');
+      probe.store.recordMemoryFeedback(probe.activity, before.recordId, before, feedback);
+      const stale = probe.store.readMemory(probe.activity, before.recordId);
+      const approval = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-reverification-approval@1', recordId: stale.recordId,
+        revisionId: stale.revisionId, headEventId: stale.headEventId, sourceHash: stale.source.hash }), 'user');
+      const job = probe.store.queueMemoryVerification(probe.activity, stale.recordId, stale, approval);
+      const lease = probe.store.claimCaptureJob(probe.activity, job.jobId, evolutionBudget, 30000)!;
+      for (const query of ['本项目', 'memory-feedback', 'memory-reverification']) probe.store.searchCaptureSources(lease, query);
+      for (const ref of job.range) probe.store.expandCaptureSource(lease, { ref, offset: 0, limit: 4096 });
+      const verified = probe.store.completeCaptureVerification(lease, { result: 'pass', evidence: job.range });
+      assert.equal(verified.record!.lifecycle, 'candidate'); assert.equal(verified.record!.revisionId, before.revisionId);
+    }
+    const thirdBinding = { ...initial, sessionId: randomUUID() };
+    createSandboxSession(sandbox, thirdBinding); enter(thirdBinding);
+    const third = verifiedCandidate(probe, '本项目留存原始日志', { evidence: scenario.kind === 'active-verification' ? [auxiliary] : [] });
+    probe.store.promoteMemory(probe.activity, third.record!.recordId, third.record!);
+    compareCandidate(probe, third.jobId, 'same-claim');
+    const targetId = scenario.kind === 'active-verification' ? first.record!.recordId : third.record!.recordId;
+    const target = probe.store.readMemory(probe.activity, targetId);
+    assert.equal(target.lifecycle, 'active'); assert.equal(target.verification, 'verified');
+    const prepared = probe.session.prepare(randomUUID(), '本项目如何保存日志？', [target]);
+    if (scenario.loss === 'none') {
+      probe.session.dispatch(prepared);
+      assert.equal(probe.transport.count, 1);
+      assert.equal(probe.store.revalidateMemory(probe.activity, targetId).reason, null);
+    } else {
+      const path = probe.store.sessionSource(lostSource.binding).path;
+      if (scenario.loss === 'delete') rmSync(path);
+      else writeFileSync(path, readFileSync(path, 'utf8').trimEnd().split('\n').map(line => {
+        const event = JSON.parse(line);
+        if (event.eventId === lostSource.eventId) event.text += ' changed';
+        return JSON.stringify(event);
+      }).join('\n') + '\n');
+      assert.throws(() => probe.session.dispatch(prepared), scenario.loss === 'delete' ? { code: 'ENOENT' } : /source-evidence-gap/);
+      assert.equal(probe.transport.count, 0);
+      const invalidated = probe.store.revalidateMemory(probe.activity, targetId);
+      assert.equal(invalidated.reason, 'source-invalidated'); assert.equal(invalidated.record.verification, 'stale');
+      assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
+      enter(thirdBinding);
+      assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
+      assert.equal(probe.transport.count, 0);
+    }
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 for (const pendingFirst of [false, true]) for (const relation of ['distinct', 'supersedes', 'superseded-by', 'same-claim', 'conflict', 'evidence-gap'] as const)
   test(`a fresh capture compares an exhausted verified candidate and every remaining peer: pendingFirst=${pendingFirst}, ${relation}`, () => {
     const sandbox = createSandbox();
