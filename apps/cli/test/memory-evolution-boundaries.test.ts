@@ -7,7 +7,61 @@ import { CaptureRun } from '@euler/core';
 import { bindingOf, createSandbox, createSandboxSession, resourcesOf } from '../src/sandbox.ts';
 import { approvedSourceUnit } from './support/source-publication.ts';
 import { openProbe } from '../src/probe.ts';
-import { evolutionBudget, observedFact, pairedCanary, verifiedCandidate } from './support/memory-evolution.ts';
+import { compareCandidate, evolutionBudget, observedFact, pairedCanary, verifiedCandidate } from './support/memory-evolution.ts';
+
+for (const mutation of ['none','wrong','forget','correct']) test('duplicate evidence resolves canonically and retains the ' + mutation + ' barrier', () => {
+  const sandbox = createSandbox(), probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const drafts = ['本项目测试保留原始日志','本项目测试保存原始日志'].map(content => {
+      const source = probe.archive.append(randomUUID(), '记住：' + content);
+      const queued = probe.store.queueOwnerCapture(probe.activity, source);
+      const lease = probe.store.claimCaptureJob(probe.activity, queued.jobId, evolutionBudget, 30000)!;
+      return probe.store.captureProposedMemory(lease, { type: 'decision', content });
+    }).sort((left, right) => right.record!.recordId.localeCompare(left.record!.recordId));
+    for (const [index, draft] of drafts.entries()) {
+      const lease = probe.store.claimCaptureJob(probe.activity, draft.jobId, evolutionBudget, 30000)!;
+      probe.store.searchCaptureSources(lease, '本项目');
+      probe.store.expandCaptureSource(lease, { ref: draft.source, offset: 0, limit: 4096 });
+      const job = probe.store.completeCaptureVerification(lease, { result: 'pass', evidence: [draft.source] });
+      probe.store.promoteMemory(probe.activity, job.record!.recordId, job.record!);
+      if (index) {
+        const comparison = probe.store.claimCaptureJob(probe.activity, job.jobId, evolutionBudget, 30000)!;
+        probe.store.searchCaptureSources(comparison, '本项目');
+        for (const ref of drafts.map(item => item.source)) probe.store.expandCaptureSource(comparison, { ref, offset: 0, limit: 4096 });
+        const duplicate = probe.store.completeCaptureVerification(comparison, { result: 'pass', evidence: drafts.map(item => item.source) });
+        assert.equal(duplicate.reason, 'claim-corroborated');
+      }
+    }
+    const canonical = probe.store.readMemory(probe.activity, drafts[0]!.record!.recordId);
+    const third = verifiedCandidate(probe, '本项目测试留存原始日志');
+    probe.store.promoteMemory(probe.activity, third.record!.recordId, third.record!);
+    const lease = probe.store.claimCaptureJob(probe.activity, third.jobId, evolutionBudget, 30000)!;
+    const input = probe.store.captureComparison(lease)!;
+    assert.equal(input.peer.recordId, canonical.recordId);
+    probe.store.searchCaptureSources(lease, '本项目');
+    for (const ref of [canonical.source, third.source]) probe.store.expandCaptureSource(lease, { ref, offset: 0, limit: 4096 });
+    assert.equal(probe.store.completeCaptureVerification(lease, { result: 'pass', evidence: [canonical.source, third.source] }).reason, 'claim-corroborated');
+    assert.deepEqual(probe.store.listEligibleMemories(probe.activity).map(record => record.recordId), [canonical.recordId]);
+    assert.notEqual(probe.store.readMemory(probe.activity, canonical.recordId).headEventId, canonical.headEventId);
+    assert.equal(probe.store.registerHostInfo(probe.activity).pending.length, 1);
+    const current = probe.store.readMemory(probe.activity, canonical.recordId);
+    if (mutation === 'wrong') {
+      const feedback = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-feedback@1', kind: 'user_wrong',
+        recordId: current.recordId, revisionId: current.revisionId, headEventId: current.headEventId }), 'user');
+      probe.store.recordMemoryFeedback(probe.activity, current.recordId, current, feedback);
+    } else if (mutation === 'forget') probe.store.forgetMemory(probe.activity, current.recordId, current);
+    else if (mutation === 'correct') {
+      const input = probe.archive.append(randomUUID(), '更正：本项目仅保留错误日志');
+      probe.store.correctMemory(probe.activity, current.recordId, current, input, '本项目仅保留错误日志');
+    }
+    if (mutation !== 'none') {
+      const fourth = verifiedCandidate(probe, '本项目测试原始日志全部保留');
+      probe.store.promoteMemory(probe.activity, fourth.record!.recordId, fourth.record!);
+      assert.throws(() => compareCandidate(probe, fourth.jobId, 'same-claim'), /comparison-ineligible/);
+      assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
+    }
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
 
 test('an independently established older claim remains superseded without replacing the active claim', () => {
   const sandbox = createSandbox(), probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
@@ -150,6 +204,67 @@ test('an evidence-gap reverification retains its unresolved safety feedback on t
       probe.close(); probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
     }
     assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('a credible broad contradiction continues across every peer and survives restart without exposing confirmed conflicts', () => {
+  const sandbox = createSandbox();
+  let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const first = verifiedCandidate(probe, '本项目 Windows 本周期保存日志', { appliesTo: ['platform:win32'] }).record!;
+    probe.store.promoteMemory(probe.activity, first.recordId, first);
+    const second = verifiedCandidate(probe, '本项目 Linux 本周期保存日志', { appliesTo: ['platform:linux'] });
+    probe.store.promoteMemory(probe.activity, second.record!.recordId, second.record!);
+    assert.equal(compareCandidate(probe, second.jobId, 'distinct').record!.lifecycle, 'active');
+    const current = [first, second.record!].map(record => probe.store.readMemory(probe.activity, record.recordId));
+    const selected = current.filter(record => record.appliesTo.includes('platform:' + process.platform));
+    const prepared = probe.session.prepare(randomUUID(), '本项目当前环境如何保存日志？', selected);
+    const third = verifiedCandidate(probe, '本项目所有环境本周期都不保存日志');
+    probe.store.promoteMemory(probe.activity, third.record!.recordId, third.record!);
+    const pending = compareCandidate(probe, third.jobId, 'conflict');
+    assert.equal(pending.stage, 'comparing');
+    assert.equal(pending.record!.verification, 'conflicted');
+    assert.equal(current.filter(record => probe.store.readMemory(probe.activity, record.recordId).verification === 'conflicted').length, 1);
+    if (selected.length && probe.store.readMemory(probe.activity, selected[0]!.recordId).verification === 'conflicted') {
+      assert.throws(() => probe.session.dispatch(prepared), /memory-stale/);
+      assert.equal(probe.transport.count, 0);
+    }
+    probe.close(); probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    const completed = compareCandidate(probe, third.jobId, 'conflict');
+    assert.equal(completed.stage, 'blocked'); assert.equal(completed.reason, 'credible-conflict');
+    const members = [...current, third.record!].map(record => probe.store.readMemory(probe.activity, record.recordId));
+    assert.ok(members.every(record => record.verification === 'conflicted' && record.conflictSetId === completed.record!.conflictSetId));
+    assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
+    assert.equal(probe.store.registerHostInfo(probe.activity).pending.length, 2);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+for (const remaining of ['distinct','evidence-gap']) test('a confirmed conflict stays isolated while the remaining peer is ' + remaining, () => {
+  const sandbox = createSandbox(), probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const first = verifiedCandidate(probe, '本项目保存原始日志').record!;
+    probe.store.promoteMemory(probe.activity, first.recordId, first);
+    const second = verifiedCandidate(probe, '本项目界面采用蓝色');
+    probe.store.promoteMemory(probe.activity, second.record!.recordId, second.record!);
+    compareCandidate(probe, second.jobId, 'distinct');
+    const peers = [first, second.record!].map(record => probe.store.readMemory(probe.activity, record.recordId))
+      .sort((left, right) => left.recordId.localeCompare(right.recordId));
+    const negative = peers[0]!.recordId === first.recordId ? '本项目本周期不保存原始日志' : '本项目本周期禁止蓝色界面';
+    const third = verifiedCandidate(probe, negative);
+    probe.store.promoteMemory(probe.activity, third.record!.recordId, third.record!);
+    const prepared = probe.session.prepare(randomUUID(), '本项目有哪些已确认约束？', [peers[0]!]);
+    assert.equal(compareCandidate(probe, third.jobId, 'conflict').stage, 'comparing');
+    assert.throws(() => probe.session.dispatch(prepared), /memory-stale/);
+    assert.equal(probe.transport.count, 0);
+    if (remaining === 'distinct') assert.equal(compareCandidate(probe, third.jobId, 'distinct').reason, 'credible-conflict');
+    else {
+      const lease = probe.store.claimCaptureJob(probe.activity, third.jobId, evolutionBudget, 30000)!;
+      assert.equal(probe.store.completeCaptureVerification(lease, { result: 'evidence-gap', evidence: [] }).reason, 'comparison-evidence-gap');
+    }
+    assert.equal(probe.store.readMemory(probe.activity, peers[0]!.recordId).verification, 'conflicted');
+    assert.equal(probe.store.readMemory(probe.activity, third.record!.recordId).verification, 'conflicted');
+    assert.deepEqual(probe.store.listEligibleMemories(probe.activity).map(record => record.recordId), [peers[1]!.recordId]);
+    assert.equal(probe.store.readMemory(probe.activity, peers[1]!.recordId).headEventId, peers[1]!.headEventId);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 

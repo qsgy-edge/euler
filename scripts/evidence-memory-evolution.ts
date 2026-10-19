@@ -218,6 +218,35 @@ function validate(root: string, entry: typeof fixture.cases[number], output: str
     if (entry.id === 'negative-restore') { assert.equal(heads[0]!.revision, 1); assert.ok(events.some(event => event.kind === 'rollback' && event.batch_id)); }
     if (entry.id === 'negative-previous-lost') { assert.ok(before); assert.equal(existsSync(join(root, 'session.jsonl')), false); assert.ok(!events.some(event => event.kind === 'rollback')); }
     if (entry.id === 'source-invalidated') { assert.ok(before); assert.notDeepEqual(archives.find(item => item.header.binding.sessionId === before.header.binding.sessionId)!.events, before.events); }
+    if (entry.id === 'activation-dedup') {
+      const canonical = heads.find(record => record.lifecycle === 'active')!;
+      assert.equal(events.filter(event => event.kind === 'corroborate' && event.record_id === canonical.recordId).length, 2);
+      const attached = db.prepare('SELECT source_event_id FROM provenance_refs WHERE record_id=? AND revision_id=?')
+        .all(canonical.recordId, canonical.revisionId).map(row => row.source_event_id);
+      for (const record of heads) assert.ok(attached.includes(record.source.eventId));
+      for (const record of heads.filter(record => record.lifecycle === 'rejected')) {
+        const event = events.find(event => event.event_id === record.headEventId)!;
+        assert.equal(JSON.parse(String(event.payload)).corroborates, canonical.recordId);
+      }
+    }
+    if (entry.id === 'transport-conflict') {
+      assert.equal(attempts.length, 23); assert.equal(receiver.length, 23);
+      const work = db.prepare("SELECT source_calls FROM capture_work WHERE stage='blocked' AND reason='credible-conflict'").get()!;
+      assert.equal(work.source_calls, 32);
+      const set = heads[0]!.conflictSetId;
+      assert.ok(set); assert.ok(heads.every(record => record.conflictSetId === set));
+      const members = db.prepare('SELECT record_id FROM conflict_members WHERE conflict_set_id=?').all(set)
+        .map(row => row.record_id).sort();
+      assert.deepEqual(members, heads.map(record => record.recordId).sort());
+      const comparisons = events.filter(event => event.kind === 'comparison').map(event => JSON.parse(String(event.payload)));
+      const proofs = comparisons.filter(event => event.result === 'pass' && event.input.relation === 'conflict');
+      assert.equal(proofs.length, 2); assert.equal(new Set(proofs.map(event => event.input.peer.recordId)).size, 2);
+      assert.ok(comparisons.some(event => event.result === null && event.comparison.conflicts.length === 1));
+      for (const head of heads) {
+        const event = JSON.parse(String(events.find(event => event.event_id === head.headEventId)!.payload));
+        assert.deepEqual(event.members.sort(), members);
+      }
+    }
     if (entry.id === 'transport-comparison') { assert.equal(attempts.length, 14); assert.equal(receiver.length, 14); }
     if (entry.id === 'transport-budget') {
       assert.equal(heads.filter(record => record.lifecycle === 'candidate').length, 1);
@@ -259,7 +288,7 @@ const receipt = { schema: 'memory-evolution-evidence@1', startedAt, endedAt: new
   dirty: execFileSync('git', ['status','--porcelain'], { cwd: repo, encoding: 'utf8' }).trim().length > 0,
   implementationFiles: implementationFiles.map(path => ({ path, sha256: digest(readFileSync(join(repo, path))) })),
   fixtureDigest: digest(readFileSync(join(repo, 'fixtures/t14-memory-evolution-cases.json'))), commands, roots, checks, artifacts,
-  gaps: ['actual-provider-semantic-quality','other-platforms-require-their-own-receipts','non-cli-host-integration','production-backup-purge-and-torn-archive-fault-closure'] };
+  gaps: ['actual-provider-semantic-quality','large-archive-comparison-throughput','other-platforms-require-their-own-receipts','non-cli-host-integration','production-backup-purge-and-torn-archive-fault-closure'] };
 save('receipt.json', JSON.stringify(receipt, null, 2) + '\n');
 console.log(JSON.stringify({ evidence: destination, result: receipt.result, syntheticPassed: passed, checks: checks.length }));
 if (!passed) process.exitCode = 1;

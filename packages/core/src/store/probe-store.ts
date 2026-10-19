@@ -97,7 +97,7 @@ export interface MemoryComparison {
 }
 interface MemoryComparisonState {
   schema: 'memory-comparison-state@1'; jobId: string; candidate: MemoryRecord; peers: MemoryRecord[]; peerIndex: number;
-  relation: MemoryComparison['relation']; replacements: string[];
+  relation: MemoryComparison['relation']; replacements: string[]; conflicts: string[]; originHeadId: string;
 }
 export interface CaptureJob {
   jobId: string; ownerId: string; scope: MemoryScope; source: SourceAck; range: SourceAck[];
@@ -3886,7 +3886,25 @@ export class ProbeStore {
       ORDER BY record_id LIMIT 33`)
       .all(candidate.scope.id, candidate.recordId);
     check(rows.length <= 32, 'comparison-coverage-gap');
-    return rows.map(row => this.#readMemoryUnsafe(String(row.record_id)));
+    const peers = rows.map(row => this.#readMemoryUnsafe(String(row.record_id)));
+    return peers.filter(peer => {
+      const visited = new Set<string>();
+      let current = peer;
+      while (current.lifecycle === 'rejected' && current.verification === 'verified') {
+        check(!visited.has(current.recordId), 'comparison-evidence-gap');
+        visited.add(current.recordId);
+        const event = this.#db.prepare('SELECT payload FROM memory_events WHERE event_id=?').get(current.headEventId)!;
+        const rejection = JSON.parse(String(event.payload));
+        if (rejection.kind !== 'reject' || rejection.reason !== 'duplicate-claim') return true;
+        const proof = this.#db.prepare('SELECT payload FROM memory_events WHERE event_id=?').get(rejection.comparisonEventId)!;
+        const compared = JSON.parse(String(proof.payload)).input as MemoryComparison;
+        const target = [candidate, ...peers].find(record => record.recordId === rejection.corroborates);
+        if (!target || target.recordId !== compared.peer.recordId || target.revisionId !== compared.peer.revisionId) return true;
+        if (target.lifecycle !== 'rejected' || target.recordId === candidate.recordId) return false;
+        current = target;
+      }
+      return true;
+    });
   }
 
   #memoryComparisonState(jobId: string): MemoryComparisonState {
@@ -3930,15 +3948,43 @@ export class ProbeStore {
         && JSON.stringify(comparison.peer.appliesTo) === JSON.stringify(comparison.candidate.appliesTo), 'comparison-ineligible');
       state.replacements.push(comparison.peer.recordId);
     }
+    if (result.result === 'pass' && comparison.relation === 'same-claim') {
+      const peer = comparison.peer, candidate = comparison.candidate;
+      check(peer.lifecycle === 'active' && peer.verification === 'verified'
+        && JSON.stringify(peer.appliesTo) === JSON.stringify(candidate.appliesTo)
+        && peer.validFrom === candidate.validFrom && peer.validUntil === candidate.validUntil, 'comparison-ineligible');
+      this.#eligible(peer);
+    }
+    if (result.result === 'pass' && comparison.relation === 'conflict') {
+      const peer = comparison.peer, candidate = comparison.candidate;
+      check(peer.verification === 'verified' && peer.lifecycle !== 'tombstoned'
+        && JSON.stringify(peer.scope) === JSON.stringify(candidate.scope)
+        && memoryApplicabilityOverlaps(peer.appliesTo, candidate.appliesTo) && memoryPeriodsOverlap(peer, candidate), 'comparison-ineligible');
+    }
+    const isolate = result.result === 'pass' && (comparison.relation === 'conflict'
+      || state.conflicts.length > 0 && comparison.relation === 'same-claim');
+    if (isolate) state.conflicts.push(comparison.peer.recordId);
     if (result.result === 'block' && nextRelation) {
       state.relation = nextRelation; continuing = true;
-    } else if (result.result === 'pass' && ['distinct','supersedes'].includes(comparison.relation) && state.peerIndex + 1 < state.peers.length) {
+    } else if (result.result === 'pass' && (['distinct','supersedes','conflict'].includes(comparison.relation) || state.conflicts.length > 0)
+      && state.peerIndex + 1 < state.peers.length) {
       state.peerIndex++; state.relation = 'same-claim'; continuing = true;
     }
-    const current = this.#withMemoryHash({ ...comparison.candidate, headEventId: randomUUID() });
+    let current = this.#withMemoryHash({ ...comparison.candidate, headEventId: randomUUID() });
     this.#appendMemoryEvent(comparison.candidate, current, 'comparison', current.source.eventId,
       { input: comparison, comparison: state, runId, result: result.result, evidence: result.evidence, sourceUnits });
+    if (isolate) {
+      const isolated = this.#conflictMemories([current, ...state.peers.filter(peer => state.conflicts.includes(peer.recordId))], [], current.headEventId);
+      current = isolated[0]!.record;
+      state.candidate = current;
+      state.peers = state.peers.map(peer => isolated.find(item => item.record.recordId === peer.recordId)?.record ?? peer);
+    }
     if (continuing) {
+      if (isolate) {
+        const after = this.#withMemoryHash({ ...current, headEventId: randomUUID() });
+        this.#appendMemoryEvent(current, after, 'comparison', current.source.eventId, { comparison: state, result: null });
+        current = after;
+      }
       this.#db.prepare(`UPDATE capture_work SET stage='comparing',reason='comparison-evidence-required',expected_head_id=?,comparison_event_id=?,
         lease_token=NULL,lease_activity=NULL,lease_until=0,searched_refs='[]',expanded_refs='[]' WHERE job_id=?`)
         .run(current.headEventId, current.headEventId, lease.jobId);
@@ -3947,6 +3993,11 @@ export class ProbeStore {
     if (result.result !== 'pass') {
       this.#db.prepare(`UPDATE capture_work SET stage='blocked',reason=?,expected_head_id=?,lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?`)
         .run(reason, current.headEventId, lease.jobId);
+      return this.#captureJob(lease.jobId);
+    }
+    if (state.conflicts.length) {
+      this.#db.prepare(`UPDATE capture_work SET stage='blocked',reason='credible-conflict',expected_head_id=?,lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?`)
+        .run(current.headEventId, lease.jobId);
       return this.#captureJob(lease.jobId);
     }
     if (['distinct','supersedes'].includes(comparison.relation)) {
@@ -3978,21 +4029,8 @@ export class ProbeStore {
         .run(after.headEventId, lease.jobId);
       return this.#captureJob(lease.jobId);
     }
-    if (comparison.relation === 'conflict') {
-      const peer = comparison.peer;
-      check(!(current.validUntil && peer.validFrom && current.validUntil <= peer.validFrom)
-        && !(peer.validUntil && current.validFrom && peer.validUntil <= current.validFrom), 'comparison-ineligible');
-      const conflict = this.conflictMemory(lease.activity, current.recordId, current, peer.recordId, peer);
-      this.#db.prepare(`UPDATE capture_work SET stage='blocked',reason='credible-conflict',expected_head_id=?,lease_token=NULL,lease_activity=NULL,lease_until=0 WHERE job_id=?`)
-        .run(conflict.left.record.headEventId, lease.jobId);
-      return this.#captureJob(lease.jobId);
-    }
     check(comparison.relation === 'same-claim', 'comparison-evidence-required');
     const peer = comparison.peer;
-    check(peer.lifecycle === 'active' && peer.verification === 'verified'
-      && JSON.stringify(peer.appliesTo) === JSON.stringify(current.appliesTo)
-      && peer.validFrom === current.validFrom && peer.validUntil === current.validUntil, 'comparison-ineligible');
-    this.#eligible(peer);
     this.#corroborate(peer, [current.source]);
     const corroborated = this.#withMemoryHash({ ...peer, headEventId: randomUUID() });
     this.#appendMemoryEvent(peer, corroborated, 'corroborate', current.source.eventId,
@@ -4021,7 +4059,7 @@ export class ProbeStore {
         const work = this.#db.prepare('SELECT job_id FROM capture_work WHERE record_id=? AND expected_head_id=?').get(recordId, current.headEventId);
         check(work, 'capture-evidence-gap');
         const state: MemoryComparisonState = { schema: 'memory-comparison-state@1', jobId: String(work.job_id),
-          candidate: current, peers, peerIndex: 0, relation: 'same-claim', replacements: [] };
+          candidate: current, peers, peerIndex: 0, relation: 'same-claim', replacements: [], conflicts: [], originHeadId: current.headEventId };
         const after = this.#withMemoryHash({ ...current, headEventId: randomUUID() });
         this.#appendMemoryEvent(current, after, 'comparison', current.source.eventId, { comparison: state, result: null });
         this.#db.prepare(`UPDATE capture_work SET stage='comparing',reason='comparison-evidence-required',expected_head_id=?,
@@ -4307,6 +4345,17 @@ export class ProbeStore {
     });
   }
 
+  #conflictMemories(records: MemoryRecord[], requests: string[], comparisonEventId?: string): MemoryOperation[] {
+    const conflictSetId = randomUUID(), members = records.map(record => record.recordId);
+    this.#db.prepare('INSERT INTO conflict_sets VALUES (?, ?)').run(conflictSetId, new Date().toISOString());
+    return records.map((record, index) => {
+      this.#db.prepare('INSERT INTO conflict_members VALUES (?, ?)').run(conflictSetId, record.recordId);
+      const after = this.#withMemoryHash({ ...record, verification: 'conflicted', conflictSetId, headEventId: randomUUID() });
+      this.#appendMemoryEvent(record, after, 'conflict', record.source.eventId, { conflictSetId, members, comparisonEventId }, requests[index]);
+      return { status: 'committed', record: after, eventId: after.headEventId };
+    });
+  }
+
   conflictMemory(activity: Activity, leftId: string, leftExpected: MemoryRecord, rightId: string, rightExpected: MemoryRecord): ConflictOperation {
     return this.withActivity(activity, () => {
       check(leftId !== rightId, 'invalid-conflict');
@@ -4325,17 +4374,9 @@ export class ProbeStore {
       }
       check(left.verification === 'verified' && right.verification === 'verified' && left.lifecycle !== 'tombstoned' && right.lifecycle !== 'tombstoned'
         && JSON.stringify(left.scope) === JSON.stringify(right.scope) && memoryApplicabilityOverlaps(left.appliesTo, right.appliesTo)
-        && !(left.validUntil && right.validFrom && left.validUntil <= right.validFrom)
-        && !(right.validUntil && left.validFrom && right.validUntil <= left.validFrom), 'invalid-conflict');
-      const conflictSetId = randomUUID();
-      this.#db.prepare('INSERT INTO conflict_sets VALUES (?, ?)').run(conflictSetId, new Date().toISOString());
-      this.#db.prepare('INSERT INTO conflict_members VALUES (?, ?), (?, ?)').run(conflictSetId, leftId, conflictSetId, rightId);
-      const nextLeft = this.#withMemoryHash({ ...left, verification: 'conflicted', conflictSetId, headEventId: randomUUID() });
-      const nextRight = this.#withMemoryHash({ ...right, verification: 'conflicted', conflictSetId, headEventId: randomUUID() });
-      this.#appendMemoryEvent(left, nextLeft, 'conflict', left.source.eventId, { conflictSetId, members: [leftId, rightId] }, leftRequest);
-      this.#appendMemoryEvent(right, nextRight, 'conflict', right.source.eventId, { conflictSetId, members: [leftId, rightId] }, rightRequest);
-      return { status: 'committed', left: { status: 'committed', record: nextLeft, eventId: nextLeft.headEventId },
-        right: { status: 'committed', record: nextRight, eventId: nextRight.headEventId }, conflictSetId };
+        && memoryPeriodsOverlap(left, right), 'invalid-conflict');
+      const [nextLeft, nextRight] = this.#conflictMemories([left, right], [leftRequest, rightRequest]);
+      return { status: 'committed', left: nextLeft!, right: nextRight!, conflictSetId: nextLeft!.record.conflictSetId };
     });
   }
 
@@ -4772,7 +4813,7 @@ export class ProbeStore {
       check(final && sha256(String(final.payload)) === final.payload_hash, 'comparison-evidence-gap');
       const state = JSON.parse(String(final.payload)).comparison as MemoryComparisonState;
       const start = this.#db.prepare('SELECT seq FROM memory_events WHERE record_id=? AND event_id=?')
-        .get(String(final.record_id), state.candidate.headEventId);
+        .get(String(final.record_id), state.originHeadId);
       check(start, 'comparison-evidence-gap');
       for (const event of this.#db.prepare("SELECT payload,payload_hash FROM memory_events WHERE record_id=? AND seq>? AND seq<=? AND kind='comparison'")
         .all(String(final.record_id), Number(start.seq), Number(final.seq))) {
@@ -5228,6 +5269,11 @@ function parseMemoryCondition(condition: string): { kind: keyof SearchTarget; va
 function laterFactPeriod(candidate: Pick<MemoryRecord, 'type' | 'validFrom'>, previous: MemoryRecord): boolean {
   return candidate.type === 'fact' && previous.type === 'fact' && candidate.validFrom !== null
     && previous.validUntil !== null && previous.validUntil <= candidate.validFrom;
+}
+
+function memoryPeriodsOverlap(left: Pick<MemoryRecord, 'validFrom' | 'validUntil'>, right: Pick<MemoryRecord, 'validFrom' | 'validUntil'>): boolean {
+  return !(left.validUntil && right.validFrom && left.validUntil <= right.validFrom)
+    && !(right.validUntil && left.validFrom && right.validUntil <= left.validFrom);
 }
 
 function memoryApplicabilityOverlaps(left: readonly string[], right: readonly string[]): boolean {

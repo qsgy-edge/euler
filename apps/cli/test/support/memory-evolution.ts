@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { API_VERSION, DEFAULT_BUDGET, ProbeSession, fileIdentity, sha256 } from '@euler/core';
-import type { MemoryRecord, SourceAck } from '@euler/core';
+import type { MemoryComparison, MemoryRecord, SourceAck } from '@euler/core';
 import { approvedSourceUnit } from './source-publication.ts';
 import { bindingOf } from '../../src/sandbox.ts';
 import type { Sandbox } from '../../src/sandbox.ts';
@@ -42,6 +42,21 @@ export function pairedCanary(probe: Probe, sandbox: Sandbox, record: MemoryRecor
     return { baselineRunId: baseline.runId, treatmentRunId: treatment.runId, baselinePayload: baseline.payload,
       treatmentPayload: treatment.payload, expectedResponseHash: sha256(expectedText) };
   });
+}
+
+export function compareCandidate(probe: Probe, jobId: string, relation: MemoryComparison['relation']) {
+  for (let step = 0; step < 5; step++) {
+    const lease = probe.store.claimCaptureJob(probe.activity, jobId, evolutionBudget, 30000)!;
+    const input = probe.store.captureComparison(lease)!;
+    const evidence = [input.candidate.source, input.peer.source, ...input.feedback];
+    probe.store.searchCaptureSources(lease, '本项目');
+    if (input.feedback.length) probe.store.searchCaptureSources(lease, 'memory-feedback');
+    for (const ref of evidence) probe.store.expandCaptureSource(lease, { ref, offset: 0, limit: 4096 });
+    const pass = input.relation === relation;
+    const job = probe.store.completeCaptureVerification(lease, { result: pass ? 'pass' : 'block', evidence });
+    if (pass) return job;
+  }
+  throw Error('comparison-fixture-exhausted');
 }
 
 export function verifiedCandidate(probe: Probe, content: string,

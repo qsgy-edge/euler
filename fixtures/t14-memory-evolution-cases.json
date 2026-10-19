@@ -5,7 +5,7 @@
     {
       "id": "activation-dedup",
       "active": 1,
-      "rejected": 1,
+      "rejected": 2,
       "stale": 0,
       "conflicted": 0,
       "superseded": 0,
@@ -118,6 +118,15 @@
       "conflicted": 0,
       "superseded": 0,
       "batches": 1
+    },
+    {
+      "id": "transport-conflict",
+      "active": 0,
+      "rejected": 0,
+      "stale": 0,
+      "conflicted": 3,
+      "superseded": 0,
+      "batches": 2
     },
     {
       "id": "transport-comparison",
