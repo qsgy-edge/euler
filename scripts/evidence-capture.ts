@@ -114,8 +114,9 @@ for (const entry of fixture.cases) {
             if (envelope.p2.length === 0) assert.equal(envelope.p3.intent.step, 'verifier');
           }
         }
-        assert.equal(db.prepare("SELECT count(*) AS n FROM memory_heads WHERE lifecycle='active'").get()!.n, 0);
-        assert.equal(db.prepare('SELECT count(*) AS n FROM host_info_batches').get()!.n, 0);
+        const activated = entry.verification === 'verified' ? 1 : 0;
+        assert.equal(db.prepare("SELECT count(*) AS n FROM memory_heads WHERE lifecycle='active'").get()!.n, activated);
+        assert.equal(db.prepare("SELECT count(*) AS n FROM host_info_batches WHERE delivery='delivered'").get()!.n, activated);
         if (entry.verification === null) assert.equal(work.record_id, null);
         else {
           const head = db.prepare('SELECT * FROM memory_heads WHERE record_id=?').get(String(work.record_id))!;

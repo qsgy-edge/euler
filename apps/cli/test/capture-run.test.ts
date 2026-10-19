@@ -46,7 +46,7 @@ test('the background run records real job attempts and gives the Verifier a fres
     assert.equal(run.nextModel(), null);
     const result = probe.store.readCaptureJob(probe.activity, job.jobId);
     assert.equal(result.record!.verification, 'verified');
-    assert.equal(result.record!.lifecycle, 'candidate');
+    assert.equal(result.record!.lifecycle, 'active');
     const ledger = probe.store.requestStatus(lease.activity, run.runId);
     assert.equal(ledger.run.ownerKind, 'job');
     assert.equal(ledger.run.ownerId, job.jobId);
@@ -54,7 +54,7 @@ test('the background run records real job attempts and gives the Verifier a fres
     assert(ledger.attempts.every(attempt => attempt.outcome === 'received'));
     assert.equal(probe.transport.count, 4);
     assert.doesNotMatch(JSON.stringify(ledger.events), /项目测试应保留完整原始日志/);
-    assert.equal(probe.store.listHostInfo(probe.activity).length, 0);
+    assert.equal(probe.store.registerHostInfo(probe.activity).pending.length, 1);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 

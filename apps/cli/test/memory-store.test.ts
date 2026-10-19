@@ -185,11 +185,14 @@ test('source loss blocks verification and exposure, and no-op/exposure create no
     probe.store.correctMemory(probe.activity, c.record.recordId, a.record, input, '');
     assert.equal(count(), before);
     assert.deepEqual(probe.store.readMemory(probe.activity, c.record.recordId), a.record);
-    assert.equal(db.prepare('SELECT count(*) AS n FROM feedback_events').get()!.n, 1);
+    assert.equal(db.prepare("SELECT count(*) AS n FROM feedback_events WHERE kind='retrieved'").get()!.n, 1);
     const bytes = readFileSync(`${sandbox.root}/session.jsonl`, 'utf8');
     writeFileSync(`${sandbox.root}/session.jsonl`, bytes.replace(sandbox.fixture.text, 'Changed source'));
-    assert.throws(() => probe.store.listEligibleMemories(probe.activity), /source-evidence-gap/);
-    assert.throws(() => probe.store.verifyMemory(probe.activity, c.record.recordId, a.record, 'pass', [input]), /source-evidence-gap/);
+    assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
+    const stale = probe.store.readMemory(probe.activity, c.record.recordId);
+    assert.equal(stale.verification, 'stale');
+    assert.equal(count(), Number(before) + 1);
+    assert.throws(() => probe.store.verifyMemory(probe.activity, c.record.recordId, stale, 'pass', [input]), /source-evidence-gap/);
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 

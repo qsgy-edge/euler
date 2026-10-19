@@ -10,7 +10,7 @@ import type { Sandbox } from './sandbox.ts';
 type Probe = ReturnType<typeof openProbe>;
 
 /** One explicitly configured test route, with independent role contexts and no ambient credential discovery. */
-export function createCaptureWorker(path?: string, onFailure?: (error: unknown) => void) {
+export function createCaptureWorker(path?: string, onFailure?: (error: unknown) => void, recoverInfo?: () => boolean) {
   let configured: ReturnType<typeof configuredTransport> | null = null, setupError: unknown;
   if (path) {
     try { configured = configuredTransport(path); check(configured.captureCapability, 'capture-capability-required'); }
@@ -20,7 +20,9 @@ export function createCaptureWorker(path?: string, onFailure?: (error: unknown) 
   const run = async (probe: Probe, foregroundActive = false, signal?: AbortSignal): Promise<CaptureJob[]> => {
     const report = (jobs: CaptureJob[]) => {
       console.log(JSON.stringify({ event: 'capture-queue', jobs: jobs.map(job => ({ jobId: job.jobId, stage: job.stage,
-        reason: job.reason, recordId: job.record?.recordId ?? null, verification: job.record?.verification ?? null })) }));
+        reason: job.reason, recordId: job.record?.recordId ?? null, verification: job.record?.verification ?? null,
+        lifecycle: job.record?.lifecycle ?? null, level: job.stage === 'unknown' ? 'error'
+          : job.stage === 'blocked' || job.stage === 'pending' && job.reason ? 'warning' : 'info' })) }));
       return jobs;
     };
     if (!probe.store.listCaptureJobs(probe.activity, 1, true).length) return [];
@@ -28,6 +30,7 @@ export function createCaptureWorker(path?: string, onFailure?: (error: unknown) 
     if (setupError) { report(probe.store.deferCaptureJobs(probe.activity, 'capture-configuration-unavailable')); throw setupError; }
     if (foregroundActive) return report(probe.store.deferCaptureJobs(probe.activity, 'foreground-run-active'));
     if (probe.store.captureDrainBlocked(probe.activity)) return report(probe.store.deferCaptureJobs(probe.activity, 'request-recovery-required'));
+    if (recoverInfo?.() === false) return report(probe.store.deferCaptureJobs(probe.activity, 'host-info-recovery-required'));
     if (!prerequisites) {
       try { await verifyTransportPrerequisites(['capture','capture-run','capture-failure','capture-pump','capture-http-protocol','analysis-proposal','proposal-approval'], 'capture-prerequisites', signal); }
       catch (error) { report(probe.store.deferCaptureJobs(probe.activity, signal?.aborted ? 'capture-stopped' : 'prerequisite-evidence-gap')); throw error; }
@@ -41,7 +44,7 @@ export function createCaptureWorker(path?: string, onFailure?: (error: unknown) 
     return report(await drainCaptures(probe, { batch: 16, deadlineMs: Math.min(30000, selected.budget.wallClockMs), budget: selected.budget,
       config: { proposer: [route], verifier: [route] }, encode: selected.transport.encode.bind(selected.transport), adapterVersion: 'capture-http@1',
       ...(signal ? { signal } : {}),
-      host: { stream: selected.transport.stream.bind(selected.transport) } }));
+      host: { stream: selected.transport.stream.bind(selected.transport), ...(recoverInfo ? { recoverInfo } : {}) } }));
   };
   let halted = false;
   return async (probe: Probe, foregroundActive = false, signal?: AbortSignal): Promise<CaptureJob[]> => {
@@ -55,8 +58,8 @@ export function createCaptureWorker(path?: string, onFailure?: (error: unknown) 
   };
 }
 
-export function scheduleCaptures(probe: Probe, path?: string) {
-  const worker = createCaptureWorker(path, reportCaptureFailure), abort = new AbortController();
+export function scheduleCaptures(probe: Probe, path: string | undefined, recoverInfo: () => boolean) {
+  const worker = createCaptureWorker(path, reportCaptureFailure, recoverInfo), abort = new AbortController();
   let pending = false, foreground = false, running: Promise<void> | undefined;
   const kick = (foregroundActive = false) => {
     if (abort.signal.aborted) return;
@@ -67,7 +70,8 @@ export function scheduleCaptures(probe: Probe, path?: string) {
         if (path) await new Promise<void>(resolve => setImmediate(resolve));
         if (abort.signal.aborted) return;
         pending = false;
-        await worker(probe, foreground, abort.signal);
+        const jobs = await worker(probe, foreground, abort.signal);
+        if (jobs.length && !abort.signal.aborted) recoverInfo();
       } while (pending);
     })().finally(() => { running = undefined; });
   };
@@ -81,13 +85,13 @@ export function reportCaptureFailure(error: unknown): void {
     diagnosticHash: sha256(message), halted: true }));
 }
 
-export async function runCaptureDrain(sandbox: Sandbox, path?: string): Promise<void> {
+export async function runCaptureDrain(sandbox: Sandbox, path: string | undefined, recoverInfo: (probe: Probe) => boolean): Promise<void> {
   const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
-  try { console.log(JSON.stringify({ event: 'capture-drained', jobs: (await createCaptureWorker(path)(probe)).length })); }
+  try { console.log(JSON.stringify({ event: 'capture-drained', jobs: (await createCaptureWorker(path, undefined, () => recoverInfo(probe))(probe)).length })); }
   finally { probe.close(); }
 }
 export async function drainCaptures(probe: Probe, options: { batch: number; deadlineMs: number; budget: ProbeBudget;
-  config: CaptureConfig; host: Pick<AgentPump, 'stream'>; jobId?: string;
+  config: CaptureConfig; host: Pick<AgentPump, 'stream' | 'recoverInfo'>; jobId?: string;
   encode?: ConstructorParameters<typeof CaptureRun>[4]; adapterVersion?: string; signal?: AbortSignal }): Promise<CaptureJob[]> {
   check(Number.isSafeInteger(options.batch) && options.batch > 0 && options.batch <= 16
     && Number.isSafeInteger(options.deadlineMs) && options.deadlineMs > 0 && options.deadlineMs <= 30000, 'invalid-capture-drain');
@@ -98,20 +102,25 @@ export async function drainCaptures(probe: Probe, options: { batch: number; dead
     if (options.signal?.aborted || probe.store.captureDrainBlocked(probe.activity)) break;
     if (Date.now() >= deadline) break;
     let result = job;
-    // Each role gets one lease/primary+fallback chain; job identity and cumulative budget remain fixed.
-    for (let phase = 0; phase < 2 && Date.now() < deadline; phase++) {
+    // Each role or fixed comparison gets an isolated lease; all requests consume the same job budget.
+    for (let phase = 0; phase <= options.budget.maxModelAttempts && Date.now() < deadline; phase++) {
+      if (options.host.recoverInfo?.() === false) {
+        const deferred = probe.store.deferCaptureJobs(probe.activity, 'host-info-recovery-required');
+        return [...results, ...deferred.filter(item => !results.some(previous => previous.jobId === item.jobId))];
+      }
       const lease = probe.store.claimCaptureJob(probe.activity, job.jobId, options.budget, Math.max(1, deadline - Date.now()));
       if (!lease) { result = probe.store.readCaptureJob(probe.activity, job.jobId); break; }
       const run = new CaptureRun(probe.store, lease, probe.archive, options.config, options.encode, options.adapterVersion);
       result = await pumpCapture(run, options.host, options.signal);
-      if (result.stage !== 'verifying') break;
+      if (result.reason === 'host-info-recovery-required' && ['proposing','verifying','comparing'].includes(result.stage)) return [...results, result];
+      if (!['verifying','comparing'].includes(result.stage)) break;
     }
     results.push(result);
   }
   return results;
 }
 
-export async function runCaptureDemo(sandbox: Sandbox, scenario: string): Promise<void> {
+export async function runCaptureDemo(sandbox: Sandbox, scenario: string, recoverInfo: (probe: Probe) => boolean): Promise<void> {
   check(['synthetic','block','evidence-gap','protocol','unknown'].includes(scenario), 'capture-synthetic-scenario-required');
   const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
   try {
@@ -121,6 +130,7 @@ export async function runCaptureDemo(sandbox: Sandbox, scenario: string): Promis
     const config: CaptureConfig = { proposer: [route, { ...route, model: 'fallback-fixture' }], verifier: [route] };
     const budget = { ...DEFAULT_BUDGET, contextLimit: 20000, maxTotalTokens: 100000, maxModelAttempts: 8 };
     await drainCaptures(probe, { adapterVersion: 'capture-counting@1', jobId: job.jobId, batch: 8, deadlineMs: 30000, budget, config, host: {
+      recoverInfo: () => recoverInfo(probe),
       async *stream(request, signal, send) {
         signal.throwIfAborted();
         const attempt = send(request.payload);

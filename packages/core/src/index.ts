@@ -24,7 +24,7 @@ export { REQUEST_POLICY_HASH, REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, assembly
 export type { RequestAssembly, RequestAssemblyInput, RequestAttempt, RequestAttemptOutcome, RequestAssemblyState, RequestEvent, RequestEventKind, RequestOwnerKind, RequestRun, RequestRunState, RequestStatus, RequestRecovery, RequestReconciliation } from './store/request-ledger.ts';
 export type {
   Activity, ExecutionOwner, ExecutionStream, AttemptOwnership, Intent, IntentTransition, MemoryType, MemoryLifecycle, MemoryVerification, MemoryScopeKind,
-  MemoryScope, MemoryCaptureOptions, MemoryRecord, MemoryOperation, CaptureJob, CaptureLease, ProposedMemory, CaptureVerification, ConflictOperation, RememberRequest, RememberVerification, RememberResult, HostInfo, HostInfoDelivery, HostInfoView,
+  MemoryScope, MemoryCaptureOptions, MemoryRecord, MemoryOperation, MemoryPromotion, MemoryComparison, CaptureJob, CaptureLease, ProposedMemory, CaptureVerification, ConflictOperation, RememberRequest, RememberVerification, RememberResult, HostInfo, HostInfoDelivery, HostInfoView,
   MemoryChange, MemoryPresentation, MemoryOperationResult, OwnerReceipt, ActivationBatch,
   EvolutionProposalInput, EvolutionProposal, SearchTarget, MemoryDiscoveryApproval, SearchRequest, SearchResult, SearchPage, SearchProjectionReceipt,
   SourceUnitInput, SourceUnit, SourceSearchRequest, SourceSearchHit, SourceSearchPage, SourceExpandRequest, SourceUnitExcerpt,

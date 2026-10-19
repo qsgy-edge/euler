@@ -1,6 +1,6 @@
 # T12: explicit owner memory fast lane and durable Host Info (synthetic)
 
-Issue: [#12](https://github.com/qsgy-edge/euler/issues/12). This slice uses only disposable SQLite, synthetic CLI archives and the local counting transport. The disposable schema is version 16; there is no production migration or live owner switch.
+Issue: [#12](https://github.com/qsgy-edge/euler/issues/12). This slice uses only disposable SQLite, synthetic CLI archives and the local counting transport. The disposable schema is version 17; there is no production migration or live owner switch.
 
 ## Owner statement grammar
 
@@ -33,7 +33,7 @@ The existing `host_presentations` table is session/branch/token-bound approval s
 
 ## CLI
 
-`remember --sandbox <dir> [--host-info unavailable] [--no-active-project] [--synthetic-proposals]` runs an owner session over stdin. Commands: an owner statement, `propose <text>` (only with explicit `--synthetic-proposals`; a synthetic assistant fixture, not a real model turn), `同意`/`agree`, `取消`/`cancel`, `info`, `info <batchId>`, `ask <question>`, `stop`. The owner-facing Info surface is the append-only `owner-info.jsonl` carrier bound in `sandbox.json`; stdout notices are non-authoritative. `info --sandbox <dir> [--batch <id>]` queries without an agent session.
+`remember --sandbox <dir> [--host-info unavailable] [--no-active-project] [--synthetic-proposals]` runs an owner session over stdin. Commands: an owner statement, `propose <text>` (only with explicit `--synthetic-proposals`; a synthetic assistant fixture, not a real model turn), `同意`/`agree`, `取消`/`cancel`, `info`, `info <batchId>`, `feedback <recordId> <headEventId> helpful|wrong|stale|safety`, `ask <question>`, `stop`. Feedback and ordinary promotion use the [memory evolution contract](t14-memory-evolution.md). The owner-facing Info surface is the append-only `owner-info.jsonl` carrier bound in `sandbox.json`; stdout notices are non-authoritative. `info --sandbox <dir> [--batch <id>]` queries without an agent session.
 
 On start the Host backfills durable owner events whose capture was lost (idempotent by source identity), drains search, and delivers pending Info. Owner-visible results carry `status`, `stage`, `reason`, `level` and `info` (non-store outcomes have null stage/record fields):
 
