@@ -64,7 +64,12 @@ export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: P
           cwd: files?.root.path ?? null, privileges: 'current Windows user; fixed file API only; no elevation or shell' });
       });
     }) : {}),
-    stream: transport ? transport.stream.bind(transport) : async function* (request, _signal, send) {
+    stream: async function* (request, signal, authorizeSend) {
+      const send: typeof authorizeSend = payload => {
+        check(deliverMemoryInfo(sandbox, probe), 'host-info-recovery-required');
+        return authorizeSend(payload);
+      };
+      if (transport) { yield* transport.stream(request, signal, send); return; }
       if (scenario === 'failure') throw new Error('synthetic-before-send-failure');
       send(request.payload); requests++;
       if (scenario === 'unknown') throw new Error('synthetic-disconnection');

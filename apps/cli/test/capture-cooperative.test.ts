@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -11,8 +11,104 @@ import { sha256 } from '@euler/core';
 import { AGENT_BUDGET } from '../src/agent-cli.ts';
 import { createSandbox, resourcesOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
+import { verifiedCandidate } from './support/memory-evolution.ts';
 
 const cli = (...args: string[]) => execFileSync(process.execPath, ['apps/cli/src/main.ts', ...args], { encoding: 'utf8', timeout: 20000 });
+
+test('agent refuses a pending Info registration failure and resumes after durable recovery', () => {
+  const sandbox = createSandbox();
+  try {
+    const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    try {
+      const record = verifiedCandidate(probe, '本项目保存原始日志').record!;
+      probe.store.promoteMemory(probe.activity, record.recordId, record);
+    } finally { probe.close(); }
+    const db = new DatabaseSync(resourcesOf(sandbox).store.path);
+    try { db.exec("CREATE TRIGGER fail_info BEFORE INSERT ON host_info_batches BEGIN SELECT RAISE(ABORT,'injected-info-failure'); END"); }
+    finally { db.close(); }
+    const blocked = spawnSync(process.execPath, ['apps/cli/src/main.ts', 'agent', '--sandbox', sandbox.root, '--scenario', 'plain'],
+      { encoding: 'utf8', timeout: 20000 });
+    assert.equal(blocked.error, undefined);
+    const events = blocked.stdout.trim().split('\n').map(line => JSON.parse(line));
+    assert.ok(events.some(event => event.event === 'info-error'));
+    const result = events.find(event => event.event === 'agent-result');
+    assert.equal(result.fixtureProviderCount, 0);
+    assert.deepEqual(result.ledger.attempts, []);
+    assert.equal(result.status.terminal, 'failed');
+    assert.equal(blocked.status, 1);
+    const restored = new DatabaseSync(resourcesOf(sandbox).store.path);
+    try { restored.exec('DROP TRIGGER fail_info'); } finally { restored.close(); }
+    const recovered = cli('agent', '--sandbox', sandbox.root, '--scenario', 'plain').trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(recovered.find(event => event.event === 'agent-result').fixtureProviderCount, 1);
+    assert.equal(recovered.filter(event => event.event === 'info-notice').length, 1);
+    assert.ok(recovered.findIndex(event => event.event === 'info-notice') < recovered.findIndex(event => event.event === 'agent-result'));
+    const reopened = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    try { assert.deepEqual(reopened.store.listHostInfo(reopened.activity).map(info => info.delivery), ['delivered']); }
+    finally { reopened.close(); }
+  } finally { rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+test('agent rechecks Info for a batch committed while the first HTTP response is in flight', async () => {
+  const sandbox = createSandbox(), configRoot = mkdtempSync(join(tmpdir(), 'euler-agent-info-'));
+  const payloads: string[] = [];
+  let receiverError: unknown;
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on('data', chunk => chunks.push(chunk));
+    request.on('end', () => {
+      try {
+        payloads.push(Buffer.concat(chunks).toString('utf8'));
+        if (payloads.length === 1) {
+          const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+          try {
+            const record = verifiedCandidate(probe, '本项目保存原始日志').record!;
+            probe.store.promoteMemory(probe.activity, record.recordId, record);
+          } finally { probe.close(); }
+          const db = new DatabaseSync(resourcesOf(sandbox).store.path);
+          try { db.exec("CREATE TRIGGER fail_info BEFORE INSERT ON host_info_batches BEGIN SELECT RAISE(ABORT,'injected-late-info-failure'); END"); }
+          finally { db.close(); }
+        }
+        response.writeHead(200, { 'content-type': 'application/json' });
+        const message = payloads.length === 1
+          ? { role: 'assistant', content: null, tool_calls: [{ id: 'echo', type: 'function', function: { name: 'controlled_echo', arguments: '{"text":"fixture"}' } }] }
+          : { role: 'assistant', content: 'READY' };
+        response.end(JSON.stringify({ model: 'agent-info-test', choices: [{ message, finish_reason: payloads.length === 1 ? 'tool_calls' : 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 10 } }));
+      } catch (error) { receiverError = error; response.writeHead(500); response.end('{}'); }
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const configPath = join(configRoot, 'transport.json');
+    writeFileSync(configPath, JSON.stringify({ provider: 'synthetic-http', model: 'agent-info-test',
+      baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}`, authNamespace: 'synthetic-http', credentialEnv: 'T14_INFO_TEST_TOKEN',
+      contextWindow: 32000, maxTokens: 1024, budget: AGENT_BUDGET, authorization: 'synthetic-test-only' }));
+    const child = await new Promise<{ code: number | null; stdout: string; stderr: string }>(resolve => {
+      execFile(process.execPath, ['apps/cli/src/main.ts', 'agent', '--scenario', 'real', '--sandbox', sandbox.root, '--transport-config', configPath],
+        { encoding: 'utf8', timeout: 150000, maxBuffer: 4 * 1024 * 1024, env: { ...process.env, T14_INFO_TEST_TOKEN: 'SYNTHETIC-INFO-TOKEN' } },
+        (error, stdout, stderr) => resolve({ code: error ? typeof error.code === 'number' ? error.code : null : 0, stdout, stderr }));
+    });
+    assert.equal(receiverError, undefined);
+    assert.equal(child.code, 1, child.stderr);
+    const events = child.stdout.trim().split('\n').map(line => JSON.parse(line));
+    assert.ok(events.some(event => event.event === 'info-error' && event.reason === 'injected-late-info-failure'));
+    const result = events.find(event => event.event === 'agent-result');
+    assert.equal(payloads.length, 1);
+    assert.equal(result.networkCount, 1);
+    assert.equal(result.status.terminal, 'failed');
+    assert.deepEqual(result.ledger.attempts.map((attempt: { outcome: string; payloadHash: string }) => [attempt.outcome, attempt.payloadHash]),
+      [['received', sha256(payloads[0]!)]]);
+    assert.equal(result.status.tools[0].result.outcome, 'success');
+    const db = new DatabaseSync(resourcesOf(sandbox).store.path);
+    try { db.exec('DROP TRIGGER fail_info'); } finally { db.close(); }
+    const recovered = cli('agent', '--sandbox', sandbox.root, '--scenario', 'plain').trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(recovered.filter(event => event.event === 'info-notice').length, 1);
+    assert.equal(recovered.find(event => event.event === 'agent-result').fixtureProviderCount, 1);
+  } finally {
+    server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(sandbox.root, { recursive: true, force: true }); rmSync(configRoot, { recursive: true, force: true });
+  }
+});
+
 test('ordinary Agent and remember jobs persist the missing route reason without attempts or synthetic job injection', () => {
   const sandbox = createSandbox();
   try {

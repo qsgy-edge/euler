@@ -3963,20 +3963,33 @@ export class ProbeStore {
     }
     if (result.result === 'pass' && comparison.relation === 'same-claim') {
       const peer = comparison.peer, candidate = comparison.candidate;
-      check(peer.lifecycle === 'active' && peer.verification === 'verified'
+      check((peer.lifecycle === 'active' && peer.verification === 'verified'
+        || ['active','candidate'].includes(peer.lifecycle) && peer.verification === 'conflicted' && Boolean(peer.conflictSetId))
         && JSON.stringify(peer.appliesTo) === JSON.stringify(candidate.appliesTo)
         && peer.validFrom === candidate.validFrom && peer.validUntil === candidate.validUntil, 'comparison-ineligible');
-      this.#eligible(peer);
+      if (peer.verification === 'verified') this.#eligible(peer);
+      else {
+        check(!memoryTemporalStatus(peer, Date.now()), 'memory-not-current');
+        this.#validateMemorySources(peer);
+      }
     }
     if (result.result === 'pass' && comparison.relation === 'conflict') {
       const peer = comparison.peer, candidate = comparison.candidate;
-      check(peer.verification === 'verified' && peer.lifecycle !== 'tombstoned'
-        && JSON.stringify(peer.scope) === JSON.stringify(candidate.scope)
+      check((peer.verification === 'verified' || peer.verification === 'conflicted' && Boolean(peer.conflictSetId))
+        && peer.lifecycle !== 'tombstoned' && JSON.stringify(peer.scope) === JSON.stringify(candidate.scope)
         && memoryApplicabilityOverlaps(peer.appliesTo, candidate.appliesTo) && memoryPeriodsOverlap(peer, candidate), 'comparison-ineligible');
+      this.#validateMemorySources(peer);
     }
     const isolate = result.result === 'pass' && (comparison.relation === 'conflict'
-      || state.conflicts.length > 0 && comparison.relation === 'same-claim');
-    if (isolate) state.conflicts.push(comparison.peer.recordId);
+      || comparison.relation === 'same-claim' && (state.conflicts.length > 0 || comparison.peer.verification === 'conflicted'));
+    if (isolate) {
+      const members = new Set([...state.conflicts, comparison.peer.recordId]);
+      const groups = new Set(state.peers.filter(peer => members.has(peer.recordId) && peer.conflictSetId).map(peer => peer.conflictSetId));
+      for (const peer of state.peers) if (peer.verification === 'conflicted' && peer.lifecycle !== 'tombstoned'
+        && peer.conflictSetId && groups.has(peer.conflictSetId)) members.add(peer.recordId);
+      for (const peer of state.peers.filter(peer => members.has(peer.recordId))) this.#validateMemorySources(peer);
+      state.conflicts = [...members];
+    }
     if (result.result === 'block' && nextRelation) {
       state.relation = nextRelation; continuing = true;
     } else if (result.result === 'pass' && (['distinct','supersedes','conflict'].includes(comparison.relation) || state.conflicts.length > 0)
@@ -3986,6 +3999,14 @@ export class ProbeStore {
     let current = this.#withMemoryHash({ ...comparison.candidate, headEventId: randomUUID() });
     this.#appendMemoryEvent(comparison.candidate, current, 'comparison', current.source.eventId,
       { input: comparison, comparison: state, runId, result: result.result, evidence: result.evidence, sourceUnits });
+    if (result.result === 'pass' && comparison.relation === 'same-claim') {
+      const peer = comparison.peer;
+      this.#corroborate(peer, [current.source]);
+      const corroborated = this.#withMemoryHash({ ...peer, headEventId: randomUUID() });
+      this.#appendMemoryEvent(peer, corroborated, 'corroborate', current.source.eventId,
+        { source: current.source, comparisonEventId: current.headEventId });
+      state.peers = state.peers.map(record => record.recordId === peer.recordId ? corroborated : record);
+    }
     if (isolate) {
       const isolated = this.#conflictMemories([current, ...state.peers.filter(peer => state.conflicts.includes(peer.recordId))], [], current.headEventId);
       current = isolated[0]!.record;
@@ -4044,10 +4065,6 @@ export class ProbeStore {
     }
     check(comparison.relation === 'same-claim', 'comparison-evidence-required');
     const peer = comparison.peer;
-    this.#corroborate(peer, [current.source]);
-    const corroborated = this.#withMemoryHash({ ...peer, headEventId: randomUUID() });
-    this.#appendMemoryEvent(peer, corroborated, 'corroborate', current.source.eventId,
-      { source: current.source, comparisonEventId: current.headEventId });
     const after = this.#withMemoryHash({ ...current, lifecycle: 'rejected', headEventId: randomUUID() });
     this.#appendMemoryEvent(current, after, 'reject', current.source.eventId,
       { reason: 'duplicate-claim', corroborates: peer.recordId, comparisonEventId: current.headEventId });
@@ -4804,11 +4821,11 @@ export class ProbeStore {
     }
   }
   #checkVerification(record: MemoryRecord, readSources = false, projects: readonly string[] = [this.#binding.projectId]): void {
-    if (!record.verificationRunId) { check(record.verification !== 'verified', 'verification-evidence-gap'); return; }
+    if (!record.verificationRunId) { check(!['verified','conflicted'].includes(record.verification), 'verification-evidence-gap'); return; }
     const row = this.#db.prepare('SELECT * FROM verification_runs WHERE run_id=?').get(record.verificationRunId);
     check(row && row.record_id === record.recordId && row.revision_id === record.revisionId
       && sha256(String(row.evidence_json)) === row.evidence_hash
-      && (record.verification !== 'verified' || row.result === 'pass'), 'verification-evidence-gap');
+      && (!['verified','conflicted'].includes(record.verification) || row.result === 'pass'), 'verification-evidence-gap');
     const evidence = JSON.parse(String(row.evidence_json)) as SourceAck[];
     this.#checkEvidenceRows('verification_evidence', 'run_id', record.verificationRunId, evidence);
     if (readSources) {

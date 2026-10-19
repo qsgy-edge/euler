@@ -9,6 +9,42 @@ import { approvedSourceUnit } from './support/source-publication.ts';
 import { openProbe } from '../src/probe.ts';
 import { compareCandidate, evolutionBudget, observedFact, pairedCanary, verifiedCandidate } from './support/memory-evolution.ts';
 
+for (const firstRelation of ['same-claim','conflict'] as const) test('new evidence extends an existing conflict group with ' + firstRelation + ' first', () => {
+  const sandbox = createSandbox();
+  let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const first = verifiedCandidate(probe, '本项目本周期保存原始日志');
+    probe.store.promoteMemory(probe.activity, first.record!.recordId, first.record!);
+    const second = verifiedCandidate(probe, '本项目本周期不保存原始日志');
+    probe.store.promoteMemory(probe.activity, second.record!.recordId, second.record!);
+    assert.equal(compareCandidate(probe, second.jobId, 'conflict').reason, 'credible-conflict');
+    const peers = [first, second].map(job => probe.store.readMemory(probe.activity, job.record!.recordId))
+      .sort((left, right) => left.recordId.localeCompare(right.recordId));
+    const same = peers[firstRelation === 'same-claim' ? 0 : 1]!;
+    const candidate = verifiedCandidate(probe, same.recordId === first.record!.recordId
+      ? '本项目本周期保留原始日志' : '本项目本周期不保留原始日志');
+    probe.store.promoteMemory(probe.activity, candidate.record!.recordId, candidate.record!);
+    for (let index = 0; index < peers.length; index++) {
+      const compared = compareCandidate(probe, candidate.jobId, peers[index]!.recordId === same.recordId ? 'same-claim' : 'conflict');
+      assert.equal(compared.stage, index === 0 ? 'comparing' : 'blocked');
+      assert.equal(compared.reason, index === 0 ? 'comparison-evidence-required' : 'credible-conflict');
+      const members = [...peers, candidate.record!].map(record => probe.store.readMemory(probe.activity, record.recordId));
+      assert.ok(members.every(record => record.verification === 'conflicted' && record.conflictSetId === members[0]!.conflictSetId));
+      assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
+      probe.store.drainSearchProjection(probe.activity, 128);
+      assert.ok(probe.store.searchMemories(probe.activity, { query: '本项目' }).results.every(hit => hit.kind === 'status'));
+      probe.close(); probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    }
+    const history = probe.store.inspectMemory(probe.activity, same.recordId).history;
+    const corroboration = history.filter(event => event.kind === 'corroborate');
+    assert.equal(corroboration.length, 1);
+    assert.deepEqual(JSON.parse(corroboration[0]!.payload).source, candidate.source);
+    assert.throws(() => probe.session.prepare(randomUUID(), '本项目如何保留日志？',
+      [probe.store.readMemory(probe.activity, candidate.record!.recordId)]), /assembly-evidence-gap/);
+    assert.equal(probe.transport.count, 0);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 for (const mutation of ['none','wrong','forget','correct']) test('duplicate evidence resolves canonically and retains the ' + mutation + ' barrier', () => {
   const sandbox = createSandbox(), probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
   try {
