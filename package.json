@@ -17,7 +17,8 @@
     "evidence:guidance": "node scripts/evidence-guidance.ts",
     "evidence:source-recovery": "node scripts/evidence-source-recovery.ts",
     "evidence:owner-memory": "node scripts/evidence-owner-memory.ts",
-    "evidence:capture": "node scripts/evidence-capture.ts"
+    "evidence:capture": "node scripts/evidence-capture.ts",
+    "evidence:memory-evolution": "node scripts/evidence-memory-evolution.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

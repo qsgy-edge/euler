@@ -221,6 +221,21 @@ class OwnerMemoryHost {
     catch { return false; }
   }
 
+  feedback(recordId: string, expectedHead: string, kind: string): void {
+    check(['helpful','wrong','stale','safety'].includes(kind), 'invalid-memory-feedback');
+    const { store, activity, archive } = this.probe;
+    const current = store.readMemory(activity, recordId);
+    check(current.headEventId === expectedHead, 'memory-stale');
+    archive.append(randomUUID(), `feedback ${recordId} ${expectedHead} ${kind}`, 'user');
+    const input = archive.append(randomUUID(), JSON.stringify({ schema: 'memory-feedback@1',
+      kind: kind === 'safety' ? 'safety_violation' : `user_${kind}`, recordId, revisionId: current.revisionId, headEventId: expectedHead }), 'user');
+    const result = store.recordMemoryFeedback(activity, recordId, current, input);
+    this.drain(); this.deliver();
+    emit('memory-feedback-result', { level: kind === 'helpful' ? 'info' : 'warning', status: result.status, feedbackId: result.feedbackId,
+      recordId, headEventId: result.record.headEventId, revisionId: result.record.revisionId,
+      lifecycle: result.record.lifecycle, verification: result.record.verification, reason: kind });
+  }
+
   drain(): void {
     try { this.probe.store.drainSearchProjection(this.probe.activity, 128); }
     catch (error) { emit('search-projection-lag', { level: 'warning', reason: (error as Error).message }); }
@@ -320,6 +335,8 @@ class OwnerMemoryHost {
       }
     }
     for (const record of delta.records) selected.set(record.recordId, record);
+    for (const hit of page.results) if (hit.kind === 'status') emit('memory-warning', { level: 'warning',
+      reason: hit.reason, claimRef: hit.claimRef, verification: hit.verification });
     const records = [...selected.values()].slice(0, 16);
     const turn = session.prepare(randomUUID(), question, records);
     const receipt = session.dispatch(turn);
@@ -341,17 +358,18 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
   const probe = openProbe(sandbox, OWNER_BUDGET, undefined, undefined, undefined, true);
   const lines = createInterface({ input: process.stdin });
   const commands = lines[Symbol.asyncIterator]();
-  const capture = scheduleCaptures(probe, options.captureConfig);
+  let capture: ReturnType<typeof scheduleCaptures> | undefined;
   try {
     const log = options.hostInfo === 'durable' ? openOwnerInfo(sandbox, probe) : null;
     const host = new OwnerMemoryHost(probe, log, options.scenario as OwnerScenario, options.noActiveProject);
+    capture = scheduleCaptures(probe, options.captureConfig, () => { host.drain(); host.deliver(); });
     host.backfill();
     host.drain();
     host.deliver();
     capture.kick();
     emit('remember-ready', { pid: process.pid, hostInfo: log ? 'durable' : 'unavailable', infoPath: log?.path ?? null,
       ...counts(probe.store.listHostInfo(probe.activity)), syntheticProposals: options.syntheticProposals,
-      commands: [...OWNER_MEMORY_FORMS, ...(options.syntheticProposals ? ['propose <text>'] : []), '同意', '取消', 'info', 'info <batchId>', 'ask <question>', 'stop'] });
+      commands: [...OWNER_MEMORY_FORMS, ...(options.syntheticProposals ? ['propose <text>'] : []), '同意', '取消', 'info', 'info <batchId>', 'feedback <recordId> <headEventId> helpful|wrong|stale|safety', 'ask <question>', 'stop'] });
     const archive = (text: string): SourceAck | null => {
       try { return probe.archive.append(randomUUID(), text); }
       catch (error) { report('live', 'error', 'error', { committed: false, reason: (error as Error).message }); return null; }
@@ -362,6 +380,11 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
         if (line === 'stop') break;
         if (line === 'info') { host.listInfo(); continue; }
         if (line.startsWith('info ')) { host.showInfo(line.slice(5).trim()); continue; }
+        if (line.startsWith('feedback ')) {
+          const fields = line.split(/\s+/);
+          check(fields.length === 4, 'invalid-memory-feedback');
+          host.feedback(fields[1]!, fields[2]!, fields[3]!); continue;
+        }
         if (line.startsWith('ask ')) { host.ask(line.slice(4).trim()); continue; }
         if (line.startsWith('propose ')) {
           // Synthetic stand-in for a model proposal (no real provider in this slice); off unless explicitly enabled.
@@ -394,7 +417,18 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
       } catch (error) { emit('command-error', { reason: (error as Error).message }); }
       finally { capture.kick(); }
     }
-  } finally { lines.close(); await capture.close(); probe.close(); }
+  } finally { lines.close(); await capture?.close(); probe.close(); }
+}
+
+/** Uses the same durable owner carrier after a background batch or during startup recovery. */
+export function deliverMemoryInfo(sandbox: Sandbox, probe: ReturnType<typeof openProbe>): boolean {
+  const host = new OwnerMemoryHost(probe, openOwnerInfo(sandbox, probe), 'success', false);
+  host.drain(); return host.deliver();
+}
+
+export function runInfoDelivery(sandbox: Sandbox): void {
+  const probe = openProbe(sandbox, OWNER_BUDGET, undefined, undefined, undefined, true);
+  try { deliverMemoryInfo(sandbox, probe); } finally { probe.close(); }
 }
 
 /** Queries Info without an agent session; listing never settles unread, opening a batch does. */

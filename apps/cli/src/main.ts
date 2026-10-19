@@ -11,7 +11,7 @@ import type { Sandbox } from './sandbox.ts';
 import { openProbe } from './probe.ts';
 import { startCli } from './process-driver.ts';
 import { AGENT_BUDGET, runAgentDemo } from './agent-cli.ts';
-import { runInfoQuery, runRememberSession } from './owner-memory.ts';
+import { runInfoDelivery, runInfoQuery, runRememberSession } from './owner-memory.ts';
 import { runHandoffDemo } from './analysis-handoff.ts';
 import { runCaptureDemo, runCaptureDrain } from './capture.ts';
 import { killPoint } from './kill-point.ts';
@@ -259,9 +259,9 @@ async function main() {
     } finally { probe.close(); }
     return;
   }
-  if (command === 'capture-drain') return runCaptureDrain(sandbox, args.values['capture-config']);
+  if (command === 'capture-drain') { await runCaptureDrain(sandbox, args.values['capture-config']); return runInfoDelivery(sandbox); }
   if (command === 'handoff') return runHandoffDemo(sandbox, args.values.scenario);
-  if (command === 'capture') return runCaptureDemo(sandbox, args.values.scenario);
+  if (command === 'capture') { await runCaptureDemo(sandbox, args.values.scenario); return runInfoDelivery(sandbox); }
   if (command === 'agent') return runAgentDemo(sandbox, args.values.scenario === 'success' ? 'tool' : args.values.scenario,
     { ...AGENT_BUDGET, ...options }, { interactive: args.values.interactive,
       ...(args.values['capture-config'] ? { captureConfig: args.values['capture-config'] } : {}),

@@ -20,7 +20,9 @@ export function createCaptureWorker(path?: string, onFailure?: (error: unknown) 
   const run = async (probe: Probe, foregroundActive = false, signal?: AbortSignal): Promise<CaptureJob[]> => {
     const report = (jobs: CaptureJob[]) => {
       console.log(JSON.stringify({ event: 'capture-queue', jobs: jobs.map(job => ({ jobId: job.jobId, stage: job.stage,
-        reason: job.reason, recordId: job.record?.recordId ?? null, verification: job.record?.verification ?? null })) }));
+        reason: job.reason, recordId: job.record?.recordId ?? null, verification: job.record?.verification ?? null,
+        lifecycle: job.record?.lifecycle ?? null, level: job.stage === 'unknown' ? 'error'
+          : job.stage === 'blocked' || job.stage === 'pending' && job.reason ? 'warning' : 'info' })) }));
       return jobs;
     };
     if (!probe.store.listCaptureJobs(probe.activity, 1, true).length) return [];
@@ -55,7 +57,7 @@ export function createCaptureWorker(path?: string, onFailure?: (error: unknown) 
   };
 }
 
-export function scheduleCaptures(probe: Probe, path?: string) {
+export function scheduleCaptures(probe: Probe, path?: string, onComplete?: (jobs: CaptureJob[]) => void) {
   const worker = createCaptureWorker(path, reportCaptureFailure), abort = new AbortController();
   let pending = false, foreground = false, running: Promise<void> | undefined;
   const kick = (foregroundActive = false) => {
@@ -67,7 +69,8 @@ export function scheduleCaptures(probe: Probe, path?: string) {
         if (path) await new Promise<void>(resolve => setImmediate(resolve));
         if (abort.signal.aborted) return;
         pending = false;
-        await worker(probe, foreground, abort.signal);
+        const jobs = await worker(probe, foreground, abort.signal);
+        if (jobs.length && !abort.signal.aborted) onComplete?.(jobs);
       } while (pending);
     })().finally(() => { running = undefined; });
   };
@@ -98,13 +101,13 @@ export async function drainCaptures(probe: Probe, options: { batch: number; dead
     if (options.signal?.aborted || probe.store.captureDrainBlocked(probe.activity)) break;
     if (Date.now() >= deadline) break;
     let result = job;
-    // Each role gets one lease/primary+fallback chain; job identity and cumulative budget remain fixed.
-    for (let phase = 0; phase < 2 && Date.now() < deadline; phase++) {
+    // Each role or fixed comparison gets an isolated lease; all requests consume the same job budget.
+    for (let phase = 0; phase <= options.budget.maxModelAttempts && Date.now() < deadline; phase++) {
       const lease = probe.store.claimCaptureJob(probe.activity, job.jobId, options.budget, Math.max(1, deadline - Date.now()));
       if (!lease) { result = probe.store.readCaptureJob(probe.activity, job.jobId); break; }
       const run = new CaptureRun(probe.store, lease, probe.archive, options.config, options.encode, options.adapterVersion);
       result = await pumpCapture(run, options.host, options.signal);
-      if (result.stage !== 'verifying') break;
+      if (!['verifying','comparing'].includes(result.stage)) break;
     }
     results.push(result);
   }

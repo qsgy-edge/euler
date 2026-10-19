@@ -87,7 +87,10 @@ test('the configured worker consumes ordinary jobs at startup and agent_end over
       const jobs = probe.store.listCaptureJobs(probe.activity);
       assert.equal(jobs.length, 3); assert(jobs.every(job => job.stage === 'complete'));
       const record = jobs.find(job => job.record)?.record;
-      assert.equal(record?.content, '验证需要原始日志'); assert.equal(record?.verification, 'verified'); assert.equal(record?.lifecycle, 'candidate');
+      assert.equal(record?.content, '验证需要原始日志'); assert.equal(record?.verification, 'verified'); assert.equal(record?.lifecycle, 'active');
+      const info = probe.store.listHostInfo(probe.activity);
+      assert.equal(info.length, 1); assert.equal(info[0]!.delivery, 'delivered');
+      assert.ok(events.some(event => event.event === 'info-notice' && event.batchId === info[0]!.batchId));
     } finally { probe.close(); }
     const db = new DatabaseSync(resourcesOf(sandbox).store.path, { readOnly: true });
     try {

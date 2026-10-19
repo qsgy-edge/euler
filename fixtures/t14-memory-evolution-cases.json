@@ -1,0 +1,114 @@
+{
+  "schema": "memory-evolution-fixture@1",
+  "scope": "synthetic-only",
+  "cases": [
+    {
+      "id": "activation-dedup",
+      "active": 1,
+      "rejected": 1,
+      "stale": 0,
+      "conflicted": 0,
+      "superseded": 0,
+      "batches": 1
+    },
+    {
+      "id": "coexist",
+      "active": 2,
+      "rejected": 0,
+      "stale": 0,
+      "conflicted": 0,
+      "superseded": 0,
+      "batches": 2
+    },
+    {
+      "id": "supersession",
+      "active": 1,
+      "rejected": 0,
+      "stale": 0,
+      "conflicted": 0,
+      "superseded": 1,
+      "batches": 2
+    },
+    {
+      "id": "conflict",
+      "active": 0,
+      "rejected": 0,
+      "stale": 0,
+      "conflicted": 2,
+      "superseded": 0,
+      "batches": 1
+    },
+    {
+      "id": "expiry",
+      "active": 0,
+      "rejected": 0,
+      "stale": 1,
+      "conflicted": 0,
+      "superseded": 0,
+      "batches": 0
+    },
+    {
+      "id": "source-invalidated",
+      "active": 0,
+      "rejected": 0,
+      "stale": 1,
+      "conflicted": 0,
+      "superseded": 0,
+      "batches": 1
+    },
+    {
+      "id": "owner-feedback",
+      "active": 0,
+      "rejected": 0,
+      "stale": 1,
+      "conflicted": 0,
+      "superseded": 0,
+      "batches": 1
+    },
+    {
+      "id": "negative-first",
+      "active": 0,
+      "rejected": 1,
+      "stale": 0,
+      "conflicted": 0,
+      "superseded": 0,
+      "batches": 1
+    },
+    {
+      "id": "negative-restore",
+      "active": 1,
+      "rejected": 0,
+      "stale": 0,
+      "conflicted": 0,
+      "superseded": 0,
+      "batches": 3
+    },
+    {
+      "id": "negative-previous-lost",
+      "active": 0,
+      "rejected": 1,
+      "stale": 0,
+      "conflicted": 0,
+      "superseded": 0,
+      "batches": 2
+    },
+    {
+      "id": "transport-budget",
+      "active": 1,
+      "rejected": 0,
+      "stale": 0,
+      "conflicted": 0,
+      "superseded": 0,
+      "batches": 1
+    },
+    {
+      "id": "transport-comparison",
+      "active": 2,
+      "rejected": 0,
+      "stale": 0,
+      "conflicted": 0,
+      "superseded": 0,
+      "batches": 2
+    }
+  ]
+}

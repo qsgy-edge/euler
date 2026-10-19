@@ -114,7 +114,7 @@ export async function pumpAgent(run: AgentRun, host: AgentPump): Promise<AgentSt
 
 /** Background I/O pump; all job, source and fallback transitions stay in Core. */
 export async function pumpCapture(run: CaptureRun, host: Pick<AgentPump, 'stream'>, signal?: AbortSignal): Promise<CaptureJob> {
-  if (!['proposing','verifying'].includes(run.status().stage)) return run.status();
+  if (!['proposing','verifying','comparing'].includes(run.status().stage)) return run.status();
   const release = run.observeExecution();
   const abort = new AbortController();
   const stopped = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
@@ -128,7 +128,7 @@ export async function pumpCapture(run: CaptureRun, host: Pick<AgentPump, 'stream
       run.finishModel(attempt.attemptId, reply, transport);
     }
   } catch (error) {
-    if (['proposing','verifying'].includes(run.status().stage)) run.fail(error);
+    if (['proposing','verifying','comparing'].includes(run.status().stage)) run.fail(error);
     throw error;
   } finally { release(); clearTimeout(deadline); }
   return run.status();

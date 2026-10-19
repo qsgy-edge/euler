@@ -15,6 +15,7 @@ import { pumpAgent } from './agent-pump.ts';
 import type { AgentPump } from './agent-pump.ts';
 import { configuredTransport, verifyTransportPrerequisites } from './model-transport.ts';
 import { scheduleCaptures } from './capture.ts';
+import { deliverMemoryInfo } from './owner-memory.ts';
 import fixture from '../../../fixtures/controlled-agent.json' with { type: 'json' };
 
 export const AGENT_BUDGET: ProbeBudget = { version: 'probe-budget@1', contextLimit: 32000, outputReserve: 1024,
@@ -32,7 +33,8 @@ export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: P
   if (configured) { budget = configured.budget; await verifyTransportPrerequisites(); }
   if (scenario === 'budget') budget = { ...budget, maxModelAttempts: 1 };
   const probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
-  const capture = scheduleCaptures(probe, options.captureConfig);
+  const capture = scheduleCaptures(probe, options.captureConfig, () => { deliverMemoryInfo(sandbox, probe); });
+  deliverMemoryInfo(sandbox, probe);
   capture.kick(true);
   const transport = configured?.transport;
   const route = configured ? { provider: configured.model.provider, model: configured.model.id, route: configured.model.baseUrl, authNamespace: configured.authNamespace }
