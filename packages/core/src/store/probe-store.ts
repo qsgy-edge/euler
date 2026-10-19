@@ -3910,7 +3910,10 @@ export class ProbeStore {
         const proof = this.#db.prepare('SELECT payload FROM memory_events WHERE event_id=?').get(rejection.comparisonEventId)!;
         const compared = JSON.parse(String(proof.payload)).input as MemoryComparison;
         const target = this.#readMemoryHead(rejection.corroborates);
-        if (target.recordId !== compared.peer.recordId || target.revisionId !== compared.peer.revisionId) return true;
+        const endpoint = compared.peer.recordId === current.recordId ? compared.peer : compared.candidate;
+        const counterpart = endpoint === compared.peer ? compared.candidate : compared.peer;
+        if (endpoint.recordId !== current.recordId || endpoint.revisionId !== current.revisionId
+          || target.recordId !== counterpart.recordId || target.revisionId !== counterpart.revisionId) return true;
         if (target.lifecycle === 'superseded') return false;
         if (target.recordId !== candidate.recordId && !peers.some(record => record.recordId === target.recordId)) return true;
         if (target.lifecycle !== 'rejected' || target.recordId === candidate.recordId) return false;
@@ -3945,6 +3948,27 @@ export class ProbeStore {
     });
   }
 
+  #sameClaimCandidates(state: MemoryComparisonState): { record: MemoryRecord; comparisonEventId: string }[] {
+    return this.#db.prepare(`SELECT event_id,payload FROM memory_events WHERE record_id=? AND kind='comparison'
+      AND json_extract(payload,'$.comparison.originHeadId')=? AND json_extract(payload,'$.result')='pass'
+      AND json_extract(payload,'$.input.relation')='same-claim' AND json_extract(payload,'$.input.peer.lifecycle')='candidate'
+      AND json_extract(payload,'$.input.peer.verification')='verified' ORDER BY seq`)
+      .all(state.candidate.recordId, state.originHeadId).map(row => {
+        const peer = (JSON.parse(String(row.payload)).input as MemoryComparison).peer;
+        return { record: state.peers.find(record => record.recordId === peer.recordId)!, comparisonEventId: String(row.event_id) };
+      });
+  }
+
+  #settleSameClaimCandidates(state: MemoryComparisonState, target: MemoryRecord): void {
+    for (const { record, comparisonEventId } of this.#sameClaimCandidates(state)) {
+      this.#assertMemoryExpected(record.recordId, record);
+      this.#eligible(record);
+      const after = this.#withMemoryHash({ ...record, lifecycle: 'rejected', headEventId: randomUUID() });
+      this.#appendMemoryEvent(record, after, 'reject', record.source.eventId,
+        { reason: 'duplicate-claim', corroborates: target.recordId, comparisonEventId });
+    }
+  }
+
   #completeMemoryComparison(lease: CaptureLease, result: CaptureVerification): CaptureJob {
     const comparison = this.captureComparison(lease)!;
     const { reason, sourceUnits } = this.#captureVerificationEvidence(lease.jobId, result, 'comparison');
@@ -3952,6 +3976,8 @@ export class ProbeStore {
       .every(ref => result.evidence.some(actual => sameSourceAck(ref, actual))), 'verification-independent-evidence-required');
     const runId = this.#saveVerification(comparison.candidate, result.result, result.evidence, 'independent-verifier@1', reason, sourceUnits);
     const state = this.#memoryComparisonState(lease.jobId);
+    const sameCandidate = result.result === 'pass' && comparison.relation === 'same-claim'
+      && comparison.peer.lifecycle === 'candidate' && comparison.peer.verification === 'verified';
     let continuing = false;
     const nextRelation = memoryRelations[memoryRelations.indexOf(comparison.relation) + 1];
     if (result.result === 'pass' && comparison.relation === 'supersedes') {
@@ -3963,7 +3989,7 @@ export class ProbeStore {
     }
     if (result.result === 'pass' && comparison.relation === 'same-claim') {
       const peer = comparison.peer, candidate = comparison.candidate;
-      check((peer.lifecycle === 'active' && peer.verification === 'verified'
+      check((['active','candidate'].includes(peer.lifecycle) && peer.verification === 'verified'
         || ['active','candidate'].includes(peer.lifecycle) && peer.verification === 'conflicted' && Boolean(peer.conflictSetId))
         && JSON.stringify(peer.appliesTo) === JSON.stringify(candidate.appliesTo)
         && peer.validFrom === candidate.validFrom && peer.validUntil === candidate.validUntil, 'comparison-ineligible');
@@ -3983,7 +4009,7 @@ export class ProbeStore {
     const isolate = result.result === 'pass' && (comparison.relation === 'conflict'
       || comparison.relation === 'same-claim' && (state.conflicts.length > 0 || comparison.peer.verification === 'conflicted'));
     if (isolate) {
-      const members = new Set([...state.conflicts, comparison.peer.recordId]);
+      const members = new Set([...state.conflicts, ...this.#sameClaimCandidates(state).map(item => item.record.recordId), comparison.peer.recordId]);
       const groups = new Set(state.peers.filter(peer => members.has(peer.recordId) && peer.conflictSetId).map(peer => peer.conflictSetId));
       for (const peer of state.peers) if (peer.verification === 'conflicted' && peer.lifecycle !== 'tombstoned'
         && peer.conflictSetId && groups.has(peer.conflictSetId)) members.add(peer.recordId);
@@ -3992,29 +4018,31 @@ export class ProbeStore {
     }
     if (result.result === 'block' && nextRelation) {
       state.relation = nextRelation; continuing = true;
-    } else if (result.result === 'pass' && (['distinct','supersedes','conflict'].includes(comparison.relation) || state.conflicts.length > 0)
+    } else if (result.result === 'pass' && (['distinct','supersedes','conflict'].includes(comparison.relation) || sameCandidate || state.conflicts.length > 0)
       && state.peerIndex + 1 < state.peers.length) {
       state.peerIndex++; state.relation = 'same-claim'; continuing = true;
     }
     let current = this.#withMemoryHash({ ...comparison.candidate, headEventId: randomUUID() });
     this.#appendMemoryEvent(comparison.candidate, current, 'comparison', current.source.eventId,
       { input: comparison, comparison: state, runId, result: result.result, evidence: result.evidence, sourceUnits });
+    const comparisonEventId = current.headEventId;
     if (result.result === 'pass' && comparison.relation === 'same-claim') {
-      const peer = comparison.peer;
-      this.#corroborate(peer, [current.source]);
-      const corroborated = this.#withMemoryHash({ ...peer, headEventId: randomUUID() });
-      this.#appendMemoryEvent(peer, corroborated, 'corroborate', current.source.eventId,
-        { source: current.source, comparisonEventId: current.headEventId });
-      state.peers = state.peers.map(record => record.recordId === peer.recordId ? corroborated : record);
+      const target = sameCandidate ? current : comparison.peer;
+      const source = sameCandidate ? comparison.peer.source : current.source;
+      this.#corroborate(target, [source]);
+      const corroborated = this.#withMemoryHash({ ...target, headEventId: randomUUID() });
+      this.#appendMemoryEvent(target, corroborated, 'corroborate', source.eventId, { source, comparisonEventId });
+      if (sameCandidate) current = corroborated;
+      else state.peers = state.peers.map(record => record.recordId === target.recordId ? corroborated : record);
     }
     if (isolate) {
-      const isolated = this.#conflictMemories([current, ...state.peers.filter(peer => state.conflicts.includes(peer.recordId))], [], current.headEventId);
+      const isolated = this.#conflictMemories([current, ...state.peers.filter(peer => state.conflicts.includes(peer.recordId))], [], comparisonEventId);
       current = isolated[0]!.record;
       state.candidate = current;
       state.peers = state.peers.map(peer => isolated.find(item => item.record.recordId === peer.recordId)?.record ?? peer);
     }
     if (continuing) {
-      if (isolate) {
+      if (isolate || sameCandidate) {
         const after = this.#withMemoryHash({ ...current, headEventId: randomUUID() });
         this.#appendMemoryEvent(current, after, 'comparison', current.source.eventId, { comparison: state, result: null });
         current = after;
@@ -4026,14 +4054,14 @@ export class ProbeStore {
     }
     if (result.result !== 'pass') return this.#finishMemoryComparison(lease.jobId, current.headEventId, 'blocked', reason);
     if (state.conflicts.length) return this.#finishMemoryComparison(lease.jobId, current.headEventId, 'blocked', 'credible-conflict');
-    if (['distinct','supersedes'].includes(comparison.relation)) {
+    if (['distinct','supersedes'].includes(comparison.relation) || sameCandidate) {
       this.#eligible(current);
       const previous = state.peers.filter(peer => state.replacements.includes(peer.recordId) && peer.lifecycle !== 'tombstoned').map(peer => {
         this.#assertMemoryExpected(peer.recordId, peer);
         this.#checkVerification(peer, true);
         const after = this.#withMemoryHash({ ...peer, lifecycle: 'superseded', headEventId: randomUUID() });
         this.#appendMemoryEvent(peer, after, 'supersede', peer.source.eventId,
-          { supersededBy: current.recordId, comparisonEventId: current.headEventId });
+          { supersededBy: current.recordId, comparisonEventId });
         return { before: peer, after };
       });
       const active = this.#withMemoryHash({ ...current, lifecycle: 'active', headEventId: randomUUID() });
@@ -4041,7 +4069,8 @@ export class ProbeStore {
       check(!suppressed || suppressed.lifecycle === 'tombstoned' && laterFactPeriod(current, suppressed)
         && state.replacements.includes(suppressed.recordId), 'memory-suppressed');
       this.#appendMemoryEvent(current, active, 'activate', current.source.eventId,
-        { automatic: true, previous, comparisonEventId: current.headEventId });
+        { automatic: true, previous, comparisonEventId });
+      this.#settleSameClaimCandidates(state, active);
       return this.#finishMemoryComparison(lease.jobId, active.headEventId, 'complete', null);
     }
     if (comparison.relation === 'superseded-by') {
@@ -4049,6 +4078,7 @@ export class ProbeStore {
       const after = this.#withMemoryHash({ ...current, lifecycle: 'superseded', headEventId: randomUUID() });
       this.#appendMemoryEvent(current, after, 'supersede', current.source.eventId,
         { supersededBy: comparison.peer.recordId, comparisonEventId: current.headEventId });
+      this.#settleSameClaimCandidates(state, after);
       return this.#finishMemoryComparison(lease.jobId, after.headEventId, 'complete', 'superseded-claim');
     }
     check(comparison.relation === 'same-claim', 'comparison-evidence-required');
@@ -4056,6 +4086,7 @@ export class ProbeStore {
     const after = this.#withMemoryHash({ ...current, lifecycle: 'rejected', headEventId: randomUUID() });
     this.#appendMemoryEvent(current, after, 'reject', current.source.eventId,
       { reason: 'duplicate-claim', corroborates: peer.recordId, comparisonEventId: current.headEventId });
+    this.#settleSameClaimCandidates(state, after);
     return this.#finishMemoryComparison(lease.jobId, after.headEventId, 'complete', 'claim-corroborated');
   }
 

@@ -9,6 +9,91 @@ import { approvedSourceUnit } from './support/source-publication.ts';
 import { openProbe } from '../src/probe.ts';
 import { compareCandidate, evolutionBudget, observedFact, pairedCanary, verifiedCandidate } from './support/memory-evolution.ts';
 
+for (const pendingFirst of [false, true]) for (const relation of ['distinct', 'supersedes', 'superseded-by', 'same-claim', 'conflict', 'evidence-gap'] as const)
+  test(`a fresh capture compares an exhausted verified candidate and every remaining peer: pendingFirst=${pendingFirst}, ${relation}`, () => {
+    const sandbox = createSandbox();
+    let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    try {
+      const drafts = ['本项目日志保留原始数据', '本项目开发环境执行完整测试'].map(content => {
+        const source = probe.archive.append(randomUUID(), '记住：' + content);
+        const job = probe.store.queueOwnerCapture(probe.activity, source);
+        const lease = probe.store.claimCaptureJob(probe.activity, job.jobId, evolutionBudget, 30000)!;
+        return probe.store.captureProposedMemory(lease, { type: 'decision', content });
+      }).sort((a, b) => a.record!.recordId.localeCompare(b.record!.recordId));
+      const pending = drafts[pendingFirst ? 0 : 1]!, active = drafts[pendingFirst ? 1 : 0]!;
+      for (const draft of [active, pending]) {
+        const lease = probe.store.claimCaptureJob(probe.activity, draft.jobId, evolutionBudget, 30000)!;
+        probe.store.searchCaptureSources(lease, '本项目');
+        probe.store.expandCaptureSource(lease, { ref: draft.source, offset: 0, limit: 4096 });
+        const verified = probe.store.completeCaptureVerification(lease, { result: 'pass', evidence: [draft.source] });
+        probe.store.promoteMemory(probe.activity, verified.record!.recordId, verified.record!);
+      }
+      const route = { provider: 'synthetic', model: 'candidate-budget', route: 'local-counting', authNamespace: 'synthetic', capability: 'standard' as const };
+      const lease = probe.store.claimCaptureJob(probe.activity, pending.jobId, evolutionBudget, 30000)!;
+      const run = new CaptureRun(probe.store, lease, probe.archive,
+        { proposer: [route], verifier: [route, { ...route, model: 'fallback' }] }, undefined, 'capture-counting@1');
+      const request = run.nextModel()!, attempt = run.startModel(request, request.payload);
+      assert.equal(run.maySend(attempt.attemptId, request.payload), true);
+      probe.transport.send(request.payload, attempt);
+      run.finishModel(attempt.attemptId, { text: 'malformed', calls: [], stop: 'end', usage: { input: evolutionBudget.maxTotalTokens, output: 1 } });
+      assert.equal(run.nextModel(), null);
+      assert.equal(run.status().reason, 'capture-budget-exhausted');
+      assert.equal(run.status().record!.lifecycle, 'candidate');
+      const candidate = verifiedCandidate(probe, '本项目当前约定：' + pending.record!.content);
+      probe.store.promoteMemory(probe.activity, candidate.record!.recordId, candidate.record!);
+      let current = probe.store.readCaptureJob(probe.activity, candidate.jobId);
+      const visited = new Set<string>();
+      while (current.stage === 'comparing') {
+        const nextLease = probe.store.claimCaptureJob(probe.activity, candidate.jobId, evolutionBudget, 30000)!;
+        const input = probe.store.captureComparison(nextLease)!;
+        const same = input.peer.recordId === pending.record!.recordId;
+        visited.add(input.peer.recordId);
+        if (!same && relation === 'evidence-gap') {
+          current = probe.store.completeCaptureVerification(nextLease, { result: 'evidence-gap', evidence: [], reason: 'synthetic-comparison-gap' });
+        } else {
+          probe.store.pauseCapture(nextLease);
+          current = compareCandidate(probe, candidate.jobId, same ? 'same-claim' : relation as Exclude<typeof relation, 'evidence-gap'>);
+        }
+        probe.close(); probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+      }
+      assert.equal(probe.store.readCaptureJob(probe.activity, pending.jobId).reason, 'capture-budget-exhausted');
+      assert.equal(probe.store.claimCaptureJob(probe.activity, pending.jobId, evolutionBudget, 30000), null);
+      if (relation === 'distinct' || relation === 'supersedes') {
+        assert.equal(visited.size, 2); assert.equal(current.record!.lifecycle, 'active');
+        assert.equal(probe.store.readMemory(probe.activity, active.record!.recordId).lifecycle, relation === 'distinct' ? 'active' : 'superseded');
+        const old = probe.store.inspectMemory(probe.activity, pending.record!.recordId);
+        assert.equal(old.record.lifecycle, 'rejected');
+        assert.equal(JSON.parse(old.history.at(-1)!.payload).corroborates, candidate.record!.recordId);
+        const history = probe.store.inspectMemory(probe.activity, candidate.record!.recordId).history;
+        assert.ok(history.some(event => event.kind === 'corroborate' && JSON.parse(event.payload).source.eventId === pending.source.eventId));
+        const later = verifiedCandidate(probe, '本项目继续约定：' + pending.record!.content);
+        probe.store.promoteMemory(probe.activity, later.record!.recordId, later.record!);
+        let result = probe.store.readCaptureJob(probe.activity, later.jobId);
+        while (result.stage === 'comparing') {
+          const nextLease = probe.store.claimCaptureJob(probe.activity, later.jobId, evolutionBudget, 30000)!;
+          const input = probe.store.captureComparison(nextLease)!;
+          assert.notEqual(input.peer.recordId, pending.record!.recordId);
+          probe.store.pauseCapture(nextLease);
+          result = compareCandidate(probe, later.jobId, input.peer.recordId === candidate.record!.recordId ? 'same-claim' : 'distinct');
+        }
+        assert.equal(result.reason, 'claim-corroborated');
+      } else if (relation === 'same-claim' || relation === 'superseded-by') {
+        assert.equal(current.record!.lifecycle, relation === 'same-claim' ? 'rejected' : 'superseded');
+        assert.deepEqual(probe.store.listEligibleMemories(probe.activity).map(record => record.recordId), [active.record!.recordId]);
+        const old = probe.store.readMemory(probe.activity, pending.record!.recordId);
+        assert.equal(old.lifecycle, pendingFirst ? 'rejected' : 'candidate');
+      } else if (relation === 'conflict') {
+        assert.equal(visited.size, 2); assert.equal(current.reason, 'credible-conflict');
+        const records = [active.record!, pending.record!, candidate.record!].map(record => probe.store.readMemory(probe.activity, record.recordId));
+        assert.ok(records.every(record => record.verification === 'conflicted' && record.conflictSetId === records[0]!.conflictSetId));
+        assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
+      } else {
+        assert.equal(current.stage, 'blocked'); assert.equal(current.record!.lifecycle, 'candidate');
+        assert.deepEqual(probe.store.listEligibleMemories(probe.activity).map(record => record.recordId), [active.record!.recordId]);
+      }
+    } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+  });
+
 for (const firstRelation of ['same-claim','conflict'] as const) test('new evidence extends an existing conflict group with ' + firstRelation + ' first', () => {
   const sandbox = createSandbox();
   let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);

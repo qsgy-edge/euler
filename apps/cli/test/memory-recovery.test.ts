@@ -58,9 +58,10 @@ test(`two real writers compete (${scenario}); each request reconciles only its o
   try {
     const setup = startCli(['memory', '--sandbox', sandbox.root]);
     assert.equal((await setup.exit).code, 0);
-    writers.push(startCli(['memory-worker', '--scenario', scenario, '--sandbox', sandbox.root]),
-      startCli(['memory-worker', '--scenario', scenario, '--sandbox', sandbox.root]));
-    const ready = await Promise.all(writers.map(writer => writer.waitFor('memory-ready')));
+    writers.push(startCli(['memory-worker', '--scenario', scenario, '--sandbox', sandbox.root]));
+    const firstReady = await writers[0]!.waitFor('memory-ready');
+    writers.push(startCli(['memory-worker', '--scenario', scenario, '--sandbox', sandbox.root]));
+    const ready = [firstReady, await writers[1]!.waitFor('memory-ready')];
     assert.deepEqual(ready[0]!.expected, ready[1]!.expected);
     assert.notEqual(ready[0]!.requestHash, ready[1]!.requestHash);
     for (const writer of writers) writer.command('commit');
