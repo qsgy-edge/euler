@@ -81,6 +81,7 @@ export class ProbeSession {
     const current = this.recoverIntent();
     const intent = current ?? this.#store.transitionIntent(this.#activity, null, input, { step: 'first-turn', status: 'active' }, text);
     check(intent.status === 'active', 'intent-not-active');
+    const operationSummaries = this.#store.correctionModelSummaries(this.#activity);
     // The synthetic wire format has no provider hooks or model-generated instruction fields.
     const payload = JSON.stringify({
       schema: 'synthetic-request@1', route: 'local-counting', model: 'none',
@@ -91,6 +92,7 @@ export class ProbeSession {
       intent: { goal: intent.goal, constraints: intent.constraints, step: intent.step, status: intent.status },
       ...(used.length ? { memories: used.map(record => ({ kind: 'untrusted-memory', recordId: record.recordId,
         revisionId: record.revisionId, content: record.content })) } : {}),
+      ...(operationSummaries.length ? { operationSummaries } : {}),
       tools: [],
     });
     // Barrier 1: the frozen assembly (content, route, policy, budget, epoch) is
@@ -138,6 +140,8 @@ export class ProbeSession {
       this.#readIntentSources(current);
       this.#active();
       check(this.#tokens + reserved <= this.#budget.maxTotalTokens, 'context-budget-exhausted');
+      check(JSON.stringify(JSON.parse(prepared.payload).operationSummaries ?? [])
+        === JSON.stringify(this.#store.correctionModelSummaries(this.#activity)), 'operation-summary-stale');
       const attempt = this.#store.startRequestAttempt(this.#activity, { runId: this.runId, assemblyId: prepared.assemblyId,
         payloadHash: prepared.payloadHash, byteLength: Buffer.byteLength(prepared.payload), adapterVersion: API_VERSION });
       return attempt;

@@ -1,3 +1,5 @@
+export { MemoryCorrections, parseCorrectionCommand } from './context/memory-correction.ts';
+export type { CorrectionInput, CorrectionCommand, CorrectionReply } from './context/memory-correction.ts';
 export { AnalysisArtifacts, parseAnalysisArtifact } from './context/analysis-artifacts.ts';
 export type { AnalysisArtifact, AnalysisHeader, ArtifactEvidence, ReportInput, HandoffInput, ExportSelection } from './context/analysis-artifacts.ts';
 export { CaptureRun } from './context/capture-run.ts';

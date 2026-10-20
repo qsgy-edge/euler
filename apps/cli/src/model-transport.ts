@@ -76,7 +76,8 @@ export class HttpModelTransport {
     // Intent is bounded data, never a provider-supplied instruction channel.
     const firstUser = messages.findIndex(message => message.role === 'user');
     if (firstUser >= 0) messages[firstUser] = { ...messages[firstUser],
-      content: JSON.stringify({ input: messages[firstUser]!.content, intent: request.p3.intent }) };
+      content: JSON.stringify({ input: messages[firstUser]!.content, intent: request.p3.intent,
+        ...(request.p1.operationSummaries?.length ? { operationSummaries: request.p1.operationSummaries } : {}) }) };
     return JSON.stringify({ model: this.#model.id, stream: false, max_tokens: this.#budget.outputReserve, messages,
       tools: request.p0.tools.map(tool => ({ type: 'function', function: { name: tool.name.replaceAll('.', '_'), description: tool.description, parameters: tool.parameters } })) });
   }

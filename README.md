@@ -18,6 +18,8 @@ Job-owned capture and independent verification, immutable reports, approved proj
 
 Ordinary project candidates use [promotion, comparison and feedback gates](docs/implementation/t14-memory-evolution.md): fixed activation/Info batches, provenance, supersession, conflict isolation and source/feedback invalidation. Run `npm run evidence:memory-evolution` for retained synthetic observations. Real-provider quality and full cross-mode acceptance remain evidence gaps.
 
+Owner corrections use the actual CLI input, complete previews and live approval before [atomic correction and result recovery](docs/implementation/t15-owner-correction.md). Corrected bodies remain unverified until independent reverification. Run `npm run evidence:memory-correction` for retained CLI/SQLite observations.
+
 Full X-card acceptance, real provider dispatch, production schema/host acceptance, migration, and MC cutover remain unverified. CI and host results must be read from the artifact for the specific implementation and platform; this repository is not production-ready.
 
 - [Euler v1 implementation specification](docs/architecture/issues/15-euler-v1-spec.md)
