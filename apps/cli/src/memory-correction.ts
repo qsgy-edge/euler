@@ -1,5 +1,5 @@
 import { AgentRun, MemoryCorrections, check, parseCorrectionCommand } from '@euler/core';
-import type { CorrectionInput, CorrectionReply, MemoryPresentation } from '@euler/core';
+import type { CorrectionInput, CorrectionReply, MemoryPresentation, ToolCall } from '@euler/core';
 import { configuredTransport, verifyTransportPrerequisites } from './model-transport.ts';
 import { pumpAgent } from './agent-pump.ts';
 import { killPoint } from './kill-point.ts';
@@ -114,8 +114,8 @@ export class CorrectionHost {
     const status = await pumpAgent(run, { stream: transport.stream.bind(transport),
       recoverInfo: () => { store.correctionModelSummaries(activity); return this.#recoverInfo(); },
       execute: async call => {
-        const reply = this.core.handle(input, call);
-        await this.show(reply);
+        const reply = await this.handle(input, text, call);
+        check(reply, 'operation-response-unavailable');
         if (reply.kind !== 'result') return JSON.stringify({ status: reply.kind === 'preview' ? 'pending' : 'inspected',
           token: reply.presentation.token, operationId: reply.presentation.operationId });
         return JSON.stringify({ status: reply.result.status, operationId: reply.result.operationId,
@@ -125,12 +125,12 @@ export class CorrectionHost {
     await emit('memory-model-result', { runId: run.runId, terminal: status.terminal, attempts: status.attempts });
   }
 
-  async handle(input: CorrectionInput, text: string): Promise<void> {
+  async handle(input: CorrectionInput, text: string, intent?: ToolCall): Promise<CorrectionReply | void> {
     const command = parseCorrectionCommand(text);
     try {
-      if (text.startsWith('model ')) { await this.model(input, text); return; }
+      if (text.startsWith('model ') && !intent) { await this.model(input, text); return; }
       if (command?.kind === 'correct') this.#checkpoint('correction-before-record');
-      const reply = this.core.handle(input);
+      const reply = this.core.handle(input, intent);
       if (reply.kind === 'preview') this.#checkpoint('correction-after-record');
       if (reply.kind === 'result' && reply.canonical === 'committed' && command?.kind === 'commit') {
         this.#checkpoint('correction-after-commit');
@@ -141,15 +141,23 @@ export class CorrectionHost {
           receipts: reply.result.receiptIds.map(id => this.#probe.store.readOwnerReceipt(this.#probe.activity, id)) });
       }
       await this.show(reply);
+      return reply;
     }
     catch (error) {
-      // A thrown commit acknowledgement does not tell us whether the transaction committed.
-      if (command?.kind === 'commit') {
-        try { await this.show(this.core.result(command.token)); return; }
-        catch { await emit('memory-result', { status: 'error', canonical: 'unknown', reason: 'operation-reconciliation-required', token: command.token }); return; }
+      // Both input paths reconcile a lost commit acknowledgement against canonical state.
+      if (command?.kind === 'commit' && (!text.startsWith('model ') || intent)) {
+        try {
+          const reply = this.core.result(command.token);
+          await this.show(reply); return reply;
+        } catch {
+          const reply: CorrectionReply = { kind: 'result', result: { status: 'error', operationId: null, receiptIds: [],
+            reason: 'operation-reconciliation-required' }, canonical: 'unknown' };
+          await emit('memory-result', { ...reply.result, canonical: reply.canonical, token: command.token }); return reply;
+        }
       }
-      await emit('memory-result', { status: command?.kind === 'correct' ? 'unavailable' : 'error',
-        canonical: 'unchanged', reason: (error as Error).message });
+      const reply: CorrectionReply = { kind: 'result', result: { status: command?.kind === 'correct' ? 'unavailable' : 'error',
+        operationId: null, receiptIds: [], reason: (error as Error).message }, canonical: 'unchanged' };
+      await emit('memory-result', { ...reply.result, canonical: reply.canonical }); return reply;
     }
   }
 }

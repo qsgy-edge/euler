@@ -26,7 +26,7 @@ export function parseCorrectionCommand(text: string): CorrectionCommand | null {
   if (change) {
     let content: unknown;
     try { content = JSON.parse(change[3]!); } catch { return null; }
-    if (typeof content !== 'string' || Buffer.byteLength(content) > 60000) return null;
+    if (typeof content !== 'string') return null;
     return change[1] === 'correct' ? { kind: 'correct', recordId: change[2]!, content }
       : { kind: 'commit', token: change[2]!, content };
   }
@@ -120,6 +120,8 @@ export class MemoryCorrections {
       if (before.lifecycle === 'tombstoned') return this.#reject('not_actionable', 'tombstoned-not-actionable');
       const normalized = command.content.trim().normalize('NFC');
       if (!normalized || normalized === before.content.trim().normalize('NFC')) return this.#reject('no_op', 'unchanged-content');
+      // Leave room for the token and command inside the Host's 64 KiB input limit, including JSON escapes.
+      if (Buffer.byteLength(JSON.stringify(command.content)) > 60000) return this.#reject('unavailable', 'correction-content-too-large');
       const presentation = this.#store.withActivity(this.#activity, () => {
         const preview = this.#store.previewMemoryOperation(this.#activity, inspected.token,
           { kind: 'correct', input: live.source, content: command.content });

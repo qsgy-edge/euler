@@ -75,6 +75,28 @@ test('investigation, denial, opposing directions and no-op do not create pending
   } finally { f.close(); }
 });
 
+test('all correction forms reject bodies too large for the displayed approval command before creating pending state', () => {
+  const f = fixture();
+  try {
+    for (const content of ['x'.repeat(60001), '"'.repeat(40000)]) {
+      for (const text of [`correct ${f.record.recordId} ${JSON.stringify(content)}`, `把 ${f.record.recordId} 改为「${content}」`]) {
+        // Oversized raw lines fail at source admission; the other form still cannot create a preview.
+        if (Buffer.byteLength(text) > 65536) continue;
+        const reply = f.core.handle(f.core.receive(text));
+        assert.equal(f.status(reply), 'unavailable');
+        assert.equal(reply.kind === 'result' && reply.result.reason, 'correction-content-too-large');
+        assert.deepEqual(f.core.pending(), []);
+      }
+    }
+    const content = 'x'.repeat(59998);
+    const preview = f.core.handle(f.core.receive(`把 ${f.record.recordId} 改为「${content}」`));
+    assert.equal(preview.kind, 'preview');
+    if (preview.kind !== 'preview') throw new Error('preview required');
+    f.core.presented(preview.presentation);
+    assert.equal(f.status(f.core.handle(f.core.receive(`commit ${preview.presentation.token} ${JSON.stringify(content)}`))), 'committed');
+  } finally { f.close(); }
+});
+
 test('old tokens settle independently, new preview explicitly supersedes and cancellation prevents commit', () => {
   const f = fixture();
   try {

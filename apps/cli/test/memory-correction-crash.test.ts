@@ -6,22 +6,10 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { createSandbox } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
-import { startCli } from '../src/process-driver.ts';
+import { startCli, sendCommand as send } from '../src/process-driver.ts';
 import type { Observation } from '../src/process-driver.ts';
 
 type Cli = ReturnType<typeof startCli>;
-async function send(cli: Cli, line: string, event: string) {
-  const count = cli.observations.filter(row => row.event === event).length;
-  cli.command(line);
-  const until = Date.now() + 15000;
-  while (Date.now() < until) {
-    const found = cli.observations.filter(row => row.event === event)[count];
-    if (found) return found;
-    if (cli.observations.some(row => row.event === 'process-exit')) throw new Error(cli.stderr());
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-  throw new Error(`missing ${event}: ${JSON.stringify(cli.observations.slice(-4))}`);
-}
 async function kill(cli: Cli) { cli.child.kill('SIGKILL'); await cli.exit; }
 async function stop(cli: Cli) { cli.command('stop'); assert.equal((await cli.exit).code, 0, cli.stderr()); }
 function seed() {

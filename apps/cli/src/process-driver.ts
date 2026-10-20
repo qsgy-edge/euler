@@ -33,16 +33,16 @@ export function startCli(args: string[], timeoutMs = 15000, cwd?: string, env?: 
   });
   // Kept observed even if a spawn error precedes a caller's explicit exit await.
   void exit.catch(() => {});
-  function waitFor(event: string): Promise<Observation> {
+  function waitFor(event: string, from = 0): Promise<Observation> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => finish(new Error(`observation-timeout: ${event}; ${stderr}`)), timeoutMs);
+      const timer = setTimeout(() => finish(new Error(`observation-timeout: ${event}; ${JSON.stringify(observations.slice(-4))}; ${stderr}`)), timeoutMs);
       function finish(error?: Error, value?: Observation) {
         clearTimeout(timer);
         waiters.delete(check);
         if (error) reject(error); else resolve(value!);
       }
       function check() {
-        const value = observations.find(item => item.event === event);
+        const value = observations.find((item, index) => index >= from && item.event === event);
         if (value) finish(undefined, value);
         else if (failure || exited) finish(failure ?? new Error(`process exited before ${event}: ${stderr}`));
       }
@@ -52,4 +52,10 @@ export function startCli(args: string[], timeoutMs = 15000, cwd?: string, env?: 
   }
   function command(value: string) { child.stdin.write(value + '\n'); }
   return { child, observations, exit, waitFor, command, stderr: () => stderr };
+}
+
+export function sendCommand(cli: ReturnType<typeof startCli>, value: string, event: string): Promise<Observation> {
+  const from = cli.observations.length;
+  cli.command(value);
+  return cli.waitFor(event, from);
 }

@@ -5,5 +5,5 @@
   "supersededDraft": "Synthetic draft A",
   "cancelledDraft": "Synthetic draft B",
   "summaryMaxBytes": 2048,
-  "cases": ["no-op", "supersession", "cancel", "commit", "duplicate", "used-snapshot", "restart-replay", "crash-after-commit"]
+  "cases": ["no-op", "supersession", "cancel", "commit", "duplicate", "used-snapshot", "restart-replay", "crash-after-commit", "buffered-approval"]
 }

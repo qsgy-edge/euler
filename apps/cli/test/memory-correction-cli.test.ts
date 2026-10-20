@@ -4,22 +4,11 @@ import test from 'node:test';
 import { randomUUID } from 'node:crypto';
 import { createSandbox, createSandboxSession, bindingOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
-import { startCli } from '../src/process-driver.ts';
-import type { Observation } from '../src/process-driver.ts';
+import { startCli, sendCommand as send } from '../src/process-driver.ts';
+import { bufferedCorrectionApproval, delayedCorrectionOutput } from './support/memory-correction.ts';
+import correctionFixture from '../../../fixtures/t15-owner-correction.json' with { type: 'json' };
 
 type Cli = ReturnType<typeof startCli>;
-async function send(cli: Cli, line: string, event: string): Promise<Observation> {
-  const previous = cli.observations.filter(row => row.event === event).length;
-  cli.command(line);
-  const end = Date.now() + 15000;
-  while (Date.now() < end) {
-    const rows = cli.observations.filter(row => row.event === event);
-    if (rows.length > previous) return rows[previous]!;
-    assert.equal(cli.observations.some(row => row.event === 'process-exit'), false, cli.stderr());
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-  throw new Error(`missing ${event}: ${JSON.stringify(cli.observations.slice(-4))}; ${cli.stderr()}`);
-}
 async function stop(cli: Cli): Promise<void> {
   cli.command('stop');
   assert.equal((await cli.exit).code, 0, cli.stderr());
@@ -72,6 +61,37 @@ test('the CLI presents the actual correction, accepts fresh text approval and re
   } finally {
     if (!cli.observations.some(row => row.event === 'process-exit')) { cli.child.kill('SIGKILL'); await cli.exit; }
     rmSync(sandbox.root, { recursive: true, force: true });
+  }
+});
+
+test('the actual CLI rejects buffered approval before full output, then accepts a fresh live input', async () => {
+  const sandbox = createSandbox();
+  const output = delayedCorrectionOutput(sandbox);
+  const cli = startCli(['remember', '--sandbox', sandbox.root], undefined, undefined, output.env);
+  const original = correctionFixture.original;
+  const corrected = correctionFixture.corrected;
+  try {
+    await cli.waitFor('remember-ready');
+    const remembered = await send(cli, `记住偏好：${original}`, 'remember-result');
+    const id = String(remembered.recordId);
+    const { preview, early, rejected } = await bufferedCorrectionApproval(cli, sandbox, id, corrected, output);
+    assert.equal(rejected.status, 'unavailable');
+    assert.equal(rejected.reason, 'presentation-before-live-input-required');
+    assert.deepEqual(rejected.receiptIds, []);
+    const inspected = await send(cli, `inspect ${id}`, 'memory-inspect');
+    assert.equal((inspected.targets as { content: string; revision: number }[])[0]!.content, original);
+    assert.equal((inspected.targets as { revision: number }[])[0]!.revision, 1);
+    const committed = await send(cli, `commit ${preview.token} ${JSON.stringify(corrected)}`, 'memory-result');
+    assert.equal(committed.status, 'committed');
+    await stop(cli);
+    const probe = openProbe(sandbox);
+    try {
+      assert.equal(probe.store.readMemory(probe.activity, id).revision, 2);
+      assert.notEqual(probe.store.correctionDelivery(probe.activity, preview.token).approval!.eventId, early.eventId);
+    } finally { probe.close(); }
+  } finally {
+    if (!cli.observations.some(row => row.event === 'process-exit')) { cli.child.kill('SIGKILL'); await cli.exit; }
+    output.close(); rmSync(sandbox.root, { recursive: true, force: true });
   }
 });
 

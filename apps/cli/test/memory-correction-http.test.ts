@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { DEFAULT_BUDGET } from '@euler/core';
 import { startCli } from '../src/process-driver.ts';
@@ -40,8 +41,24 @@ test('the configured CLI HTTP path revalidates model intent and sends only bound
     credentialEnv: 'EULER_CORRECTION_TEST_KEY', contextWindow: 32000, maxTokens: 1024, authorization: 'synthetic-test-only',
     budget: { ...DEFAULT_BUDGET, contextLimit: 32000, maxTotalTokens: 128000, maxModelAttempts: 4, maxToolCalls: 4,
       outputReserve: 1024, wallClockMs: 30000 } }));
+  const preload = join(temp, 'lookup-fault.mjs');
+  writeFileSync(preload, `import { ProbeStore } from ${JSON.stringify(new URL('../../../packages/core/src/store/probe-store.ts', import.meta.url).href)};
+if (process.argv.includes('remember') && process.argv.includes(${JSON.stringify(sandbox.root)})) {
+  const read = ProbeStore.prototype.memoryOperationStatus;
+  let once = true;
+  ProbeStore.prototype.memoryOperationStatus = function(...args) {
+    const result = read.apply(this, args);
+    if (once && result.status === 'committed') {
+      once = false;
+      process.stdout.write(JSON.stringify({event:'correction-lookup-fault',operationId:result.operationId}) + '\\n');
+      throw new Error('injected-post-commit-lookup-failure');
+    }
+    return result;
+  };
+}`);
   const cli = startCli(['remember', '--sandbox', sandbox.root, '--transport-config', config], 60000, undefined,
-    { ...process.env, EULER_CORRECTION_TEST_KEY: 'synthetic' });
+    { ...process.env, EULER_CORRECTION_TEST_KEY: 'synthetic',
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${pathToFileURL(preload).href}` });
   async function completed(index: number) {
     const end = Date.now() + 15000;
     while (Date.now() < end) {
@@ -63,6 +80,8 @@ test('the configured CLI HTTP path revalidates model intent and sends only bound
     token = String(cli.observations.find(row => row.event === 'memory-preview')!.token);
     cli.command(`model commit ${token} "Corrected"`);
     await completed(2);
+    assert.equal(cli.observations.filter(row => row.event === 'correction-lookup-fault').length, 1);
+    assert.equal(cli.observations.filter(row => row.event === 'memory-result').at(-1)!.canonical, 'committed');
     assert.equal(bodies.length, 6);
     const firstUser = bodies[5]!.messages.find(message => message.role === 'user')!;
     const summary = JSON.parse(firstUser.content).operationSummaries[0];

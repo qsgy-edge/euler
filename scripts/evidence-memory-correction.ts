@@ -7,7 +7,8 @@ import { join, relative } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { createSandbox } from '../apps/cli/src/sandbox.ts';
-import { startCli } from '../apps/cli/src/process-driver.ts';
+import { startCli, sendCommand as send } from '../apps/cli/src/process-driver.ts';
+import { bufferedCorrectionApproval, delayedCorrectionOutput } from '../apps/cli/test/support/memory-correction.ts';
 import fixture from '../fixtures/t15-owner-correction.json' with { type: 'json' };
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
@@ -20,27 +21,15 @@ const checks: { id: string; passed: boolean; diagnostic?: string }[] = [];
 const commands: { command: string[]; stdout: string; stderr: string; code: number | null; signal: string | null }[] = [];
 type Cli = ReturnType<typeof startCli>;
 const clients: Cli[] = [];
-function launch(root: string, label: string, scenario?: string) {
+function launch(root: string, label: string, scenario?: string, env?: NodeJS.ProcessEnv) {
   const args = ['remember', '--sandbox', root, ...(scenario ? ['--scenario', scenario] : [])];
-  const cli = startCli(args); clients.push(cli);
+  const cli = startCli(args, undefined, undefined, env); clients.push(cli);
   const stdout: Buffer[] = [], stderr: Buffer[] = [];
   cli.child.stdout.on('data', (data: Buffer) => stdout.push(Buffer.from(data)));
   cli.child.stderr.on('data', (data: Buffer) => stderr.push(Buffer.from(data)));
   const captured = cli.exit.then(exit => { commands.push({ command: [process.execPath, 'apps/cli/src/main.ts', ...args],
     stdout: save(`${label}/stdout.txt`, Buffer.concat(stdout)), stderr: save(`${label}/stderr.txt`, Buffer.concat(stderr)), ...exit }); });
   return { ...cli, captured };
-}
-async function send(cli: Cli, text: string, event: string) {
-  const count = cli.observations.filter(row => row.event === event).length;
-  cli.command(text);
-  const deadline = Date.now() + 15000;
-  while (Date.now() < deadline) {
-    const found = cli.observations.filter(row => row.event === event)[count];
-    if (found) return found;
-    assert.equal(cli.observations.some(row => row.event === 'process-exit'), false, cli.stderr());
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-  throw new Error(`missing ${event}`);
 }
 async function stop(cli: ReturnType<typeof launch>) { cli.command('stop'); assert.equal((await cli.exit).code, 0, cli.stderr()); await cli.captured; }
 function verify(id: string, action: () => void) {
@@ -49,7 +38,7 @@ function verify(id: string, action: () => void) {
 }
 
 // Read SQLite and original archive bytes independently of Store projection/read APIs.
-function validate(root: string, id: string, operationId: string, token: string, receiptIds: unknown) {
+function validate(root: string, id: string, operationId: string, token: string, receiptIds: unknown, earlySource?: string) {
   const lines = readFileSync(join(root, 'session.jsonl'), 'utf8').trimEnd().split('\n');
   const header = JSON.parse(lines.shift()!);
   const sources = lines.map(line => {
@@ -95,6 +84,12 @@ function validate(root: string, id: string, operationId: string, token: string, 
     assert.equal(delivery.model_hash, digest(String(delivery.model_source)));
     const approval = source(String(delivery.approval_source)); assert.equal(approval.role, 'user');
     assert.equal(approval.text, `commit ${token} ${JSON.stringify(fixture.corrected)}`);
+    if (earlySource) {
+      const early = source(earlySource);
+      assert.equal(early.role, 'user'); assert.equal(early.text, approval.text);
+      assert.notEqual(early.eventId, approval.eventId);
+      assert.ok(sources.findIndex(row => row.event.eventId === early.eventId) < sources.findIndex(row => row.event.eventId === approval.eventId));
+    }
     const model = source(String(delivery.model_source)); assert.equal(model.role, 'tool');
     assert.ok(Buffer.byteLength(model.text) <= fixture.summaryMaxBytes);
     const summary = JSON.parse(model.text);
@@ -162,6 +157,34 @@ for (const crash of [false, true]) {
     for (const cli of clients) if (!cli.observations.some(row => row.event === 'process-exit')) { cli.child.kill('SIGKILL'); await cli.exit; }
     cpSync(sandbox.root, join(destination, label, 'raw-sandbox'), { recursive: true });
     rmSync(sandbox.root, { recursive: true, force: true });
+  }
+}
+{
+  const sandbox = createSandbox(), output = delayedCorrectionOutput(sandbox);
+  try {
+    save('buffered/output-delay.mjs', readFileSync(output.preload));
+    const cli = launch(sandbox.root, 'buffered/session', undefined, output.env);
+    await cli.waitFor('remember-ready');
+    const remembered = await send(cli, `记住偏好：${fixture.original}`, 'remember-result');
+    const id = String(remembered.recordId);
+    const { preview, early, rejected } = await bufferedCorrectionApproval(cli, sandbox, id, fixture.corrected, output);
+    save('buffered/early-source.json', JSON.stringify(early, null, 2) + '\n');
+    const before = await send(cli, `inspect ${id}`, 'memory-inspect');
+    const committed = await send(cli, `commit ${preview.token} ${JSON.stringify(fixture.corrected)}`, 'memory-result');
+    await stop(cli);
+    verify('buffered-approval', () => {
+      assert.equal(rejected.status, 'unavailable'); assert.equal(rejected.reason, 'presentation-before-live-input-required');
+      assert.deepEqual(rejected.receiptIds, []);
+      assert.equal((before.targets as { content: string; revision: number }[])[0]!.content, fixture.original);
+      assert.equal((before.targets as { revision: number }[])[0]!.revision, 1);
+      assert.equal(committed.status, 'committed');
+      validate(sandbox.root, id, preview.operationId!, preview.token, committed.receiptIds, JSON.stringify(early));
+    });
+  } catch (error) { checks.push({ id: 'buffered-approval', passed: false, diagnostic: save('buffered/error.txt', (error as Error).stack ?? String(error)) }); }
+  finally {
+    for (const cli of clients) if (!cli.observations.some(row => row.event === 'process-exit')) { cli.child.kill('SIGKILL'); await cli.exit; }
+    cpSync(sandbox.root, join(destination, 'buffered', 'raw-sandbox'), { recursive: true });
+    output.close(); rmSync(sandbox.root, { recursive: true, force: true });
   }
 }
 const artifacts: { path: string; bytes: number; sha256: string }[] = [];
