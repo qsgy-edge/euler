@@ -9,6 +9,8 @@ import { appendDurably } from './archive.ts';
 import { killPoint } from './kill-point.ts';
 import { scheduleCaptures } from './capture.ts';
 import { openProbe } from './probe.ts';
+import { CORRECTION_SCENARIOS, CorrectionHost } from './memory-correction.ts';
+import type { CorrectionInput } from '@euler/core';
 import { OWNER_INFO_FILE } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
 
@@ -352,32 +354,44 @@ function fastLaneInput(text: string): boolean {
   try { return Boolean(parseOwnerAgreement(text)); } catch { return true; }
 }
 
-export interface RememberOptions { hostInfo: 'durable' | 'unavailable'; noActiveProject: boolean; scenario: string; syntheticProposals: boolean; captureConfig?: string }
+export interface RememberOptions { hostInfo: 'durable' | 'unavailable'; noActiveProject: boolean; scenario: string; syntheticProposals: boolean; captureConfig?: string; transportConfig?: string }
 
 export async function runRememberSession(sandbox: Sandbox, options: RememberOptions): Promise<void> {
-  check((OWNER_SCENARIOS as readonly string[]).includes(options.scenario), 'invalid-owner-scenario');
+  check(([...OWNER_SCENARIOS, ...CORRECTION_SCENARIOS] as readonly string[]).includes(options.scenario), 'invalid-owner-scenario');
   const probe = openProbe(sandbox, OWNER_BUDGET, undefined, undefined, undefined, true);
+  let host: OwnerMemoryHost;
+  const corrections = new CorrectionHost(probe, { scenario: options.scenario, recoverInfo: () => host.deliver(),
+    ...(options.transportConfig ? { transportConfig: options.transportConfig } : {}) });
   const lines = createInterface({ input: process.stdin });
+  const liveInputs: (CorrectionInput | null)[] = [];
+  lines.on('line', text => {
+    try { liveInputs.push(corrections.receive(text)); }
+    catch (error) { liveInputs.push(null); emit('memory-result', { status: 'error', canonical: 'unchanged', reason: (error as Error).message }); }
+  });
   const commands = lines[Symbol.asyncIterator]();
   let capture: ReturnType<typeof scheduleCaptures> | undefined;
   try {
     const log = options.hostInfo === 'durable' ? openOwnerInfo(sandbox, probe) : null;
-    const host = new OwnerMemoryHost(probe, log, options.scenario as OwnerScenario, options.noActiveProject);
+    host = new OwnerMemoryHost(probe, log, (OWNER_SCENARIOS as readonly string[]).includes(options.scenario)
+      ? options.scenario as OwnerScenario : 'success', options.noActiveProject);
     capture = scheduleCaptures(probe, options.captureConfig, () => { host.drain(); return host.deliver(); });
     host.backfill();
     host.drain();
     host.deliver();
+    await corrections.recover();
     capture.kick();
     emit('remember-ready', { pid: process.pid, hostInfo: log ? 'durable' : 'unavailable', infoPath: log?.path ?? null,
       ...counts(probe.store.listHostInfo(probe.activity)), syntheticProposals: options.syntheticProposals,
-      commands: [...OWNER_MEMORY_FORMS, ...(options.syntheticProposals ? ['propose <text>'] : []), '同意', '取消', 'info', 'info <batchId>', 'feedback <recordId> <headEventId> helpful|wrong|stale|safety', 'ask <question>', 'stop'] });
+      commands: [...OWNER_MEMORY_FORMS, ...(options.syntheticProposals ? ['propose <text>'] : []), '同意', '取消', 'info', 'info <batchId>', 'feedback <recordId> <headEventId> helpful|wrong|stale|safety', 'ask <question>', 'used <assemblyId> [recordId]', 'source <recordId> [offset]', 'inspect <recordId>', 'correct <recordId> <JSON string>', 'commit <token> <JSON string>', 'cancel <token>', 'replay <token>', 'model <correction command>', 'stop'] });
     const archive = (text: string): SourceAck | null => {
       try { return probe.archive.append(randomUUID(), text); }
       catch (error) { report('live', 'error', 'error', { committed: false, reason: (error as Error).message }); return null; }
     };
     for await (const raw of commands) {
+      const live = liveInputs.shift();
       const line = raw.trim();
       try {
+        if (live) { await corrections.handle(live, raw); continue; }
         if (line === 'stop') break;
         if (line === 'info') { host.listInfo(); continue; }
         if (line.startsWith('info ')) { host.showInfo(line.slice(5).trim()); continue; }
@@ -386,7 +400,22 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
           check(fields.length === 4, 'invalid-memory-feedback');
           host.feedback(fields[1]!, fields[2]!, fields[3]!); continue;
         }
-        if (line.startsWith('ask ')) { host.ask(line.slice(4).trim()); continue; }
+        if (line.startsWith('used ')) {
+          const fields = line.split(/\s+/);
+          check(fields.length === 2 || fields.length === 3, 'invalid-inspect-command');
+          emit('memory-used', probe.store.inspectAssembly(probe.activity, fields[1]!, fields[2])); continue;
+        }
+        if (line.startsWith('source ')) {
+          const fields = line.split(/\s+/);
+          check(fields.length === 2 || fields.length === 3, 'invalid-source-command');
+          const record = probe.store.readMemory(probe.activity, fields[1]!);
+          const page = probe.store.expandSource(probe.activity, { ref: record.source, offset: Number(fields[2] ?? 0), limit: 4096 });
+          emit('memory-source', { recordId: record.recordId, revisionId: record.revisionId, ...page }); continue;
+        }
+        if (line.startsWith('ask ')) {
+          if (!await corrections.deliver()) { emit('ask-refused', { reason: 'operation-presentation-recovery-required' }); continue; }
+          host.ask(line.slice(4).trim()); continue;
+        }
         if (line.startsWith('propose ')) {
           // Synthetic stand-in for a model proposal (no real provider in this slice); off unless explicitly enabled.
           if (!options.syntheticProposals) { emit('command-rejected', { reason: 'synthetic-proposals-disabled' }); continue; }

@@ -1,6 +1,6 @@
 # Capture, independent verification and analysis handoff
 
-Issue: [#13](https://github.com/qsgy-edge/euler/issues/13). This implementation uses disposable schema version 17, synthetic archives and controlled test transport. Ordinary activation uses the [promotion and feedback gates](t14-memory-evolution.md). It has no production migration, MC access or background daemon.
+Issue: [#13](https://github.com/qsgy-edge/euler/issues/13). This implementation uses disposable schema version 18, synthetic archives and controlled test transport. Ordinary activation uses the [promotion and feedback gates](t14-memory-evolution.md). It has no production migration, MC access or background daemon.
 
 ## Run and inspect
 

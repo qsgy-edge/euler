@@ -36,14 +36,20 @@ test('a preview persists its full canonical snapshot, replaces the session pendi
     probe = openProbe(sandbox);
     assert.deepEqual(probe.store.readMemoryPresentation(probe.activity, replacement.token), replacement);
     probe.store.acknowledgeMemoryPresentation(probe.activity, replacement.token, replacement.hash);
-    const result = probe.store.commitMemoryOperation(probe.activity, replacement.token);
+    const result = probe.store.commitMemoryOperation(probe.activity, replacement.token, { reverify: true });
     assert.equal(result.status, 'committed');
     assert.equal(result.receiptIds.length, 1);
     assert.equal(probe.store.readOwnerReceipt(probe.activity, result.receiptIds[0]!).operationId, replacement.operationId);
     assert.equal(probe.store.readMemory(probe.activity, captured.record.recordId).content, 'Corrected fact');
     assert.equal(probe.store.readMemory(probe.activity, captured.record.recordId).headEventId, replacement.updateEventIds[0]);
     assert.deepEqual(probe.store.memoryOperationStatus(probe.activity, replacement.token), result);
+    const jobs = probe.store.listCaptureJobs(probe.activity).filter(job => job.source.eventId === source.eventId);
+    assert.equal(jobs.length, 1);
+    assert.equal(jobs[0]!.record?.recordId, captured.record.recordId);
+    assert.equal(jobs[0]!.stage, 'pending');
+    assert.equal(result.current[0]!.verification, 'unverified');
     assert.equal(probe.store.commitMemoryOperation(probe.activity, replacement.token).status, 'settled');
+    assert.deepEqual(probe.store.listCaptureJobs(probe.activity).filter(job => job.source.eventId === source.eventId), jobs);
     assert.throws(() => probe.session.tool('memory.commit', input), /tool-unavailable/);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });

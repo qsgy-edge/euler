@@ -17,11 +17,12 @@ export interface AgentHost {
   encode?: (request: NeutralRequest) => string;
   source: HostAdapter['source'] & { append(eventId: string, text: string, role?: 'user' | 'assistant' | 'tool'): SourceAck };
   files?: FileCapability;
+  memoryCorrections?: boolean;
 }
 export interface NeutralRequest extends ModelRoute {
   schema: 'euler-model@1';
   p0: { policy: string; tools: ToolSchema[] };
-  p1: Record<string, never>;
+  p1: { operationSummaries?: ReturnType<ProbeStore['correctionModelSummaries']> };
   p2: { inputs: { role: 'user'; content: string }[]; assistant: ModelReply; results: { callId: string; outcome: string; modelResult: string }[] }[];
   p3: { intent: { goal: string; constraints: string[]; step: string }; messages: { role: 'user'; content: string }[] };
 }
@@ -37,7 +38,7 @@ export class AgentRun {
   readonly #host: AgentHost;
   readonly #route: ModelRoute;
   readonly #budget: ProbeBudget;
-  readonly #prepared = new WeakMap<ModelRequest, string>();
+  readonly #prepared = new WeakMap<ModelRequest, { digest: string; summaryHash: string }>();
   #inflight: string | null = null;
   readonly #calls = new Map<string, ToolCall>();
   readonly #executionMode: 'parallel-safe' | 'sequential';
@@ -120,7 +121,7 @@ export class AgentRun {
     this.#event({ kind: 'admitted', eventIds: pending.map(input => input.source.eventId) });
     const sources = state.inputs.filter(input => input.mode === 'steer').map(input => input.source);
     const p0 = { policy: POLICY + (this.#host.files ? ` File capability snapshot: ${sha256(JSON.stringify(this.#host.files))}.` : ''),
-      tools: [...coreToolSchemas(), controlledToolSchema(), ...(this.#host.files ? fileToolSchemas() : [])] };
+      tools: [...coreToolSchemas({ corrections: Boolean(this.#host.memoryCorrections) }), controlledToolSchema(), ...(this.#host.files ? fileToolSchemas() : [])] };
     const ledger = this.#store.requestStatus(this.#activity, this.runId);
     const priorInputs = new Set<string>();
     const p2 = state.responses.map(response => {
@@ -145,7 +146,10 @@ export class AgentRun {
     });
     const p3 = { intent: { goal: intent.goal, constraints: intent.constraints, step: intent.step },
       messages: state.inputs.filter(input => input.mode === 'steer' && !priorInputs.has(input.source.eventId)).map(input => ({ role: 'user' as const, content: this.#host.source.read(input.source).text })) };
-    const neutral: NeutralRequest = { schema: 'euler-model@1', ...this.#route, p0, p1: {}, p2, p3 };
+    const operationSummaries = this.#store.correctionModelSummaries(this.#activity);
+    for (const { delivery } of this.#store.correctionDeliveries(this.#activity)) if (delivery.model) sources.push(delivery.model);
+    const neutral: NeutralRequest = { schema: 'euler-model@1', ...this.#route, p0,
+      p1: operationSummaries.length ? { operationSummaries } : {}, p2, p3 };
     const payload = this.#host.encode ? this.#host.encode(structuredClone(neutral)) : JSON.stringify(neutral);
     const byteLength = Buffer.byteLength(payload);
     const reserved = byteLength + this.#budget.outputReserve + this.#budget.safetyMargin;
@@ -153,22 +157,26 @@ export class AgentRun {
       this.stop(reserved > this.#budget.contextLimit ? 'needs-input' : 'budget-exhausted'); return null;
     }
     const assembly = this.#store.appendRequestAssembly(this.#activity, { runId: this.runId, epoch: this.#activity.epoch,
-      route: JSON.stringify(this.#route), model: this.#route.model, policyHash: this.#host.files ? sha256(JSON.stringify(p0)) : REQUEST_POLICY_HASH, estimator: 'utf8-bytes-upper-bound@1',
+      route: JSON.stringify(this.#route), model: this.#route.model, policyHash: this.#host.files || this.#host.memoryCorrections ? sha256(JSON.stringify(p0)) : REQUEST_POLICY_HASH, estimator: 'utf8-bytes-upper-bound@1',
       sources, intent: { eventId: intent.eventId, hash: intent.hash }, payload, payloadHash: sha256(payload), byteLength,
       estimatedTokens: byteLength, budget: this.#budget, zones: { p0: Buffer.byteLength(JSON.stringify(p0)), p1: 0, p2: 0, p3: byteLength - Buffer.byteLength(JSON.stringify(p0)) },
       selection: sources.map((source, ordinal) => ({ ordinal, hash: source.hash, reason: 'mandatory-source' })), degradation: 'none' });
     this.#event({ kind: 'bound', assemblyId: assembly.assemblyId, eventIds: pending.map(input => input.source.eventId) });
     const request = { assemblyId: assembly.assemblyId, payload, payloadHash: sha256(payload) };
-    this.#prepared.set(request, sha256(JSON.stringify(request)));
+    this.#prepared.set(request, { digest: sha256(JSON.stringify(request)), summaryHash: sha256(JSON.stringify(operationSummaries)) });
     this.#ready = request;
     return request;
   }
   startModel(request: ModelRequest, payload: string): RequestAttempt {
     this.#store.assertDispatchBoundary();
     check(this.#active() && !this.#inflight, 'run-not-admissible');
-    check(this.#prepared.get(request) === sha256(JSON.stringify(request)) && payload === request.payload, 'payload-mismatch');
-    const attempt = this.#store.startRequestAttempt(this.#activity, { runId: this.runId, assemblyId: request.assemblyId,
-      payloadHash: sha256(payload), byteLength: Buffer.byteLength(payload), adapterVersion: API_VERSION });
+    check(this.#prepared.get(request)?.digest === sha256(JSON.stringify(request)) && payload === request.payload, 'payload-mismatch');
+    const attempt = this.#store.withActivity(this.#activity, () => {
+      check(this.#prepared.get(request)?.summaryHash === sha256(JSON.stringify(this.#store.correctionModelSummaries(this.#activity))),
+        'operation-summary-stale');
+      return this.#store.startRequestAttempt(this.#activity, { runId: this.runId, assemblyId: request.assemblyId,
+        payloadHash: sha256(payload), byteLength: Buffer.byteLength(payload), adapterVersion: API_VERSION });
+    });
     this.#prepared.delete(request);
     this.#ready = null;
     this.#inflight = attempt.attemptId;
@@ -260,7 +268,9 @@ export class AgentRun {
       || this.#usageTokens() + 1024 > this.#budget.maxTotalTokens) { this.stop('budget-exhausted'); return null; }
     const call = this.#calls.get(callId);
     check(call, 'unknown-tool-call');
-    if (call.name !== 'controlled.echo') {
+    const correction = this.#host.memoryCorrections && ['memory.inspect', 'memory.preview', 'memory.commit', 'memory.cancel'].includes(call.name);
+    if (correction) this.#store.assertToolAdmission(this.#activity, this.runId);
+    if (call.name !== 'controlled.echo' && !correction) {
       const file = state.files.find(item => item.admission.callId === callId);
       if (!this.#host.files || !file || (call.name === 'file.write' && !file.approved)) {
         this.#result(callId, 'unavailable', 'Tool unavailable or approval missing', 'capability-unavailable'); return null;

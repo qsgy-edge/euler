@@ -279,6 +279,7 @@ async function main() {
     return runRememberSession(sandbox, { hostInfo: args.values['host-info'] as 'durable' | 'unavailable',
       noActiveProject: args.values['no-active-project'], scenario: args.values.scenario,
       syntheticProposals: args.values['synthetic-proposals'],
+      ...(args.values['transport-config'] ? { transportConfig: args.values['transport-config'] } : {}),
       ...(args.values['capture-config'] ? { captureConfig: args.values['capture-config'] } : {}) });
   }
   if (command === 'info') return runInfoQuery(sandbox, args.values.batch);

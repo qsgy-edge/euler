@@ -1,6 +1,6 @@
 # T11: source recovery and actual-used inspection (synthetic)
 
-Issue: [#11](https://github.com/qsgy-edge/euler/issues/11). This slice uses only disposable SQLite and synthetic CLI archives. The disposable schema is version 13; there is no production migration or live owner switch.
+Issue: [#11](https://github.com/qsgy-edge/euler/issues/11). This slice uses only disposable SQLite and synthetic CLI archives. The disposable schema is version 18; there is no production migration or live owner switch.
 
 `ProbeStore.expandSource` verifies the complete archive acknowledgement and original text hash before returning a bounded Unicode-code-point page. `inspectAssembly` returns the frozen source acknowledgements and ordinals; derived source-unit or proposal expansion remains a separate unit lookup and cannot claim assembly membership from a matching raw acknowledgement alone. An unpublished raw ref is readable only in its owning session. `publishSourceUnit` registers a bounded, immutable source/archive range with its real source owner and target project; every project-visible publication requires a separate archived `user`-role decision bound to the originating active intent, source ref, exact range, kind and target project. Repeated publication reconciles by stable request identity. A source unit never changes the archive binding. Its target project can discover only the published range, not follow the returned locator to the mixed original. Reports/handoffs are pre-stored synthetic inputs here; their generation, delivery and export belong to T13.
 

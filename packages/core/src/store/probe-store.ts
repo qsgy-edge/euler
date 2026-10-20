@@ -1,3 +1,4 @@
+import { memoryOperationSummary, parseCorrectionCommand } from '../context/memory-correction.ts';
 import { parseAnalysisArtifact } from '../context/analysis-artifacts.ts';
 import type { ExportSelection } from '../context/analysis-artifacts.ts';
 import { replayAgent } from '../context/agent-state.ts';
@@ -221,7 +222,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=17), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=18), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -503,6 +504,18 @@ CREATE TABLE pending_operations (
   UNIQUE(session_id,operation_id),
   FOREIGN KEY(operation_id,presentation_id) REFERENCES host_presentations(operation_id,presentation_id)
 ) STRICT;
+CREATE TABLE host_operation_delivery (
+  operation_id TEXT PRIMARY KEY REFERENCES pending_operations(operation_id), summary_event_id TEXT NOT NULL UNIQUE,
+  owner_ack INTEGER NOT NULL DEFAULT 0 CHECK(owner_ack IN (0,1)),
+  approval_source TEXT, approval_hash TEXT, model_source TEXT, model_hash TEXT,
+  CHECK((approval_source IS NULL)=(approval_hash IS NULL)), CHECK((model_source IS NULL)=(model_hash IS NULL))
+) STRICT;
+CREATE TRIGGER operation_delivery_monotonic BEFORE UPDATE ON host_operation_delivery
+WHEN NEW.operation_id IS NOT OLD.operation_id OR NEW.summary_event_id IS NOT OLD.summary_event_id OR NEW.owner_ack<OLD.owner_ack
+  OR (OLD.approval_source IS NOT NULL AND (NEW.approval_source IS NOT OLD.approval_source OR NEW.approval_hash IS NOT OLD.approval_hash))
+  OR (OLD.model_source IS NOT NULL AND (NEW.model_source IS NOT OLD.model_source OR NEW.model_hash IS NOT OLD.model_hash))
+BEGIN SELECT RAISE(ABORT,'operation-delivery-monotonic'); END;
+CREATE TRIGGER immutable_operation_delivery_delete BEFORE DELETE ON host_operation_delivery BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER operation_event_target BEFORE INSERT ON memory_events
 WHEN NEW.operation_id IS NOT NULL AND NOT EXISTS (
   SELECT 1 FROM pending_operations o JOIN host_presentations p ON p.presentation_id=o.presentation_id
@@ -661,15 +674,15 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=17;
+PRAGMA user_version=18;
 ` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
-`).join('') + ['memory_heads','intent_heads','owner_fences','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
+`).join('') + ['memory_heads','intent_heads','owner_fences','host_operation_delivery','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
   'verification_runs','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts','host_info_batches','capture_work'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
-`).join('') + ['memory_heads','intent_heads','owner_fences','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts','source_projection_jobs','host_info_batches','capture_work'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
+`).join('') + ['memory_heads','intent_heads','owner_fences','host_operation_delivery','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts','source_projection_jobs','host_info_batches','capture_work'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
 CREATE TRIGGER owned_${table}_${operation.toLowerCase()} BEFORE ${operation} ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
 `)).join('') + `
@@ -732,15 +745,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,17,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,18,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 17, 'unsupported-probe-schema');
+        check(version === 18, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 17 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 18 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -1422,13 +1435,14 @@ export class ProbeStore {
         && new Set(usedMemories.map(item => item.recordId)).size === usedMemories.length, 'invalid-assembly-selection');
       const snapshots = usedMemories.map(use => this.#assemblyMemory(use, true));
       if (input.route === 'local-counting') {
-        let payload: { schema?: string; memories?: unknown; messages?: { role?: string; content?: unknown }[] };
+        let payload: { schema?: string; memories?: unknown; operationSummaries?: unknown; messages?: { role?: string; content?: unknown }[] };
         try { payload = JSON.parse(input.payload) as typeof payload; }
         catch { throw new Error('assembly-payload-mismatch'); }
         check(payload.schema === 'synthetic-request@1' && input.sources.length === 1
           && sameBinding(input.sources[0]!.binding, this.#binding) && Array.isArray(payload.messages)
           && payload.messages.length === 2 && payload.messages[1]?.role === 'user'
           && payload.messages[1].content === this.#archiveRef(input.sources[0]!).text
+          && JSON.stringify(payload.operationSummaries ?? []) === JSON.stringify(this.correctionModelSummaries(activity))
           && JSON.stringify(payload.memories ?? []) === JSON.stringify(
           snapshots.map(record => ({ kind: 'untrusted-memory', recordId: record.recordId,
             revisionId: record.revisionId, content: record.content }))), 'assembly-payload-mismatch');
@@ -1506,6 +1520,7 @@ export class ProbeStore {
       const frozenAssembly = status.assemblies.find(item => item.assemblyId === input.assemblyId);
       check(frozenAssembly && this.#requestIntentCurrent(activity, run, frozenAssembly), 'intent-stale');
       this.#verifyRequestSources([frozenAssembly]);
+      if (run.ownerKind === 'session') this.correctionModelSummaries(activity);
       for (const use of frozenAssembly.usedMemories) this.#assemblyMemory(use, true);
       const assembly = this.#db.prepare('SELECT * FROM request_assemblies WHERE assembly_id=? AND run_id=?')
         .get(input.assemblyId, input.runId);
@@ -2070,7 +2085,7 @@ export class ProbeStore {
   queueMemoryVerification(activity: Activity, recordId: string, expected: MemoryRecord, approval?: SourceAck): CaptureJob {
     return this.withActivity(activity, () => {
       const record = this.#assertMemoryExpected(recordId, expected);
-      check(!['tombstoned','superseded'].includes(record.lifecycle), 'memory-not-eligible');
+      check(record.lifecycle !== 'tombstoned' && (!approval || record.lifecycle !== 'superseded'), 'memory-not-eligible');
       const event = this.#db.prepare('SELECT kind,payload FROM memory_events WHERE event_id=?').get(record.headEventId);
       let source = record.source;
       if (approval) {
@@ -2819,6 +2834,109 @@ export class ProbeStore {
     });
   }
 
+  registerCorrectionDelivery(activity: Activity, token: string) {
+    return this.withActivity(activity, () => {
+      const presentation = this.readMemoryPresentation(activity, token);
+      check(presentation.kind === 'correct' && presentation.operationId, 'correction-token-required');
+      this.#db.prepare('INSERT OR IGNORE INTO host_operation_delivery(operation_id,summary_event_id) VALUES (?,?)')
+        .run(presentation.operationId, randomUUID());
+      return this.correctionDelivery(activity, token);
+    });
+  }
+
+  correctionDelivery(activity: Activity, token: string) {
+    return this.withActivity(activity, () => {
+      const presentation = this.readMemoryPresentation(activity, token);
+      const row = this.#db.prepare('SELECT * FROM host_operation_delivery WHERE operation_id=?').get(presentation.operationId!);
+      check(row, 'operation-delivery-missing');
+      const source = (field: 'approval' | 'model'): SourceAck | null => {
+        if (row[`${field}_source`] === null) return null;
+        const payload = String(row[`${field}_source`]);
+        check(sha256(payload) === row[`${field}_hash`], 'operation-delivery-evidence-gap');
+        const ref = JSON.parse(payload) as SourceAck;
+        check(sameBinding(ref.binding, this.#binding), 'operation-delivery-evidence-gap');
+        this.#archiveRef(ref);
+        return ref;
+      };
+      return { operationId: presentation.operationId!, summaryEventId: String(row.summary_event_id),
+        ownerDelivered: row.owner_ack === 1, approval: source('approval'), model: source('model') };
+    });
+  }
+
+  recordCorrectionApproval(activity: Activity, token: string, input: SourceAck): void {
+    this.withActivity(activity, () => {
+      const presentation = this.readMemoryPresentation(activity, token);
+      const raw = this.#archiveRef(input);
+      const command = parseCorrectionCommand(raw.text);
+      check(raw.role === 'user' && sameBinding(input.binding, this.#binding) && command?.kind === 'commit'
+        && command.token === token && command.content === presentation.content, 'correction-approval-mismatch');
+      const delivery = this.correctionDelivery(activity, token);
+      check(!delivery.approval && this.memoryOperationStatus(activity, token).status === 'pending', 'operation-already-settled');
+      const payload = JSON.stringify(input);
+      this.#db.prepare('UPDATE host_operation_delivery SET approval_source=?,approval_hash=? WHERE operation_id=?')
+        .run(payload, sha256(payload), presentation.operationId!);
+    });
+  }
+
+  acknowledgeCorrectionOwner(activity: Activity, token: string): void {
+    this.withActivity(activity, () => {
+      const result = this.memoryOperationStatus(activity, token);
+      check(result.operationId && result.status !== 'pending' && result.status !== 'invalid_identity', 'operation-not-settled');
+      this.#db.prepare('UPDATE host_operation_delivery SET owner_ack=1 WHERE operation_id=?').run(result.operationId);
+    });
+  }
+
+  correctionVerificationQueued(activity: Activity, token: string): boolean {
+    return this.withActivity(activity, () => {
+      const presentation = this.readMemoryPresentation(activity, token);
+      const result = this.memoryOperationStatus(activity, token);
+      if (presentation.kind !== 'correct' || result.status !== 'committed') return false;
+      const job = this.#db.prepare('SELECT payload,payload_hash FROM capture_jobs WHERE source_owner=? AND source_event_id=?')
+        .get(presentation.input!.binding.sessionId, presentation.input!.eventId);
+      if (!job) return false;
+      check(sha256(String(job.payload)) === job.payload_hash, 'capture-job-integrity');
+      const payload = JSON.parse(String(job.payload));
+      return payload.lane === 'reverification' && payload.recordId === result.current[0]!.recordId
+        && payload.expectedHead === result.current[0]!.headEventId;
+    });
+  }
+
+  correctionSummary(activity: Activity, token: string) {
+    return this.withActivity(activity, () => memoryOperationSummary(this.readMemoryPresentation(activity, token), this.memoryOperationStatus(activity, token)));
+  }
+
+  acknowledgeCorrectionModel(activity: Activity, token: string, source: SourceAck): void {
+    this.withActivity(activity, () => {
+      const delivery = this.correctionDelivery(activity, token);
+      const summary = this.correctionSummary(activity, token);
+      const raw = this.#archiveRef(source);
+      check(delivery.ownerDelivered && source.eventId === delivery.summaryEventId && sameBinding(source.binding, this.#binding)
+        && raw.role === 'tool' && raw.text === JSON.stringify(summary), 'operation-summary-mismatch');
+      const payload = JSON.stringify(source);
+      this.#db.prepare('UPDATE host_operation_delivery SET model_source=?,model_hash=? WHERE operation_id=?')
+        .run(payload, sha256(payload), delivery.operationId);
+    });
+  }
+
+  correctionDeliveries(activity: Activity) {
+    return this.withActivity(activity, () => this.#db.prepare(`SELECT p.token FROM host_operation_delivery d
+      JOIN pending_operations o ON o.operation_id=d.operation_id JOIN host_presentations p ON p.presentation_id=o.presentation_id
+      WHERE p.session_id=? AND p.branch_id=? AND o.state!='pending' ORDER BY p.ordinal`)
+      .all(this.#binding.sessionId, this.#binding.branchId).map(row => {
+        const token = String(row.token);
+        return { token, result: this.memoryOperationStatus(activity, token), delivery: this.correctionDelivery(activity, token) };
+      }));
+  }
+
+  correctionModelSummaries(activity: Activity) {
+    return this.withActivity(activity, () => this.correctionDeliveries(activity).map(({ token, delivery }) => {
+      check(delivery.ownerDelivered && delivery.model, 'operation-presentation-recovery-required');
+      const summary = this.correctionSummary(activity, token);
+      check(this.#archiveRef(delivery.model).text === JSON.stringify(summary), 'operation-summary-mismatch');
+      return summary;
+    }));
+  }
+
   recoverMemoryOperations(activity: Activity) {
     return this.withActivity(activity, () => this.#db.prepare(`SELECT p.token,p.acknowledged FROM pending_operations o
       JOIN host_presentations p ON p.presentation_id=o.presentation_id WHERE p.session_id=? AND p.branch_id=? ORDER BY p.ordinal`)
@@ -2852,7 +2970,7 @@ export class ProbeStore {
 
   // Store transaction seam for the controlled synthetic Host. ProbeSession keeps
   // memory.commit unavailable; this primitive is not an approval signal or UI.
-  commitMemoryOperation(activity: Activity, token: string): MemoryOperationResult {
+  commitMemoryOperation(activity: Activity, token: string, options: { reverify?: boolean } = {}): MemoryOperationResult {
     return this.withActivity(activity, () => {
       const status = this.memoryOperationStatus(activity, token);
       if (status.status === 'invalid_identity') return status;
@@ -2872,7 +2990,11 @@ export class ProbeStore {
           this.#committingOperation = presentation.operationId;
           try {
             const changed = current.map((target, index) => {
-              if (presentation.kind === 'correct') return this.correctMemory(activity, target.recordId, target, presentation.input!, presentation.content!);
+              if (presentation.kind === 'correct') {
+                const changed = this.correctMemory(activity, target.recordId, target, presentation.input!, presentation.content!);
+                if (options.reverify && changed.status === 'committed') this.queueMemoryVerification(activity, target.recordId, changed.record);
+                return changed;
+              }
               if (presentation.kind === 'forget') return this.forgetMemory(activity, target.recordId, target);
               if (presentation.kind === 'restore') return this.restoreMemory(activity, target.recordId, target);
               check(presentation.kind === 'rollback', 'invalid-memory-operation');
