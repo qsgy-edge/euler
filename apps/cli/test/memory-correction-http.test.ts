@@ -12,7 +12,9 @@ import { startCli } from '../src/process-driver.ts';
 import { createSandbox } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 
-test('the configured CLI HTTP path revalidates model intent and sends only bounded terminal summaries', async () => {
+const prerequisiteFixture = new URL('./support/capture-prerequisite-fixture.mjs', import.meta.url).href;
+
+for (const prerequisite of ['accept', 'reject'] as const) test(`the configured CLI HTTP path revalidates model intent and sends only bounded terminal summaries: ${prerequisite}`, async () => {
   const sandbox = createSandbox();
   const temp = mkdtempSync(join(tmpdir(), 'euler-correction-http-'));
   let probe = openProbe(sandbox);
@@ -57,8 +59,8 @@ if (process.argv.includes('remember') && process.argv.includes(${JSON.stringify(
   };
 }`);
   const cli = startCli(['remember', '--sandbox', sandbox.root, '--transport-config', config], 60000, undefined,
-    { ...process.env, EULER_CORRECTION_TEST_KEY: 'synthetic',
-      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${pathToFileURL(preload).href}` });
+    { ...process.env, EULER_CORRECTION_TEST_KEY: 'synthetic', T13_PREREQUISITE_FIXTURE: prerequisite,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${prerequisiteFixture} --import=${pathToFileURL(preload).href}` });
   async function completed(index: number) {
     const end = Date.now() + 15000;
     while (Date.now() < end) {
@@ -71,7 +73,20 @@ if (process.argv.includes('remember') && process.argv.includes(${JSON.stringify(
   try {
     await cli.waitFor('remember-ready');
     cli.command(`model 帮我判断是否应该纠正 ${record.recordId}？`);
-    const gate = await cli.waitFor('correction-prerequisites'); assert.equal(gate.passed, true);
+    const gate = await cli.waitFor('correction-prerequisites');
+    assert.equal(gate.passed, prerequisite === 'accept');
+    assert.match((gate.command as string[]).join(' '), /correction-prerequisite-fixture/);
+    if (prerequisite === 'reject') {
+      assert.equal((await cli.waitFor('memory-result')).reason, 'prerequisite-evidence-gap');
+      cli.command('stop'); assert.equal((await cli.exit).code, 0, cli.stderr());
+      assert.equal(bodies.length, 0);
+      probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+      try {
+        assert.equal(probe.store.readMemory(probe.activity, record.recordId).revision, 1);
+        assert.equal(probe.store.recoverMemoryOperations(probe.activity).length, 0);
+      } finally { probe.close(); }
+      return;
+    }
     await completed(0);
     assert.equal(cli.observations.find(row => row.event === 'memory-result')!.status, 'not_actionable');
     assert.equal(cli.observations.filter(row => row.event === 'memory-preview').length, 0);
