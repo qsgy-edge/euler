@@ -198,7 +198,7 @@ const receipt = { schema: 'owner-correction-evidence@1', startedAt, endedAt: new
   dirty: execFileSync('git', ['status', '--porcelain'], { cwd: repo, encoding: 'utf8' }).trim().length > 0,
   environment: { platform: platform(), release: release(), arch: arch(), node: process.version },
   fixtureDigest: digest(readFileSync(join(repo, 'fixtures/t15-owner-correction.json'))), commands, checks, artifacts,
-  gaps: ['actual-provider-semantic-quality', 'other-platforms-require-their-own-receipts', 'non-cli-host-integration', 'production-data-and-migration'] };
+  gaps: ['actual-provider-semantic-quality', 'long-session-correction-summary-compaction', 'other-platforms-require-their-own-receipts', 'non-cli-host-integration', 'production-data-and-migration'] };
 save('receipt.json', JSON.stringify(receipt, null, 2) + '\n');
 console.log(JSON.stringify({ evidence: destination, result: receipt.result, syntheticPassed: passed, checks: checks.length }));
 if (!passed) process.exitCode = 1;

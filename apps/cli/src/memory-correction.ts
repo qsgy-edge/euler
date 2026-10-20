@@ -21,7 +21,7 @@ export class CorrectionHost {
   readonly #recoverInfo: () => boolean;
   #configured: ReturnType<typeof configuredTransport> | null = null;
   #run: AgentRun | null = null;
-  #stopped = false;
+  readonly #setupAbort = new AbortController();
   constructor(probe: ReturnType<typeof openProbe>, options: { scenario?: string; transportConfig?: string; recoverInfo?: () => boolean } = {}) {
     this.#probe = probe; this.#scenario = options.scenario ?? 'success'; this.#transportConfig = options.transportConfig;
     this.#recoverInfo = options.recoverInfo ?? (() => true);
@@ -32,7 +32,7 @@ export class CorrectionHost {
   }
 
   receive(text: string): CorrectionInput | null {
-    if (text.trim() === 'stop') { this.#stopped = true; this.#run?.cancel(); return null; }
+    if (text.trim() === 'stop') { this.#setupAbort.abort(); this.#run?.cancel(); return null; }
     return /^(inspect|correct|commit|cancel|replay|model)(?: |$)/.test(text.trim()) || /^(把 |不要|别|是否|帮我判断|恢复被|撤销彻底|do not |don't )/i.test(text)
       ? this.core.receive(text) : null;
   }
@@ -98,7 +98,11 @@ export class CorrectionHost {
     if (!await this.deliver() || !this.#recoverInfo()) return;
     if (!this.#configured) {
       const configured = configuredTransport(this.#transportConfig);
-      await verifyTransportPrerequisites(['memory-correction'], 'correction-prerequisites');
+      try { await verifyTransportPrerequisites(['memory-correction'], 'correction-prerequisites', this.#setupAbort.signal); }
+      catch (error) {
+        if (!this.#setupAbort.signal.aborted) throw error;
+        await emit('memory-model-cancelled', { sends: 0, reason: 'owner-stopped-before-send' }); return;
+      }
       this.#configured = configured;
     }
     const { transport, model, authNamespace, budget } = this.#configured;
@@ -110,7 +114,7 @@ export class CorrectionHost {
       { provider: model.provider, model: model.id, route: model.baseUrl, authNamespace }, budget);
     run.receive(input.eventId, text);
     this.#run = run;
-    if (this.#stopped) run.cancel();
+    if (this.#setupAbort.signal.aborted) run.cancel();
     const status = await pumpAgent(run, { stream: transport.stream.bind(transport),
       recoverInfo: () => { store.correctionModelSummaries(activity); return this.#recoverInfo(); },
       execute: async call => {

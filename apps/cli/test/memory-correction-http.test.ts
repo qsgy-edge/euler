@@ -112,3 +112,53 @@ if (process.argv.includes('remember') && process.argv.includes(${JSON.stringify(
     rmSync(temp, { recursive: true, force: true }); rmSync(sandbox.root, { recursive: true, force: true });
   }
 });
+
+test('stop aborts the first model prerequisite process and sends no HTTP request', async () => {
+  const sandbox = createSandbox(), temp = mkdtempSync(join(tmpdir(), 'euler-correction-setup-'));
+  let sends = 0;
+  const server = createServer((_request, response) => { sends++; response.end('{}'); });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const config = join(temp, 'transport.json'), preload = join(temp, 'setup.mjs');
+  writeFileSync(config, JSON.stringify({ provider: 'fixture', model: 'setup-fixture',
+    baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}/v1`, authNamespace: 'synthetic-test',
+    credentialEnv: 'EULER_CORRECTION_TEST_KEY', contextWindow: 32000, maxTokens: 1024, authorization: 'synthetic-test-only',
+    budget: { ...DEFAULT_BUDGET, contextLimit: 32000, maxTotalTokens: 128000, outputReserve: 1024, wallClockMs: 30000 } }));
+  writeFileSync(preload, `import cp from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+if (process.argv.includes('remember') && process.argv.includes(${JSON.stringify(sandbox.root)})) {
+  const execFile = cp.execFile;
+  cp.execFile = (file, args, ...rest) => {
+    if (file === process.execPath && args?.includes('apps/cli/test/memory-correction.test.ts')) {
+      args.splice(0, args.length, '-e', 'setInterval(() => {}, 1000)');
+      const child = execFile(file, args, ...rest);
+      process.stdout.write(JSON.stringify({event:'correction-setup-held',pid:child.pid}) + '\\n');
+      child.once('close', () => process.stdout.write(JSON.stringify({event:'correction-setup-exited',pid:child.pid}) + '\\n'));
+      return child;
+    }
+    return execFile(file, args, ...rest);
+  };
+  syncBuiltinESMExports();
+}`);
+  const cli = startCli(['remember', '--sandbox', sandbox.root, '--transport-config', config], 15000, undefined,
+    { ...process.env, EULER_CORRECTION_TEST_KEY: 'synthetic', NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${pathToFileURL(preload).href}` });
+  let heldPid: number | undefined;
+  try {
+    await cli.waitFor('remember-ready');
+    cli.command(`model inspect ${randomUUID()}`);
+    heldPid = Number((await cli.waitFor('correction-setup-held')).pid);
+    cli.command('stop');
+    const exit = await Promise.race([cli.exit, new Promise<null>(resolve => { const timer = setTimeout(() => resolve(null), 3000); timer.unref(); })]);
+    assert.ok(exit, 'stop must terminate the prerequisite child without waiting for its timeout');
+    assert.equal(exit.code, 0, cli.stderr());
+    assert.ok(cli.observations.some(row => row.event === 'correction-setup-exited' && row.pid === heldPid));
+    assert.ok(cli.observations.some(row => row.event === 'memory-model-cancelled' && row.sends === 0));
+    assert.equal(sends, 0);
+  } finally {
+    if (heldPid && !cli.observations.some(row => row.event === 'correction-setup-exited')) {
+      try { process.kill(heldPid, 'SIGKILL'); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+    }
+    if (!cli.observations.some(row => row.event === 'process-exit')) { cli.child.kill('SIGKILL'); await cli.exit; }
+    server.closeAllConnections(); server.close(); await once(server, 'close');
+    rmSync(temp, { recursive: true, force: true }); rmSync(sandbox.root, { recursive: true, force: true });
+  }
+});
