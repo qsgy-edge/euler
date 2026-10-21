@@ -4,7 +4,69 @@ import { rmSync } from 'node:fs';
 import test from 'node:test';
 import { bindingOf, createSandbox, createSandboxSession } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
-import { compareCandidate, verifiedCandidate } from './support/memory-evolution.ts';
+import { compareCandidate, evolutionBudget, verifiedCandidate } from './support/memory-evolution.ts';
+
+for (const content of ['本项目使用 pnpm', '  本项目使用 pnpm  ', '本项目命名使用 cafe\u0301'])
+test('a reverified correction is the canonical active claim before and after forget: ' + JSON.stringify(content), () => {
+  const sandbox = createSandbox(), probe = openProbe(sandbox);
+  try {
+    const initial = probe.store.rememberMemory(probe.activity, {
+      input: probe.archive.append(randomUUID(), '记住偏好：本项目使用 npm'), hostInfo: 'durable' }).record;
+    const corrected = probe.store.correctMemory(probe.activity, initial.recordId, initial,
+      probe.archive.append(randomUUID(), '本项目更正为：' + content), content).record;
+    const job = probe.store.queueMemoryVerification(probe.activity, corrected.recordId, corrected);
+    const lease = probe.store.claimCaptureJob(probe.activity, job.jobId, evolutionBudget, 30000)!;
+    probe.store.searchCaptureSources(lease, '本项目');
+    for (const ref of job.range) probe.store.expandCaptureSource(lease, { ref, offset: 0, limit: 4096 });
+    const verified = probe.store.completeCaptureVerification(lease, { result: 'pass', evidence: job.range }).record!;
+    const active = probe.store.promoteMemory(probe.activity, verified.recordId, verified).record;
+    assert.equal(active.lifecycle, 'active');
+    const repeated = probe.store.rememberMemory(probe.activity, {
+      input: probe.archive.append(randomUUID(), '记住偏好：' + content.trim().normalize('NFC')), hostInfo: 'durable' });
+    assert.equal(repeated.status, 'no_op');
+    assert.equal(repeated.record.recordId, initial.recordId);
+    assert.equal(repeated.reason, 'claim-already-active');
+    probe.store.forgetMemory(probe.activity, active.recordId, active);
+    probe.store.drainSearchProjection(probe.activity);
+    const page = probe.store.searchMemories(probe.activity, { query: '本项目' });
+    assert.equal(page.status, 'ready');
+    assert.deepEqual(page.results, []);
+    assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('direct capture retains a later-period fact as an unverified candidate without reopening the forgotten interval', t => {
+  const sandbox = createSandbox(), probe = openProbe(sandbox);
+  try {
+    const now = Date.now(); t.mock.timers.enable({ apis: ['Date'], now });
+    const split = new Date(now + 1000).toISOString();
+    const options = { type: 'fact' as const, scope: { kind: 'project' as const, id: sandbox.fixture.projectId, resolved: true },
+      claimKey: 'synthetic/resource', appliesTo: [], validFrom: new Date(now - 1000).toISOString(), validUntil: split };
+    const input = probe.archive.append(randomUUID(), '本项目合成资源状态为 A');
+    const captured = probe.store.captureMemory(probe.activity, input, '本项目合成资源状态为 A', options).record;
+    const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [input]).record;
+    const active = probe.store.activateMemory(probe.activity, verified.recordId, verified).record;
+    const forgotten = probe.store.forgetMemory(probe.activity, active.recordId, active).record;
+    t.mock.timers.tick(1001);
+    const nextInput = probe.archive.append(randomUUID(), '本项目合成资源状态为 A');
+    const nextOptions = { ...options, validFrom: split, validUntil: new Date(now + 2000).toISOString() };
+    const next = probe.store.captureMemory(probe.activity, nextInput, active.content, nextOptions);
+    assert.equal(next.status, 'committed');
+    assert.notEqual(next.record.recordId, forgotten.recordId);
+    assert.equal(next.record.lifecycle, 'candidate'); assert.equal(next.record.verification, 'unverified');
+    assert.deepEqual(probe.store.captureMemory(probe.activity, nextInput, active.content, nextOptions).record, next.record);
+    const overlapping = probe.store.captureMemory(probe.activity, probe.archive.append(randomUUID(), '旧区间重复导入'), active.content,
+      { ...nextOptions, validFrom: new Date(now).toISOString() });
+    assert.equal(overlapping.status, 'no_op'); assert.equal(overlapping.record.recordId, forgotten.recordId);
+    const approval = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-reverification-approval@1',
+      recordId: next.record.recordId, revisionId: next.record.revisionId, headEventId: next.record.headEventId, sourceHash: nextInput.hash }));
+    const queued = probe.store.queueMemoryVerification(probe.activity, next.record.recordId, next.record, approval);
+    assert.equal(queued.record!.recordId, next.record.recordId);
+    assert.equal(queued.stage, 'pending');
+    assert.equal(probe.store.readMemory(probe.activity, forgotten.recordId).headEventId, forgotten.headEventId);
+    assert.deepEqual(probe.store.listEligibleMemories(probe.activity), []);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
 
 for (const origin of ['correction', 'cross-session-correction', 'corroboration'] as const)
 test(`forget freezes the current claim and established source lineages: ${origin}`, () => {

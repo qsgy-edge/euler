@@ -2016,7 +2016,9 @@ export class ProbeStore {
         return { status: 'no_op', record, eventId: null };
       }
       const suppressed = this.#suppressed(claimKey, [input], scope, appliesTo);
-      if (suppressed) return { status: 'no_op', record: suppressed, eventId: null };
+      if (suppressed && !laterFactPeriod({ type: options.type, validFrom }, suppressed)) {
+        return { status: 'no_op', record: suppressed, eventId: null };
+      }
       const recordId = randomUUID();
       const revisionId = randomUUID();
       const eventId = randomUUID();
@@ -2270,7 +2272,7 @@ export class ProbeStore {
       const claimKey = proposal.content.trim().normalize('NFC');
       check(claimKey.length > 0, 'invalid-capture-proposal');
       const suppressed = this.#suppressed(claimKey, job.range, job.scope, appliesTo);
-      if (suppressed && !(suppressed.lifecycle === 'tombstoned' && laterFactPeriod({ type: proposal.type, validFrom }, suppressed))) {
+      if (suppressed && !laterFactPeriod({ type: proposal.type, validFrom }, suppressed)) {
         this.#db.prepare("UPDATE capture_work SET stage='blocked',reason='memory-suppressed',lease_token=NULL,lease_activity=NULL WHERE job_id=?").run(job.jobId);
         return this.#captureJob(job.jobId);
       }
@@ -4726,12 +4728,14 @@ export class ProbeStore {
       evidence: JSON.parse(String(row.evidence_json)) as SourceAck[] };
   }
   #activeClaim(claimKey: string, statement: OwnerMemoryStatement, scope: MemoryScope, exclude: string | null): MemoryRecord | null {
-    const rows = this.#db.prepare(`SELECT h.record_id FROM memory_heads h JOIN memory_records r ON r.record_id=h.record_id
-      WHERE r.owner_id=? AND r.claim_key=? AND h.lifecycle='active' AND h.scope_kind=? AND h.scope_id=? AND h.record_id IS NOT ?`)
-      .all(this.#binding.ownerId, claimKey, scope.kind, scope.id, exclude);
+    const rows = this.#db.prepare(`SELECT h.record_id,v.content FROM memory_heads h JOIN memory_records r ON r.record_id=h.record_id
+      JOIN memory_revisions v ON v.revision_id=h.revision_id
+      WHERE r.owner_id=? AND v.type=? AND h.lifecycle='active' AND h.scope_kind=? AND h.scope_id=? AND h.record_id IS NOT ?`)
+      .all(this.#binding.ownerId, statement.type, scope.kind, scope.id, exclude);
     for (const row of rows) {
+      if (String(row.content).trim().normalize('NFC') !== claimKey) continue;
       const record = this.#readMemoryUnsafe(String(row.record_id));
-      if (record.type === statement.type && record.content === statement.content && record.appliesTo.length === 0) return record;
+      if (record.type === statement.type && record.content.trim().normalize('NFC') === claimKey && record.appliesTo.length === 0) return record;
     }
     return null;
   }
