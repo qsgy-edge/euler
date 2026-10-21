@@ -19,7 +19,8 @@
     "evidence:owner-memory": "node scripts/evidence-owner-memory.ts",
     "evidence:capture": "node scripts/evidence-capture.ts",
     "evidence:memory-evolution": "node scripts/evidence-memory-evolution.ts",
-    "evidence:memory-correction": "node scripts/evidence-memory-correction.ts"
+    "evidence:memory-correction": "node scripts/evidence-memory-correction.ts",
+    "evidence:memory-forget": "node scripts/evidence-memory-forget.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -6,8 +6,10 @@ import type { ToolCall } from './agent-state.ts';
 
 export interface CorrectionInput { readonly eventId: string }
 export type CorrectionCommand = { kind: 'inspect'; recordId: string }
+  | { kind: 'forget'; recordId: string } | { kind: 'restore'; recordId: string }
   | { kind: 'correct'; recordId: string; content: string }
   | { kind: 'commit'; token: string; content: string }
+  | { kind: 'commit'; token: string; operation: 'forget' | 'restore' }
   | { kind: 'cancel'; token: string } | { kind: 'replay'; token: string };
 export type CorrectionReply = { kind: 'inspect' | 'preview'; presentation: MemoryPresentation }
   | { kind: 'result'; result: MemoryOperationResult; canonical: 'committed' | 'unchanged' | 'unknown';
@@ -19,9 +21,11 @@ const identity = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 /** A small, explicit input grammar. Open language is a request to restate, never mutation authority. */
 export function parseCorrectionCommand(text: string): CorrectionCommand | null {
   if (text.startsWith('model ')) text = text.slice(6);
-  const simple = new RegExp(`^(inspect|cancel|replay) (${identity})$`).exec(text.trim());
-  if (simple) return simple[1] === 'inspect' ? { kind: 'inspect', recordId: simple[2]! }
-    : { kind: simple[1] as 'cancel' | 'replay', token: simple[2]! };
+  const simple = new RegExp(`^(inspect|forget|restore|cancel|replay) (${identity})$`).exec(text.trim());
+  if (simple) return simple[1] === 'cancel' || simple[1] === 'replay' ? { kind: simple[1], token: simple[2]! }
+    : { kind: simple[1] as 'inspect' | 'forget' | 'restore', recordId: simple[2]! };
+  const approval = new RegExp(`^commit (${identity}) (forget|restore)$`).exec(text.trim());
+  if (approval) return { kind: 'commit', token: approval[1]!, operation: approval[2] as 'forget' | 'restore' };
   const change = new RegExp(`^(correct|commit) (${identity}) ([\\s\\S]+)$`).exec(text.trim());
   if (change) {
     let content: unknown;
@@ -35,14 +39,24 @@ export function parseCorrectionCommand(text: string): CorrectionCommand | null {
   return chinese ? { kind: 'correct', recordId: chinese[1]!, content: chinese[2]! } : null;
 }
 
+export function isLiveMemoryOperation(kind: MemoryPresentation['kind']): boolean {
+  return kind === 'correct' || kind === 'forget' || kind === 'restore';
+}
+
+export function matchesMemoryApproval(command: CorrectionCommand | null, presentation: MemoryPresentation): boolean {
+  return command?.kind === 'commit' && command.token === presentation.token
+    && ('operation' in command ? command.operation === presentation.kind && presentation.content === null
+      : presentation.kind === 'correct' && command.content === presentation.content);
+}
+
 export const MEMORY_SUMMARY_MAX_BYTES = 2048;
 /** Versioned model plane: identifiers and terminal state only; never canonical body, source or owner receipt. */
 export function memoryOperationSummary(presentation: MemoryPresentation, result: MemoryOperationResult) {
-  check(presentation.kind === 'correct' && result.operationId === presentation.operationId
+  check(isLiveMemoryOperation(presentation.kind) && result.operationId === presentation.operationId
     && result.status !== 'pending' && result.status !== 'invalid_identity', 'operation-not-settled');
   const records = (result.current.length ? result.current : result.expected).map(record => ({ recordId: record.recordId,
     revisionId: record.revisionId, revision: record.revision, lifecycle: record.lifecycle, verification: record.verification }));
-  const summary = { schema: 'memory-operation-summary@1', operationId: result.operationId, kind: 'correct',
+  const summary = { schema: 'memory-operation-summary@1', operationId: result.operationId, kind: presentation.kind,
     status: result.status, records, reason: result.reason && /^[a-z][a-z0-9-]{0,80}$/.test(result.reason) ? result.reason
       : result.reason ? 'operation-failed' : null };
   check(Buffer.byteLength(JSON.stringify(summary)) <= MEMORY_SUMMARY_MAX_BYTES, 'operation-summary-limit');
@@ -76,12 +90,12 @@ export class MemoryCorrections {
 
   pending(): MemoryPresentation[] {
     return this.#store.recoverMemoryOperations(this.#activity)
-      .filter(item => item.presentation.kind === 'correct' && item.result.status === 'pending').map(item => item.presentation);
+      .filter(item => isLiveMemoryOperation(item.presentation.kind) && item.result.status === 'pending').map(item => item.presentation);
   }
 
   result(token: string, settled = false): CorrectionReply {
     const result = this.#store.memoryOperationStatus(this.#activity, token);
-    if (result.status !== 'invalid_identity' && this.#store.readMemoryPresentation(this.#activity, token).kind !== 'correct') {
+    if (result.status !== 'invalid_identity' && !isLiveMemoryOperation(this.#store.readMemoryPresentation(this.#activity, token).kind)) {
       return this.#reject('invalid_identity', 'correction-token-required');
     }
     return { kind: 'result', result: settled && result.status !== 'pending' && result.status !== 'invalid_identity'
@@ -130,16 +144,28 @@ export class MemoryCorrections {
       });
       return { kind: 'preview', presentation };
     }
+    if (kind === 'forget' || kind === 'restore') {
+      const inspected = this.#store.inspectMemoryPresentation(this.#activity, [command.recordId]);
+      if (inspected.targets[0]!.lifecycle !== (kind === 'forget' ? 'active' : 'tombstoned')) {
+        return this.#reject('not_actionable', 'memory-not-actionable');
+      }
+      const presentation = this.#store.withActivity(this.#activity, () => {
+        const preview = this.#store.previewMemoryOperation(this.#activity, inspected.token, { kind });
+        this.#store.registerCorrectionDelivery(this.#activity, preview.token);
+        return preview;
+      });
+      return { kind: 'preview', presentation };
+    }
     const status = this.#store.memoryOperationStatus(this.#activity, command.token);
     if (status.status !== 'pending') return this.result(command.token, true);
     const presentation = this.#store.readMemoryPresentation(this.#activity, command.token);
-    if (presentation.kind !== 'correct') return this.#reject('invalid_identity', 'correction-token-required');
+    if (!isLiveMemoryOperation(presentation.kind)) return this.#reject('invalid_identity', 'correction-token-required');
     if (kind === 'cancel') {
       const result = this.#store.cancelMemoryOperation(this.#activity, command.token);
       return { kind: 'result', result, canonical: 'unchanged' };
     }
+    if (!matchesMemoryApproval(command, presentation)) return this.#reject('invalid_identity', 'submitted-content-mismatch');
     if (!live.tokens.has(command.token)) return this.#reject('unavailable', 'presentation-before-live-input-required');
-    if (command.content !== presentation.content) return this.#reject('invalid_identity', 'submitted-content-mismatch');
     // No source scan can create this live capability. A fresh event carries the actual text and opaque token.
     this.#live.delete(input);
     this.#store.withActivity(this.#activity, () => {
@@ -152,7 +178,10 @@ export class MemoryCorrections {
   #matches(command: CorrectionCommand, intent: ToolCall): boolean {
     const expected = command.kind === 'inspect' ? { name: 'memory.inspect', arguments: { recordId: command.recordId } }
       : command.kind === 'correct' ? { name: 'memory.preview', arguments: { recordId: command.recordId, content: command.content } }
-      : command.kind === 'commit' ? { name: 'memory.commit', arguments: { token: command.token, content: command.content } }
+      : command.kind === 'forget' || command.kind === 'restore'
+        ? { name: 'memory.preview', arguments: { recordId: command.recordId, operation: command.kind } }
+      : command.kind === 'commit' ? { name: 'memory.commit', arguments: 'operation' in command
+        ? { token: command.token, operation: command.operation } : { token: command.token, content: command.content } }
       : { name: command.kind === 'cancel' ? 'memory.cancel' : 'memory.status', arguments: { token: command.token } };
     return intent.name === expected.name && Object.keys(intent.arguments).sort().join(',') === Object.keys(expected.arguments).sort().join(',')
       && Object.entries(expected.arguments).every(([key, value]) => intent.arguments[key] === value);

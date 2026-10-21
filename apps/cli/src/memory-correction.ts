@@ -33,16 +33,21 @@ export class CorrectionHost {
 
   receive(text: string): CorrectionInput | null {
     if (text.trim() === 'stop') { this.#setupAbort.abort(); this.#run?.cancel(); return null; }
-    return /^(inspect|correct|commit|cancel|replay|model)(?: |$)/.test(text.trim()) || /^(把 |不要|别|是否|帮我判断|恢复被|撤销彻底|do not |don't )/i.test(text)
+    return /^(inspect|correct|forget|restore|commit|cancel|replay|model)(?: |$)/.test(text.trim()) || /^(把 |不要|别|是否|帮我判断|恢复被|撤销彻底|do not |don't )/i.test(text)
       ? this.core.receive(text) : null;
   }
 
   async present(presentation: MemoryPresentation, kind: 'inspect' | 'preview'): Promise<void> {
     if (kind === 'preview' && this.#scenario === 'correction-preview-unavailable') throw new Error('injected-presentation-unavailable');
     await emit(`memory-${kind}`, { ...presentation,
-      ...(kind === 'preview' ? { diff: { before: presentation.targets[0]!.content, after: presentation.content },
-        status: 'pending', note: '预览时 canonical 内容；提交后保留 lifecycle，新正文先标 unverified 并排入复验。',
-        command: `commit ${presentation.token} ${JSON.stringify(presentation.content)}`, cancel: `cancel ${presentation.token}` } : {}) });
+      ...(kind === 'preview' ? {
+        ...(presentation.kind === 'correct' ? { diff: { before: presentation.targets[0]!.content, after: presentation.content } } : {}),
+        status: 'pending', note: presentation.kind === 'forget'
+          ? '批准后停止正常检索与注入；保留历史，同源内容保持抑制，恢复需另行预览和批准。'
+          : presentation.kind === 'restore' ? '单独批准恢复此记忆；提交时重验来源、scope、有效期、验证状态和当前 head，合格后恢复检索与注入。'
+          : '预览时 canonical 内容；提交后保留 lifecycle，新正文先标 unverified 并排入复验。',
+        command: `commit ${presentation.token} ${presentation.kind === 'correct' ? JSON.stringify(presentation.content) : presentation.kind}`,
+        cancel: `cancel ${presentation.token}` } : {}) });
     if (kind === 'preview') this.#checkpoint('correction-after-output');
     this.core.presented(presentation);
   }
@@ -98,7 +103,7 @@ export class CorrectionHost {
     if (!await this.deliver() || !this.#recoverInfo()) return;
     if (!this.#configured) {
       const configured = configuredTransport(this.#transportConfig);
-      try { await verifyTransportPrerequisites(['memory-correction'], 'correction-prerequisites', this.#setupAbort.signal); }
+      try { await verifyTransportPrerequisites(['memory-correction', 'memory-forget-restore', 'memory-suppression'], 'correction-prerequisites', this.#setupAbort.signal); }
       catch (error) {
         if (!this.#setupAbort.signal.aborted) throw error;
         await emit('memory-model-cancelled', { sends: 0, reason: 'owner-stopped-before-send' }); return;
@@ -133,7 +138,7 @@ export class CorrectionHost {
     const command = parseCorrectionCommand(text);
     try {
       if (text.startsWith('model ') && !intent) { await this.model(input, text); return; }
-      if (command?.kind === 'correct') this.#checkpoint('correction-before-record');
+      if (command?.kind === 'correct' || command?.kind === 'forget' || command?.kind === 'restore') this.#checkpoint('correction-before-record');
       const reply = this.core.handle(input, intent);
       if (reply.kind === 'preview') this.#checkpoint('correction-after-record');
       if (reply.kind === 'result' && reply.canonical === 'committed' && command?.kind === 'commit') {
@@ -159,7 +164,7 @@ export class CorrectionHost {
           await emit('memory-result', { ...reply.result, canonical: reply.canonical, token: command.token }); return reply;
         }
       }
-      const reply: CorrectionReply = { kind: 'result', result: { status: command?.kind === 'correct' ? 'unavailable' : 'error',
+      const reply: CorrectionReply = { kind: 'result', result: { status: command?.kind === 'correct' || command?.kind === 'forget' || command?.kind === 'restore' ? 'unavailable' : 'error',
         operationId: null, receiptIds: [], reason: (error as Error).message }, canonical: 'unchanged' };
       await emit('memory-result', { ...reply.result, canonical: reply.canonical }); return reply;
     }

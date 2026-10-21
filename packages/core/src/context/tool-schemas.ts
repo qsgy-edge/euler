@@ -15,13 +15,17 @@ export interface ToolSchema { name: string; version: string; hash: string; descr
 export function coreToolSchemas(options: { corrections?: boolean } = {}): ToolSchema[] {
   return CORE_TOOLS.map(name => {
     const correction = options.corrections && ['memory.inspect', 'memory.preview', 'memory.commit', 'memory.cancel'].includes(name);
+    const mutation = { type: 'string', enum: ['forget', 'restore'] };
     const fields = correction ? name === 'memory.inspect' ? { recordId: string }
-      : name === 'memory.preview' ? { recordId: string, content: string }
-      : name === 'memory.commit' ? { token: string, content: string } : { token: string } : schemas[name];
-    const parameters = { type: 'object', properties: structuredClone(fields), required: Object.keys(fields), additionalProperties: false };
-    return { name, version: correction ? '2' : '1', hash: sha256(JSON.stringify({ name, parameters })), parameters,
+      : name === 'memory.preview' ? { recordId: string, content: string, operation: mutation }
+      : name === 'memory.commit' ? { token: string, content: string, operation: mutation } : { token: string } : schemas[name];
+    const change = correction && ['memory.preview', 'memory.commit'].includes(name);
+    const parameters = { type: 'object', properties: structuredClone(fields),
+      required: change ? [name === 'memory.preview' ? 'recordId' : 'token'] : Object.keys(fields), additionalProperties: false,
+      ...(change ? { oneOf: [{ required: ['content'] }, { required: ['operation'] }] } : {}) };
+    return { name, version: correction ? '3' : '1', hash: sha256(JSON.stringify({ name, parameters })), parameters,
       available: Boolean(correction), executionMode: 'sequential', description: correction
-        ? `${name}: propose the exact inspect/correct/commit/cancel command from the live user input; the Host revalidates input, token and text. Confirmation fields grant no authority.`
+        ? `${name}: propose the exact inspect/correct/forget/restore/commit/cancel command from the live user input; use content for correct or operation for forget/restore. The Host revalidates input, token and change. Confirmation fields grant no authority.`
         : `${name}: unavailable in this controlled CLI slice.` };
   });
 }

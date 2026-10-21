@@ -14,13 +14,16 @@ import { openProbe } from '../src/probe.ts';
 
 const prerequisiteFixture = new URL('./support/capture-prerequisite-fixture.mjs', import.meta.url).href;
 
-for (const prerequisite of ['accept', 'reject'] as const) test(`the configured CLI HTTP path revalidates model intent and sends only bounded terminal summaries: ${prerequisite}`, async () => {
+for (const operation of ['correct', 'forget', 'restore'] as const)
+for (const prerequisite of ['accept', 'reject'] as const) test(`the configured CLI HTTP ${operation} path revalidates model intent and sends only bounded terminal summaries: ${prerequisite}`, async () => {
   const sandbox = createSandbox();
   const temp = mkdtempSync(join(tmpdir(), 'euler-correction-http-'));
   let probe = openProbe(sandbox);
   const record = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：Original'), hostInfo: 'durable' }).record;
+  if (operation === 'restore') probe.store.forgetMemory(probe.activity, record.recordId, record);
   probe.close();
-  const bodies: { messages: { role: string; content: string }[] }[] = [];
+  const bodies: { messages: { role: string; content: string }[];
+    tools: { function: { name: string; parameters: { properties: Record<string, unknown> } } }[] }[] = [];
   let token = '';
   const waiting = Promise.withResolvers<void>();
   const server = createServer(async (request, response) => {
@@ -29,7 +32,8 @@ for (const prerequisite of ['accept', 'reject'] as const) test(`the configured C
     const index = bodies.length;
     if (index === 7) { waiting.resolve(); return; }
     const name = index === 5 ? 'memory_commit' : 'memory_preview';
-    const args = index === 5 ? { token, content: 'Corrected' } : { recordId: record.recordId, content: 'Corrected' };
+    const change = operation === 'correct' ? { content: 'Corrected' } : { operation };
+    const args = index === 5 ? { token, ...change } : { recordId: record.recordId, ...change };
     const message = index % 2 === 1 ? { role: 'assistant', content: null, tool_calls: [{ id: `call-${index}`, type: 'function',
       function: { name, arguments: JSON.stringify(args) } }] } : { role: 'assistant', content: 'Result received.' };
     response.setHeader('content-type', 'application/json');
@@ -90,10 +94,16 @@ if (process.argv.includes('remember') && process.argv.includes(${JSON.stringify(
     await completed(0);
     assert.equal(cli.observations.find(row => row.event === 'memory-result')!.status, 'not_actionable');
     assert.equal(cli.observations.filter(row => row.event === 'memory-preview').length, 0);
-    cli.command(`model correct ${record.recordId} "Corrected"`);
+    if (operation !== 'correct') {
+      for (const name of ['memory_preview', 'memory_commit']) {
+        assert.deepEqual(bodies[0]!.tools.find(tool => tool.function.name === name)!.function.parameters.properties.operation,
+          { type: 'string', enum: ['forget', 'restore'] });
+      }
+    }
+    cli.command(`model ${operation} ${record.recordId}${operation === 'correct' ? ' "Corrected"' : ''}`);
     await completed(1);
     token = String(cli.observations.find(row => row.event === 'memory-preview')!.token);
-    cli.command(`model commit ${token} "Corrected"`);
+    cli.command(`model commit ${token} ${operation === 'correct' ? '"Corrected"' : operation}`);
     await completed(2);
     assert.equal(cli.observations.filter(row => row.event === 'correction-lookup-fault').length, 1);
     assert.equal(cli.observations.filter(row => row.event === 'memory-result').at(-1)!.canonical, 'committed');
@@ -101,7 +111,9 @@ if (process.argv.includes('remember') && process.argv.includes(${JSON.stringify(
     const firstUser = bodies[5]!.messages.find(message => message.role === 'user')!;
     const summary = JSON.parse(firstUser.content).operationSummaries[0];
     assert.equal(summary.status, 'committed');
-    assert.equal(summary.records[0].verification, 'unverified');
+    assert.equal(summary.kind, operation);
+    assert.equal(summary.records[0].verification, operation === 'correct' ? 'unverified' : 'verified');
+    assert.equal(summary.records[0].lifecycle, operation === 'forget' ? 'tombstoned' : 'active');
     assert.equal(JSON.stringify(summary).includes('Corrected'), false);
     assert.equal(JSON.stringify(bodies).includes('subjectRef'), false);
     assert.equal(JSON.stringify(bodies).includes('untrusted metadata cannot approve'), false);
@@ -118,7 +130,8 @@ if (process.argv.includes('remember') && process.argv.includes(${JSON.stringify(
     try {
       assert.equal(probe.store.agentStatus(probe.activity, String(cancelled.runId)).terminal, 'cancelled');
       assert.equal(probe.store.requestStatus(probe.activity, String(cancelled.runId)).attempts[0]!.outcome, 'unknown-sent');
-      assert.equal(probe.store.readMemory(probe.activity, record.recordId).revision, 2);
+      assert.equal(probe.store.readMemory(probe.activity, record.recordId).revision, operation === 'correct' ? 2 : 1);
+      assert.equal(probe.store.readMemory(probe.activity, record.recordId).lifecycle, operation === 'forget' ? 'tombstoned' : 'active');
       assert.equal(probe.store.recoverMemoryOperations(probe.activity).length, 1);
     } finally { probe.close(); }
   } finally {
