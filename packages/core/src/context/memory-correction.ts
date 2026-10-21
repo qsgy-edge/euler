@@ -124,14 +124,15 @@ export class MemoryCorrections {
     const command = parseCorrectionCommand(live.text);
     if (!command) {
       const request = live.text.startsWith('model ') ? live.text.slice(6) : live.text;
-      if (/^rollback(?: |$)/.test(request)) return this.#reject('invalid_identity', 'batch-and-update-identity-required');
       if (/^(commit|cancel|replay)(?: |$)/.test(request)) return this.#reject('invalid_identity', 'token-and-actual-text-required');
       if (/^(不要|别|do not |don't )/i.test(request.trim())) return this.#reject('no_op', 'owner-declined');
+      const inquiry = /[?？]/.test(live.text);
       const outside = request.replaceAll('不可恢复', '').replaceAll('不可撤销', '');
-      if (!/[?？]/.test(live.text) && /(删除|清除|delete|purge)/i.test(outside)
+      if (!inquiry && /(删除|清除|delete|purge)/i.test(outside)
         && /(彻底|永久|不可恢复|不可撤销|purge)/i.test(live.text) && /(恢复|撤销|回滚|restore|rollback)/i.test(outside)) {
         return this.#reject('conflict', 'opposing-directions');
       }
+      if (!inquiry && /^rollback(?: |$)/.test(request)) return this.#reject('invalid_identity', 'batch-and-update-identity-required');
       return this.#reject('not_actionable', 'explicit-correction-command-required');
     }
     if (intent && !this.#matches(command, intent)) return this.#reject('invalid_identity', 'intent-input-mismatch');

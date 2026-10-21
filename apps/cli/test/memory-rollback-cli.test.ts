@@ -44,7 +44,7 @@ test('CLI selects fixed Info events, approves once, and keeps read history and r
   }
 });
 
-test('CLI classifies missing, duplicate, foreign and stale rollback identities without creating a pending operation', async () => {
+test('CLI preserves conflict/inquiry handling and exact rollback identity terminals without pending work', async () => {
   const { sandbox, probe, batch } = rollbackFixture();
   const extra = probe.store.rememberMemory(probe.activity, {
     input: probe.archive.append(randomUUID(), '记住偏好：另一个批次'), hostInfo: 'durable',
@@ -61,6 +61,14 @@ test('CLI classifies missing, duplicate, foreign and stale rollback identities w
     ]) {
       const reply = await send(cli, command, 'memory-result');
       assert.equal(reply.status, 'invalid_identity', command); assert.equal(reply.canonical, 'unchanged');
+    }
+    for (const [command, status] of [
+      [`rollback and purge ${first.recordId}`, 'conflict'],
+      [`rollback 永久删除 ${first.recordId}`, 'conflict'],
+      [`rollback and purge ${first.recordId}?`, 'not_actionable'],
+    ]) {
+      const reply = await send(cli, command!, 'memory-result');
+      assert.equal(reply.status, status, command); assert.equal(reply.canonical, 'unchanged');
     }
     const other = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
     try { other.store.forgetMemory(other.activity, first.recordId, first.after); } finally { other.close(); }
