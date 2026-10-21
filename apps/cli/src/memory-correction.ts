@@ -1,4 +1,4 @@
-import { AgentRun, MemoryCorrections, check, parseCorrectionCommand } from '@euler/core';
+import { AgentRun, MemoryCorrections, check, isLiveMemoryOperation, parseCorrectionCommand } from '@euler/core';
 import type { CorrectionInput, CorrectionReply, MemoryPresentation, ToolCall } from '@euler/core';
 import { configuredTransport, verifyTransportPrerequisites } from './model-transport.ts';
 import { pumpAgent } from './agent-pump.ts';
@@ -154,9 +154,10 @@ export class CorrectionHost {
 
   async handle(input: CorrectionInput, text: string, intent?: ToolCall): Promise<CorrectionReply | void> {
     const command = parseCorrectionCommand(text);
+    const previewCommand = command !== null && isLiveMemoryOperation(command.kind);
     try {
       if (text.startsWith('model ') && !intent) { await this.model(input, text); return; }
-      if (command?.kind === 'correct' || command?.kind === 'forget' || command?.kind === 'restore' || command?.kind === 'rollback') this.#checkpoint('correction-before-record');
+      if (previewCommand) this.#checkpoint('correction-before-record');
       const reply = this.core.handle(input, intent);
       if (reply.kind === 'preview') this.#checkpoint('correction-after-record');
       if (reply.kind === 'result' && reply.canonical === 'committed' && command?.kind === 'commit') {
@@ -181,7 +182,7 @@ export class CorrectionHost {
           await emit('memory-result', { ...reply.result, canonical: reply.canonical, token: command.token }); return reply;
         }
       }
-      const reply: CorrectionReply = { kind: 'result', result: { status: command?.kind === 'correct' || command?.kind === 'forget' || command?.kind === 'restore' || command?.kind === 'rollback' ? 'unavailable' : 'error',
+      const reply: CorrectionReply = { kind: 'result', result: { status: previewCommand ? 'unavailable' : 'error',
         operationId: null, receiptIds: [], reason: (error as Error).message }, canonical: 'unchanged' };
       await emit('memory-result', { ...reply.result, canonical: reply.canonical }); return reply;
     }

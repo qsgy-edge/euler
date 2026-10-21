@@ -2,6 +2,7 @@
   "schema": "batch-rollback-fixture@1",
   "memberCount": 3,
   "contents": ["合成批次偏好 0", "合成批次偏好 1", "合成批次偏好 2"],
-  "summaryMaxBytes": 2048,
-  "cases": ["all", "subset", "cancel", "concurrent-change", "after-commit"]
+  "summaryMaxBytes": 8192,
+  "maxMemberCount": 32,
+  "cases": ["all", "subset", "cancel", "concurrent-change", "after-commit", "maximum"]
 }

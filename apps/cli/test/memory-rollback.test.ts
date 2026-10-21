@@ -31,14 +31,14 @@ function fixture(count = 2) {
 test('selection is exact: empty, duplicate, foreign and manually corrected events cannot be submitted', () => {
   const f = fixture();
   try {
-    assert.equal(f.result(`rollback ${f.batch.batchId}`).result.status, 'not_actionable');
-    assert.throws(() => f.select([f.batch.events[0]!.eventId, f.batch.events[0]!.eventId]), /invalid-batch-selection/);
-    assert.throws(() => f.select([f.batch.events[0]!.eventId, randomUUID()]), /invalid-batch-selection/);
+    assert.equal(f.result(`rollback ${f.batch.batchId}`).result.status, 'invalid_identity');
+    assert.equal(f.result(`rollback ${f.batch.batchId} ${f.batch.events[0]!.eventId} ${f.batch.events[0]!.eventId}`).result.status, 'invalid_identity');
+    assert.equal(f.result(`rollback ${f.batch.batchId} ${f.batch.events[0]!.eventId} ${randomUUID()}`).result.status, 'invalid_identity');
     const event = f.batch.events[0]!;
     const source = f.probe.archive.append(randomUUID(), 'Owner correction');
     const corrected = f.probe.store.correctMemory(f.probe.activity, event.recordId, event.after, source, 'Owner correction');
-    assert.throws(() => f.select([corrected.eventId!]), /invalid-batch-selection/);
-    assert.throws(() => f.select([event.eventId]), /memory-stale/);
+    assert.equal(f.result(`rollback ${f.batch.batchId} ${corrected.eventId}`).result.status, 'invalid_identity');
+    assert.equal(f.result(`rollback ${f.batch.batchId} ${event.eventId}`).result.status, 'stale');
     assert.equal(f.probe.store.recoverMemoryOperations(f.probe.activity).length, 0);
   } finally { f.close(); }
 });
@@ -111,7 +111,7 @@ test('fresh previews undo B then A while a pre-B card stays stale and revisions 
     const b = f.probe.store.reviseMemory(f.probe.activity, original.recordId, a.record, bSource, 'B', [bSource]);
     f.probe.store.registerHostInfo(f.probe.activity);
     const bBatch = f.probe.store.listHostInfo(f.probe.activity).at(-1)!.batchId;
-    assert.throws(() => f.select([a.eventId!, b.eventId!], bBatch), /invalid-batch-selection/);
+    assert.equal(f.result(`rollback ${bBatch} ${a.eventId} ${b.eventId}`).result.status, 'invalid_identity');
     const undoB = f.select([b.eventId!], bBatch); f.core.presented(undoB);
     assert.equal(f.result(`commit ${undoB.token} rollback`).result.status, 'committed');
     const rejected = core.handle(core.receive(`commit ${old.presentation.token} rollback`));
@@ -221,9 +221,11 @@ test('the largest supported batch has a bounded model summary without dropping o
     assert.equal(reply.result.status, 'committed');
     assert.equal(reply.result.receiptIds.length, 32);
     const summary = f.probe.store.correctionSummary(f.probe.activity, preview.token);
-    assert.ok(Buffer.byteLength(JSON.stringify(summary)) <= 2048);
+    assert.deepEqual(summary.records.map(record => record.recordId), preview.targets.map(record => record.recordId));
+    assert.ok(summary.records.every(record => record.revision === 1 && record.lifecycle === 'candidate' && record.verification === 'verified'));
+    assert.ok(Buffer.byteLength(JSON.stringify(summary)) <= 8192);
     assert.equal('recordCount' in summary && summary.recordCount, 32);
-    assert.equal('truncated' in summary && summary.truncated, true);
+    assert.equal('truncated' in summary, false);
     assert.equal(JSON.stringify(summary).includes('合成批次偏好'), false);
   } finally { f.close(); }
 });

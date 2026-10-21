@@ -10,6 +10,7 @@ import { startCli, sendCommand as send } from '../apps/cli/src/process-driver.ts
 import { bindingOf, createSandboxSession } from '../apps/cli/src/sandbox.ts';
 import { openProbe } from '../apps/cli/src/probe.ts';
 import { rollbackFixture } from '../apps/cli/test/support/memory-rollback.ts';
+import { API_VERSION } from '@euler/core';
 import fixture from '../fixtures/t17-batch-rollback.json' with { type: 'json' };
 
 const repo = fileURLToPath(new URL('../', import.meta.url)), startedAt = new Date().toISOString();
@@ -40,7 +41,7 @@ const snapshot = (value: { hash?: string; [key: string]: unknown }) => {
 };
 
 // Independent checks of closed SQLite and actual JSONL/stdout bytes; no Store replay or read helpers.
-function validate(root: string, token: string, expected: 'committed' | 'cancelled' | 'stale', selected: string[], stdoutPaths: string[]) {
+function validate(root: string, token: string, expected: 'committed' | 'cancelled' | 'stale', selected: string[], memberCount: number, stdoutPaths: string[]) {
   const lines = readFileSync(join(root, 'session.jsonl'), 'utf8').trimEnd().split('\n');
   const header = JSON.parse(lines.shift()!);
   const archive = lines.map(line => {
@@ -56,16 +57,17 @@ function validate(root: string, token: string, expected: 'committed' | 'cancelle
     assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 19);
     assert.equal(db.prepare('PRAGMA integrity_check').get()!.integrity_check, 'ok');
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
+    assert.equal(db.prepare('SELECT sqlite_version() AS version').get()!.version, process.versions.sqlite);
     const stored = db.prepare('SELECT * FROM host_presentations WHERE token=?').get(token)!;
     assert.equal(digest(String(stored.payload)), stored.payload_hash);
     const presentation = JSON.parse(String(stored.payload)); assert.deepEqual(presentation.eventIds, selected);
     const batch = db.prepare('SELECT * FROM activation_batches WHERE batch_id=?').get(presentation.batchId)!;
     assert.equal(batch.payload, presentation.batchPayload); assert.equal(digest(String(batch.payload)), batch.payload_hash);
-    assert.equal(batch.payload_hash, presentation.batchDigest); assert.equal(batch.member_count, fixture.memberCount);
+    assert.equal(batch.payload_hash, presentation.batchDigest); assert.equal(batch.member_count, memberCount);
     const manifest = JSON.parse(String(batch.payload));
     const events = db.prepare('SELECT * FROM memory_events WHERE batch_id=? ORDER BY batch_ordinal').all(presentation.batchId);
     assert.equal(JSON.stringify(manifest.events), '[' + events.map(row => row.payload).join(',') + ']');
-    assert.deepEqual(manifest.events.map((event: { after: { content: string } }) => event.after.content), fixture.contents);
+    assert.deepEqual(manifest.events.slice(0, fixture.contents.length).map((event: { after: { content: string } }) => event.after.content), fixture.contents);
     const pending = db.prepare('SELECT * FROM pending_operations WHERE operation_id=?').get(presentation.operationId)!;
     assert.equal(pending.state, expected); assert.equal(digest(String(pending.result)), pending.result_hash);
     const result = JSON.parse(String(pending.result)); assert.deepEqual(result.expected, presentation.targets);
@@ -88,7 +90,23 @@ function validate(root: string, token: string, expected: 'committed' | 'cancelle
     assert.ok(Buffer.byteLength(model.text) <= fixture.summaryMaxBytes);
     const summary = JSON.parse(model.text); assert.equal(summary.status, expected); assert.equal(summary.kind, 'rollback');
     assert.equal(summary.recordCount, selected.length);
-    assert.deepEqual(Object.keys(summary).sort(), ['schema', 'operationId', 'kind', 'status', 'records', 'reason', 'recordCount', 'truncated'].sort());
+    assert.deepEqual(Object.keys(summary).sort(), ['schema', 'operationId', 'kind', 'status', 'records', 'reason', 'recordCount'].sort());
+    assert.deepEqual(summary.records, presentation.targets.map((target: { recordId: string }) => {
+      const current = result.current.find((record: { recordId: string }) => record.recordId === target.recordId);
+      return { recordId: target.recordId, revisionId: current?.revisionId ?? null, revision: current?.revision ?? null,
+        lifecycle: current?.lifecycle ?? null, verification: current?.verification ?? null };
+    }));
+    const assemblies = db.prepare('SELECT * FROM request_assemblies').all(); assert.ok(assemblies.length > 0);
+    for (const assembly of assemblies) {
+      assert.equal(assembly.route, 'local-counting'); assert.equal(assembly.model, 'none');
+      const request = observations.find(row => row.event === 'ask-result' && row.receipt?.assemblyId === assembly.assembly_id);
+      assert.ok(request && typeof request.payload === 'string');
+      assert.equal(digest(request.payload), assembly.payload_hash);
+      assert.equal(Buffer.byteLength(request.payload), assembly.byte_length);
+      const payload = JSON.parse(request.payload); assert.deepEqual(payload.operationSummaries, [summary]);
+      assert.deepEqual(db.prepare('SELECT DISTINCT adapter_version FROM request_attempts WHERE assembly_id=?').all(String(assembly.assembly_id))
+        .map(row => row.adapter_version), [API_VERSION]);
+    }
     for (const content of fixture.contents) assert.equal(model.text.includes(content), false);
     for (const [index, row] of changed.entries()) {
       assert.equal(row.kind, 'rollback'); assert.equal(row.target_event_id, selected[index]);
@@ -141,7 +159,8 @@ function validate(root: string, token: string, expected: 'committed' | 'cancelle
 }
 
 for (const id of fixture.cases) {
-  const { sandbox, probe, batch } = rollbackFixture(fixture.memberCount); probe.close();
+  const memberCount = id === 'maximum' ? fixture.maxMemberCount : fixture.memberCount;
+  const { sandbox, probe, batch } = rollbackFixture(memberCount); probe.close();
   const start = commands.length;
   try {
     let cli = launch(sandbox.root, `${id}/initial`, id === 'after-commit'); await cli.waitFor('remember-ready');
@@ -169,7 +188,7 @@ for (const id of fixture.cases) {
       : id !== 'concurrent-change' || event !== batch.events.at(-1)).map(event => event.recordId).sort();
     assert.deepEqual((answer.selected as string[]).sort(), active);
     await stop(cli);
-    validate(sandbox.root, String(preview.token), expected, selected, commands.slice(start).map(command => command.stdout));
+    validate(sandbox.root, String(preview.token), expected, selected, memberCount, commands.slice(start).map(command => command.stdout));
     checks.push({ id, passed: true });
   } catch (error) {
     checks.push({ id, passed: false, diagnostic: save(`${id}/error.txt`, (error as Error).stack ?? String(error)) });
@@ -194,7 +213,12 @@ const receipt = { schema: 'batch-rollback-evidence@1', startedAt, endedAt: new D
   result: passed ? 'evidence-gap' : 'failed', syntheticPassed: passed,
   commit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim(),
   dirty: execFileSync('git', ['status', '--porcelain'], { cwd: repo, encoding: 'utf8' }).trim().length > 0,
-  environment: { platform: platform(), release: release(), arch: arch(), node: process.version },
+  implementationTree: execFileSync('git', ['rev-parse', 'HEAD^{tree}'], { cwd: repo, encoding: 'utf8' }).trim(),
+  specReferences: ['15:I15-I17', '11:rollback', '14:Two presentation planes/Required terminal states', '12:X-09/X-10/X-11'],
+  environment: { platform: platform(), release: release(), arch: arch(), node: process.version, sqlite: process.versions.sqlite },
+  execution: { transport: 'local-counting', providerVersion: 'not-applicable', model: 'none', modelVersion: 'not-applicable', adapterVersion: API_VERSION },
+  heldOut: { applicability: 'not-used-by-this-synthetic-fixture' },
+  controlledEffects: ['disposable-sqlite', 'synthetic-session-jsonl', 'synthetic-owner-info-jsonl', 'local-counting-receiver', 'cli-stdout-stderr'],
   fixtureDigest: digest(readFileSync(join(repo, 'fixtures/t17-batch-rollback.json'))), commands, checks, artifacts,
   gaps: ['actual-provider-semantic-quality', 'long-session-operation-summary-compaction', 'purge-closure-deletion-not-enabled',
     'source-append-crash-and-unknown-outcomes', 'other-platforms-require-their-own-receipts', 'non-cli-host-integration', 'production-data-and-migration'] };
