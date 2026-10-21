@@ -58,6 +58,9 @@ jobs:
       - name: Record forget suppression and independently approved restore observations
         if: always()
         run: npm run evidence:memory-forget
+      - name: Record batch rollback and recovery observations
+        if: always()
+        run: npm run evidence:memory-rollback
       - uses: actions/upload-artifact@v4
         if: always()
         with:

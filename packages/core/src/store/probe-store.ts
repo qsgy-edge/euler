@@ -2801,12 +2801,21 @@ export class ProbeStore {
           && stored.selected_event_id === (value.eventIds[index] ?? null) && stored.update_event_id === (value.updateEventIds[index] ?? null)
           && stored.snapshot === this.#snapshotBytes(target)
           && stored.snapshot_hash === target.hash && target.hash === sha256(String(stored.snapshot)), 'presentation-evidence-gap');
-        const event = this.#db.prepare('SELECT after_snapshot FROM memory_events WHERE event_id=? AND record_id=?').get(target.headEventId, target.recordId);
-        check(event?.after_snapshot === stored.snapshot, 'presentation-evidence-gap');
+        if (value.kind !== 'rollback') {
+          const event = this.#db.prepare('SELECT after_snapshot FROM memory_events WHERE event_id=? AND record_id=?').get(target.headEventId, target.recordId);
+          check(event?.after_snapshot === stored.snapshot, 'presentation-evidence-gap');
+        }
       }
       if (value.batchId) {
-        const batch = this.#readActivationBatch(value.batchId);
-        check(value.batchDigest === batch.digest && value.batchPayload === batch.payload, 'batch-evidence-gap');
+        // Read the immutable presentation independently of later canonical damage. Commit
+        // revalidates the live batch inside its transaction and durably settles stale selections.
+        check(typeof value.batchPayload === 'string' && sha256(value.batchPayload) === value.batchDigest, 'batch-evidence-gap');
+        const batch = JSON.parse(value.batchPayload);
+        check(batch.schema === 'activation-batch@1' && batch.batchId === value.batchId
+          && batch.ownerId === this.#binding.ownerId && Array.isArray(batch.events) && batch.events.length > 0
+          && new Set(value.eventIds).size === value.eventIds.length && new Set(value.targets.map(target => target.recordId)).size === value.targets.length
+          && value.eventIds.every((eventId, index) => batch.events.some((event: { eventId: string; recordId: string }) =>
+            event.eventId === eventId && event.recordId === value.targets[index]!.recordId)), 'batch-evidence-gap');
       }
       return { ...value, hash: String(row.payload_hash) };
     });
@@ -2987,12 +2996,19 @@ export class ProbeStore {
       const ack = this.#db.prepare('SELECT acknowledged FROM host_presentations WHERE presentation_id=?').get(presentation.presentationId)!;
       if (ack.acknowledged !== 1) return this.#settleOperation(presentation, 'unavailable', [], [], 'presentation-not-acknowledged');
       const current: MemoryRecord[] = [];
+      let validated = false;
       try {
         return this.#transaction(() => {
+          if (presentation.kind === 'rollback') {
+            const batch = this.#readActivationBatch(presentation.batchId!);
+            check(batch.digest === presentation.batchDigest && batch.payload === presentation.batchPayload, 'batch-evidence-gap');
+          }
           for (const expected of presentation.targets) current.push(this.#readMemoryUnsafe(expected.recordId));
           for (const [index, expected] of presentation.targets.entries()) {
             check(expected.hash === current[index]!.hash && this.#snapshotBytes(expected) === this.#snapshotBytes(current[index]!), 'memory-stale');
+            if (presentation.kind === 'rollback') this.#assertRollbackTarget(current[index]!, presentation.eventIds[index]!);
           }
+          validated = true;
           check(this.#committingOperation === null, 'nested-owner-operation');
           this.#committingOperation = presentation.operationId;
           try {
@@ -3014,7 +3030,7 @@ export class ProbeStore {
         });
       } catch (error) {
         const reason = (error as Error).message;
-        return this.#settleOperation(presentation, reason === 'memory-stale' ? 'stale' : 'error', current, [], reason);
+        return this.#settleOperation(presentation, reason === 'memory-stale' || presentation.kind === 'rollback' && !validated ? 'stale' : 'error', current, [], reason);
       }
     });
   }
@@ -3035,10 +3051,34 @@ export class ProbeStore {
     });
   }
 
+  /** One owner-facing receipt derived from the immutable, atomically committed member receipts. */
+  rollbackReceipt(activity: Activity, token: string) {
+    return this.withActivity(activity, () => {
+      const presentation = this.readMemoryPresentation(activity, token);
+      const result = this.memoryOperationStatus(activity, token);
+      check(presentation.kind === 'rollback' && result.status === 'committed', 'rollback-receipt-unavailable');
+      const members = presentation.eventIds.map((eventId, index) => {
+        const row = this.#db.prepare('SELECT * FROM memory_events WHERE event_id=? AND operation_id=?')
+          .get(presentation.updateEventIds[index]!, presentation.operationId!);
+        check(row && row.kind === 'rollback' && row.target_event_id === eventId
+          && row.record_id === presentation.targets[index]!.recordId && sha256(String(row.payload)) === row.payload_hash
+          && row.before_snapshot === this.#snapshotBytes(result.expected[index]!)
+          && row.after_snapshot === this.#snapshotBytes(result.current[index]!)
+          && row.receipt_id === result.receiptIds[index], 'operation-receipt-gap');
+        return { eventId, recordId: String(row.record_id), revocationEventId: String(row.event_id),
+          receipt: this.readOwnerReceipt(activity, String(row.receipt_id)), before: result.expected[index]!, after: result.current[index]! };
+      });
+      const receipt = { schema: 'batch-rollback-receipt@1', operationId: presentation.operationId!,
+        batchId: presentation.batchId!, batchDigest: presentation.batchDigest!, outcome: 'committed', members };
+      return { ...receipt, hash: sha256(JSON.stringify(receipt)) };
+    });
+  }
+
   #assertRollbackTarget(current: MemoryRecord, targetEventId: string): MemoryRecord {
     uuid(targetEventId);
     const event = this.#db.prepare('SELECT * FROM memory_events WHERE event_id=?').get(targetEventId);
-    check(event && event.record_id === current.recordId && ['activate','auto-revise'].includes(String(event.kind)) && event.before_snapshot, 'rollback-not-actionable');
+    check(event && event.record_id === current.recordId && ['activate','auto-revise'].includes(String(event.kind))
+      && event.before_snapshot && JSON.parse(String(event.payload)).automatic === true, 'rollback-not-actionable');
     const targetAfter = this.#parseMemorySnapshot(String(event.after_snapshot));
     check(this.#businessSnapshot(current) === this.#businessSnapshot(targetAfter), 'memory-stale');
     check(!this.#db.prepare("SELECT 1 FROM memory_events WHERE record_id=? AND kind='rollback' AND target_event_id=?")

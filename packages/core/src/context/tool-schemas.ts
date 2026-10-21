@@ -15,17 +15,24 @@ export interface ToolSchema { name: string; version: string; hash: string; descr
 export function coreToolSchemas(options: { corrections?: boolean } = {}): ToolSchema[] {
   return CORE_TOOLS.map(name => {
     const correction = options.corrections && ['memory.inspect', 'memory.preview', 'memory.commit', 'memory.cancel'].includes(name);
-    const mutation = { type: 'string', enum: ['forget', 'restore'] };
+    const mutation = { type: 'string', enum: ['forget', 'restore', 'rollback'] };
     const fields = correction ? name === 'memory.inspect' ? { recordId: string }
-      : name === 'memory.preview' ? { recordId: string, content: string, operation: mutation }
+      : name === 'memory.preview' ? { recordId: string, content: string, operation: mutation, batchId: string,
+        eventIds: { type: 'array', items: string, minItems: 1, maxItems: 32, uniqueItems: true } }
       : name === 'memory.commit' ? { token: string, content: string, operation: mutation } : { token: string } : schemas[name];
     const change = correction && ['memory.preview', 'memory.commit'].includes(name);
     const parameters = { type: 'object', properties: structuredClone(fields),
-      required: change ? [name === 'memory.preview' ? 'recordId' : 'token'] : Object.keys(fields), additionalProperties: false,
-      ...(change ? { oneOf: [{ required: ['content'] }, { required: ['operation'] }] } : {}) };
-    return { name, version: correction ? '3' : '1', hash: sha256(JSON.stringify({ name, parameters })), parameters,
+      required: change ? (name === 'memory.preview' ? [] : ['token']) : Object.keys(fields), additionalProperties: false,
+      ...(change ? { oneOf: name === 'memory.preview' ? [
+        { required: ['recordId', 'content'], not: { anyOf: [{ required: ['operation'] }, { required: ['batchId'] }, { required: ['eventIds'] }] } },
+        { required: ['recordId', 'operation'], properties: { operation: { enum: ['forget', 'restore'] } },
+          not: { anyOf: [{ required: ['content'] }, { required: ['batchId'] }, { required: ['eventIds'] }] } },
+        { required: ['batchId', 'eventIds', 'operation'], properties: { operation: { const: 'rollback' } },
+          not: { anyOf: [{ required: ['recordId'] }, { required: ['content'] }] } },
+      ] : [{ required: ['content'] }, { required: ['operation'] }] } : {}) };
+    return { name, version: correction ? '4' : '1', hash: sha256(JSON.stringify({ name, parameters })), parameters,
       available: Boolean(correction), executionMode: 'sequential', description: correction
-        ? `${name}: propose the exact inspect/correct/forget/restore/commit/cancel command from the live user input; use content for correct or operation for forget/restore. The Host revalidates input, token and change. Confirmation fields grant no authority.`
+        ? `${name}: propose the exact memory command from live user input. Correct uses recordId/content; forget/restore use recordId/operation; rollback uses operation/batchId/eventIds from a fixed Info batch. Commit uses token and content or operation. The Host revalidates the complete input, selection and token; tool fields grant no authority.`
         : `${name}: unavailable in this controlled CLI slice.` };
   });
 }

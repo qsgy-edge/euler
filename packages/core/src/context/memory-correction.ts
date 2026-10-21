@@ -7,9 +7,10 @@ import type { ToolCall } from './agent-state.ts';
 export interface CorrectionInput { readonly eventId: string }
 export type CorrectionCommand = { kind: 'inspect'; recordId: string }
   | { kind: 'forget'; recordId: string } | { kind: 'restore'; recordId: string }
+  | { kind: 'rollback'; batchId: string; eventIds: string[] }
   | { kind: 'correct'; recordId: string; content: string }
   | { kind: 'commit'; token: string; content: string }
-  | { kind: 'commit'; token: string; operation: 'forget' | 'restore' }
+  | { kind: 'commit'; token: string; operation: 'forget' | 'restore' | 'rollback' }
   | { kind: 'cancel'; token: string } | { kind: 'replay'; token: string };
 export type CorrectionReply = { kind: 'inspect' | 'preview'; presentation: MemoryPresentation }
   | { kind: 'result'; result: MemoryOperationResult; canonical: 'committed' | 'unchanged' | 'unknown';
@@ -24,8 +25,10 @@ export function parseCorrectionCommand(text: string): CorrectionCommand | null {
   const simple = new RegExp(`^(inspect|forget|restore|cancel|replay) (${identity})$`).exec(text.trim());
   if (simple) return simple[1] === 'cancel' || simple[1] === 'replay' ? { kind: simple[1], token: simple[2]! }
     : { kind: simple[1] as 'inspect' | 'forget' | 'restore', recordId: simple[2]! };
-  const approval = new RegExp(`^commit (${identity}) (forget|restore)$`).exec(text.trim());
-  if (approval) return { kind: 'commit', token: approval[1]!, operation: approval[2] as 'forget' | 'restore' };
+  const rollback = new RegExp(`^rollback (${identity})((?: ${identity})+)$`).exec(text.trim());
+  if (rollback) return { kind: 'rollback', batchId: rollback[1]!, eventIds: rollback[2]!.trim().split(' ') };
+  const approval = new RegExp(`^commit (${identity}) (forget|restore|rollback)$`).exec(text.trim());
+  if (approval) return { kind: 'commit', token: approval[1]!, operation: approval[2] as 'forget' | 'restore' | 'rollback' };
   const change = new RegExp(`^(correct|commit) (${identity}) ([\\s\\S]+)$`).exec(text.trim());
   if (change) {
     let content: unknown;
@@ -40,7 +43,7 @@ export function parseCorrectionCommand(text: string): CorrectionCommand | null {
 }
 
 export function isLiveMemoryOperation(kind: MemoryPresentation['kind']): boolean {
-  return kind === 'correct' || kind === 'forget' || kind === 'restore';
+  return kind === 'correct' || kind === 'forget' || kind === 'restore' || kind === 'rollback';
 }
 
 export function matchesMemoryApproval(command: CorrectionCommand | null, presentation: MemoryPresentation): boolean {
@@ -58,7 +61,14 @@ export function memoryOperationSummary(presentation: MemoryPresentation, result:
     revisionId: record.revisionId, revision: record.revision, lifecycle: record.lifecycle, verification: record.verification }));
   const summary = { schema: 'memory-operation-summary@1', operationId: result.operationId, kind: presentation.kind,
     status: result.status, records, reason: result.reason && /^[a-z][a-z0-9-]{0,80}$/.test(result.reason) ? result.reason
-      : result.reason ? 'operation-failed' : null };
+      : result.reason ? 'operation-failed' : null,
+    ...(presentation.kind === 'rollback' ? { recordCount: presentation.targets.length, truncated: false } : {}) };
+  if (presentation.kind === 'rollback') {
+    summary.truncated = records.length !== presentation.targets.length;
+    while (records.length && Buffer.byteLength(JSON.stringify(summary)) > MEMORY_SUMMARY_MAX_BYTES) {
+      records.pop(); summary.truncated = true;
+    }
+  }
   check(Buffer.byteLength(JSON.stringify(summary)) <= MEMORY_SUMMARY_MAX_BYTES, 'operation-summary-limit');
   return summary;
 }
@@ -156,6 +166,24 @@ export class MemoryCorrections {
       });
       return { kind: 'preview', presentation };
     }
+    if (kind === 'rollback') {
+      const presentation = this.#store.withActivity(this.#activity, () => {
+        const { batch } = this.#store.readHostInfo(this.#activity, command.batchId);
+        check(command.eventIds.length > 0 && command.eventIds.length <= batch.events.length
+          && new Set(command.eventIds).size === command.eventIds.length, 'invalid-batch-selection');
+        const selected = command.eventIds.map(id => {
+          const event = batch.events.find(event => event.eventId === id);
+          check(event, 'invalid-batch-selection');
+          return event;
+        });
+        const inspected = this.#store.inspectMemoryPresentation(this.#activity, selected.map(event => event.recordId));
+        const preview = this.#store.previewMemoryOperation(this.#activity, inspected.token,
+          { kind, batchId: batch.batchId, eventIds: command.eventIds });
+        this.#store.registerCorrectionDelivery(this.#activity, preview.token);
+        return preview;
+      });
+      return { kind: 'preview', presentation };
+    }
     const status = this.#store.memoryOperationStatus(this.#activity, command.token);
     if (status.status !== 'pending') return this.result(command.token, true);
     const presentation = this.#store.readMemoryPresentation(this.#activity, command.token);
@@ -180,11 +208,12 @@ export class MemoryCorrections {
       : command.kind === 'correct' ? { name: 'memory.preview', arguments: { recordId: command.recordId, content: command.content } }
       : command.kind === 'forget' || command.kind === 'restore'
         ? { name: 'memory.preview', arguments: { recordId: command.recordId, operation: command.kind } }
+      : command.kind === 'rollback' ? { name: 'memory.preview', arguments: { operation: 'rollback', batchId: command.batchId, eventIds: command.eventIds } }
       : command.kind === 'commit' ? { name: 'memory.commit', arguments: 'operation' in command
         ? { token: command.token, operation: command.operation } : { token: command.token, content: command.content } }
       : { name: command.kind === 'cancel' ? 'memory.cancel' : 'memory.status', arguments: { token: command.token } };
     return intent.name === expected.name && Object.keys(intent.arguments).sort().join(',') === Object.keys(expected.arguments).sort().join(',')
-      && Object.entries(expected.arguments).every(([key, value]) => intent.arguments[key] === value);
+      && Object.entries(expected.arguments).every(([key, value]) => JSON.stringify(intent.arguments[key]) === JSON.stringify(value));
   }
 
   #reject(status: 'not_actionable' | 'conflict' | 'no_op' | 'invalid_identity' | 'unavailable', reason: string): CorrectionReply {
