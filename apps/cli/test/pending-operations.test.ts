@@ -187,7 +187,9 @@ test('storage rejects forged presentation identities and re-signed batch payload
     const payload = JSON.stringify(changed);
     db.prepare('UPDATE activation_batches SET payload=?,payload_hash=? WHERE batch_id=?').run(payload, createHash('sha256').update(payload).digest('hex'), batch.batchId);
     assert.throws(() => probe.store.readActivationBatch(probe.activity, batch.batchId), /batch-evidence-gap/);
-    assert.throws(() => probe.store.readMemoryPresentation(probe.activity, preview.token), /batch-evidence-gap/);
+    assert.deepEqual(probe.store.readMemoryPresentation(probe.activity, preview.token), preview);
+    probe.store.acknowledgeMemoryPresentation(probe.activity, preview.token, preview.hash);
+    assert.equal(probe.store.commitMemoryOperation(probe.activity, preview.token).status, 'stale');
     assert.equal(probe.store.readMemory(probe.activity, batch.events[0]!.recordId).headEventId, batch.events[0]!.eventId);
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
