@@ -12,28 +12,32 @@ import type { Observation } from '../src/process-driver.ts';
 type Cli = ReturnType<typeof startCli>;
 async function kill(cli: Cli) { cli.child.kill('SIGKILL'); await cli.exit; }
 async function stop(cli: Cli) { cli.command('stop'); assert.equal((await cli.exit).code, 0, cli.stderr()); }
-function seed() {
+function seed(operation: 'correct' | 'forget' | 'restore' = 'correct') {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);
   try {
     const record = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：Original'), hostInfo: 'durable' }).record;
+    if (operation === 'restore') probe.store.forgetMemory(probe.activity, record.recordId, record);
     return { sandbox, record };
   } finally { probe.close(); }
 }
 
+for (const operation of ['correct', 'forget', 'restore'] as const)
 for (const stage of ['before-record', 'after-record', 'after-output', 'after-commit', 'after-owner', 'after-model']) {
-  test(`CLI crash ${stage} recovers the same operation and requires fresh input for an uncommitted preview`, async () => {
-    const { sandbox, record } = seed();
+  test(`CLI ${operation} crash ${stage} recovers the same operation and requires fresh input for an uncommitted preview`, async () => {
+    const { sandbox, record } = seed(operation);
+    const request = `${operation} ${record.recordId}${operation === 'correct' ? ' "Corrected"' : ''}`;
+    const approval = (token: unknown) => `commit ${token} ${operation === 'correct' ? '"Corrected"' : operation}`;
     const clients: Cli[] = [];
     try {
       const cli = startCli(['remember', '--sandbox', sandbox.root, '--scenario', `correction-${stage}`]); clients.push(cli);
       await cli.waitFor('remember-ready');
       const previewStage = ['before-record', 'after-record', 'after-output'].includes(stage);
       let preview: Observation | undefined;
-      if (previewStage) cli.command(`correct ${record.recordId} "Corrected"`);
+      if (previewStage) cli.command(request);
       else {
-        preview = await send(cli, `correct ${record.recordId} "Corrected"`, 'memory-preview');
-        cli.command(`commit ${preview.token} "Corrected"`);
+        preview = await send(cli, request, 'memory-preview');
+        cli.command(approval(preview.token));
       }
       await cli.waitFor('correction-checkpoint'); await kill(cli);
       let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
@@ -44,16 +48,21 @@ for (const stage of ['before-record', 'after-record', 'after-output', 'after-com
         if (!previewStage) {
           assert.equal(operations[0]!.result.status, 'committed');
           receiptBytes = JSON.stringify(probe.store.readOwnerReceipt(probe.activity, operations[0]!.result.receiptIds[0]!));
-        } else assert.equal(probe.store.readMemory(probe.activity, record.recordId).content, 'Original');
+        } else {
+          const unchanged = probe.store.readMemory(probe.activity, record.recordId);
+          assert.equal(unchanged.content, 'Original');
+          assert.equal(unchanged.lifecycle, operation === 'restore' ? 'tombstoned' : 'active');
+        }
       } finally { probe.close(); }
       const resumed = startCli(['remember', '--sandbox', sandbox.root]); clients.push(resumed);
       await resumed.waitFor('remember-ready');
       if (previewStage) {
         const shown = stage === 'before-record'
-          ? await send(resumed, `correct ${record.recordId} "Corrected"`, 'memory-preview')
+          ? await send(resumed, request, 'memory-preview')
           : resumed.observations.find(row => row.event === 'memory-preview')!;
-        assert.equal(shown.content, 'Corrected');
-        const committed = await send(resumed, `commit ${shown.token} "Corrected"`, 'memory-result');
+        assert.equal(shown.kind, operation);
+        assert.equal(shown.content, operation === 'correct' ? 'Corrected' : null);
+        const committed = await send(resumed, approval(shown.token), 'memory-result');
         assert.equal(committed.status, 'committed');
       } else {
         assert.equal(resumed.observations.filter(row => row.event === 'memory-owner-entry').length, stage === 'after-commit' ? 1 : 0);
@@ -62,14 +71,16 @@ for (const stage of ['before-record', 'after-record', 'after-output', 'after-com
         assert.equal(replay.status, 'committed');
         const owner = resumed.observations.filter(row => row.event === 'memory-owner-entry').at(-1)!;
         assert.equal(JSON.stringify((owner.receipts as unknown[])[0]), receiptBytes);
-        assert.equal((await send(resumed, `commit ${preview!.token} "Corrected"`, 'memory-result')).status, 'settled');
+        assert.equal((await send(resumed, approval(preview!.token), 'memory-result')).status, 'settled');
       }
       const answer = await send(resumed, 'ask preferences', 'ask-result');
       assert.equal(JSON.parse(String(answer.payload)).operationSummaries[0].status, 'committed');
       await stop(resumed);
       probe = openProbe(sandbox);
       try {
-        assert.equal(probe.store.readMemory(probe.activity, record.recordId).revision, 2);
+        const current = probe.store.readMemory(probe.activity, record.recordId);
+        assert.equal(current.revision, operation === 'correct' ? 2 : 1);
+        assert.equal(current.lifecycle, operation === 'forget' ? 'tombstoned' : 'active');
         const operations = probe.store.recoverMemoryOperations(probe.activity);
         assert.equal(operations.length, 1);
         assert.equal(operations[0]!.result.receiptIds.length, 1);

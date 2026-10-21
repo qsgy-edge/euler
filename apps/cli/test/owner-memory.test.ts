@@ -286,14 +286,15 @@ test('Info keeps the frozen batch and shows current member state after a later o
   withProbe(probe => {
     const first = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：使用 pnpm'), hostInfo: 'durable' });
     probe.store.registerHostInfo(probe.activity);
+    const second = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住决定：使用 Node 24'), hostInfo: 'durable' });
+    assert.equal(second.status, 'activated');
     probe.store.forgetMemory(probe.activity, first.record.recordId, first.record);
-    assert.deepEqual(probe.store.registerHostInfo(probe.activity).pending.map(info => info.batchId), [first.batchId]);
+    assert.deepEqual(probe.store.registerHostInfo(probe.activity).pending.map(info => info.batchId), [first.batchId, second.batchId]);
     const view = probe.store.readHostInfo(probe.activity, first.batchId!);
     assert.deepEqual([view.batch.events.length, view.batch.events[0]!.kind, view.batch.events[0]!.before.lifecycle,
       view.batch.events[0]!.after.lifecycle, view.batch.events[0]!.after.content], [1, 'activate', 'candidate', 'active', '使用 pnpm']);
     assert.deepEqual([view.members[0]!.recordId, view.members[0]!.current?.lifecycle, view.members[0]!.changed, view.members[0]!.unavailable],
       [first.record.recordId, 'tombstoned', true, null]);
-    const second = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住决定：使用 Node 24'), hostInfo: 'durable' });
     assert.notEqual(second.batchId, first.batchId);
     assert.deepEqual(probe.store.registerHostInfo(probe.activity).pending.map(info => info.batchId), [first.batchId, second.batchId]);
     assert.deepEqual(probe.store.readHostInfo(probe.activity, first.batchId!).batch.events.map(event => event.recordId), [first.record.recordId]);

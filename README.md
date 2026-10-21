@@ -20,6 +20,8 @@ Ordinary project candidates use [promotion, comparison and feedback gates](docs/
 
 Owner corrections use the actual CLI input, complete previews and live approval before [atomic correction and result recovery](docs/implementation/t15-owner-correction.md). Corrected bodies remain unverified until independent reverification. Run `npm run evidence:memory-correction` for retained CLI/SQLite observations.
 
+[Forget and restore](docs/implementation/t16-forget-restore.md) use the same live approval and durable recovery path. Forget preserves history and suppresses same-source recapture; restore requires a separate preview, approval and current eligibility. Run `npm run evidence:memory-forget` for retained CLI, suppression and immutable receipt observations.
+
 Full X-card acceptance, real provider dispatch, production schema/host acceptance, migration, and MC cutover remain unverified. CI and host results must be read from the artifact for the specific implementation and platform; this repository is not production-ready.
 
 - [Euler v1 implementation specification](docs/architecture/issues/15-euler-v1-spec.md)

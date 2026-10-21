@@ -382,7 +382,7 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
     capture.kick();
     emit('remember-ready', { pid: process.pid, hostInfo: log ? 'durable' : 'unavailable', infoPath: log?.path ?? null,
       ...counts(probe.store.listHostInfo(probe.activity)), syntheticProposals: options.syntheticProposals,
-      commands: [...OWNER_MEMORY_FORMS, ...(options.syntheticProposals ? ['propose <text>'] : []), '同意', '取消', 'info', 'info <batchId>', 'feedback <recordId> <headEventId> helpful|wrong|stale|safety', 'ask <question>', 'used <assemblyId> [recordId]', 'source <recordId> [offset]', 'inspect <recordId>', 'correct <recordId> <JSON string>', 'commit <token> <JSON string>', 'cancel <token>', 'replay <token>', 'model <correction command>', 'stop'] });
+      commands: [...OWNER_MEMORY_FORMS, ...(options.syntheticProposals ? ['propose <text>'] : []), '同意', '取消', 'info', 'info <batchId>', 'feedback <recordId> <headEventId> helpful|wrong|stale|safety', 'ask <question>', 'used <assemblyId> [recordId]', 'source <recordId> [offset]', 'inspect <recordId>', 'correct <recordId> <JSON string>', 'forget <recordId>', 'restore <recordId>', 'commit <token> <JSON string|forget|restore>', 'cancel <token>', 'replay <token>', 'model <memory command>', 'stop'] });
     const archive = (text: string): SourceAck | null => {
       try { return probe.archive.append(randomUUID(), text); }
       catch (error) { report('live', 'error', 'error', { committed: false, reason: (error as Error).message }); return null; }

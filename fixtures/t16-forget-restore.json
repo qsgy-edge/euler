@@ -1,0 +1,11 @@
+{
+  "schema": "forget-restore-fixture@1",
+  "original": "本项目使用 pnpm",
+  "paraphrase": "本项目使用 pnpm。",
+  "summaryMaxBytes": 2048,
+  "cases": [
+    "normal",
+    "forget-after-commit",
+    "restore-after-commit"
+  ]
+}

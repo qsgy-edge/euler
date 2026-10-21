@@ -173,7 +173,7 @@ test('a complete model response reaches the same correction gate through AgentRu
   } finally { f.close(); }
 });
 
-test('replay reports only a real correction verification job and rejects a different operation kind', () => {
+test('replay reports a verification job only for a correction, never for forget', () => {
   const f = fixture();
   try {
     const inspection = f.probe.store.inspectMemoryPresentation(f.probe.activity, [f.record.recordId]);
@@ -192,7 +192,9 @@ test('replay reports only a real correction verification job and rejects a diffe
       f.probe.store.inspectMemoryPresentation(f.probe.activity, [current.recordId]).token, { kind: 'forget' });
     f.probe.store.acknowledgeMemoryPresentation(f.probe.activity, forget.token, forget.hash);
     f.probe.store.commitMemoryOperation(f.probe.activity, forget.token);
-    assert.equal(f.status(f.core.handle(f.core.receive(`replay ${forget.token}`))), 'invalid_identity');
+    const forgotten = f.core.handle(f.core.receive(`replay ${forget.token}`));
+    assert.equal(f.status(forgotten), 'committed');
+    assert.equal('verification' in forgotten, false);
   } finally { f.close(); }
 });
 

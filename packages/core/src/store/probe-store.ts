@@ -1,4 +1,4 @@
-import { memoryOperationSummary, parseCorrectionCommand } from '../context/memory-correction.ts';
+import { isLiveMemoryOperation, matchesMemoryApproval, memoryOperationSummary, parseCorrectionCommand } from '../context/memory-correction.ts';
 import { parseAnalysisArtifact } from '../context/analysis-artifacts.ts';
 import type { ExportSelection } from '../context/analysis-artifacts.ts';
 import { replayAgent } from '../context/agent-state.ts';
@@ -222,7 +222,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=18), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=19), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -674,7 +674,7 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=18;
+PRAGMA user_version=19;
 ` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
@@ -745,15 +745,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,18,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,19,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 18, 'unsupported-probe-schema');
+        check(version === 19, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 18 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 19 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -2015,7 +2015,7 @@ export class ProbeStore {
         check(record.claimKey === claimKey, 'identity-conflict');
         return { status: 'no_op', record, eventId: null };
       }
-      const suppressed = this.#suppressed(claimKey, input.binding.sessionId, scope, appliesTo);
+      const suppressed = this.#suppressed(claimKey, [input], scope, appliesTo);
       if (suppressed) return { status: 'no_op', record: suppressed, eventId: null };
       const recordId = randomUUID();
       const revisionId = randomUUID();
@@ -2269,7 +2269,7 @@ export class ProbeStore {
       this.#validateSource(job.source, proposal.content, job.scope);
       const claimKey = proposal.content.trim().normalize('NFC');
       check(claimKey.length > 0, 'invalid-capture-proposal');
-      const suppressed = this.#suppressed(claimKey, job.source.binding.sessionId, job.scope, appliesTo);
+      const suppressed = this.#suppressed(claimKey, job.range, job.scope, appliesTo);
       if (suppressed && !(suppressed.lifecycle === 'tombstoned' && laterFactPeriod({ type: proposal.type, validFrom }, suppressed))) {
         this.#db.prepare("UPDATE capture_work SET stage='blocked',reason='memory-suppressed',lease_token=NULL,lease_activity=NULL WHERE job_id=?").run(job.jobId);
         return this.#captureJob(job.jobId);
@@ -2636,7 +2636,7 @@ export class ProbeStore {
           this.#corroborate(duplicate, range); // Ticket 08 §10: new evidence for the same claim only appends provenance.
           return this.#rememberResult('no_op', duplicate, range, 'claim-already-active');
         }
-        const suppressed = this.#suppressed(claimKey, input.binding.sessionId, scope, []);
+        const suppressed = this.#suppressed(claimKey, range, scope, []);
         if (suppressed) return this.#rememberResult('no_op', suppressed, range, 'memory-suppressed');
         record = this.#withMemoryHash({ schema: 'memory-record@1', recordId: randomUUID(), revisionId: randomUUID(), revision: 1,
           claimKey, content: statement.content, contentHash: sha256(statement.content), type: statement.type,
@@ -2654,8 +2654,10 @@ export class ProbeStore {
       if (record.verification === 'unverified') {
         const prior = record.verificationRunId ? this.#verificationOf(record) : null;
         if (prior?.verifier === 'owner-fast-lane@1') return this.#rememberResult('blocked', record, range, prior.reason);
-        const result = statement.type === 'fact' ? 'evidence-gap' : 'pass';
-        const reason = result === 'pass' ? null : 'objective-fact-authority-required';
+        const ambiguous = this.#suppressionPeers(range, record.scope, record.appliesTo).length > 0;
+        const reason = ambiguous ? 'suppression-identity-evidence-gap'
+          : statement.type === 'fact' ? 'objective-fact-authority-required' : null;
+        const result = reason ? 'evidence-gap' : 'pass';
         const runId = this.#saveVerification(record, result, range, 'owner-fast-lane@1', reason);
         const verified = this.#withMemoryHash({ ...record, verificationRunId: runId,
           verification: result === 'pass' ? 'verified' : 'unverified', headEventId: randomUUID() });
@@ -2666,8 +2668,11 @@ export class ProbeStore {
         if (result !== 'pass') return this.#rememberResult('blocked', record, range, reason);
       }
       if (request.hostInfo !== 'durable') return this.#rememberResult('blocked', record, range, 'host-info-unavailable');
-      if (this.#suppressed(record.claimKey, record.source.binding.sessionId, record.scope, record.appliesTo)) {
+      if (this.#suppressed(record.claimKey, this.#memorySources(record), record.scope, record.appliesTo)) {
         return this.#rememberResult('blocked', record, range, 'memory-suppressed');
+      }
+      if (this.#suppressionPeers(this.#memorySources(record), record.scope, record.appliesTo).length) {
+        return this.#rememberResult('blocked', record, range, 'suppression-identity-evidence-gap');
       }
       if (this.#activeClaim(record.claimKey, statement, record.scope, record.recordId)) {
         return this.#rememberResult('blocked', record, range, 'claim-already-active');
@@ -2837,7 +2842,7 @@ export class ProbeStore {
   registerCorrectionDelivery(activity: Activity, token: string) {
     return this.withActivity(activity, () => {
       const presentation = this.readMemoryPresentation(activity, token);
-      check(presentation.kind === 'correct' && presentation.operationId, 'correction-token-required');
+      check(isLiveMemoryOperation(presentation.kind) && presentation.operationId, 'correction-token-required');
       this.#db.prepare('INSERT OR IGNORE INTO host_operation_delivery(operation_id,summary_event_id) VALUES (?,?)')
         .run(presentation.operationId, randomUUID());
       return this.correctionDelivery(activity, token);
@@ -2868,8 +2873,8 @@ export class ProbeStore {
       const presentation = this.readMemoryPresentation(activity, token);
       const raw = this.#archiveRef(input);
       const command = parseCorrectionCommand(raw.text);
-      check(raw.role === 'user' && sameBinding(input.binding, this.#binding) && command?.kind === 'commit'
-        && command.token === token && command.content === presentation.content, 'correction-approval-mismatch');
+      check(raw.role === 'user' && sameBinding(input.binding, this.#binding)
+        && matchesMemoryApproval(command, presentation), 'correction-approval-mismatch');
       const delivery = this.correctionDelivery(activity, token);
       check(!delivery.approval && this.memoryOperationStatus(activity, token).status === 'pending', 'operation-already-settled');
       const payload = JSON.stringify(input);
@@ -3910,7 +3915,7 @@ export class ProbeStore {
       if (record.lifecycle !== 'active') return false;
       try {
         this.#eligible(record);
-        return !this.#suppressed(record.claimKey, record.source.binding.sessionId, record.scope, record.appliesTo);
+        return !this.#suppressed(record.claimKey, this.#memorySources(record), record.scope, record.appliesTo);
       } catch (error) {
         const reason = error instanceof Error ? error.message : '';
         if (['memory-not-eligible','memory-not-current','file-identity-changed','unsafe-file-identity'].includes(reason)
@@ -4189,7 +4194,7 @@ export class ProbeStore {
         return { before: peer, after };
       });
       const active = this.#withMemoryHash({ ...current, lifecycle: 'active', headEventId: randomUUID() });
-      const suppressed = this.#suppressed(current.claimKey, current.source.binding.sessionId, current.scope, current.appliesTo);
+      const suppressed = this.#suppressed(current.claimKey, this.#memorySources(current), current.scope, current.appliesTo);
       check(!suppressed || suppressed.lifecycle === 'tombstoned' && laterFactPeriod(current, suppressed)
         && state.replacements.includes(suppressed.recordId), 'memory-suppressed');
       this.#appendMemoryEvent(current, active, 'activate', current.source.eventId,
@@ -4257,7 +4262,8 @@ export class ProbeStore {
       const current = this.#assertMemoryExpected(recordId, expected);
       if (current.lifecycle === 'active' && current.verification === 'verified') return { status: 'no_op', record: current, eventId: null };
       check(current.lifecycle === 'candidate' && current.verification === 'verified' && current.scope.resolved && !current.conflictSetId, 'memory-not-eligible');
-      check(!this.#suppressed(current.claimKey, current.source.binding.sessionId, current.scope, current.appliesTo), 'memory-suppressed');
+      check(!this.#suppressed(current.claimKey, this.#memorySources(current), current.scope, current.appliesTo), 'memory-suppressed');
+      check(!this.#suppressionPeers(this.#memorySources(current), current.scope, current.appliesTo).length, 'suppression-identity-evidence-gap');
       const after = this.#withMemoryHash({ ...current, lifecycle: 'active', headEventId: randomUUID() });
       this.#eligible(after);
       this.#appendMemoryEvent(current, after, 'activate', current.source.eventId, { automatic: true }, request);
@@ -4275,7 +4281,8 @@ export class ProbeStore {
         check(JSON.stringify(record.scope) === JSON.stringify(scope), 'mixed-batch-scope');
         check(record.lifecycle === 'candidate', 'memory-not-eligible');
         this.#eligible(record);
-        check(!this.#suppressed(record.claimKey, record.source.binding.sessionId, record.scope, record.appliesTo), 'memory-suppressed');
+        check(!this.#suppressed(record.claimKey, this.#memorySources(record), record.scope, record.appliesTo), 'memory-suppressed');
+        check(!this.#suppressionPeers(this.#memorySources(record), record.scope, record.appliesTo).length, 'suppression-identity-evidence-gap');
       }
       const batchId = randomUUID();
       for (const [ordinal, record] of current.entries()) {
@@ -4457,7 +4464,10 @@ export class ProbeStore {
       const current = this.#assertMemoryExpected(recordId, expected);
       check(current.lifecycle === 'active', 'memory-not-active');
       const after = this.#withMemoryHash({ ...current, lifecycle: 'tombstoned', headEventId: this.#ownerEventId(recordId) });
-      this.#appendMemoryEvent(current, after, 'forget', current.source.eventId, { reversible: true }, request);
+      const suppression = { ownerId: this.#binding.ownerId, recordId, revisionId: current.revisionId,
+        headEventId: current.headEventId, scope: current.scope, appliesTo: canonicalMemoryConditions(current.appliesTo),
+        claimKey: current.claimKey, contentHash: current.contentHash, sources: this.#memorySources(current) };
+      this.#appendMemoryEvent(current, after, 'forget', current.source.eventId, { reversible: true, suppression }, request);
       return { status: 'committed', record: after, eventId: after.headEventId };
     });
   }
@@ -4780,15 +4790,45 @@ export class ProbeStore {
     }
     return runId;
   }
-  #suppressed(claimKey: string, lineage: string, scope: MemoryScope, appliesTo: string[]): MemoryRecord | null {
-    const rows = this.#db.prepare(`SELECT r.record_id FROM memory_records r JOIN memory_heads h ON h.record_id=r.record_id
-      WHERE r.owner_id=? AND r.claim_key=? AND r.source_lineage=? AND h.scope_kind=? AND h.scope_id=? AND h.lifecycle='tombstoned'`)
-      .all(this.#binding.ownerId, claimKey, lineage, scope.kind, scope.id);
-    for (const row of rows) {
-      const record = this.#readMemoryUnsafe(String(row.record_id));
-      if (JSON.stringify(record.appliesTo) === JSON.stringify(appliesTo)) return record;
+  #memorySources(record: MemoryRecord): SourceAck[] {
+    const sources: SourceAck[] = [record.source];
+    for (const row of this.#db.prepare('SELECT payload,payload_hash FROM provenance_refs WHERE record_id=? ORDER BY rowid')
+      .all(record.recordId)) {
+      check(sha256(String(row.payload)) === row.payload_hash, 'memory-evidence-gap');
+      const value = JSON.parse(String(row.payload)) as { recordId: string; source: SourceAck };
+      check(value.recordId === record.recordId, 'memory-evidence-gap');
+      if (!sources.some(source => sameSourceAck(source, value.source))) sources.push(value.source);
     }
-    return null;
+    return sources;
+  }
+  #suppressionPeers(sources: readonly SourceAck[], scope: MemoryScope, appliesTo: string[]): MemoryRecord[] {
+    const rows = this.#db.prepare(`SELECT h.record_id,e.payload,e.payload_hash FROM memory_heads h
+      JOIN memory_records r ON r.record_id=h.record_id JOIN memory_events e ON e.record_id=h.record_id
+      WHERE r.owner_id=? AND h.scope_kind=? AND h.scope_id=? AND h.lifecycle='tombstoned'
+        AND e.kind='forget' AND e.seq=(SELECT MAX(f.seq) FROM memory_events f WHERE f.record_id=h.record_id AND f.kind='forget')`)
+      .all(this.#binding.ownerId, scope.kind, scope.id);
+    const peers: MemoryRecord[] = [];
+    for (const row of rows) {
+      check(sha256(String(row.payload)) === row.payload_hash, 'memory-evidence-gap');
+      const { before, suppression } = JSON.parse(String(row.payload)) as { before: MemoryRecord;
+        suppression: { ownerId: string; recordId: string; revisionId: string; headEventId: string;
+          scope: MemoryScope; appliesTo: string[]; claimKey: string; contentHash: string; sources: SourceAck[] } };
+      check(suppression && suppression.ownerId === this.#binding.ownerId && suppression.recordId === row.record_id
+        && suppression.revisionId === before.revisionId && suppression.headEventId === before.headEventId
+        && suppression.claimKey === before.claimKey && suppression.contentHash === before.contentHash
+        && JSON.stringify(suppression.scope) === JSON.stringify(before.scope)
+        && JSON.stringify(suppression.appliesTo) === JSON.stringify(canonicalMemoryConditions(before.appliesTo))
+        && suppression.sources.some(source => sameSourceAck(source, before.source)), 'memory-evidence-gap');
+      // A CLI archive session is the logical source lineage; event IDs and byte ranges are versions within it.
+      if (JSON.stringify(suppression.appliesTo) === JSON.stringify(canonicalMemoryConditions(appliesTo))
+        && suppression.sources.some(source => sources.some(input => input.binding.ownerId === source.binding.ownerId
+          && input.binding.sessionId === source.binding.sessionId))) peers.push(this.#readMemoryHead(String(row.record_id)));
+    }
+    return peers;
+  }
+  #suppressed(claimKey: string, sources: readonly SourceAck[], scope: MemoryScope, appliesTo: string[]): MemoryRecord | null {
+    return this.#suppressionPeers(sources, scope, appliesTo).find(record => record.claimKey === claimKey
+      || record.content.trim().normalize('NFC') === claimKey) ?? null;
   }
   expandSource(activity: Activity, request: { ref: SourceAck; offset: number; limit: number }): SourceExcerpt;
   expandSource(activity: Activity, request: { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string }): SourceUnitExcerpt;
@@ -5478,6 +5518,13 @@ function parseMemoryCondition(condition: string): { kind: keyof SearchTarget; va
   if (parts.length === 2 && ['agent','platform','component'].includes(parts[0]!)
     && /^[^:\s]+$/u.test(parts[1]!)) return { kind: parts[0] as keyof SearchTarget, value: parts[1]! };
   return null;
+}
+
+function canonicalMemoryConditions(conditions: readonly string[]): string[] {
+  return [...new Set(conditions.map(value => {
+    const condition = parseMemoryCondition(value)!;
+    return `${condition.kind}:${condition.value}`;
+  }))].sort();
 }
 
 function laterFactPeriod(candidate: Pick<MemoryRecord, 'type' | 'validFrom'>, previous: MemoryRecord): boolean {
