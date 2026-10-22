@@ -107,7 +107,21 @@ try {
       for (const assembly of db.prepare('SELECT * FROM request_assemblies WHERE run_id=?').all(String(runId))) {
         const context = JSON.parse(String(assembly.context));
         assert.ok(windows.some(window => window.windowId === context.windowId));
-        assert.ok(runtime.some(event => event.kind === 'cache-epoch-opened' && event.cacheEpoch === context.cacheEpoch && event.prefixHash === context.prefixHash));
+        const epoch = runtime.find(event => event.kind === 'cache-epoch-opened' && event.cacheEpoch === context.cacheEpoch && event.prefixHash === context.prefixHash);
+        assert.ok(epoch); assert.match(context.operationHash, /^[a-f0-9]{64}$/);
+        assert.equal(epoch.operationHash, context.operationHash);
+        assert.equal(epoch.guidanceRunId, context.guidanceRunId);
+        assert.equal(runtime[0].guidanceRunId, context.guidanceRunId);
+        if (context.guidanceRunId) {
+          const selected = db.prepare('SELECT run_id,route,payload_hash,sources FROM request_assemblies WHERE assembly_id=?').get(context.guidanceAssemblyId);
+          assert.ok(selected); assert.equal(selected.run_id, context.guidanceRunId); assert.equal(selected.route, 'guidance-acceptance');
+          const refs = JSON.parse(String(selected.sources)).filter((ref: { contentHash: string }) => ref.contentHash === selected.payload_hash);
+          assert.equal(refs.length, 1);
+          assert.ok(JSON.parse(String(assembly.sources)).some((ref: unknown) => JSON.stringify(ref) === JSON.stringify(refs[0])));
+          const raw = archive.get(`${refs[0].binding.sessionId}/${refs[0].eventId}`);
+          assert.ok(raw); assert.equal(hash(raw.text), selected.payload_hash);
+          assert.equal(JSON.parse(raw.text).schema, 'instruction-snapshot@1');
+        } else assert.equal(context.guidanceAssemblyId, undefined);
         const budget = JSON.parse(String(assembly.budget));
         assert.ok(Number(assembly.byte_length) + budget.outputReserve + budget.safetyMargin <= budget.contextLimit);
         for (const ref of JSON.parse(String(assembly.sources))) {

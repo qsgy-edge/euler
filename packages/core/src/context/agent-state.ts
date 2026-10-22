@@ -14,7 +14,7 @@ export interface ToolResult {
 }
 export interface ToolFact { callId: string; name: string; argumentsHash: string; attemptId: string; started: boolean; result: ToolResult | null }
 export type AgentEvent =
-  | { kind: 'opened'; route: ModelRoute; files?: FileCapability; discoveryGrantId?: string }
+  | { kind: 'opened'; route: ModelRoute; files?: FileCapability; discoveryGrantId?: string; guidanceRunId?: string }
   | { kind: 'source-access'; sourceEventId: string; binding: Binding; discoveryGrantId: string }
   | { kind: 'window-opened'; windowId: string; previousWindowId: string | null; firstResponse: number; reason: 'initial' | 'pressure' | 'explicit'; recovery: SourceAck[] }
   | ({ kind: 'cache-epoch-opened' } & RequestContext)
@@ -33,6 +33,7 @@ export interface AgentStatus {
   terminal: RunTerminal | null;
   attempts: number;
   discoveryGrantId: string | null;
+  guidanceRunId: string | null;
   windows: Extract<AgentEvent, { kind: 'window-opened' }>[];
   cacheEpoch: RequestContext | null;
   invalidEpochs: string[];
@@ -42,13 +43,14 @@ export interface AgentStatus {
   responses: { attemptId: string; source: SourceAck }[];
 }
 export function replayAgent(events: AgentEvent[], attempts: number): AgentStatus {
-  const state: AgentStatus = { terminal: null, attempts, discoveryGrantId: null, windows: [], cacheEpoch: null, invalidEpochs: [], inputs: [], responses: [], tools: [], files: [] };
+  const state: AgentStatus = { terminal: null, attempts, discoveryGrantId: null, guidanceRunId: null, windows: [], cacheEpoch: null, invalidEpochs: [], inputs: [], responses: [], tools: [], files: [] };
   check(events[0]?.kind === 'opened', 'agent-evidence-gap');
   for (const [index, event] of events.entries()) {
     check(!state.terminal || event.kind === 'file-reconciled' || event.kind === 'source-access', 'agent-event-after-terminal');
     switch (event.kind) {
       case 'opened':
-        check(index === 0, 'agent-evidence-gap'); state.discoveryGrantId = event.discoveryGrantId ?? null; break;
+        check(index === 0, 'agent-evidence-gap'); state.discoveryGrantId = event.discoveryGrantId ?? null;
+        state.guidanceRunId = event.guidanceRunId ?? null; break;
       case 'source-access':
         check(event.discoveryGrantId === state.discoveryGrantId, 'source-access-mismatch'); break;
       case 'window-opened':
@@ -60,8 +62,10 @@ export function replayAgent(events: AgentEvent[], attempts: number): AgentStatus
       case 'cache-epoch-opened':
         check(!state.cacheEpoch && !state.invalidEpochs.includes(event.cacheEpoch)
           && event.windowId === state.windows.at(-1)?.windowId
-          && (event.discoveryGrantId ?? null) === state.discoveryGrantId, 'cache-epoch-invalid');
-        state.cacheEpoch = { windowId: event.windowId, cacheEpoch: event.cacheEpoch, prefixHash: event.prefixHash,
+          && (event.discoveryGrantId ?? null) === state.discoveryGrantId
+          && (event.guidanceRunId ?? null) === state.guidanceRunId, 'cache-epoch-invalid');
+        state.cacheEpoch = { windowId: event.windowId, cacheEpoch: event.cacheEpoch, prefixHash: event.prefixHash, operationHash: event.operationHash,
+          ...(event.guidanceRunId ? { guidanceRunId: event.guidanceRunId } : {}),
           ...(event.discoveryGrantId ? { discoveryGrantId: event.discoveryGrantId } : {}) }; break;
       case 'cache-epoch-invalidated':
         check(state.cacheEpoch?.cacheEpoch === event.cacheEpoch, 'cache-epoch-invalid');

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
-import { AgentRun, DEFAULT_BUDGET, MemoryCorrections } from '@euler/core';
+import { AgentRun, API_VERSION, DEFAULT_BUDGET, GuidanceSession, MemoryCorrections, fileIdentity } from '@euler/core';
 import { pumpAgent } from '../src/agent-pump.ts';
 import { HttpModelTransport } from '../src/model-transport.ts';
 import { bindingOf, createSandbox, createSandboxSession } from '../src/sandbox.ts';
@@ -18,6 +18,113 @@ function toolTurn(run: AgentRun, id: string) {
   run.finishModel(attempt.attemptId, { text: '', stop: 'tools', calls: [{ id, name: 'controlled.echo', arguments: { text: id } }] });
   run.startTool(id); run.finishTool(id, id);
 }
+
+for (const change of ['membership', 'snapshot'] as const)
+for (const boundary of ['start', 'send'] as const)
+test(`guidance ${change} committed after preparation blocks the ${boundary} boundary`, () => {
+  const sandbox = createSandbox(), probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
+  const writer = openProbe(sandbox, budget, undefined, undefined, undefined, true);
+  try {
+    const root = join(sandbox.root, 'project'), workspace = randomUUID();
+    mkdirSync(root, { recursive: true });
+    const instructions = join(sandbox.root, 'agent', 'workspaces', workspace);
+    mkdirSync(instructions, { recursive: true });
+    writeFileSync(join(instructions, 'AGENTS.md'), 'WORKSPACE-T18-POLICY: require JSON output.');
+    const config = { dataRoot: { path: sandbox.root, identity: fileIdentity(sandbox.root) },
+      projects: [{ projectId: sandbox.fixture.projectId, root: { path: root, identity: fileIdentity(root) } }], sharedSkills: null, sources: [] };
+    const guidance = new GuidanceSession(probe.store, probe.activity, probe.archive, config);
+    const target = { projectId: sandbox.fixture.projectId, path: join(root, 'example.ts') };
+    const host = { binding: bindingOf(sandbox), source: probe.archive,
+      guidance: { session: guidance, targets: [target], operation: { name: 'synthetic.read' as const, targets: [target.path] } } };
+    const run = new AgentRun(probe.store, probe.activity, host, route, budget);
+    run.receive(randomUUID(), 'Inspect the synthetic file.');
+    const request = run.nextModel()!; assert.doesNotMatch(request.payload, /WORKSPACE-T18-POLICY/);
+    const oldEpoch = run.status().cacheEpoch!.cacheEpoch;
+    const frozen = probe.store.requestStatus(probe.activity, run.runId).assemblies.at(-1)!;
+    const missingSelection = { ...frozen.context! }; delete missingSelection.guidanceAssemblyId;
+    assert.throws(() => probe.store.appendRequestAssembly(probe.activity, { ...frozen, payload: request.payload,
+      context: missingSelection }), /guidance-snapshot-stale/);
+    const prepare = guidance.prepare.bind(guidance); let armed = boundary === 'start';
+    guidance.prepare = targets => {
+      const result = prepare(targets);
+      if (armed) {
+        armed = false;
+        if (change === 'membership') writer.store.bindWorkspace(writer.activity, workspace, [sandbox.fixture.projectId]);
+        else {
+          writeFileSync(join(root, 'AGENTS.md'), 'WORKSPACE-T18-POLICY: require JSON output.');
+          new GuidanceSession(writer.store, writer.activity, writer.archive, config, guidance.runId).prepare([target]);
+        }
+      }
+      return result;
+    };
+    if (boundary === 'start') {
+      assert.throws(() => run.startModel(request, request.payload), /guidance-(membership|snapshot)-stale/);
+      assert.equal(run.status().cacheEpoch, null); assert.equal(run.status().attempts, 0);
+      run.cancel();
+      const retry = new AgentRun(probe.store, probe.activity, { ...host, guidance: { ...host.guidance,
+        session: new GuidanceSession(probe.store, probe.activity, probe.archive, config, guidance.runId) } }, route, budget);
+      retry.receive(randomUUID(), 'Inspect the synthetic file under the current workspace instructions.');
+      const rebuilt = retry.nextModel()!;
+      assert.match(rebuilt.payload, /WORKSPACE-T18-POLICY/); assert.notEqual(retry.status().cacheEpoch!.cacheEpoch, oldEpoch);
+      const prefixEpoch = retry.status().cacheEpoch!.cacheEpoch;
+      const firstGuidance = probe.store.requestStatus(probe.activity, retry.runId).assemblies.at(-1)!.context!.guidanceAssemblyId;
+      toolTurn(retry, 'current-step');
+      const intent = probe.store.readIntent(probe.activity)!;
+      probe.store.transitionIntent(probe.activity, intent.eventId, probe.archive.append(randomUUID(), 'Advance only the current step.'),
+        { status: 'active', step: 'next-step' });
+      const next = retry.nextModel()!;
+      assert.equal(retry.status().cacheEpoch!.cacheEpoch, prefixEpoch);
+      assert.notEqual(probe.store.requestStatus(probe.activity, retry.runId).assemblies.at(-1)!.context!.guidanceAssemblyId, firstGuidance);
+      const attempt = retry.startModel(next, next.payload);
+      assert.equal(retry.maySend(attempt.attemptId, next.payload), true);
+      retry.finishModel(attempt.attemptId, { text: '{}', calls: [], stop: 'end' });
+    } else {
+      const attempt = run.startModel(request, request.payload); armed = true;
+      assert.throws(() => run.maySend(attempt.attemptId, request.payload), /guidance-(membership|snapshot)-stale/);
+      assert.equal(run.status().cacheEpoch, null); run.cancel();
+      assert.equal(probe.store.requestStatus(probe.activity, run.runId).attempts.at(-1)!.outcome, 'cancelled-before-send');
+    }
+  } finally { writer.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+for (const boundary of ['store-start', 'send'] as const)
+test(`a committed forget summary cannot escape the ${boundary} transaction`, () => {
+  const sandbox = createSandbox(), probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
+  const writer = openProbe(sandbox, budget, undefined, undefined, undefined, true);
+  try {
+    const record = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：Atlas uses npm'), hostInfo: 'durable' }).record;
+    const run = new AgentRun(probe.store, probe.activity, { binding: bindingOf(sandbox), source: probe.archive }, route, budget);
+    run.receive(randomUUID(), 'Inspect the current preference.'); const request = run.nextModel()!;
+    assert.deepEqual(JSON.parse(request.payload).p1.operationSummaries ?? [], []);
+    const settle = () => {
+      const corrections = new MemoryCorrections(writer.store, writer.activity, writer.archive);
+      const preview = corrections.handle(corrections.receive(`forget ${record.recordId}`));
+      assert.equal(preview.kind, 'preview'); if (preview.kind !== 'preview') throw new Error('preview missing');
+      corrections.presented(preview.presentation);
+      const result = corrections.handle(corrections.receive(`commit ${preview.presentation.token} forget`));
+      assert.equal(result.kind === 'result' && result.result.status, 'committed');
+      writer.store.acknowledgeCorrectionOwner(writer.activity, preview.presentation.token);
+      const delivery = writer.store.correctionDelivery(writer.activity, preview.presentation.token);
+      writer.store.acknowledgeCorrectionModel(writer.activity, preview.presentation.token, writer.archive.append(delivery.summaryEventId,
+        JSON.stringify(writer.store.correctionSummary(writer.activity, preview.presentation.token)), 'tool'));
+    };
+    if (boundary === 'store-start') {
+      settle();
+      assert.throws(() => probe.store.startRequestAttempt(probe.activity, { runId: run.runId, assemblyId: request.assemblyId,
+        payloadHash: request.payloadHash, byteLength: Buffer.byteLength(request.payload), adapterVersion: API_VERSION }), /operation-summary-stale/);
+      assert.equal(run.status().attempts, 0); run.cancel();
+    } else {
+      const attempt = run.startModel(request, request.payload);
+      const summaries = probe.store.correctionModelSummaries.bind(probe.store); let armed = true;
+      probe.store.correctionModelSummaries = activity => { const result = summaries(activity); if (armed) { armed = false; settle(); } return result; };
+      assert.throws(() => run.maySend(attempt.attemptId, request.payload), /operation-summary-stale/);
+      assert.equal(run.status().cacheEpoch, null); run.cancel();
+      assert.equal(probe.store.requestStatus(probe.activity, run.runId).attempts.at(-1)!.outcome, 'cancelled-before-send');
+    }
+    assert.equal(probe.store.readMemory(probe.activity, record.recordId).lifecycle, 'tombstoned');
+    assert.equal(probe.store.correctionModelSummaries(probe.activity)[0]!.status, 'committed');
+  } finally { writer.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
 
 test('window rebuilding retains every admitted steering constraint in neutral and HTTP payloads', () => {
   const sandbox = createSandbox(), probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);

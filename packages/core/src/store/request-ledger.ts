@@ -42,7 +42,11 @@ export interface AssemblyMemoryUse {
   reason: 'selected-memory' | 'retrieved-memory';
 }
 
-export interface RequestContext { windowId: string; cacheEpoch: string; prefixHash: string; discoveryGrantId?: string }
+export interface RequestContext {
+  windowId: string; cacheEpoch: string; prefixHash: string; operationHash: string;
+  // The instruction selection belongs to the assembly; P3-only changes can retain the prefix epoch.
+  guidanceRunId?: string; guidanceAssemblyId?: string; discoveryGrantId?: string;
+}
 export interface RequestAssemblyInput {
   runId: string; epoch: number; route: string; model: string; policyHash: string;
   context?: RequestContext;

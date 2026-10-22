@@ -110,6 +110,7 @@ export class AgentRun {
       store.authorizeRequestRun(activity, this.runId, { budget, intent: null,
         relatedRunId: options.recovery?.relatedRunId ?? null, acceptDuplicateRisk: options.recovery?.acceptDuplicateRisk ?? false });
       this.#event({ kind: 'opened', route: this.#route, ...(this.#host.files ? { files: structuredClone(this.#host.files) } : {}),
+        ...(this.#host.guidance ? { guidanceRunId: this.#host.guidance.session.runId } : {}),
         ...(this.#host.discoveryGrantId ? { discoveryGrantId: this.#host.discoveryGrantId } : {}) });
       this.#event({ kind: 'window-opened', windowId: randomUUID(), previousWindowId: null, firstResponse: 0, reason: 'initial', recovery: [] });
     });
@@ -342,16 +343,20 @@ export class AgentRun {
     if (reserved > this.#budget.contextLimit || this.#usageTokens() + reserved > this.#budget.maxTotalTokens) {
       this.stop(reserved > this.#budget.contextLimit ? 'needs-input' : 'budget-exhausted'); return null;
     }
-    const prefixHash = sha256(JSON.stringify({ p0, p1: neutral.p1, route: this.#route, estimator: 'utf8-bytes-upper-bound@1' }));
+    const prefixHash = sha256(JSON.stringify({ p0, p1: neutral.p1, route: this.#route, estimator: 'utf8-bytes-upper-bound@1',
+      guidance: snapshot ? { runId: this.#host.guidance!.session.runId, cacheEpoch: snapshot.cacheEpoch, configHash: snapshot.configHash } : null }));
+    const operationHash = sha256(JSON.stringify(operationSummaries));
     let context = this.status().cacheEpoch;
-    if (context?.prefixHash !== prefixHash) {
+    if (context?.prefixHash !== prefixHash || context.operationHash !== operationHash) {
       this.#invalidateCache('prefix-changed');
-      context = { windowId: window.windowId, cacheEpoch: randomUUID(), prefixHash,
+      context = { windowId: window.windowId, cacheEpoch: randomUUID(), prefixHash, operationHash,
+        ...(this.#host.guidance ? { guidanceRunId: this.#host.guidance.session.runId } : {}),
         ...(this.#host.discoveryGrantId ? { discoveryGrantId: this.#host.discoveryGrantId } : {}) };
       this.#event({ kind: 'cache-epoch-opened', ...context });
     }
     const usedMemories = this.#store.agentMemoryUses(this.#activity, this.runId, selectedSources);
-    const assembly = this.#store.appendRequestAssembly(this.#activity, { runId: this.runId, epoch: this.#activity.epoch, context, usedMemories,
+    const assembly = this.#store.appendRequestAssembly(this.#activity, { runId: this.runId, epoch: this.#activity.epoch,
+      context: { ...context, ...(guidance ? { guidanceAssemblyId: guidance.assemblyId } : {}) }, usedMemories,
       route: JSON.stringify(this.#route), model: this.#route.model, policyHash: sha256(JSON.stringify(p0)), estimator: 'utf8-bytes-upper-bound@1',
       sources: selectedSources, intent: { eventId: intent.eventId, hash: intent.hash }, payload, payloadHash: sha256(payload), byteLength,
       estimatedTokens: byteLength, budget: this.#budget, zones: { p0: Buffer.byteLength(JSON.stringify(p0)),
@@ -368,14 +373,16 @@ export class AgentRun {
     this.#store.assertDispatchBoundary();
     check(this.#active() && !this.#inflight, 'run-not-admissible');
     check(this.#prepared.get(request)?.digest === sha256(JSON.stringify(request)) && payload === request.payload, 'payload-mismatch');
-    this.#checkGuidance(this.#prepared.get(request)!.guidanceHash);
-    this.#checkRetrieval();
-    const attempt = this.#store.withActivity(this.#activity, () => {
-      check(this.#prepared.get(request)?.summaryHash === sha256(JSON.stringify(this.#store.correctionModelSummaries(this.#activity))),
-        'operation-summary-stale');
-      return this.#store.startRequestAttempt(this.#activity, { runId: this.runId, assemblyId: request.assemblyId,
+    let attempt: RequestAttempt;
+    try {
+      this.#checkGuidance(this.#prepared.get(request)!.guidanceHash);
+      this.#checkRetrieval();
+      attempt = this.#store.startRequestAttempt(this.#activity, { runId: this.runId, assemblyId: request.assemblyId,
         payloadHash: sha256(payload), byteLength: Buffer.byteLength(payload), adapterVersion: API_VERSION });
-    });
+    } catch (error) {
+      this.#invalidateCache('admission-snapshot-stale');
+      throw error;
+    }
     this.#inflightGuidanceHash = this.#prepared.get(request)!.guidanceHash;
     this.#inflightSummaryHash = this.#prepared.get(request)!.summaryHash;
     this.#prepared.delete(request);
@@ -395,9 +402,14 @@ export class AgentRun {
       this.#invalidateCache('operation-summary-changed');
       throw new Error('operation-summary-stale');
     }
-    const allowed = !this.status().terminal && this.#store.requestMaySend(this.#activity, this.runId);
-    if (allowed) this.#sent = true;
-    return allowed;
+    try {
+      const allowed = !this.status().terminal && this.#store.requestMaySend(this.#activity, this.runId);
+      if (allowed) this.#sent = true;
+      return allowed;
+    } catch (error) {
+      this.#invalidateCache('send-snapshot-stale');
+      throw error;
+    }
   }
   finishModel(attemptId: string, reply: ModelReply): void {
     if (!this.#active()) return;

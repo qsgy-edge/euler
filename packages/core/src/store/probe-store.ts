@@ -1498,7 +1498,10 @@ export class ProbeStore {
       }
       if (input.context) {
         uuid(input.context.windowId); uuid(input.context.cacheEpoch);
-        check(/^[a-f0-9]{64}$/.test(input.context.prefixHash), 'invalid-context-identity');
+        if (input.context.guidanceRunId !== undefined) uuid(input.context.guidanceRunId);
+        if (input.context.guidanceAssemblyId !== undefined) uuid(input.context.guidanceAssemblyId);
+        check(/^[a-f0-9]{64}$/.test(input.context.prefixHash)
+          && /^[a-f0-9]{64}$/.test(input.context.operationHash), 'invalid-context-identity');
       }
       this.#assertAgentContext(activity, this.requestStatus(activity, input.runId), input);
       const usedMemories = input.usedMemories ?? [];
@@ -1651,7 +1654,7 @@ export class ProbeStore {
     });
   }
 
-  #assertAgentContext(activity: Activity, status: RequestStatus, assembly: Pick<RequestAssemblyInput, 'context' | 'sources' | 'usedMemories'>): void {
+  #assertAgentContext(activity: Activity, status: RequestStatus, assembly: Pick<RequestAssemblyInput, 'context' | 'sources' | 'usedMemories' | 'intent'>): void {
     // Counting probes also append task-outcome Agent events without using model windows.
     if (!status.events.some(event => event.kind === 'agent/event@v1'
       && (JSON.parse(event.payload).event as AgentEvent).kind === 'window-opened')) {
@@ -1659,8 +1662,27 @@ export class ProbeStore {
     }
     check(assembly.context, 'context-identity-required');
     const current = this.#readAgentLedger(status).cacheEpoch;
-    check(current && JSON.stringify(current) === JSON.stringify(assembly.context), 'cache-epoch-stale');
+    const { guidanceAssemblyId, ...epoch } = assembly.context;
+    check(current && JSON.stringify(current) === JSON.stringify(epoch), 'cache-epoch-stale');
     if (current.discoveryGrantId) this.#discoveryProjects(activity, current.discoveryGrantId);
+    check(Boolean(current.guidanceRunId) === Boolean(guidanceAssemblyId), 'guidance-snapshot-stale');
+    if (current.guidanceRunId) {
+      const guidance = this.requestStatus(activity, current.guidanceRunId);
+      const selected = guidance.assemblies.at(-1);
+      check(guidance.run.state === 'authorized' && guidance.run.epoch === activity.epoch
+        && selected && selected.assemblyId === guidanceAssemblyId && selected.route === 'guidance-acceptance', 'guidance-snapshot-stale');
+      const sources = selected.sources.filter(source => source.contentHash === selected.payloadHash);
+      check(sources.length === 1 && assembly.sources.some(source => sameSourceAck(source, sources[0])), 'guidance-snapshot-stale');
+      const text = this.#archiveRef(sources[0]!).text;
+      check(Buffer.byteLength(text) === selected.byteLength, 'guidance-snapshot-stale');
+      const instruction = JSON.parse(text) as { schema: string; intent: RequestAssemblyInput['intent'];
+        membership: ReturnType<ProbeStore['guidanceMembership']>; problems: string[] };
+      check(instruction.schema === 'instruction-snapshot@1' && instruction.problems.length === 0
+        && JSON.stringify(instruction.intent) === JSON.stringify(assembly.intent), 'guidance-snapshot-stale');
+      check(JSON.stringify(instruction.membership) === JSON.stringify(this.guidanceMembership(activity,
+        instruction.membership.projects.map(project => project.projectId))), 'guidance-membership-stale');
+    }
+    check(current.operationHash === sha256(JSON.stringify(this.correctionModelSummaries(activity))), 'operation-summary-stale');
     check(JSON.stringify(assembly.usedMemories ?? []) === JSON.stringify(this.agentMemoryUses(activity, status.run.runId, assembly.sources)),
       'assembly-memory-mismatch');
   }
