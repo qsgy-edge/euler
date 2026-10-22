@@ -1,6 +1,6 @@
 # Ordinary memory promotion, comparison and feedback
 
-Issue: [#14](https://github.com/qsgy-edge/euler/issues/14). Product behavior and persistent schema changes use a feature branch and PR. The implementation uses disposable schema 19 and synthetic data; older sandboxes are rejected rather than migrated. The governing contracts remain Ticket 08 §§8–20 and I05/I06/I17.
+Issue: [#14](https://github.com/qsgy-edge/euler/issues/14). Product behavior and persistent schema changes use a feature branch and PR. The implementation uses disposable schema 21 and synthetic data; older sandboxes are rejected rather than migrated. The governing contracts remain Ticket 08 §§8–20 and I05/I06/I17.
 
 ## Run and inspect
 

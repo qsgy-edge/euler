@@ -1454,6 +1454,29 @@ export class ProbeStore {
     });
   }
 
+  agentMemoryUses(activity: Activity, runId: string, sources: SourceAck[]): AssemblyMemoryUse[] {
+    return this.withActivity(activity, () => {
+      const uses = new Map<string, AssemblyMemoryUse>();
+      for (const tool of this.agentStatus(activity, runId).tools) {
+        if (tool.name !== 'memory.search' || tool.result?.outcome !== 'success'
+          || !sources.some(ref => sameSourceAck(ref, tool.result!.source))) continue;
+        const raw = JSON.parse(this.#archiveRef(tool.result.source).text);
+        const page = JSON.parse(raw.modelResult) as { results: { kind: string; record: MemoryRecord }[] };
+        check(Array.isArray(page.results), 'assembly-evidence-gap');
+        for (const hit of page.results) if (hit.kind === 'memory') {
+          const record = hit.record;
+          check(record.hash === sha256(this.#snapshotBytes(record)), 'assembly-evidence-gap');
+          const use: AssemblyMemoryUse = { recordId: record.recordId, revisionId: record.revisionId,
+            headEventId: record.headEventId, hash: record.hash, contentHash: record.contentHash, reason: 'retrieved-memory' };
+          const prior = uses.get(use.recordId);
+          check(!prior || JSON.stringify(prior) === JSON.stringify(use), 'memory-stale');
+          uses.set(use.recordId, use);
+        }
+      }
+      return [...uses.values()];
+    });
+  }
+
   appendRequestAssembly(activity: Activity, input: RequestAssemblyInput): RequestAssembly {
     return this.withActivity(activity, () => {
       const run = this.#requestRun(activity, input.runId);
@@ -1479,14 +1502,16 @@ export class ProbeStore {
       }
       this.#assertAgentContext(activity, this.requestStatus(activity, input.runId), input);
       const usedMemories = input.usedMemories ?? [];
-      check(Array.isArray(usedMemories) && usedMemories.length <= 16
+      check(Array.isArray(usedMemories) && usedMemories.length <= (input.context ? input.budget.maxToolCalls * 8 : 16)
         && new Set(usedMemories.map(item => item.recordId)).size === usedMemories.length, 'invalid-assembly-selection');
-      const snapshots = usedMemories.map(use => this.#assemblyMemory(use, true));
+      const projects = input.context?.discoveryGrantId ? this.#discoveryProjects(activity, input.context.discoveryGrantId).projects : undefined;
+      const snapshots = usedMemories.map(use => this.#assemblyMemory(use, true, projects));
       if (input.route === 'local-counting') {
         let payload: { schema?: string; memories?: unknown; operationSummaries?: unknown; operationArchive?: unknown; messages?: { role?: string; content?: unknown }[] };
         try { payload = JSON.parse(input.payload) as typeof payload; }
         catch { throw new Error('assembly-payload-mismatch'); }
-        check(payload.schema === 'synthetic-request@1' && input.sources.length === 1
+        check(usedMemories.every(use => use.reason === 'selected-memory')
+          && payload.schema === 'synthetic-request@1' && input.sources.length === 1
           && sameBinding(input.sources[0]!.binding, this.#binding) && Array.isArray(payload.messages)
           && payload.messages.length === 2 && payload.messages[1]?.role === 'user'
           && payload.messages[1].content === this.#archiveRef(input.sources[0]!).text
@@ -1495,7 +1520,7 @@ export class ProbeStore {
           && JSON.stringify(payload.memories ?? []) === JSON.stringify(
           snapshots.map(record => ({ kind: 'untrusted-memory', recordId: record.recordId,
             revisionId: record.revisionId, content: record.content }))), 'assembly-payload-mismatch');
-      } else check(usedMemories.length === 0, 'assembly-memory-unavailable');
+      } else check(input.context || usedMemories.length === 0, 'assembly-memory-unavailable');
       const frozen = freezeRequestPayload(input.payload);
       check(frozen.payloadHash === input.payloadHash && frozen.byteLength === input.byteLength
         && input.byteLength > 0 && input.estimatedTokens === input.byteLength, 'payload-freeze-mismatch');
@@ -1572,7 +1597,8 @@ export class ProbeStore {
       this.#verifyRequestSources([frozenAssembly], activity);
       this.#assertAgentContext(activity, status, frozenAssembly);
       if (run.ownerKind === 'session') this.correctionModelSummaries(activity);
-      for (const use of frozenAssembly.usedMemories) this.#assemblyMemory(use, true);
+      const projects = frozenAssembly.context?.discoveryGrantId ? this.#discoveryProjects(activity, frozenAssembly.context.discoveryGrantId).projects : undefined;
+      for (const use of frozenAssembly.usedMemories) this.#assemblyMemory(use, true, projects);
       const assembly = this.#db.prepare('SELECT * FROM request_assemblies WHERE assembly_id=? AND run_id=?')
         .get(input.assemblyId, input.runId);
       check(assembly, 'unknown-assembly');
@@ -1616,7 +1642,8 @@ export class ProbeStore {
       const assembly = status.assemblies.find(item => item.assemblyId === attempt?.assemblyId);
       if (assembly) {
         this.#assertAgentContext(activity, status, assembly);
-        for (const use of assembly.usedMemories) this.#assemblyMemory(use, true);
+        const projects = assembly.context?.discoveryGrantId ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : undefined;
+        for (const use of assembly.usedMemories) this.#assemblyMemory(use, true, projects);
       }
       return chargedRequestTokens(status) <= status.run.budget.maxTotalTokens
         && status.run.state === 'authorized' && status.run.epoch === activity.epoch
@@ -1624,7 +1651,7 @@ export class ProbeStore {
     });
   }
 
-  #assertAgentContext(activity: Activity, status: RequestStatus, assembly: Pick<RequestAssemblyInput, 'context'>): void {
+  #assertAgentContext(activity: Activity, status: RequestStatus, assembly: Pick<RequestAssemblyInput, 'context' | 'sources' | 'usedMemories'>): void {
     // Counting probes also append task-outcome Agent events without using model windows.
     if (!status.events.some(event => event.kind === 'agent/event@v1'
       && (JSON.parse(event.payload).event as AgentEvent).kind === 'window-opened')) {
@@ -1634,6 +1661,8 @@ export class ProbeStore {
     const current = this.#readAgentLedger(status).cacheEpoch;
     check(current && JSON.stringify(current) === JSON.stringify(assembly.context), 'cache-epoch-stale');
     if (current.discoveryGrantId) this.#discoveryProjects(activity, current.discoveryGrantId);
+    check(JSON.stringify(assembly.usedMemories ?? []) === JSON.stringify(this.agentMemoryUses(activity, status.run.runId, assembly.sources)),
+      'assembly-memory-mismatch');
   }
 
   #requestIntentCurrent(activity: Activity, run: RequestRun, assembly: RequestAssembly): boolean {
@@ -1691,13 +1720,13 @@ export class ProbeStore {
     });
   }
 
-  #assemblyMemory(use: AssemblyMemoryUse, requireCurrent = false): MemoryRecord {
+  #assemblyMemory(use: AssemblyMemoryUse, requireCurrent = false, projects: readonly string[] = [this.#binding.projectId]): MemoryRecord {
     check(use && Object.keys(use).sort().join(',') === 'contentHash,hash,headEventId,reason,recordId,revisionId'
-      && use.reason === 'selected-memory', 'invalid-assembly-selection');
+      && ['selected-memory', 'retrieved-memory'].includes(use.reason), 'invalid-assembly-selection');
     uuid(use.recordId);
     uuid(use.revisionId);
     uuid(use.headEventId);
-    const current = requireCurrent ? this.#readMemoryUnsafe(use.recordId) : this.#replayMemory(use.recordId);
+    const current = requireCurrent ? this.#readMemoryUnsafe(use.recordId, projects) : this.#replayMemory(use.recordId);
     if (!requireCurrent) {
       const head = this.#db.prepare('SELECT snapshot,snapshot_hash,head_event_id FROM memory_heads WHERE record_id=?')
         .get(use.recordId);
@@ -1712,13 +1741,16 @@ export class ProbeStore {
       && snapshot.contentHash === use.contentHash && snapshot.lifecycle === 'active'
       && snapshot.verification === 'verified', 'assembly-evidence-gap');
     this.#verifyRevision(snapshot);
-    this.#validateScope(snapshot.scope);
-    this.#validateSource(snapshot.source, undefined, snapshot.scope);
-    this.#checkVerification(snapshot, true);
+    this.#validateScope(snapshot.scope, projects);
+    this.#validateSource(snapshot.source, undefined, snapshot.scope, projects);
+    this.#checkVerification(snapshot, true, projects);
     if (requireCurrent) {
-      check(current.headEventId === use.headEventId && !memoryTemporalStatus(current, Date.now())
-        && memoryApplicability(current.appliesTo, { agent: 'cli', platform: process.platform }) === 'applicable', 'memory-stale');
-      this.#eligible(current);
+      check(current.headEventId === use.headEventId && current.lifecycle === 'active' && current.verification === 'verified'
+        && !current.conflictSetId && !memoryTemporalStatus(current, Date.now()), 'memory-stale');
+      if (use.reason === 'selected-memory') {
+        check(memoryApplicability(current.appliesTo, { agent: 'cli', platform: process.platform }) === 'applicable', 'memory-stale');
+        this.#eligible(current);
+      } else this.#validateMemorySources(current, projects);
     }
     return snapshot;
   }
@@ -1874,7 +1906,7 @@ export class ProbeStore {
   }
   inspectAssembly(activity: Activity, assemblyId: string, recordId?: string): {
     assemblyId: string; state: RequestAssemblyState; sources: { ref: SourceAck; ordinal: number; reason: string }[];
-    memories: { snapshot: MemoryRecord; ordinal: number; reason: 'selected-memory' }[];
+    memories: { snapshot: MemoryRecord; ordinal: number; reason: AssemblyMemoryUse['reason'] }[];
   } {
     return this.withActivity(activity, () => {
       uuid(assemblyId);
@@ -1887,9 +1919,10 @@ export class ProbeStore {
         check(assembly.usedMemories.some(use => use.recordId === recordId), 'assembly-source-not-used');
       }
       this.#verifyRequestSources([assembly], activity);
+      const projects = assembly.context?.discoveryGrantId ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : undefined;
       return { assemblyId, state: assembly.state,
         sources: assembly.sources.map((ref, ordinal) => ({ ref, ordinal, reason: assembly.selection[ordinal]!.reason })),
-        memories: assembly.usedMemories.map((use, ordinal) => ({ snapshot: this.#assemblyMemory(use), ordinal, reason: use.reason })) };
+        memories: assembly.usedMemories.map((use, ordinal) => ({ snapshot: this.#assemblyMemory(use, false, projects), ordinal, reason: use.reason })) };
     });
   }
 
@@ -2030,9 +2063,12 @@ export class ProbeStore {
       for (const [index, row] of rows.entries()) {
         check(row.version === index + 1 && row.expected_event_id === (latest?.eventId ?? null), 'intent-evidence-gap');
         const next = this.#readIntentSnapshot(row);
-        check(!latest || (next.intentId === latest.intentId && next.goal === latest.goal
-          && JSON.stringify(next.goalInput) === JSON.stringify(latest.goalInput)
-          && JSON.stringify(next.constraints) === JSON.stringify(latest.constraints)), 'intent-evidence-gap');
+        const newTask = latest && next.intentId !== latest.intentId;
+        check(!latest || (JSON.stringify(next.constraints) === JSON.stringify(latest.constraints)
+          && (newTask ? latest.status === 'completed' && next.status === 'active'
+            && JSON.stringify(next.goalInput) === JSON.stringify(next.input)
+            && sha256(next.goal) === next.input.contentHash && this.#archiveRef(next.input).role === 'user'
+            : next.goal === latest.goal && JSON.stringify(next.goalInput) === JSON.stringify(latest.goalInput))), 'intent-evidence-gap');
         latest = next;
       }
       const head = this.#db.prepare('SELECT event_id FROM intent_heads WHERE session_id=? AND branch_id=?')
@@ -2062,13 +2098,15 @@ export class ProbeStore {
       }
       const current = this.readIntent(activity);
       check((current?.eventId ?? null) === expected, 'intent-stale');
-      check(current || (typeof initialGoal === 'string' && Buffer.byteLength(initialGoal) <= 65536
-        && sha256(initialGoal) === input.contentHash), 'intent-needs-input');
+      const newTask = Boolean(current && initialGoal !== undefined);
+      check(!newTask || current!.status === 'completed' && transition.status === 'active', 'intent-new-task-not-authorized');
+      check(current && !newTask || (typeof initialGoal === 'string' && initialGoal.length > 0 && Buffer.byteLength(initialGoal) <= 65536
+        && sha256(initialGoal) === input.contentHash && this.#archiveRef(input).role === 'user'), 'intent-needs-input');
       const snapshot: Omit<Intent, 'hash'> = {
-        schema: 'intent@1', intentId: current?.intentId ?? randomUUID(), eventId: randomUUID(),
+        schema: 'intent@1', intentId: newTask ? randomUUID() : current?.intentId ?? randomUUID(), eventId: randomUUID(),
         version: (current?.version ?? 0) + 1, binding: this.#binding,
-        goal: current?.goal ?? initialGoal!, constraints: current?.constraints ?? ['synthetic-only', 'local-counting-transport-only'],
-        step: transition.step, status: transition.status, input, goalInput: current?.goalInput ?? input,
+        goal: newTask ? initialGoal! : current?.goal ?? initialGoal!, constraints: current?.constraints ?? ['synthetic-only', 'local-counting-transport-only'],
+        step: transition.step, status: transition.status, input, goalInput: newTask ? input : current?.goalInput ?? input,
       };
       const bytes = JSON.stringify(snapshot);
       const hash = sha256(bytes);

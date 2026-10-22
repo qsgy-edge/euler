@@ -157,6 +157,51 @@ test('an unavailable source is a paired tool failure and the model can finish no
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+for (const boundary of ['start', 'send', 'already-sent'] as const)
+test(`retrieved memory qualification is atomic at the ${boundary} boundary`, () => {
+  const sandbox = createSandbox(), probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
+  const writer = openProbe(sandbox, budget, undefined, undefined, undefined, true);
+  try {
+    const record = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：Atlas uses npm'), hostInfo: 'durable' }).record;
+    probe.store.drainSearchProjection(probe.activity);
+    const run = new AgentRun(probe.store, probe.activity, { binding: bindingOf(sandbox), source: probe.archive }, route, budget);
+    run.receive(randomUUID(), 'Inspect Atlas preferences.');
+    const first = run.nextModel()!, initial = run.startModel(first, first.payload);
+    assert.equal(run.maySend(initial.attemptId, first.payload), true);
+    run.finishModel(initial.attemptId, { text: '', stop: 'tools', calls: [{ id: 'memory', name: 'memory.search', arguments: { query: 'Atlas' } }] });
+    run.startTool('memory'); const result = run.coreToolResult('memory')!;
+    assert.equal(JSON.parse(result.modelResult).results[0].record.recordId, record.recordId);
+    run.finishTool('memory', result.modelResult);
+    const request = run.nextModel()!;
+    const frozen = probe.store.requestStatus(probe.activity, run.runId).assemblies.at(-1)!;
+    assert.equal(frozen.usedMemories[0]?.headEventId, record.headEventId);
+    assert.throws(() => probe.store.appendRequestAssembly(probe.activity, { ...frozen, payload: request.payload, usedMemories: [] }), /assembly-memory-mismatch/);
+    const forget = () => writer.store.forgetMemory(writer.activity, record.recordId, record);
+    const verify = probe.store.assertRetrievedMemory.bind(probe.store);
+    let armed = boundary === 'start';
+    probe.store.assertRetrievedMemory = (...args) => { verify(...args); if (armed) { armed = false; forget(); } };
+    if (boundary === 'start') {
+      assert.throws(() => run.startModel(request, request.payload), /memory-stale/);
+      assert.equal(probe.store.requestStatus(probe.activity, run.runId).attempts.length, 1);
+      run.cancel();
+    } else {
+      const attempt = run.startModel(request, request.payload);
+      if (boundary === 'send') {
+        armed = true;
+        assert.throws(() => run.maySend(attempt.attemptId, request.payload), /memory-stale/);
+        run.cancel();
+        assert.equal(probe.store.requestStatus(probe.activity, run.runId).attempts.at(-1)!.outcome, 'cancelled-before-send');
+      } else {
+        assert.equal(run.maySend(attempt.attemptId, request.payload), true);
+        forget();
+        run.finishModel(attempt.attemptId, { text: 'Received before revocation.', stop: 'end', calls: [] });
+        assert.equal(probe.store.requestStatus(probe.activity, run.runId).attempts.at(-1)!.outcome, 'received');
+      }
+    }
+    assert.equal(probe.store.readMemory(probe.activity, record.recordId).lifecycle, 'tombstoned');
+  } finally { writer.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('a forgotten memory result cannot be resent as historical active content after a window change', () => {
   const sandbox = createSandbox(), probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
   try {

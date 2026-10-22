@@ -51,6 +51,28 @@ test('initial intent goals must match the source content hash', () => {
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('a new task requires a completed predecessor and exact owner input, retaining the completed event', () => {
+  const sandbox = createSandbox(), probe = openProbe(sandbox);
+  try {
+    const first = probe.session.prepare(sandbox.fixture.eventId, sandbox.fixture.text).intent;
+    const input = probe.archive.append(randomUUID(), 'Task B: inspect only local evidence.');
+    const active = { status: 'active' as const, step: 'new-task' };
+    assert.throws(() => probe.store.transitionIntent(probe.activity, first.eventId, input, active, 'Task B: inspect only local evidence.'), /intent-new-task-not-authorized/);
+    const done = probe.archive.append(randomUUID(), 'Finish Task A.');
+    const completed = probe.store.transitionIntent(probe.activity, first.eventId, done, { status: 'completed', step: 'done' });
+    assert.throws(() => probe.store.transitionIntent(probe.activity, completed.eventId, input, active, 'Different task'), /intent-needs-input/);
+    const tool = probe.archive.append(randomUUID(), 'Tool cannot start Task B.', 'tool');
+    assert.throws(() => probe.store.transitionIntent(probe.activity, completed.eventId, tool, active, 'Tool cannot start Task B.'), /intent-needs-input/);
+    assert.deepEqual(probe.store.recoverIntent(probe.activity), completed);
+    const next = probe.store.transitionIntent(probe.activity, completed.eventId, input, active, 'Task B: inspect only local evidence.');
+    assert.notEqual(next.intentId, first.intentId); assert.deepEqual(next.constraints, first.constraints);
+    assert.equal(next.goal, 'Task B: inspect only local evidence.'); assert.deepEqual(next.goalInput, input);
+    assert.deepEqual(probe.store.transitionIntent(probe.activity, completed.eventId, input, active, next.goal), next);
+    assert.deepEqual(probe.store.transitionIntent(probe.activity, first.eventId, done, { status: 'completed', step: 'done' }), completed);
+    assert.deepEqual(probe.store.recoverIntent(probe.activity), next);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('source-backed intent survives reopening and a stale intent blocks final dispatch', () => {
   const sandbox = createSandbox();
   try {

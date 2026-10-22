@@ -39,7 +39,7 @@ export interface RequestRun {
 // never persisted; the ledger keeps only the frozen identity facts.
 export interface AssemblyMemoryUse {
   recordId: string; revisionId: string; headEventId: string; hash: string; contentHash: string;
-  reason: 'selected-memory';
+  reason: 'selected-memory' | 'retrieved-memory';
 }
 
 export interface RequestContext { windowId: string; cacheEpoch: string; prefixHash: string; discoveryGrantId?: string }

@@ -260,8 +260,12 @@ export class AgentRun {
     const pending = state.inputs.filter(input => input.state === 'received' && input.mode === 'steer');
     if (!pending.length && !state.responses.length && !state.inputs.some(input => input.state === 'admitted-to-loop')) return null;
     const first = state.inputs[0]!;
-    const intent = this.#store.recoverIntent(this.#activity)
-      ?? this.#store.transitionIntent(this.#activity, null, first.source, { status: 'active', step: 'controlled-run' }, this.#host.source.read(first.source).text);
+    const previousIntent = this.#store.recoverIntent(this.#activity);
+    const initial = pending[0]?.source ?? first.source;
+    const intent = !previousIntent || previousIntent.status === 'completed' && !state.responses.length && pending.length
+      ? this.#store.transitionIntent(this.#activity, previousIntent?.eventId ?? null, initial,
+        { status: 'active', step: 'controlled-run' }, this.#host.source.read(initial).text)
+      : previousIntent;
     check(intent.status === 'active', 'intent-not-active');
     this.#event({ kind: 'admitted', eventIds: pending.map(input => input.source.eventId) });
     const bindingInputs = this.status().inputs.filter(input => input.state === 'admitted-to-loop');
@@ -346,7 +350,8 @@ export class AgentRun {
         ...(this.#host.discoveryGrantId ? { discoveryGrantId: this.#host.discoveryGrantId } : {}) };
       this.#event({ kind: 'cache-epoch-opened', ...context });
     }
-    const assembly = this.#store.appendRequestAssembly(this.#activity, { runId: this.runId, epoch: this.#activity.epoch, context,
+    const usedMemories = this.#store.agentMemoryUses(this.#activity, this.runId, selectedSources);
+    const assembly = this.#store.appendRequestAssembly(this.#activity, { runId: this.runId, epoch: this.#activity.epoch, context, usedMemories,
       route: JSON.stringify(this.#route), model: this.#route.model, policyHash: sha256(JSON.stringify(p0)), estimator: 'utf8-bytes-upper-bound@1',
       sources: selectedSources, intent: { eventId: intent.eventId, hash: intent.hash }, payload, payloadHash: sha256(payload), byteLength,
       estimatedTokens: byteLength, budget: this.#budget, zones: { p0: Buffer.byteLength(JSON.stringify(p0)),

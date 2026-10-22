@@ -65,11 +65,14 @@ test(`archived cross-project tool and assistant copies retain their access depen
     }
     assert.equal(reopened.store.listCaptureJobs(reopened.activity).length, 0);
     assert.equal(reopened.store.expandSource(reopened.activity, { ref: f.goal, offset: 0, limit: 128 }).text, 'Analyze the explicitly approved synthetic project.');
-    if (end !== 'task-completed') {
+    {
+      const prior = reopened.store.recoverIntent(reopened.activity)!;
       const local = new AgentRun(reopened.store, reopened.activity, { binding: bindingOf(f.sandbox), source: reopened.archive }, route, budget);
-      local.receive(randomUUID(), 'LOCAL-RESUME-T18: continue locally and report unavailable references.'); let turn = 0;
+      const nextGoal = 'LOCAL-RESUME-T18: start a new local task and report unavailable references.';
+      const nextInput = local.receive(randomUUID(), nextGoal); let turn = 0;
       await pumpAgent(local, { async *stream(request, _signal, send) {
         send(request.payload); turn++;
+        if (end === 'task-completed') assert.equal(JSON.parse(request.payload).p3.intent.goal, nextGoal);
         if (turn > 1) {
           const result = JSON.parse(request.payload).p2.at(-1).results[0];
           assert.equal(result.modelResult.includes(f.text), false);
@@ -87,8 +90,43 @@ test(`archived cross-project tool and assistant copies retain their access depen
         yield { kind: 'complete', reply: call ? { text: '', calls: [call], stop: 'tools' } : { text: 'References unavailable.', calls: [], stop: 'end' } };
       }, async execute() { throw new Error('unexpected Host tool'); } });
       assert.equal(local.status().terminal, 'completed');
+      assert.equal(turn, 5);
+      const current = reopened.store.recoverIntent(reopened.activity)!;
+      if (end === 'task-completed') {
+        assert.notEqual(current.intentId, prior.intentId);
+        assert.equal(current.goal, nextGoal); assert.deepEqual(current.goalInput, nextInput);
+        assert.equal(current.version, prior.version + 1);
+        assert.throws(() => reopened!.store.assertMemoryDiscovery(reopened!.activity, f.grantId), /discovery-not-authorized/);
+      } else assert.equal(current.intentId, prior.intentId);
+      reopened.close(); reopened = openProbe(f.sandbox, budget, undefined, undefined, undefined, true);
+      assert.deepEqual(reopened.store.recoverIntent(reopened.activity), current);
     }
   } finally { reopened?.close(); f.close(); }
+});
+
+test('a cross-project memory stays reference-only while its exact revision is admitted and recorded', async () => {
+  const f = fixture();
+  try {
+    const record = f.foreign.store.rememberMemory(f.foreign.activity, {
+      input: f.foreign.archive.append(randomUUID(), '记住偏好：FOREIGN-T18-MEMORY uses npm'), hostInfo: 'durable' }).record;
+    f.foreign.store.drainSearchProjection(f.foreign.activity);
+    const run = f.run(); let requests = 0;
+    await pumpAgent(run, { async *stream(request, _signal, send) {
+      send(request.payload); requests++;
+      if (requests === 2) {
+        const hit = JSON.parse(JSON.parse(request.payload).p2.at(-1).results[0].modelResult).results[0];
+        assert.equal(hit.record.recordId, record.recordId); assert.equal(hit.exposureMode, 'reference_only');
+        const assembly = f.probe.store.requestStatus(f.probe.activity, run.runId).assemblies.at(-1)!;
+        assert.deepEqual(assembly.usedMemories, [{ recordId: record.recordId, revisionId: record.revisionId,
+          headEventId: record.headEventId, hash: record.hash, contentHash: record.contentHash, reason: 'retrieved-memory' }]);
+      }
+      yield { kind: 'complete', reply: requests === 1 ? { text: '', stop: 'tools', calls: [
+        { id: 'memory', name: 'memory.search', arguments: { query: 'FOREIGN-T18-MEMORY' } },
+      ] } : { text: 'Current target applicability needs verification.', stop: 'end', calls: [] } };
+    }, async execute() { throw new Error('unexpected Host tool'); } });
+    assert.equal(run.status().terminal, 'completed'); assert.equal(requests, 2);
+    assert.equal(f.foreign.store.readMemory(f.foreign.activity, record.recordId).hash, record.hash);
+  } finally { f.close(); }
 });
 
 test('revocation from another Store invalidates the frozen epoch and the Store admission transaction rejects it', () => {
