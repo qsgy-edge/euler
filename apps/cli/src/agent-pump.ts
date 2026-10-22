@@ -98,6 +98,8 @@ export async function pumpAgent(run: AgentRun, host: AgentPump): Promise<AgentSt
         }
         const call = run.startTool(pending.id);
         if (!call) return;
+        const coreResult = run.coreToolResult(call.id);
+        if (coreResult) { run.finishTool(call.id, coreResult.modelResult, coreResult.outcome); return; }
         let result: string;
         const timeout = setTimeout(() => { try { run.timeoutTool(call.id); } catch { /* no success presentation */ } }, run.toolTimeoutMs);
         try { result = await untilStopped(host.execute(call, run.signal), run.signal); }

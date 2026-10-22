@@ -65,6 +65,9 @@ export class HttpModelTransport {
   encode(request: NeutralRequest): string {
     check(request.provider === this.#model.provider && request.model === this.#model.id && request.route === this.#model.baseUrl, 'route-mismatch');
     const messages: Record<string, unknown>[] = [{ role: 'system', content: request.p0.policy }];
+    if (request.p0.guidance?.length || request.p0.guidanceRules) messages.push({ role: 'system',
+      content: JSON.stringify({ kind: 'local-guidance', blocks: request.p0.guidance ?? [], rules: request.p0.guidanceRules }) });
+    if (Object.keys(request.p1).length) messages.push({ role: 'user', content: JSON.stringify({ kind: 'context-baseline', ...request.p1 }) });
     for (const turn of request.p2) {
       messages.push(...turn.inputs);
       messages.push({ role: 'assistant', content: turn.assistant.text || null,
@@ -72,14 +75,11 @@ export class HttpModelTransport {
           function: { name: call.name.replaceAll('.', '_'), arguments: JSON.stringify(call.arguments) } })) } : {}) });
       messages.push(...turn.results.map(result => ({ role: 'tool', tool_call_id: result.callId, content: JSON.stringify({ outcome: result.outcome, result: result.modelResult }) })));
     }
-    messages.push(...request.p3.messages);
-    // Intent is bounded data, never a provider-supplied instruction channel.
-    const firstUser = messages.findIndex(message => message.role === 'user');
-    if (firstUser >= 0) messages[firstUser] = { ...messages[firstUser],
-      content: JSON.stringify({ input: messages[firstUser]!.content, intent: request.p3.intent,
-        ...(request.p1.operationSummaries?.length ? { operationSummaries: request.p1.operationSummaries } : {}) }) };
-    return JSON.stringify({ model: this.#model.id, stream: false, max_tokens: this.#budget.outputReserve, messages,
-      tools: request.p0.tools.map(tool => ({ type: 'function', function: { name: tool.name.replaceAll('.', '_'), description: tool.description, parameters: tool.parameters } })) });
+    // P2 stays byte-for-byte historical. Current intent and input occupy only the dynamic tail.
+    const [current, ...rest] = request.p3.messages;
+    messages.push({ role: 'user', content: JSON.stringify({ input: current?.content ?? null, intent: request.p3.intent }) }, ...rest);
+    return JSON.stringify({ model: this.#model.id, stream: false, max_tokens: this.#budget.outputReserve,
+      tools: request.p0.tools.map(tool => ({ type: 'function', function: { name: tool.name.replaceAll('.', '_'), description: tool.description, parameters: tool.parameters } })), messages });
   }
   async *stream(request: ModelRequest, signal: AbortSignal, authorizeSend: AuthorizeSend): AsyncIterable<{ kind: 'complete'; reply: ModelReply; failure?: CaptureFailure; responseHash?: string }> {
     const credential = this.#credential();

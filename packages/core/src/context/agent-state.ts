@@ -1,3 +1,4 @@
+import type { RequestContext } from '../store/request-ledger.ts';
 import type { SourceAck } from '../contracts.ts';
 import { check } from '../contracts.ts';
 import type { FileAdmission, FileReceipt, FileCapability, FileFailureReason } from './file-contract.ts';
@@ -14,6 +15,9 @@ export interface ToolResult {
 export interface ToolFact { callId: string; name: string; argumentsHash: string; attemptId: string; started: boolean; result: ToolResult | null }
 export type AgentEvent =
   | { kind: 'opened'; route: ModelRoute; files?: FileCapability }
+  | { kind: 'window-opened'; windowId: string; previousWindowId: string | null; firstResponse: number; reason: 'initial' | 'pressure' | 'explicit'; recovery: SourceAck[] }
+  | ({ kind: 'cache-epoch-opened' } & RequestContext)
+  | { kind: 'cache-epoch-invalidated'; cacheEpoch: string; reason: string }
   | { kind: 'input'; source: SourceAck; mode: 'steer' | 'follow-up' | 'queue' }
   | { kind: 'admitted'; eventIds: string[] }
   | { kind: 'bound'; assemblyId: string; eventIds: string[] }
@@ -27,18 +31,34 @@ export type AgentEvent =
 export interface AgentStatus {
   terminal: RunTerminal | null;
   attempts: number;
+  windows: Extract<AgentEvent, { kind: 'window-opened' }>[];
+  cacheEpoch: RequestContext | null;
+  invalidEpochs: string[];
   inputs: { source: SourceAck; mode: 'steer' | 'follow-up' | 'queue'; state: 'received' | 'admitted-to-loop' | 'bound-to-assembly' }[];
   tools: ToolFact[];
   files: { admission: FileAdmission; approved: boolean; approvalSource?: SourceAck; reconciled?: FileReceipt; failureReason?: FileFailureReason }[];
   responses: { attemptId: string; source: SourceAck }[];
 }
 export function replayAgent(events: AgentEvent[], attempts: number): AgentStatus {
-  const state: AgentStatus = { terminal: null, attempts, inputs: [], responses: [], tools: [], files: [] };
+  const state: AgentStatus = { terminal: null, attempts, windows: [], cacheEpoch: null, invalidEpochs: [], inputs: [], responses: [], tools: [], files: [] };
   check(events[0]?.kind === 'opened', 'agent-evidence-gap');
   for (const [index, event] of events.entries()) {
     check(!state.terminal || event.kind === 'file-reconciled', 'agent-event-after-terminal');
     switch (event.kind) {
       case 'opened': check(index === 0, 'agent-evidence-gap'); break;
+      case 'window-opened':
+        check(!state.windows.some(window => window.windowId === event.windowId)
+          && event.previousWindowId === (state.windows.at(-1)?.windowId ?? null)
+          && event.firstResponse >= 0 && event.firstResponse <= state.responses.length
+          && state.tools.every(tool => tool.result), 'window-boundary-invalid');
+        state.windows.push(event); break;
+      case 'cache-epoch-opened':
+        check(!state.cacheEpoch && !state.invalidEpochs.includes(event.cacheEpoch)
+          && event.windowId === state.windows.at(-1)?.windowId, 'cache-epoch-invalid');
+        state.cacheEpoch = { windowId: event.windowId, cacheEpoch: event.cacheEpoch, prefixHash: event.prefixHash }; break;
+      case 'cache-epoch-invalidated':
+        check(state.cacheEpoch?.cacheEpoch === event.cacheEpoch, 'cache-epoch-invalid');
+        state.invalidEpochs.push(event.cacheEpoch); state.cacheEpoch = null; break;
       case 'input':
         check(!state.inputs.some(input => input.source.eventId === event.source.eventId), 'input-already-received');
         state.inputs.push({ source: event.source, mode: event.mode, state: 'received' }); break;

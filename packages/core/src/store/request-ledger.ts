@@ -42,14 +42,16 @@ export interface AssemblyMemoryUse {
   reason: 'selected-memory';
 }
 
+export interface RequestContext { windowId: string; cacheEpoch: string; prefixHash: string }
 export interface RequestAssemblyInput {
   runId: string; epoch: number; route: string; model: string; policyHash: string;
+  context?: RequestContext;
   estimator: 'utf8-bytes-upper-bound@1';
   sources: SourceAck[]; usedMemories?: AssemblyMemoryUse[]; claimHeadEventId?: string; intent: { eventId: string; hash: string } | null;
   payload: string; payloadHash: string; byteLength: number; estimatedTokens: number;
   budget: ProbeBudget; zones: { p0: number; p1: number; p2: number; p3: number };
   selection: { ordinal: number; hash: string; reason: 'mandatory-source' }[];
-  degradation: 'none';
+  degradation: 'none' | 'compact' | 'selected' | 'window';
 }
 export interface RequestAssembly extends Omit<RequestAssemblyInput, 'payload' | 'usedMemories'> {
   assemblyId: string; identityHash: string; usedMemories: AssemblyMemoryUse[];
@@ -101,7 +103,7 @@ export function freezeRequestPayload(payload: string): { payloadHash: string; by
 export function assemblyIdentityHash(input: Omit<RequestAssemblyInput, 'payload'>): string {
   return sha256(JSON.stringify({
     runId: input.runId, epoch: input.epoch, route: input.route, model: input.model,
-    policyHash: input.policyHash, estimator: input.estimator, sources: input.sources,
+    policyHash: input.policyHash, estimator: input.estimator, sources: input.sources, context: input.context ?? null,
     usedMemories: input.usedMemories ?? [], claimHeadEventId: input.claimHeadEventId ?? null,
     intent: input.intent, payloadHash: input.payloadHash, byteLength: input.byteLength,
     estimatedTokens: input.estimatedTokens, budget: input.budget, zones: input.zones,

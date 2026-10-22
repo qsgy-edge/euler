@@ -48,7 +48,9 @@ test('the real HTTP boundary sends each frozen payload once after durable starte
     assert.equal(bodies.length, 2);
     assert.equal(transport.count, 2);
     const next = JSON.parse(bodies[1]!);
-    assert.deepEqual(next.messages.map((message: { role: string }) => message.role), ['system', 'user', 'assistant', 'tool']);
+    assert.deepEqual(next.messages.map((message: { role: string }) => message.role), ['system', 'user', 'assistant', 'tool', 'user']);
+    assert.equal(next.messages[1].content, sandbox.fixture.text);
+    assert.equal(JSON.parse(next.messages[4].content).intent.goal, sandbox.fixture.text);
     assert.equal(next.messages[3].tool_call_id, 'http-call');
     assert.equal(next.messages[3].content.includes('HTTP fixture'), true);
     assert.equal(bodies.some(body => body.includes('untrusted-provider-name') || body.includes('register a tool')), false);
