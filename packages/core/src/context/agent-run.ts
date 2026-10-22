@@ -184,9 +184,7 @@ export class AgentRun {
             const request = { query, byteBudget, limit: 8, ...(cursor ? { cursor } : {}), ...(grant ? { grantId: grant, queryId: randomUUID() } : {}) };
             const page = this.#store.searchSources(this.#activity, request);
             result = page;
-            if (grant) this.#retrievalChecks.set(callId, () => {
-              check(JSON.stringify(this.#store.searchSources(this.#activity, request)) === JSON.stringify(page), 'source-result-stale');
-            });
+            if (grant && page.results.length) this.#retrievalChecks.set(callId, () => this.#store.assertSourceSearchResult(this.#activity, request, page));
           } else result = searchSessionSources(this.#sourceRefs(), ref => this.#host.source.read(ref), query, byteBudget, cursor,
             ref => { this.#store.assertSourceAccess(this.#activity, ref, grant);
               this.#store.expandSource(this.#activity, { ref, offset: 0, limit: 1 }); });

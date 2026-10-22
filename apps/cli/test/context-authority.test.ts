@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import test from 'node:test';
 import { AgentRun, API_VERSION, DEFAULT_BUDGET } from '@euler/core';
 import type { AgentHost, SourceAck } from '@euler/core';
@@ -11,7 +12,7 @@ import { approvedSourceUnit } from './support/source-publication.ts';
 
 const route = { provider: 'fake', model: 'authority', route: 'fixture', authNamespace: 'synthetic' };
 const budget = { ...DEFAULT_BUDGET, contextLimit: 24000, maxModelAttempts: 6, maxToolCalls: 6, maxTotalTokens: 200000 };
-function fixture() {
+function fixture(maxResults = 32) {
   const sandbox = createSandbox();
   const foreignBinding = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
   createSandboxSession(sandbox, foreignBinding);
@@ -25,8 +26,8 @@ function fixture() {
   const goal = probe.archive.append(randomUUID(), 'Analyze the explicitly approved synthetic project.');
   const intent = probe.store.transitionIntent(probe.activity, null, goal, { status: 'active', step: 'analysis' }, 'Analyze the explicitly approved synthetic project.');
   const consent = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1', intentId: intent.intentId,
-    goalEventId: goal.eventId, projectIds: [foreignBinding.projectId], targets: {}, maxResults: 32, maxBytes: 64000 }));
-  const { grantId } = probe.store.authorizeMemoryDiscovery(probe.activity, consent, [foreignBinding.projectId], 32, {}, 64000);
+    goalEventId: goal.eventId, projectIds: [foreignBinding.projectId], targets: {}, maxResults, maxBytes: 64000 }));
+  const { grantId } = probe.store.authorizeMemoryDiscovery(probe.activity, consent, [foreignBinding.projectId], maxResults, {}, 64000);
   const run = (source: AgentHost['source'] = probe.archive) => {
     const value = new AgentRun(probe.store, probe.activity, { binding: bindingOf(sandbox), source, discoveryGrantId: grantId }, route, budget);
     value.receive(randomUUID(), 'Read the approved evidence and retain its exact source.'); return value;
@@ -36,6 +37,81 @@ function fixture() {
   return { sandbox, foreign, probe, text, unit, goal, grantId, run, closeProbe,
     close() { closeProbe(); foreign.close(); rmSync(sandbox.root, { recursive: true, force: true }); } };
 }
+
+test('an approved search page survives later expansion exhausting the same grant budget', async () => {
+  const f = fixture(9);
+  try {
+    for (let index = 1; index < 9; index++) {
+      const text = `${f.text} Unit ${index}.`;
+      f.foreign.store.publishSourceUnit(f.foreign.activity, approvedSourceUnit(f.foreign, {
+        ref: f.foreign.archive.append(randomUUID(), text), projectId: f.unit.projectId, kind: 'source', offset: 0, length: text.length }));
+    }
+    f.foreign.store.drainSourceProjection(f.foreign.activity);
+    const run = f.run(); let requests = 0;
+    await pumpAgent(run, { async *stream(request, _signal, send) {
+      send(request.payload); requests++;
+      if (requests === 1) yield { kind: 'complete', reply: { text: '', stop: 'tools', calls: [
+        { id: 'search', name: 'source.search', arguments: { query: 'PRIVATE-T18-NEEDLE', scope: 'project' } }] } };
+      else if (requests === 2) {
+        const page = JSON.parse(JSON.parse(request.payload).p2.at(-1).results[0].modelResult);
+        assert.equal(page.results.length, 8); assert.ok(page.nextCursor);
+        yield { kind: 'complete', reply: { text: '', stop: 'tools', calls: [
+          { id: 'expand', name: 'source.expand', arguments: { unitId: page.results[0].unitId, offset: 0, limit: 128 } }] } };
+      } else {
+        const result = JSON.parse(request.payload).p2.at(-1).results[0];
+        assert.equal(result.outcome, 'success'); assert.equal(JSON.parse(result.modelResult).text, f.text);
+        yield { kind: 'complete', reply: { text: 'Evidence read within the approved budget.', stop: 'end', calls: [] } };
+      }
+    }, async execute() { throw new Error('unexpected Host tool'); } });
+    assert.equal(run.status().terminal, 'completed'); assert.equal(requests, 3);
+    const exhausted = f.probe.store.searchSources(f.probe.activity, { query: 'PRIVATE-T18-NEEDLE', grantId: f.grantId, queryId: randomUUID() });
+    assert.equal(exhausted.coverage.reason, 'task-budget-exhausted'); assert.equal(exhausted.results.length, 0);
+  } finally { f.close(); }
+});
+
+test('query-budget exhaustion stays visible to the next model turn without an unsaved-page dependency', async () => {
+  const f = fixture(1);
+  try {
+    for (let index = 0; index < 8; index++) f.probe.store.searchSources(f.probe.activity, {
+      query: '!', grantId: f.grantId, queryId: randomUUID() });
+    const run = f.run(); let requests = 0;
+    await pumpAgent(run, { async *stream(request, _signal, send) {
+      send(request.payload); requests++;
+      if (requests === 1) yield { kind: 'complete', reply: { text: '', stop: 'tools', calls: [
+        { id: 'search', name: 'source.search', arguments: { query: 'PRIVATE-T18-NEEDLE', scope: 'project' } }] } };
+      else {
+        const page = JSON.parse(JSON.parse(request.payload).p2.at(-1).results[0].modelResult);
+        assert.equal(page.status, 'unavailable'); assert.equal(page.coverage.reason, 'task-query-budget-exhausted');
+        assert.equal(page.results.length, 0);
+        yield { kind: 'complete', reply: { text: 'The approved query budget is exhausted.', stop: 'end', calls: [] } };
+      }
+    }, async execute() { throw new Error('unexpected Host tool'); } });
+    assert.equal(run.status().terminal, 'completed'); assert.equal(requests, 2);
+  } finally { f.close(); }
+});
+
+test('saved source search validation preserves receipt identity, source integrity and current grant without spending budget', () => {
+  const f = fixture(1);
+  try {
+    const request = { query: 'PRIVATE-T18-NEEDLE', grantId: f.grantId, queryId: randomUUID() };
+    const page = f.probe.store.searchSources(f.probe.activity, request);
+    assert.equal(page.results.length, 1);
+    for (let index = 0; index < 40; index++) f.probe.store.assertSourceSearchResult(f.probe.activity, request, page);
+    assert.throws(() => f.probe.store.assertSourceSearchResult(f.probe.activity, request, { ...page, results: [] }), /source-query-result-stale/);
+    assert.throws(() => f.probe.store.assertSourceSearchResult(f.probe.activity, { ...request, query: 'forged' }, page), /source-query-result-stale/);
+    const exhausted = f.probe.store.searchSources(f.probe.activity, { ...request, queryId: randomUUID() });
+    assert.equal(exhausted.coverage.reason, 'task-budget-exhausted');
+    const path = join(f.sandbox.root, `session-${f.unit.ref.binding.sessionId}.jsonl`);
+    const original = readFileSync(path);
+    try {
+      writeFileSync(path, original.toString('utf8').split('\n')[0]! + '\n');
+      assert.throws(() => f.probe.store.assertSourceSearchResult(f.probe.activity, request, page), /source-evidence-gap/);
+    } finally { writeFileSync(path, original); }
+    f.probe.store.assertSourceSearchResult(f.probe.activity, request, page);
+    f.probe.store.revokeMemoryDiscovery(f.probe.activity, f.grantId);
+    assert.throws(() => f.probe.store.assertSourceSearchResult(f.probe.activity, request, page), /discovery-not-authorized/);
+  } finally { f.close(); }
+});
 
 for (const end of ['revoke', 'task-completed', 'local-only'] as const)
 test(`archived cross-project tool and assistant copies retain their access dependency across restart: ${end}`, async () => {

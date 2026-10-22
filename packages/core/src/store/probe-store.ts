@@ -3493,6 +3493,35 @@ export class ProbeStore {
     });
   }
 
+  #sourceSearchHash(request: SourceSearchRequest): string {
+    return sha256(JSON.stringify({ sessionId: this.#binding.sessionId, grantId: request.grantId,
+      query: request.query, limit: request.limit ?? 10, byteBudget: request.byteBudget ?? 8192, cursor: request.cursor ?? null }));
+  }
+
+  assertSourceSearchResult(activity: Activity, request: SourceSearchRequest, page: SourceSearchPage): void {
+    this.withActivity(activity, () => {
+      check(request.grantId && request.queryId, 'source-query-id-required');
+      const projects = this.#discoveryProjects(activity, request.grantId).projects;
+      const receipt = this.#db.prepare('SELECT request_hash,page_hash FROM source_query_receipts WHERE grant_id=? AND query_id=?')
+        .get(request.grantId, request.queryId);
+      check(receipt && receipt.request_hash === this.#sourceSearchHash(request)
+        && receipt.page_hash === sha256(JSON.stringify(page)), 'source-query-result-stale');
+      // The frozen page describes its original query. Later budget consumption
+      // cannot change those bytes; only current authority and evidence are rechecked.
+      for (const hit of page.results) {
+        if (hit.kind === 'proposal') {
+          const proposal = this.#proposalForProjects(hit.unitId, projects);
+          check(proposal.hash === hit.contentHash && proposal.version === hit.version && proposal.scope.id === hit.projectId,
+            'source-query-result-stale');
+        } else {
+          const { unit } = this.#sourceUnit(hit.unitId);
+          check(projects.includes(unit.projectId) && unit.projectId === hit.projectId && unit.kind === hit.kind
+            && unit.contentHash === hit.contentHash && unit.version === hit.version, 'source-query-result-stale');
+        }
+      }
+    });
+  }
+
   searchSources(activity: Activity, request: SourceSearchRequest): SourceSearchPage {
     return this.withActivity(activity, () => {
       check(request && Object.keys(request).every(key => ['query','limit','byteBudget','cursor','grantId','queryId'].includes(key))
@@ -3503,8 +3532,7 @@ export class ProbeStore {
       check((!request.grantId && request.queryId === undefined)
         || (typeof request.grantId === 'string' && typeof request.queryId === 'string'), 'source-query-id-required');
       if (request.grantId) { uuid(request.grantId); uuid(request.queryId!); }
-      const requestHash = sha256(JSON.stringify({ sessionId: this.#binding.sessionId, grantId: request.grantId,
-        query: request.query, limit, byteBudget, cursor: request.cursor ?? null }));
+      const requestHash = this.#sourceSearchHash(request);
       const receipt = request.grantId ? this.#db.prepare(`SELECT * FROM source_query_receipts WHERE grant_id=? AND query_id=?`)
         .get(request.grantId, request.queryId!) : null;
       check(!receipt || receipt.request_hash === requestHash, 'source-query-identity-conflict');
