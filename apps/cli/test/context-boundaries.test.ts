@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { AgentRun, DEFAULT_BUDGET, MemoryCorrections } from '@euler/core';
 import { pumpAgent } from '../src/agent-pump.ts';
+import { HttpModelTransport } from '../src/model-transport.ts';
 import { bindingOf, createSandbox, createSandboxSession } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 
@@ -17,6 +18,29 @@ function toolTurn(run: AgentRun, id: string) {
   run.finishModel(attempt.attemptId, { text: '', stop: 'tools', calls: [{ id, name: 'controlled.echo', arguments: { text: id } }] });
   run.startTool(id); run.finishTool(id, id);
 }
+
+test('window rebuilding retains every admitted steering constraint in neutral and HTTP payloads', () => {
+  const sandbox = createSandbox(), probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
+  try {
+    const run = new AgentRun(probe.store, probe.activity, { binding: bindingOf(sandbox), source: probe.archive }, route, budget);
+    run.receive(randomUUID(), 'Complete the synthetic inspection.');
+    toolTurn(run, 'one');
+    run.receive(randomUUID(), 'Use JSON for the final answer.');
+    run.receive(randomUUID(), 'Do not change any files.');
+    toolTurn(run, 'two'); toolTurn(run, 'three');
+    run.newWindow();
+    const request = run.nextModel()!;
+    assert.match(request.payload, /Use JSON for the final answer/);
+    assert.match(request.payload, /Do not change any files/);
+    const transport = new HttpModelTransport({ api: 'openai-completions', provider: route.provider, id: route.model,
+      name: route.model, baseUrl: 'http://127.0.0.1:1/v1', reasoning: false, input: ['text'],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: budget.contextLimit, maxTokens: budget.outputReserve }, budget, () => 'synthetic');
+    const neutral = JSON.parse(request.payload); neutral.route = 'http://127.0.0.1:1/v1';
+    const encoded = transport.encode(neutral);
+    assert.match(encoded, /Use JSON for the final answer/); assert.match(encoded, /Do not change any files/);
+    run.cancel();
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
 
 test('a newly settled memory operation between admission and send invalidates the old snapshot without sending', () => {
   const sandbox = createSandbox(), probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);

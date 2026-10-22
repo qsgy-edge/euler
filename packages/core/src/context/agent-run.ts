@@ -33,6 +33,7 @@ export interface NeutralRequest extends ModelRoute {
     guidanceRules?: Pick<InstructionSnapshot, 'membership' | 'targets' | 'activations' | 'references' | 'constraints' | 'resolutions' | 'directives'> & { operation: GuidanceOperation } };
   p1: { operationSummaries?: ReturnType<ProbeStore['correctionModelSummaries']>;
     operationArchive?: ReturnType<ProbeStore['correctionModelContext']>['operationArchive'];
+    activeInputs?: { role: 'user'; content: string }[];
     recovery?: { runId: string; windowId: string; omittedTurns: number } };
   p2: { inputs: { role: 'user'; content: string }[]; assistant: ModelReply; results: { callId: string; outcome: string; modelResult: string }[] }[];
   p3: { intent: { goal: string; constraints: string[]; step: string }; messages: { role: 'user'; content: string }[] };
@@ -108,7 +109,8 @@ export class AgentRun {
     store.withActivity(activity, () => {
       store.authorizeRequestRun(activity, this.runId, { budget, intent: null,
         relatedRunId: options.recovery?.relatedRunId ?? null, acceptDuplicateRisk: options.recovery?.acceptDuplicateRisk ?? false });
-      this.#event({ kind: 'opened', route: this.#route, ...(this.#host.files ? { files: structuredClone(this.#host.files) } : {}) });
+      this.#event({ kind: 'opened', route: this.#route, ...(this.#host.files ? { files: structuredClone(this.#host.files) } : {}),
+        ...(this.#host.discoveryGrantId ? { discoveryGrantId: this.#host.discoveryGrantId } : {}) });
       this.#event({ kind: 'window-opened', windowId: randomUUID(), previousWindowId: null, firstResponse: 0, reason: 'initial', recovery: [] });
     });
   }
@@ -158,8 +160,11 @@ export class AgentRun {
         if (typeof args.eventId === 'string') {
           const ref = this.#host.source.lookup(args.eventId);
           check(ref, 'source-evidence-gap');
-          result = this.#store.expandSource(this.#activity, { ref, offset, limit });
-          this.#retrievalChecks.set(callId, () => { this.#store.expandSource(this.#activity, { ref, offset, limit }); });
+          const read = () => {
+            this.#store.assertSourceAccess(this.#activity, ref, grant);
+            return this.#store.expandSource(this.#activity, { ref, offset, limit });
+          };
+          result = read(); this.#retrievalChecks.set(callId, read);
         } else {
           const request = { unitId: args.unitId as string, offset, limit, ...(grant ? { grantId: grant, queryId: randomUUID() } : {}) };
           const excerpt = this.#store.expandSource(this.#activity, request);
@@ -182,7 +187,8 @@ export class AgentRun {
               check(JSON.stringify(this.#store.searchSources(this.#activity, request)) === JSON.stringify(page), 'source-result-stale');
             });
           } else result = searchSessionSources(this.#sourceRefs(), ref => this.#host.source.read(ref), query, byteBudget, cursor,
-            ref => { this.#store.expandSource(this.#activity, { ref, offset: 0, limit: 1 }); });
+            ref => { this.#store.assertSourceAccess(this.#activity, ref, grant);
+              this.#store.expandSource(this.#activity, { ref, offset: 0, limit: 1 }); });
         } else if (call.name === 'memory.search') {
           const page = this.#store.searchMemories(this.#activity, { query, byteBudget, limit: 8,
             ...(cursor ? { cursor } : {}), ...(grant ? { grantId: grant } : {}) });
@@ -304,9 +310,14 @@ export class AgentRun {
     for (const { delivery } of this.#store.correctionDeliveries(this.#activity)) if (delivery.model) sources.push(delivery.model);
     const window = state.windows.at(-1)!;
     sources.push(...turnSources.slice(window.firstResponse).flat());
+    const retained = new Set(turnSources.slice(window.firstResponse).flat().map(ref => ref.eventId));
+    const activeInputs = state.inputs.filter(input => input.mode === 'steer'
+      && priorInputs.has(input.source.eventId) && !retained.has(input.source.eventId));
+    sources.push(...activeInputs.map(input => input.source));
     const selectedSources = [...new Map(sources.map(source => [source.eventId, source])).values()];
     const neutral: NeutralRequest = { schema: 'euler-model@1', ...this.#route, p0,
       p1: { ...(operationSummaries.length ? operationContext : {}),
+        ...(activeInputs.length ? { activeInputs: activeInputs.map(input => ({ role: 'user' as const, content: this.#host.source.read(input.source).text })) } : {}),
         ...(window.firstResponse ? { recovery: { runId: this.runId, windowId: window.windowId, omittedTurns: window.firstResponse } } : {}) },
       p2: p2.slice(window.firstResponse), p3 };
     let degradation: RequestAssemblyInput['degradation'] = state.windows.length > 1 ? 'window' : operationContext.operationArchive ? 'compact' : 'none';
@@ -331,7 +342,8 @@ export class AgentRun {
     let context = this.status().cacheEpoch;
     if (context?.prefixHash !== prefixHash) {
       this.#invalidateCache('prefix-changed');
-      context = { windowId: window.windowId, cacheEpoch: randomUUID(), prefixHash };
+      context = { windowId: window.windowId, cacheEpoch: randomUUID(), prefixHash,
+        ...(this.#host.discoveryGrantId ? { discoveryGrantId: this.#host.discoveryGrantId } : {}) };
       this.#event({ kind: 'cache-epoch-opened', ...context });
     }
     const assembly = this.#store.appendRequestAssembly(this.#activity, { runId: this.runId, epoch: this.#activity.epoch, context,
@@ -395,20 +407,20 @@ export class AgentRun {
     });
     check(new Set(calls.map(call => call.id)).size === calls.length && calls.every(call => !this.#calls.has(call.id)), 'duplicate-tool-call');
     // Whitelist data fields: provider metadata can never register capabilities.
-    const source = this.#host.source.append(randomUUID(), JSON.stringify({ text: reply.text, calls, stop: reply.stop }), 'assistant');
+    const source = this.#appendOutput(JSON.stringify({ text: reply.text, calls, stop: reply.stop }), 'assistant');
     this.#store.withActivity(this.#activity, () => {
       this.#store.finishRequestAttempt(this.#activity, { attemptId, outcome: 'received', usage: { count: 1, finishReason: reply.stop,
         ...(reply.usage ? { inputTokens: reply.usage.input, outputTokens: reply.usage.output } : {}),
         ...(reply.modelHash ? { modelHash: reply.modelHash } : {}) } });
       this.#event({ kind: 'response', attemptId, source, calls: calls.map(call => ({ callId: call.id, name: call.name, argumentsHash: sha256(JSON.stringify(call.arguments)) })) });
-      this.#inflight = null;
-      for (const call of calls) this.#calls.set(call.id, call);
-      if (this.#usageTokens() > this.#budget.maxTotalTokens) this.stop('budget-exhausted');
-      else if (reply.stop === 'error') this.#terminal('failed');
-      else if (!calls.length && !this.status().inputs.some(input => input.state === 'received' && input.mode === 'steer')) {
-        this.#terminal(reply.stop === 'length' ? 'needs-input' : 'completed');
-      }
     });
+    this.#inflight = null;
+    for (const call of calls) this.#calls.set(call.id, call);
+    if (this.#usageTokens() > this.#budget.maxTotalTokens) this.stop('budget-exhausted');
+    else if (reply.stop === 'error') this.#terminal('failed');
+    else if (!calls.length && !this.status().inputs.some(input => input.state === 'received' && input.mode === 'steer')) {
+      this.#terminal(reply.stop === 'length' ? 'needs-input' : 'completed');
+    }
   }
   followUp(): AgentRun | null {
     const state = this.status();
@@ -507,7 +519,7 @@ export class AgentRun {
     const intent = this.#store.readIntent(this.#activity)!;
     const token = randomUUID();
     const presentation = { token, callId, path: target.path, existingIdentity: target.identity, content: String(call.arguments.content ?? '') };
-    const source = this.#host.source.append(randomUUID(), JSON.stringify({ kind: 'file-presentation', ...presentation }), 'tool');
+    const source = this.#appendOutput(JSON.stringify({ kind: 'file-presentation', ...presentation }), 'tool');
     this.#event({ kind: 'file-prepared', admission: { callId, presentationId: token, capabilityHash: sha256(JSON.stringify(capability)),
       intentEventId: intent.eventId, intentHash: intent.hash, epoch: this.#activity.epoch,
       operation: call.name as 'file.read' | 'file.write', rawPath: String(call.arguments.path), parts,
@@ -534,7 +546,7 @@ export class AgentRun {
   finishFileFailure(callId: string, reason: FileFailureReason): void {
     check(['file-output-too-large', 'file-invalid-utf8', 'file-create-conflict', 'file-create-denied'].includes(reason), 'file-failure-evidence-invalid');
     if (this.status().terminal) {
-      const source = this.#host.source.append(randomUUID(), JSON.stringify({ callId, failureReason: reason }), 'tool');
+      const source = this.#appendOutput(JSON.stringify({ callId, failureReason: reason }), 'tool');
       this.#event({ kind: 'file-reconciled', callId, source, failureReason: reason });
     } else this.#result(callId, 'failure', reason, reason);
   }
@@ -545,13 +557,21 @@ export class AgentRun {
       && (!file.admission.target.identity || JSON.stringify(file.admission.target.identity) === JSON.stringify(receipt.identity)), 'file-receipt-mismatch');
     const text = JSON.stringify(receipt);
     if (this.status().terminal) {
-      const source = this.#host.source.append(randomUUID(), text, 'tool');
+      const source = this.#appendOutput(text, 'tool');
       this.#event({ kind: 'file-reconciled', callId, source, receipt: structuredClone(receipt) });
     } else this.#result(callId, 'success', text, null, receipt);
   }
   finishTool(callId: string, modelResult: string, outcome: 'success' | 'failure' = 'success'): void {
     check(typeof modelResult === 'string', 'invalid-tool-result');
     this.#result(callId, outcome, modelResult, outcome === 'failure' ? 'tool-error' : null);
+  }
+  #appendOutput(text: string, role: 'assistant' | 'tool'): SourceAck {
+    const eventId = randomUUID();
+    // Reserve the access dependency before appending bytes, including lost archive acknowledgements.
+    if (this.#host.discoveryGrantId) this.#event({ kind: 'source-access', sourceEventId: eventId,
+      binding: this.#host.binding, discoveryGrantId: this.#host.discoveryGrantId });
+    this.#store.assertDispatchBoundary();
+    return this.#host.source.append(eventId, text, role);
   }
   #result(callId: string, outcome: ToolResult['outcome'], modelResult: string, errorClass: string | null, file?: FileReceipt): void {
     const state = this.status();
@@ -568,7 +588,7 @@ export class AgentRun {
       archivedOutcome = 'failure';
       archivedErrorClass = 'tool-result-truncated';
     }
-    const source = this.#host.source.append(randomUUID(), encode(archivedResult, archivedOutcome), 'tool');
+    const source = this.#appendOutput(encode(archivedResult, archivedOutcome), 'tool');
     this.#store.withActivity(this.#activity, () => {
       this.#event({ kind: 'tool-result', result: { callId, executionState: tool.started ? 'started' : 'not_started',
         outcome: archivedOutcome, argumentsHash: tool.argumentsHash, errorClass: archivedErrorClass, source, ...(file ? { file: structuredClone(file) } : {}) } });

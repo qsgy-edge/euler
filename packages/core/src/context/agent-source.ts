@@ -21,18 +21,22 @@ export function searchSessionSources(refs: SourceAck[], read: (ref: SourceAck) =
   const range = refs.slice(0, end);
   const terms = query.normalize('NFC').toLocaleLowerCase().trim().split(/\s+/u);
   const results: { eventId: string; ref: SourceAck; role: string | null; preview: string; offset: number; end: number }[] = [];
-  let next = offset;
+  let next = offset, unauthorized = 0;
   for (; next < range.length; next++) {
     const ref = range[next]!;
+    try { validate?.(ref); }
+    catch (error) {
+      if (!(error instanceof Error) || !['discovery-not-authorized', 'analysis-task-not-active'].includes(error.message)) throw error;
+      unauthorized++; continue;
+    }
     const source = read(ref);
     if (!terms.some(term => source.text.normalize('NFC').toLocaleLowerCase().includes(term))) continue;
-    validate?.(ref);
     const points = Array.from(source.text);
     const hit = { eventId: ref.eventId, ref, role: source.role ?? null, preview: points.slice(0, 160).join(''), offset: 0, end: points.length };
     if (results.length === 8 || Buffer.byteLength(JSON.stringify([...results, hit])) > byteBudget) break;
     results.push(hit);
   }
-  return { status: 'ready' as const, results, coverage: { sessionId: range[0]?.binding.sessionId ?? null, rawEvents: end, inspected: next },
+  return { status: 'ready' as const, results, coverage: { sessionId: range[0]?.binding.sessionId ?? null, rawEvents: end, inspected: next, unauthorized },
     truncated: next < end, nextCursor: next < end ? Buffer.from(JSON.stringify({ queryHash: sha256(query),
       through: range.at(-1)!.eventId, offset: next, hash: sha256(JSON.stringify(range)) })).toString('base64url') : null };
 }

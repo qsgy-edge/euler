@@ -1,6 +1,6 @@
 # Owner correction and result recovery
 
-Issue: [#15](https://github.com/qsgy-edge/euler/issues/15). This implementation uses a feature branch and PR because it changes CLI behavior, Core admission and durable state. It implements I15–I17 and the Correct contract using synthetic data and disposable schema 19. Older sandboxes are rejected; no production migration is provided.
+Issue: [#15](https://github.com/qsgy-edge/euler/issues/15). This implementation uses a feature branch and PR because it changes CLI behavior, Core admission and durable state. It implements I15–I17 and the Correct contract using synthetic data and disposable schema 21. Older sandboxes are rejected; no production migration is provided.
 
 ## Use the CLI
 

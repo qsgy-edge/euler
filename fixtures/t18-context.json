@@ -1,6 +1,7 @@
 {
   "schema": "t18-context@1",
   "marker": "RAW-MARKER-T18",
+  "unavailableEventId": "00000000-0000-4000-8000-000000000018",
   "evidence": "EVIDENCE-T18: Atlas synthetic logging supports a frozen environment field; current repository conditions still require review.",
   "preference": "Atlas synthetic logging uses UTC timestamps",
   "approvedSection": "HANDOFF-T18: Inspect Atlas logging against the frozen capability description. Scope: synthetic logging. Non-goal: implementation or network verification. Acceptance: review current source conditions before proposing a change.",

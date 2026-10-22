@@ -17,6 +17,7 @@ const command = ['apps/cli/src/main.ts', 'context', '--scenario', args.values['t
 const child = spawnSync(process.execPath, command, { encoding: 'utf8', maxBuffer: 4_194_304 });
 writeFileSync(join(directory, 'stdout.jsonl'), child.stdout ?? '');
 writeFileSync(join(directory, 'stderr.txt'), child.stderr ?? '');
+const fixture = JSON.parse(readFileSync('fixtures/t18-context.json', 'utf8'));
 const checks: Record<string, boolean> = {};
 let failure: string | null = null;
 let result: Record<string, unknown> | undefined;
@@ -33,7 +34,7 @@ try {
   assert.ok(result && result.syntheticPassed === true);
   const db = new DatabaseSync(join(directory, 'sandbox', 'probe.sqlite'), { readOnly: true });
   try {
-    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 20);
+    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 21);
     sqlite = String(db.prepare('SELECT sqlite_version() AS version').get()!.version);
     checks.schema = true;
     const archive = new Map<string, { line: string; text: string }>();
@@ -46,11 +47,60 @@ try {
         archive.set(`${header.binding.sessionId}/${entry.eventId}`, { line, text: entry.text });
       }
     }
-    for (const runId of [result.originRunId, result.targetRunId]) {
+    for (const runId of [result.originRunId, result.targetRunId, result.proposalRunId]) {
       const rows = db.prepare('SELECT * FROM request_events WHERE run_id=? ORDER BY seq').all(String(runId));
       for (const [index, row] of rows.entries()) { assert.equal(row.seq, index + 1); assert.equal(row.hash, hash(String(row.payload))); }
       const runtime = rows.filter(row => row.kind === 'agent/event@v1').map(row => JSON.parse(String(row.payload)).event);
       assert.equal(runtime.at(-1).kind, 'terminal'); assert.equal(runtime.at(-1).terminal, 'completed');
+      const bodies = new Map<string, string>();
+      for (const [index, event] of runtime.entries()) {
+        const ref = event.kind === 'response' ? event.source : event.kind === 'tool-result' ? event.result.source : null;
+        if (!ref) continue;
+        const raw = archive.get(`${ref.binding.sessionId}/${ref.eventId}`);
+        assert.ok(raw); assert.equal(hash(raw.line), ref.hash); assert.equal(hash(raw.text), ref.contentHash);
+        assert.equal(Buffer.byteLength(raw.line), ref.byteLength); bodies.set(ref.eventId, raw.text);
+        if (runtime[0].discoveryGrantId) {
+          const access = runtime.slice(0, index).find(item => item.kind === 'source-access' && item.sourceEventId === ref.eventId);
+          assert.ok(access); assert.deepEqual(access.binding, ref.binding);
+          assert.equal(access.discoveryGrantId, runtime[0].discoveryGrantId);
+        }
+      }
+      const tools = runtime.filter(event => event.kind === 'tool-result').map(event => ({ event, raw: JSON.parse(bodies.get(event.result.source.eventId)!) }));
+      if (runId === result.originRunId) {
+        const missing = runtime.filter(event => event.kind === 'response').flatMap(event => JSON.parse(bodies.get(event.source.eventId)!).calls)
+          .find(call => call.name === 'source.expand' && call.arguments.eventId === fixture.unavailableEventId);
+        assert.ok(missing);
+        const expandIds = new Set(runtime.filter(event => event.kind === 'response').flatMap(event => event.calls)
+          .filter(call => call.name === 'source.expand').map(call => call.callId));
+        const expectedUnits = db.prepare("SELECT unit_id FROM source_units WHERE kind='source' AND content_hash=?").all(hash(fixture.evidence));
+        assert.equal(expectedUnits.length, 1);
+        assert.ok(tools.some(tool => {
+          if (!expandIds.has(tool.event.result.callId) || tool.raw.outcome !== 'success') return false;
+          const excerpt = JSON.parse(tool.raw.modelResult);
+          return excerpt.unitId === expectedUnits[0]!.unit_id && excerpt.text === fixture.evidence;
+        }));
+        checks.projectEvidenceInLoop = true;
+        const failed = tools.find(tool => tool.event.result.callId === missing.id);
+        assert.ok(failed); assert.equal(failed.raw.outcome, 'failure');
+        assert.equal(JSON.parse(failed.raw.modelResult).status, 'unavailable');
+        assert.ok(runtime.slice(runtime.indexOf(failed.event) + 1).some(event => event.kind === 'response'));
+        assert.equal(db.prepare('SELECT state FROM memory_discovery_grants WHERE grant_id=?').get(runtime[0].discoveryGrantId)!.state, 'revoked');
+        checks.unavailableThenContinue = true; checks.durableSourceAccess = true;
+      } else {
+        assert.equal(runtime[0].discoveryGrantId, undefined);
+        const expanded = tools.map(tool => JSON.parse(tool.raw.modelResult)).filter(value => value.unitId);
+        if (runId === result.targetRunId) {
+          assert.ok((result.approvedUnits as string[]).every(id => expanded.some(value => value.unitId === id)));
+          assert.ok(expanded.some(value => value.kind === 'report-section' && value.version === 1 && value.text === fixture.approvedSection));
+          assert.ok(expanded.some(value => value.kind === 'report-section' && value.version === 2 && value.text === fixture.approvedNextSection));
+          assert.ok(expanded.some(value => value.kind === 'handoff' && value.text === '# Ordinary Markdown handoff\n\n' + fixture.approvedNextSection));
+          checks.handoffAndVersionsInLoop = true;
+        } else {
+          const proposalId = result.proposalId;
+          assert.ok(expanded.some(value => value.kind === 'proposal' && value.unitId === proposalId && value.text.includes('PROPOSAL-T18')));
+          checks.proposalInLoop = true;
+        }
+      }
       const windows = runtime.filter(event => event.kind === 'window-opened');
       assert.equal(new Set(windows.map(window => window.windowId)).size, windows.length);
       if (runId === result.originRunId) assert.ok(windows.length >= 2);

@@ -1,6 +1,6 @@
 # Forget, suppression and independently approved restore
 
-Issue: [#16](https://github.com/qsgy-edge/euler/issues/16). This changes CLI behavior, Core admission, persistent evidence and required checks, so delivery uses a feature branch and PR. The governing contracts are I04/I15–I17 and Ticket 08 §19a. Data is synthetic; disposable schema 19 rejects older sandboxes without migration.
+Issue: [#16](https://github.com/qsgy-edge/euler/issues/16). This changes CLI behavior, Core admission, persistent evidence and required checks, so delivery uses a feature branch and PR. The governing contracts are I04/I15–I17 and Ticket 08 §19a. Data is synthetic; disposable schema 21 rejects older sandboxes without migration.
 
 ## CLI entry
 

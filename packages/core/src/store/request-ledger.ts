@@ -42,7 +42,7 @@ export interface AssemblyMemoryUse {
   reason: 'selected-memory';
 }
 
-export interface RequestContext { windowId: string; cacheEpoch: string; prefixHash: string }
+export interface RequestContext { windowId: string; cacheEpoch: string; prefixHash: string; discoveryGrantId?: string }
 export interface RequestAssemblyInput {
   runId: string; epoch: number; route: string; model: string; policyHash: string;
   context?: RequestContext;

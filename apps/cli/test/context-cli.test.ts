@@ -24,6 +24,9 @@ test('the CLI connects window recovery, project discovery and an independently a
     assert.equal(receipt.verdict, 'evidence-gap');
     assert.equal(receipt.oldGrantDenied, true);
     assert.equal(receipt.deletedHandoffRecovered, true);
+    assert.equal(receipt.unavailableContinued, true);
+    assert.equal(receipt.reportVersionsRecovered, true);
+    assert.equal(receipt.proposalContinued, true);
     const sandbox = openSandbox(root!);
     const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
     try {
@@ -31,6 +34,7 @@ test('the CLI connects window recovery, project discovery and an independently a
       assert.equal(probe.store.agentStatus(probe.activity, receipt.originRunId as string).terminal, 'completed');
       assert.ok(ledger.assemblies.some(assembly => assembly.degradation === 'window'));
       assert.ok(ledger.attempts.length >= 5);
+      assert.equal(probe.store.agentStatus(probe.activity, receipt.originRunId as string).tools.filter(tool => tool.result?.outcome === 'failure').length, 1);
       assert.ok(ledger.assemblies.every(assembly => assembly.context));
       assert.equal(new Set(ledger.assemblies.map(assembly => assembly.context!.windowId)).size >= 2, true);
     } finally { probe.close(); }
@@ -38,6 +42,16 @@ test('the CLI connects window recovery, project discovery and an independently a
     try {
       assert.equal(target.store.agentStatus(target.activity, receipt.targetRunId as string).terminal, 'completed');
       assert.equal(target.store.readEvolutionProposal(target.activity, receipt.proposalId as string).inert, true);
+      const expansions = target.store.agentStatus(target.activity, receipt.targetRunId as string).tools
+        .filter(tool => tool.name === 'source.expand').map(tool => JSON.parse(JSON.parse(target.archive.read(tool.result!.source).text).modelResult));
+      assert.ok(expansions.some(excerpt => excerpt.kind === 'handoff' && excerpt.text.startsWith('# Ordinary Markdown handoff')));
+      assert.ok((receipt.approvedUnits as string[]).every(id => expansions.some(excerpt => excerpt.unitId === id)));
+      const proposalRun = target.store.agentStatus(target.activity, receipt.proposalRunId as string);
+      assert.equal(proposalRun.terminal, 'completed');
+      assert.ok(proposalRun.tools.filter(tool => tool.name === 'source.expand').some(tool => {
+        const excerpt = JSON.parse(JSON.parse(target.archive.read(tool.result!.source).text).modelResult);
+        return excerpt.unitId === receipt.proposalId && excerpt.kind === 'proposal';
+      }));
     } finally { target.close(); }
   } finally { if (root) rmSync(root, { recursive: true, force: true }); }
 });

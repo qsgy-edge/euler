@@ -1,6 +1,6 @@
 # Batch rollback from durable Info
 
-Issue: [#17](https://github.com/qsgy-edge/euler/issues/17). This implementation changes CLI behavior, Core mutation gates and required checks; delivery uses a feature branch and PR. The governing contracts are I15–I17, Ticket 11/14 rollback and X-09/X-10/X-11. All data is synthetic. It reuses disposable schema 19 and existing carriers without migration.
+Issue: [#17](https://github.com/qsgy-edge/euler/issues/17). This implementation changes CLI behavior, Core mutation gates and required checks; delivery uses a feature branch and PR. The governing contracts are I15–I17, Ticket 11/14 rollback and X-09/X-10/X-11. All data is synthetic. It reuses disposable schema 21 and existing carriers without migration.
 
 ## CLI entry
 

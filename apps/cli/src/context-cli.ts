@@ -50,7 +50,7 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
   }
   check(scenario === 'real' || !configPath, 'context-route-requires-real-scenario');
   const configured = configPath ? configuredTransport(configPath) : null;
-  if (configured) await verifyTransportPrerequisites(['context-window', 'context-boundaries', 'guidance', 'source-discovery', 'analysis-handoff'], 'context-prerequisites');
+  if (configured) await verifyTransportPrerequisites(['context-window', 'context-boundaries', 'context-authority', 'context-operations', 'guidance', 'source-discovery', 'analysis-handoff'], 'context-prerequisites');
   const budget = configured?.budget ?? localBudget;
   const transport = configured?.transport;
   const route = configured ? { provider: configured.model.provider, model: configured.model.id,
@@ -76,6 +76,7 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
     const goal = `Controlled synthetic acceptance. Complete these ordered steps using the available tools: `
       + `controlled.echo with text first; controlled.echo with text second; recover ${fixture.marker} using source.search scope=session and source.expand; `
       + `memory.search for Atlas; source.search scope=project for EVIDENCE-T18, then source.expand the matching unit. `
+      + `Finally call source.expand eventId=${fixture.unavailableEventId}, offset=0, limit=32; this synthetic reference is unavailable. Observe its failure and continue to the final report. `
       + `Return only JSON with facts, inferences, recommendations, unresolved. facts must contain the exact expanded evidence sentence. `
       + `recommendations must equal this preapproved synthetic section exactly: ${fixture.approvedSection} `
       + `Keep inferences separate and state that current source conditions require review. No network verification or implementation is authorized.`;
@@ -108,7 +109,8 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
         : turn === 4 ? { id: 'raw-expand', name: 'source.expand', arguments: { eventId: run.status().tools[0]!.result!.source.eventId, offset: 0, limit: 160 } }
         : turn === 5 ? { id: 'memories', name: 'memory.search', arguments: { query: 'Atlas' } }
         : turn === 6 ? { id: 'project-search', name: 'source.search', arguments: { query: 'EVIDENCE-T18', scope: 'project' } }
-        : turn === 7 ? { id: 'project-expand', name: 'source.expand', arguments: { unitId: evidenceUnit.unitId, offset: 0, limit: 512 } } : null;
+        : turn === 7 ? { id: 'project-expand', name: 'source.expand', arguments: { unitId: evidenceUnit.unitId, offset: 0, limit: 512 } }
+        : turn === 8 ? { id: 'unreachable', name: 'source.expand', arguments: { eventId: fixture.unavailableEventId, offset: 0, limit: 32 } } : null;
       yield { kind: 'complete', reply: call ? { text: '', stop: 'tools', calls: [call] }
         : { text: JSON.stringify({ facts: fixture.evidence, inferences: fixture.inference,
           recommendations: fixture.approvedSection, unresolved: fixture.unresolved }), stop: 'end', calls: [] } };
@@ -129,10 +131,18 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
       && Object.values(reportValue).every(value => typeof value === 'string' && value.length > 0 && Buffer.byteLength(value) <= 8192)
       && String(reportValue.facts).includes(fixture.evidence) && reportValue.recommendations === fixture.approvedSection, 'context-report-contract');
     const status = run.status();
-    check(switched && status.tools.every(tool => tool.result?.outcome === 'success')
+    const missingCall = status.responses.flatMap(response => (JSON.parse(origin.archive.read(response.source).text) as ModelReply).calls)
+      .find(call => call.name === 'source.expand' && call.arguments.eventId === fixture.unavailableEventId);
+    const unavailableContinued = Boolean(missingCall && status.tools.find(tool => tool.callId === missingCall.id)?.result?.outcome === 'failure');
+    check(switched && unavailableContinued && status.tools.every(tool => tool.result?.outcome === (tool.callId === missingCall!.id ? 'failure' : 'success'))
       && ['memory.search', 'source.search', 'source.expand'].every(name => status.tools.some(tool => tool.name === name)), 'context-tool-evidence-gap');
     check(status.tools.some(tool => tool.name === 'source.expand'
       && origin.archive.read(tool.result!.source).text.includes(fixture.marker)), 'context-recovery-evidence-gap');
+    check(status.tools.some(tool => {
+      if (tool.name !== 'source.expand' || tool.result?.outcome !== 'success') return false;
+      const excerpt = JSON.parse(JSON.parse(origin.archive.read(tool.result.source).text).modelResult) as { unitId?: string; text?: string };
+      return excerpt.unitId === evidenceUnit.unitId && excerpt.text === fixture.evidence;
+    }), 'context-project-evidence-gap');
     const evidenceRequest = { unitId: evidenceUnit.unitId, offset: 0, limit: 512, grantId, queryId: randomUUID() };
     const evidence = origin.store.expandSource(origin.activity, evidenceRequest);
     const artifacts = new AnalysisArtifacts(origin.store, origin.activity, origin.archive);
@@ -147,8 +157,8 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
     const temporary = join(resources, 'handoff.md');
     writeFileSync(temporary, '# Ordinary Markdown handoff\n\n' + fixture.approvedNextSection);
     const handoff = artifacts.saveHandoff({ eventId: randomUUID(), title: 'Ordinary handoff', markdown: readFileSync(temporary, 'utf8'), evidence: [] });
+    const handoffUnit = publish(origin, handoff.ref, sourceBinding.projectId, 'handoff', handoff.body);
     rmSync(temporary);
-    const deletedHandoffRecovered = artifacts.read(handoff.ref).body.includes(fixture.approvedNextSection);
     origin.store.drainSourceProjection(origin.activity);
     const completed = origin.archive.append(randomUUID(), 'Finish the synthetic analysis; restore local access.');
     const currentIntent = origin.store.readIntent(origin.activity)!;
@@ -157,8 +167,8 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
     const targetBinding = { ...sourceBinding, sessionId: randomUUID() };
     createSandboxSession(sandbox, targetBinding);
     target = openProbe(sandbox, budget, undefined, targetBinding, undefined, true);
-    const targetGoal = 'Discover HANDOFF-T18 with source.search scope=project, expand the approved report section, and evaluate it under current local authority. '
-      + 'No Skill is required. Read both immutable versions if needed. Return exactly {"assessment":"requires-current-source-review","authority":"local-only"}. '
+    const targetGoal = 'Discover HANDOFF-T18 with source.search scope=project. Expand the newest report section, the ordinary Markdown handoff, and the older report section, in that order. Evaluate them under current local authority. '
+      + 'The temporary handoff file has been deleted; use its archived published unit. No Skill is required. Return exactly {"assessment":"requires-current-source-review","authority":"local-only"}. '
       + 'Do not implement, publish or inherit the previous analysis grant.';
     const targetIntent = begin(target, targetGoal);
     const denied = new AgentRun(target.store, target.activity, { binding: targetBinding, source: target.archive, discoveryGrantId: grantId }, route, budget);
@@ -173,7 +183,9 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
     const targetScript: AgentPump['stream'] = async function* (request, _signal, send) {
       const attempt = send(request.payload); target!.transport.send(request.payload, attempt); targetTurn++;
       const call = targetTurn === 1 ? { id: 'handoff-search', name: 'source.search', arguments: { query: 'HANDOFF-T18', scope: 'project' } }
-        : targetTurn === 2 ? { id: 'handoff-expand', name: 'source.expand', arguments: { unitId: currentUnit.unitId, offset: 0, limit: 1024 } } : null;
+        : targetTurn === 2 ? { id: 'handoff-expand', name: 'source.expand', arguments: { unitId: currentUnit.unitId, offset: 0, limit: 1024 } }
+        : targetTurn === 3 ? { id: 'markdown-expand', name: 'source.expand', arguments: { unitId: handoffUnit.unitId, offset: 0, limit: 1024 } }
+        : targetTurn === 4 ? { id: 'old-report-expand', name: 'source.expand', arguments: { unitId: firstUnit.unitId, offset: 0, limit: 1024 } } : null;
       yield { kind: 'complete', reply: call ? { text: '', calls: [call], stop: 'tools' }
         : { text: '{"assessment":"requires-current-source-review","authority":"local-only"}', calls: [], stop: 'end' } };
     };
@@ -181,15 +193,43 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
       recoverInfo: () => deliverMemoryInfo(sandbox, target!),
       async execute() { throw new Error('target-host-tool-unavailable'); } });
     const assessment = JSON.parse(finalText(target, continuation)) as { assessment: string; authority: string };
+    const expansions = continuation.status().tools.filter(tool => tool.name === 'source.expand' && tool.result?.outcome === 'success')
+      .map(tool => JSON.parse(JSON.parse(target!.archive.read(tool.result!.source).text).modelResult) as { unitId: string; text: string });
+    const deletedHandoffRecovered = expansions.some(excerpt => excerpt.unitId === handoffUnit.unitId && excerpt.text === handoff.body);
+    const reportVersionsRecovered = expansions.some(excerpt => excerpt.unitId === firstUnit.unitId && excerpt.text === fixture.approvedSection)
+      && expansions.some(excerpt => excerpt.unitId === currentUnit.unitId && excerpt.text === fixture.approvedNextSection);
     check(assessment.assessment === 'requires-current-source-review' && assessment.authority === 'local-only'
-      && continuation.status().tools.some(tool => tool.name === 'source.expand' && tool.result?.outcome === 'success'), 'handoff-evidence-gap');
+      && deletedHandoffRecovered && reportVersionsRecovered, 'handoff-evidence-gap');
     const proposalValue = { target: 'src/logging.ts', targetType: 'code' as const, owner: targetBinding.ownerId,
       scope: { kind: 'project' as const, id: targetBinding.projectId, resolved: true },
       expectedChange: fixture.approvedNextSection, evidenceRefs: [], sourceUnits: [currentUnit.unitId],
-      evaluation: { schema: 'evaluation-contract@1' as const, level: 'L1' as const, assertions: ['Review current synthetic source conditions before any implementation.'] } };
+      evaluation: { schema: 'evaluation-contract@1' as const, level: 'L1' as const, assertions: ['PROPOSAL-T18: Review current synthetic source conditions before any implementation.'] } };
     const proposalApproval = target.archive.append(randomUUID(), JSON.stringify({ schema: 'analysis-proposal-approval@1', proposal: proposalValue }));
     const proposal = target.store.saveEvolutionProposal(target.activity, proposalApproval, proposalValue);
     target.store.drainSourceProjection(target.activity);
+    const proposalRun = new AgentRun(target.store, target.activity, { binding: targetBinding, source: target.archive,
+      ...(transport ? { encode: transport.encode.bind(transport) } : {}) }, route, budget);
+    activeRun = proposalRun;
+    proposalRun.receive(randomUUID(), 'Continue with PROPOSAL-T18: use source.search scope=project and source.expand to read the saved inert proposal. '
+      + 'Evaluate the required current-source review without implementing anything. Return exactly {"assessment":"requires-current-source-review","authority":"local-only","proposal":"inert"}.');
+    let proposalTurn = 0;
+    const proposalScript: AgentPump['stream'] = async function* (request, _signal, send) {
+      const attempt = send(request.payload); target!.transport.send(request.payload, attempt); proposalTurn++;
+      const call = proposalTurn === 1 ? { id: 'proposal-search', name: 'source.search', arguments: { query: 'PROPOSAL-T18', scope: 'project' } }
+        : proposalTurn === 2 ? { id: 'proposal-expand', name: 'source.expand', arguments: { unitId: proposal.proposalId, offset: 0, limit: 4096 } } : null;
+      yield { kind: 'complete', reply: call ? { text: '', calls: [call], stop: 'tools' }
+        : { text: '{"assessment":"requires-current-source-review","authority":"local-only","proposal":"inert"}', calls: [], stop: 'end' } };
+    };
+    await pumpAgent(proposalRun, { stream: transport ? transport.stream.bind(transport) : proposalScript,
+      recoverInfo: () => deliverMemoryInfo(sandbox, target!), async execute() { throw new Error('target-host-tool-unavailable'); } });
+    const proposedAssessment = JSON.parse(finalText(target, proposalRun)) as { assessment: string; authority: string; proposal: string };
+    const proposalContinued = proposedAssessment.assessment === 'requires-current-source-review' && proposedAssessment.authority === 'local-only'
+      && proposedAssessment.proposal === 'inert' && proposalRun.status().tools.some(tool => {
+        if (tool.name !== 'source.expand' || tool.result?.outcome !== 'success') return false;
+        const excerpt = JSON.parse(JSON.parse(target!.archive.read(tool.result.source).text).modelResult) as { unitId: string; text: string };
+        return excerpt.unitId === proposal.proposalId && excerpt.text.includes('PROPOSAL-T18');
+      });
+    check(proposalContinued, 'proposal-continuation-evidence-gap');
     const targetArtifacts = new AnalysisArtifacts(target.store, target.activity, target.archive);
     const selection = [{ unitId: proposal.proposalId, hash: proposal.hash }];
     const exportApproval = target.archive.append(randomUUID(), JSON.stringify({ schema: 'analysis-export-approval@1', selection }));
@@ -197,9 +237,9 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
     emit('context-result', { syntheticPassed: true, realProvider: Boolean(transport), networkCount: transport?.count ?? 0,
       fixtureProviderCount: origin.transport.count + target.transport.count,
       verdict: transport ? 'controlled-real-loop-passed' : 'evidence-gap', fixtureDigest: sha256(JSON.stringify(fixture)), route, budget,
-      originRunId: run.runId, targetRunId: continuation.runId, targetBinding, originWindows: status.windows.map(window => window.windowId),
+      originRunId: run.runId, targetRunId: continuation.runId, proposalRunId: proposalRun.runId, targetBinding, originWindows: status.windows.map(window => window.windowId),
       report: report.ref, reportVersion: updated.version, approvedUnits: [firstUnit.unitId, currentUnit.unitId],
-      proposalId: proposal.proposalId, exportHash: exported.hash, deletedHandoffRecovered, oldGrantDenied,
+      proposalId: proposal.proposalId, exportHash: exported.hash, deletedHandoffRecovered, reportVersionsRecovered, unavailableContinued, proposalContinued, oldGrantDenied,
       gaps: transport ? [] : ['real-provider-long-session-and-new-session-behavior'] });
   } finally {
     process.off('SIGINT', abort); target?.close(); source.close(); origin.close();

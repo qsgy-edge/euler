@@ -222,7 +222,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=20), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=21), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -317,6 +317,9 @@ CREATE TABLE request_events (
   attempt_id TEXT REFERENCES request_attempts(attempt_id), activity_id TEXT NOT NULL REFERENCES owner_activities(id),
   created_at TEXT NOT NULL, payload TEXT NOT NULL, hash TEXT NOT NULL, UNIQUE(run_id,seq)
 ) STRICT;
+CREATE INDEX request_source_access ON request_events
+  (json_extract(payload,'$.event.binding.sessionId'),json_extract(payload,'$.event.sourceEventId'))
+  WHERE kind='agent/event@v1' AND json_extract(payload,'$.event.kind')='source-access';
 CREATE TABLE request_assemblies (
   assembly_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES request_runs(run_id), epoch INTEGER NOT NULL,
   route TEXT NOT NULL, model TEXT NOT NULL, policy_hash TEXT NOT NULL, estimator TEXT NOT NULL,
@@ -674,7 +677,7 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=20;
+PRAGMA user_version=21;
 ` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
@@ -745,15 +748,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,20,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,21,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 20, 'unsupported-probe-schema');
+        check(version === 21, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 20 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 21 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -871,6 +874,29 @@ export class ProbeStore {
         WHERE grant_id=? AND owner_id=? AND session_id=? AND state='active'`)
         .run(grantId, this.#binding.ownerId, this.#binding.sessionId);
       check(changed.changes === 1, 'discovery-not-authorized');
+      const runs = this.#db.prepare(`SELECT DISTINCT r.run_id FROM request_runs r JOIN request_events e ON e.run_id=r.run_id
+        WHERE r.stream_id=? AND r.state='authorized' AND e.kind='agent/event@v1'
+        AND json_extract(e.payload,'$.event.kind')='opened' AND json_extract(e.payload,'$.event.discoveryGrantId')=?`)
+        .all(activity.streamId, grantId);
+      for (const row of runs) {
+        const runId = String(row.run_id), state = this.agentStatus(activity, runId);
+        if (state.terminal) continue;
+        if (state.cacheEpoch) this.#requestEvent(runId, 'agent/event@v1', null, JSON.stringify({ runId,
+          event: { kind: 'cache-epoch-invalidated', cacheEpoch: state.cacheEpoch.cacheEpoch, reason: 'discovery-revoked' } }), activity.id);
+        this.revokeRequestRun(activity, runId);
+      }
+    });
+  }
+
+  assertSourceAccess(activity: Activity, ref: SourceAck, grantId?: string): void {
+    this.withActivity(activity, () => {
+      const projects = grantId ? this.#discoveryProjects(activity, grantId).projects : [this.#binding.projectId];
+      this.#validateSource(ref);
+      this.#assertRawSourceAccess(activity, ref, projects);
+      const artifact = parseAnalysisArtifact(this.#archiveRef(ref).text);
+      for (const evidence of artifact?.header.evidence ?? []) if ('grantId' in evidence.request && evidence.request.grantId) {
+        check(this.#discoveryProjects(activity, evidence.request.grantId).projects.every(project => projects.includes(project)), 'discovery-not-authorized');
+      }
     });
   }
 
@@ -943,6 +969,7 @@ export class ProbeStore {
         .get(projectId, this.#binding.ownerId), 'source-project-unavailable');
       check(Number.isSafeInteger(offset) && offset >= 0 && Number.isSafeInteger(length) && length > 0 && length <= 4096, 'invalid-range');
       const archive = this.#archiveRef(ref);
+      this.#assertRawSourceAccess(activity, ref);
       const points = Array.from(archive.text);
       check(offset + length <= points.length, 'invalid-range');
       const content = points.slice(offset, offset + length).join('');
@@ -1450,7 +1477,7 @@ export class ProbeStore {
         uuid(input.context.windowId); uuid(input.context.cacheEpoch);
         check(/^[a-f0-9]{64}$/.test(input.context.prefixHash), 'invalid-context-identity');
       }
-      this.#assertAgentContext(this.requestStatus(activity, input.runId), input);
+      this.#assertAgentContext(activity, this.requestStatus(activity, input.runId), input);
       const usedMemories = input.usedMemories ?? [];
       check(Array.isArray(usedMemories) && usedMemories.length <= 16
         && new Set(usedMemories.map(item => item.recordId)).size === usedMemories.length, 'invalid-assembly-selection');
@@ -1542,8 +1569,8 @@ export class ProbeStore {
       this.#requestRecoveryGate(activity, status.run.relatedRunId, input.runId);
       const frozenAssembly = status.assemblies.find(item => item.assemblyId === input.assemblyId);
       check(frozenAssembly && this.#requestIntentCurrent(activity, run, frozenAssembly), 'intent-stale');
-      this.#verifyRequestSources([frozenAssembly]);
-      this.#assertAgentContext(status, frozenAssembly);
+      this.#verifyRequestSources([frozenAssembly], activity);
+      this.#assertAgentContext(activity, status, frozenAssembly);
       if (run.ownerKind === 'session') this.correctionModelSummaries(activity);
       for (const use of frozenAssembly.usedMemories) this.#assemblyMemory(use, true);
       const assembly = this.#db.prepare('SELECT * FROM request_assemblies WHERE assembly_id=? AND run_id=?')
@@ -1584,11 +1611,11 @@ export class ProbeStore {
   requestMaySend(activity: Activity, runId: string): boolean {
     return this.withActivity(activity, () => {
       const status = this.requestStatus(activity, runId);
-      this.#verifyRequestSources(status.assemblies);
+      this.#verifyRequestSources(status.assemblies, activity);
       const attempt = status.attempts.find(item => item.outcome === 'unknown-sent');
       const assembly = status.assemblies.find(item => item.assemblyId === attempt?.assemblyId);
       if (assembly) {
-        this.#assertAgentContext(status, assembly);
+        this.#assertAgentContext(activity, status, assembly);
         for (const use of assembly.usedMemories) this.#assemblyMemory(use, true);
       }
       return chargedRequestTokens(status) <= status.run.budget.maxTotalTokens
@@ -1597,7 +1624,7 @@ export class ProbeStore {
     });
   }
 
-  #assertAgentContext(status: RequestStatus, assembly: Pick<RequestAssemblyInput, 'context'>): void {
+  #assertAgentContext(activity: Activity, status: RequestStatus, assembly: Pick<RequestAssemblyInput, 'context'>): void {
     // Counting probes also append task-outcome Agent events without using model windows.
     if (!status.events.some(event => event.kind === 'agent/event@v1'
       && (JSON.parse(event.payload).event as AgentEvent).kind === 'window-opened')) {
@@ -1606,6 +1633,7 @@ export class ProbeStore {
     check(assembly.context, 'context-identity-required');
     const current = this.#readAgentLedger(status).cacheEpoch;
     check(current && JSON.stringify(current) === JSON.stringify(assembly.context), 'cache-epoch-stale');
+    if (current.discoveryGrantId) this.#discoveryProjects(activity, current.discoveryGrantId);
   }
 
   #requestIntentCurrent(activity: Activity, run: RequestRun, assembly: RequestAssembly): boolean {
@@ -1695,8 +1723,28 @@ export class ProbeStore {
     return snapshot;
   }
 
-  #verifyRequestSources(assemblies: RequestAssembly[]): void {
-    for (const assembly of assemblies) for (const source of assembly.sources) this.#validateSource(source);
+  #assertRawSourceAccess(activity: Activity, ref: SourceAck, projects?: string[]): void {
+    const bindings = this.#db.prepare(`SELECT e.event_id,e.run_id,r.stream_id FROM request_events e
+      JOIN request_runs r ON r.run_id=e.run_id WHERE e.kind='agent/event@v1'
+      AND json_extract(e.payload,'$.event.kind')='source-access'
+      AND json_extract(e.payload,'$.event.binding.sessionId')=? AND json_extract(e.payload,'$.event.sourceEventId')=?`)
+      .all(ref.binding.sessionId, ref.eventId);
+    for (const binding of bindings) {
+      const ledger = this.#readRequestLedger(this.#requestRun({ streamId: String(binding.stream_id) }, String(binding.run_id)));
+      const event = JSON.parse(ledger.events.find(item => item.eventId === binding.event_id)!.payload).event as Extract<AgentEvent, { kind: 'source-access' }>;
+      check(sameBinding(event.binding, ref.binding) && this.#readAgentLedger(ledger).discoveryGrantId === event.discoveryGrantId, 'source-access-mismatch');
+      const required = this.#discoveryProjects(activity, event.discoveryGrantId).projects;
+      if (projects) check(required.every(project => projects.includes(project)), 'discovery-not-authorized');
+    }
+  }
+
+  #verifyRequestSources(assemblies: RequestAssembly[], activity?: Activity): void {
+    for (const assembly of assemblies) for (const source of assembly.sources) {
+      this.#validateSource(source);
+      if (activity) this.#assertRawSourceAccess(activity, source, assembly.context
+        ? assembly.context.discoveryGrantId ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : [this.#binding.projectId]
+        : undefined);
+    }
   }
 
   reconcileRequestAttempt(activity: Activity, attemptId: string): RequestStatus {
@@ -1838,7 +1886,7 @@ export class ProbeStore {
         uuid(recordId);
         check(assembly.usedMemories.some(use => use.recordId === recordId), 'assembly-source-not-used');
       }
-      this.#verifyRequestSources([assembly]);
+      this.#verifyRequestSources([assembly], activity);
       return { assemblyId, state: assembly.state,
         sources: assembly.sources.map((ref, ordinal) => ({ ref, ordinal, reason: assembly.selection[ordinal]!.reason })),
         memories: assembly.usedMemories.map((use, ordinal) => ({ snapshot: this.#assemblyMemory(use), ordinal, reason: use.reason })) };
@@ -1850,9 +1898,9 @@ export class ProbeStore {
       const ledger = this.requestStatus(activity, runId);
       check(ledger.run.activityId === activity.id && ledger.run.state === 'authorized', 'run-not-admissible');
       this.#requestRecoveryGate(activity, ledger.run.relatedRunId, runId);
-      this.#verifyRequestSources(ledger.assemblies);
+      this.#verifyRequestSources(ledger.assemblies, activity);
       const assembly = ledger.assemblies.at(-1);
-      if (assembly) this.#assertAgentContext(ledger, assembly);
+      if (assembly) this.#assertAgentContext(activity, ledger, assembly);
       const intent = this.readIntent(activity);
       check(assembly && intent?.status === 'active' && intent.eventId === assembly.intent?.eventId && intent.hash === assembly.intent.hash, 'intent-stale');
       check(Date.now() - Date.parse(ledger.run.authorizedAt) < ledger.run.budget.wallClockMs, 'run-deadline');
@@ -1867,6 +1915,11 @@ export class ProbeStore {
         .map(item => JSON.parse(item.payload).event as AgentEvent);
       const result = replayAgent([...events, event], ledger.attempts.length);
       if ('source' in event) this.#validateSource(event.source);
+      if (event.kind === 'opened' && event.discoveryGrantId) uuid(event.discoveryGrantId);
+      if (event.kind === 'source-access') {
+        uuid(event.sourceEventId); uuid(event.discoveryGrantId);
+        check(sameBinding(event.binding, this.#binding), 'source-scope-mismatch');
+      }
       if (event.kind === 'opened' && event.files) this.#validateSource(event.files.source);
       if (event.kind === 'window-opened') {
         uuid(event.windowId);
@@ -2026,8 +2079,10 @@ export class ProbeStore {
           transitionHash, bytes, hash);
       this.#db.prepare(`INSERT INTO intent_heads VALUES (?, ?, ?) ON CONFLICT(session_id,branch_id) DO UPDATE SET event_id=excluded.event_id`)
         .run(this.#binding.sessionId, this.#binding.branchId, snapshot.eventId);
-      if (snapshot.status === 'completed') this.#db.prepare(`UPDATE memory_discovery_grants SET state='revoked'
-        WHERE session_id=? AND intent_id=? AND state='active'`).run(this.#binding.sessionId, snapshot.intentId);
+      if (snapshot.status === 'completed') for (const grant of this.#db.prepare(`SELECT grant_id FROM memory_discovery_grants
+        WHERE session_id=? AND intent_id=? AND state='active'`).all(this.#binding.sessionId, snapshot.intentId)) {
+        this.revokeMemoryDiscovery(activity, String(grant.grant_id));
+      }
       return { ...snapshot, hash };
     });
   }
@@ -2083,9 +2138,10 @@ export class ProbeStore {
    * the Host has a durable Info surface, activates it together with its fixed batch
    * manifest and host-info/search outbox jobs. Any failure rolls the whole call back.
    */
-  queueCaptureBoundary(activity: Activity, runId: string, attemptId?: string): CaptureJob {
+  queueCaptureBoundary(activity: Activity, runId: string, attemptId?: string): CaptureJob | null {
     return this.withActivity(activity, () => {
       const state = this.agentStatus(activity, runId);
+      if (state.discoveryGrantId) return null;
       const tools = attemptId ? state.tools.filter(tool => tool.attemptId === attemptId) : state.tools;
       check((attemptId ? tools.length > 0 : state.terminal === 'completed')
         && tools.every(tool => tool.result && tool.result.outcome !== 'unknown'), 'capture-boundary-incomplete');
@@ -4947,6 +5003,7 @@ export class ProbeStore {
       const { ref } = request;
       check(sameBinding(ref?.binding, this.#binding), 'source-scope-mismatch');
       this.#validateSource(ref);
+      this.#assertRawSourceAccess(activity, ref);
       const raw = this.#readSource!(ref).text;
       const artifact = parseAnalysisArtifact(raw);
       if (artifact) {
