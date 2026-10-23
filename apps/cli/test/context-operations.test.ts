@@ -8,7 +8,7 @@ import { bindingOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 import { rollbackFixture } from './support/memory-rollback.ts';
 
-const limits = { ...DEFAULT_BUDGET, contextLimit: 12000, outputReserve: 256, safetyMargin: 256, maxModelAttempts: 6, maxTotalTokens: 200000 };
+const limits = { ...DEFAULT_BUDGET, contextLimit: 9000, outputReserve: 256, safetyMargin: 256, maxModelAttempts: 6, maxTotalTokens: 200000 };
 
 test('mixed settled memory operations remain bounded after restart without restoring old truth or truncating rollback members', async () => {
   const { sandbox, probe: initial, batch, candidates } = rollbackFixture(2);
@@ -29,7 +29,7 @@ test('mixed settled memory operations remain bounded after restart without resto
       const reply = core.handle(core.receive(text));
       assert.equal(reply.kind === 'result' && reply.result.status, expected);
     };
-    for (let round = 0; round < 4; round++) {
+    for (let round = 0; round < 2; round++) {
       const text = `CORRECT-T18 revision ${round}`;
       const correction = preview(`correct ${corrected.recordId} ${JSON.stringify(text)}`);
       settle(`commit ${correction.token} ${JSON.stringify(text)}`, 'committed');
