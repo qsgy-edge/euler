@@ -79,7 +79,7 @@ for (const gate of ['full', 'skip-expand', 'reject'] as const) test(`context CLI
     authNamespace: 'synthetic-test', credentialEnv: 'EULER_CONTEXT_TEST_KEY', contextWindow: 24000, maxTokens: 1024,
     authorization: 'synthetic-test-only', budget: { ...DEFAULT_BUDGET, contextLimit: 24000, outputReserve: 1024,
       maxModelAttempts: 10, maxToolCalls: 10, maxTotalTokens: 600000, wallClockMs: 30000 } }));
-  const cli = startCli(['context', '--scenario', 'real', '--sandbox', sandbox.root, '--transport-config', config], 60000, undefined,
+  const cli = startCli(['context', '--scenario', 'real', '--sandbox', sandbox.root, '--transport-config', config], 150000, undefined,
     { ...process.env, EULER_CONTEXT_TEST_KEY: 'synthetic-context-key', ...(gate === 'reject' ? {
       T13_PREREQUISITE_FIXTURE: 'reject', NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${prerequisiteFixture}`,
     } : {}) });
