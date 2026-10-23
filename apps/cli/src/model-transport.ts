@@ -34,11 +34,33 @@ export async function verifyTransportPrerequisites(extraTests: string[] = [], ev
   // Bound the nested file pool while allowing independent durable I/O to overlap.
   const command = ['--test', '--test-concurrency=4', ...tests];
   const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
+  const started = Date.now();
   const result = await new Promise<{ status: number | null; stdout: string; stderr: string }>(resolve => {
-    execFile(process.execPath, command, { cwd: root, encoding: 'utf8', timeout: 120000, maxBuffer: 4_194_304,
-      env, ...(signal ? { signal } : {}) }, (error, stdout, stderr) => resolve({ status: error ? typeof error.code === 'number' ? error.code : null : 0, stdout, stderr }));
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let stdoutBytes = 0, stderrBytes = 0, reportedTests = 0, pending = '';
+    let lastTestHash: string | null = null;
+    const child = execFile(process.execPath, command, { cwd: root, encoding: 'utf8', timeout: 120000, maxBuffer: 4_194_304,
+      env, ...(signal ? { signal } : {}) }, (error, stdout, stderr) => {
+      clearInterval(timer);
+      resolve({ status: error ? typeof error.code === 'number' ? error.code : null : 0, stdout, stderr });
+    });
+    child.stdout?.on('data', (chunk: string) => {
+      stdoutBytes += Buffer.byteLength(chunk);
+      const lines = (pending + chunk).split(/\r?\n/u);
+      pending = lines.pop()!.slice(-2048);
+      for (const line of lines) {
+        const match = line.trim().match(/^(?:ok|not ok) \d+ - (.+)$/u)
+          ?? line.trim().match(/^[✔✖] (.+) \([\d.]+ms\)$/u);
+        if (match) { reportedTests++; lastTestHash = sha256(match[1]!); }
+      }
+    });
+    child.stderr?.on('data', (chunk: string) => { stderrBytes += Buffer.byteLength(chunk); });
+    process.stdout.write(JSON.stringify({ event: event + '-started', command: ['node', ...command], pid: child.pid }) + '\n');
+    timer = setInterval(() => process.stdout.write(JSON.stringify({ event: event + '-progress',
+      elapsedMs: Date.now() - started, stdoutBytes, stderrBytes, reportedTests, lastTestHash }) + '\n'), 10000);
+    timer.unref();
   });
-  process.stdout.write(JSON.stringify({ event, command: ['node', ...command], exitCode: result.status,
+  process.stdout.write(JSON.stringify({ event, command: ['node', ...command], exitCode: result.status, elapsedMs: Date.now() - started,
     outputHash: sha256((result.stdout ?? '') + (result.stderr ?? '')), passed: result.status === 0 }) + '\n');
   signal?.throwIfAborted();
   check(result.status === 0, 'prerequisite-evidence-gap');
@@ -65,6 +87,9 @@ export class HttpModelTransport {
   encode(request: NeutralRequest): string {
     check(request.provider === this.#model.provider && request.model === this.#model.id && request.route === this.#model.baseUrl, 'route-mismatch');
     const messages: Record<string, unknown>[] = [{ role: 'system', content: request.p0.policy }];
+    if (request.p0.guidance?.length || request.p0.guidanceRules) messages.push({ role: 'system',
+      content: JSON.stringify({ kind: 'local-guidance', blocks: request.p0.guidance ?? [], rules: request.p0.guidanceRules }) });
+    if (Object.keys(request.p1).length) messages.push({ role: 'user', content: JSON.stringify({ kind: 'context-baseline', ...request.p1 }) });
     for (const turn of request.p2) {
       messages.push(...turn.inputs);
       messages.push({ role: 'assistant', content: turn.assistant.text || null,
@@ -72,14 +97,11 @@ export class HttpModelTransport {
           function: { name: call.name.replaceAll('.', '_'), arguments: JSON.stringify(call.arguments) } })) } : {}) });
       messages.push(...turn.results.map(result => ({ role: 'tool', tool_call_id: result.callId, content: JSON.stringify({ outcome: result.outcome, result: result.modelResult }) })));
     }
-    messages.push(...request.p3.messages);
-    // Intent is bounded data, never a provider-supplied instruction channel.
-    const firstUser = messages.findIndex(message => message.role === 'user');
-    if (firstUser >= 0) messages[firstUser] = { ...messages[firstUser],
-      content: JSON.stringify({ input: messages[firstUser]!.content, intent: request.p3.intent,
-        ...(request.p1.operationSummaries?.length ? { operationSummaries: request.p1.operationSummaries } : {}) }) };
-    return JSON.stringify({ model: this.#model.id, stream: false, max_tokens: this.#budget.outputReserve, messages,
-      tools: request.p0.tools.map(tool => ({ type: 'function', function: { name: tool.name.replaceAll('.', '_'), description: tool.description, parameters: tool.parameters } })) });
+    // P2 stays byte-for-byte historical. Current intent and input occupy only the dynamic tail.
+    const [current, ...rest] = request.p3.messages;
+    messages.push({ role: 'user', content: JSON.stringify({ input: current?.content ?? null, intent: request.p3.intent }) }, ...rest);
+    return JSON.stringify({ model: this.#model.id, stream: false, max_tokens: this.#budget.outputReserve,
+      tools: request.p0.tools.map(tool => ({ type: 'function', function: { name: tool.name.replaceAll('.', '_'), description: tool.description, parameters: tool.parameters } })), messages });
   }
   async *stream(request: ModelRequest, signal: AbortSignal, authorizeSend: AuthorizeSend): AsyncIterable<{ kind: 'complete'; reply: ModelReply; failure?: CaptureFailure; responseHash?: string }> {
     const credential = this.#credential();

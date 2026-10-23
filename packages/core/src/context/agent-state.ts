@@ -1,4 +1,5 @@
-import type { SourceAck } from '../contracts.ts';
+import type { RequestContext } from '../store/request-ledger.ts';
+import type { Binding, SourceAck } from '../contracts.ts';
 import { check } from '../contracts.ts';
 import type { FileAdmission, FileReceipt, FileCapability, FileFailureReason } from './file-contract.ts';
 
@@ -13,7 +14,11 @@ export interface ToolResult {
 }
 export interface ToolFact { callId: string; name: string; argumentsHash: string; attemptId: string; started: boolean; result: ToolResult | null }
 export type AgentEvent =
-  | { kind: 'opened'; route: ModelRoute; files?: FileCapability }
+  | { kind: 'opened'; route: ModelRoute; files?: FileCapability; discoveryGrantId?: string; guidanceRunId?: string }
+  | { kind: 'source-access'; sourceEventId: string; binding: Binding; discoveryGrantId: string }
+  | { kind: 'window-opened'; windowId: string; previousWindowId: string | null; firstResponse: number; reason: 'initial' | 'pressure' | 'explicit'; recovery: SourceAck[] }
+  | ({ kind: 'cache-epoch-opened' } & RequestContext)
+  | { kind: 'cache-epoch-invalidated'; cacheEpoch: string; reason: string }
   | { kind: 'input'; source: SourceAck; mode: 'steer' | 'follow-up' | 'queue' }
   | { kind: 'admitted'; eventIds: string[] }
   | { kind: 'bound'; assemblyId: string; eventIds: string[] }
@@ -27,18 +32,44 @@ export type AgentEvent =
 export interface AgentStatus {
   terminal: RunTerminal | null;
   attempts: number;
+  discoveryGrantId: string | null;
+  guidanceRunId: string | null;
+  windows: Extract<AgentEvent, { kind: 'window-opened' }>[];
+  cacheEpoch: RequestContext | null;
+  invalidEpochs: string[];
   inputs: { source: SourceAck; mode: 'steer' | 'follow-up' | 'queue'; state: 'received' | 'admitted-to-loop' | 'bound-to-assembly' }[];
   tools: ToolFact[];
   files: { admission: FileAdmission; approved: boolean; approvalSource?: SourceAck; reconciled?: FileReceipt; failureReason?: FileFailureReason }[];
   responses: { attemptId: string; source: SourceAck }[];
 }
 export function replayAgent(events: AgentEvent[], attempts: number): AgentStatus {
-  const state: AgentStatus = { terminal: null, attempts, inputs: [], responses: [], tools: [], files: [] };
+  const state: AgentStatus = { terminal: null, attempts, discoveryGrantId: null, guidanceRunId: null, windows: [], cacheEpoch: null, invalidEpochs: [], inputs: [], responses: [], tools: [], files: [] };
   check(events[0]?.kind === 'opened', 'agent-evidence-gap');
   for (const [index, event] of events.entries()) {
-    check(!state.terminal || event.kind === 'file-reconciled', 'agent-event-after-terminal');
+    check(!state.terminal || event.kind === 'file-reconciled' || event.kind === 'source-access', 'agent-event-after-terminal');
     switch (event.kind) {
-      case 'opened': check(index === 0, 'agent-evidence-gap'); break;
+      case 'opened':
+        check(index === 0, 'agent-evidence-gap'); state.discoveryGrantId = event.discoveryGrantId ?? null;
+        state.guidanceRunId = event.guidanceRunId ?? null; break;
+      case 'source-access':
+        check(event.discoveryGrantId === state.discoveryGrantId, 'source-access-mismatch'); break;
+      case 'window-opened':
+        check(!state.windows.some(window => window.windowId === event.windowId)
+          && event.previousWindowId === (state.windows.at(-1)?.windowId ?? null)
+          && event.firstResponse >= 0 && event.firstResponse <= state.responses.length
+          && state.tools.every(tool => tool.result), 'window-boundary-invalid');
+        state.windows.push(event); break;
+      case 'cache-epoch-opened':
+        check(!state.cacheEpoch && !state.invalidEpochs.includes(event.cacheEpoch)
+          && event.windowId === state.windows.at(-1)?.windowId
+          && (event.discoveryGrantId ?? null) === state.discoveryGrantId
+          && (event.guidanceRunId ?? null) === state.guidanceRunId, 'cache-epoch-invalid');
+        state.cacheEpoch = { windowId: event.windowId, cacheEpoch: event.cacheEpoch, prefixHash: event.prefixHash, operationHash: event.operationHash,
+          ...(event.guidanceRunId ? { guidanceRunId: event.guidanceRunId } : {}),
+          ...(event.discoveryGrantId ? { discoveryGrantId: event.discoveryGrantId } : {}) }; break;
+      case 'cache-epoch-invalidated':
+        check(state.cacheEpoch?.cacheEpoch === event.cacheEpoch, 'cache-epoch-invalid');
+        state.invalidEpochs.push(event.cacheEpoch); state.cacheEpoch = null; break;
       case 'input':
         check(!state.inputs.some(input => input.source.eventId === event.source.eventId), 'input-already-received');
         state.inputs.push({ source: event.source, mode: event.mode, state: 'received' }); break;

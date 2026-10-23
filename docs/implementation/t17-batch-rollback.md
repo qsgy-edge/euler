@@ -1,6 +1,6 @@
 # Batch rollback from durable Info
 
-Issue: [#17](https://github.com/qsgy-edge/euler/issues/17). This implementation changes CLI behavior, Core mutation gates and required checks; delivery uses a feature branch and PR. The governing contracts are I15–I17, Ticket 11/14 rollback and X-09/X-10/X-11. All data is synthetic. It reuses disposable schema 19 and existing carriers without migration.
+Issue: [#17](https://github.com/qsgy-edge/euler/issues/17). This implementation changes CLI behavior, Core mutation gates and required checks; delivery uses a feature branch and PR. The governing contracts are I15–I17, Ticket 11/14 rollback and X-09/X-10/X-11. All data is synthetic. It reuses disposable schema 21 and existing carriers without migration.
 
 ## CLI entry
 
@@ -50,4 +50,4 @@ npm run evidence:memory-rollback
 
 Regular tests additionally cover fabricated/buffered approval, wrong selection, overlapping cards and sessions, stale ABA heads, continuous B/A rollback, source/expiry failures, missing/incomplete/duplicate/reordered batch evidence, last-member transactional failure, the 32-member summary and six real CLI SIGKILL boundaries. The configured HTTP tests cover accepted/rejected prerequisite receipts, exact model intent, post-commit lookup recovery and cancellation. They use the shared prerequisite-process fixture for protocol isolation; the complete prerequisite suite remains covered by the existing cooperative integration test and full suite.
 
-CI runs checks and retains separate evidence on Windows, macOS and Linux. A local receipt covers only its recorded OS. `syntheticPassed` is separate from overall `evidence-gap`: actual-provider semantic quality, long-session summary/window rebuilding (T18), source append crash/unknown outcomes (#38), irreversible purge (T21/T22), non-CLI hosts and production data/migration remain unverified. The existing formal spec already defines this feature; tests and the CI evidence command extend its existing harness.
+CI runs checks and retains separate evidence on Windows, macOS and Linux. A local receipt covers only its recorded OS. `syntheticPassed` is separate from overall `evidence-gap`: actual-provider semantic quality and long-session behavior, source append crash/unknown outcomes (#38), irreversible purge (T21/T22), non-CLI hosts and production data/migration remain unverified. The existing formal spec already defines this feature; tests and the CI evidence command extend its existing harness.

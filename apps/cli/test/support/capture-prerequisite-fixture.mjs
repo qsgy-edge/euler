@@ -7,7 +7,8 @@ if (cli && ['accept', 'reject'].includes(process.env.T13_PREREQUISITE_FIXTURE)) 
   const execFile = cp.execFile;
   cp.execFile = (file, args, ...rest) => {
     const fixture = args?.includes('apps/cli/test/capture.test.ts') ? 'capture'
-      : args?.includes('apps/cli/test/memory-correction.test.ts') ? 'correction' : null;
+      : args?.includes('apps/cli/test/memory-correction.test.ts') ? 'correction'
+      : args?.includes('apps/cli/test/context-window.test.ts') ? 'context' : null;
     if (file === process.execPath && args?.[0] === '--test' && fixture) {
       const status = process.env.T13_PREREQUISITE_FIXTURE === 'reject' ? 1 : 0;
       // The Host records this exact fixture command, not a claim that the full suite ran here.

@@ -24,6 +24,8 @@ Owner corrections use the actual CLI input, complete previews and live approval 
 
 [Batch rollback](docs/implementation/t17-batch-rollback.md) selects fixed Info update events and undoes them with one complete preview and one live approval. It preserves historical revisions, fails the entire selection on stale members, and recovers immutable receipts across restart. Run `npm run evidence:memory-rollback` for retained CLI and batch evidence.
 
+[Context windows and analysis handoff](docs/implementation/t18-context-windows.md) preserve current intent, exact guidance, complete recent tool pairs and bounded operation state. Run `npm run demo -- context --scenario synthetic` or `npm run evidence:context`; an explicitly configured real route uses the same guarded loop.
+
 Full X-card acceptance, real provider dispatch, production schema/host acceptance, migration, and MC cutover remain unverified. CI and host results must be read from the artifact for the specific implementation and platform; this repository is not production-ready.
 
 - [Euler v1 implementation specification](docs/architecture/issues/15-euler-v1-spec.md)

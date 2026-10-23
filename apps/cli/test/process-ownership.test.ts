@@ -117,12 +117,15 @@ test('cancelling maintenance fences old activities and permits only a fresh proc
   const probe = openProbe(sandbox);
   try {
     const turn = probe.session.prepare(sandbox.fixture.eventId, sandbox.fixture.text);
+    const original = probe.archive.lookup(sandbox.fixture.eventId)!;
     const coordinator = randomUUID();
     const closing = probe.store.beginMaintenance(coordinator);
     const cancelled = probe.store.cancelMaintenance(coordinator);
     assert.equal(cancelled.state, 'open');
     assert.ok(cancelled.epoch > closing.epoch);
     assert.throws(() => probe.archive.append(randomUUID(), 'Late synthetic input'), /admission-closed/);
+    assert.throws(() => probe.archive.read(original), /admission-closed/);
+    assert.throws(() => probe.archive.lookup(original.eventId), /admission-closed/);
     assert.throws(() => probe.session.dispatch(turn), /admission-closed/);
     assert.throws(() => probe.store.register(), /stale-runtime-incarnation/);
     assert.equal(probe.transport.count, 0);

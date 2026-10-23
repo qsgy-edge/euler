@@ -63,7 +63,8 @@ export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET
   let activity: Activity;
   const transport = new CountingTransport(sandbox);
   const queryRequest = (attempt: RequestAttempt) => transport.query(attempt);
-  const readSource = (input: SourceAck) => archiveFor(input.binding).read(input);
+  // Core invokes this reader inside its admission transaction; direct Host reads use the gated archive below.
+  const readSource = (input: SourceAck) => archiveFor(input.binding, action => action()).read(input);
   let store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox), false, readSource, sandbox.appId, queryRequest);
   if (selectedBinding) {
     try {
@@ -72,14 +73,14 @@ export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET
       store = new ProbeStore({ ...resourcesOf(sandbox), source }, sandbox.storeId, binding, false, readSource, sandbox.appId, queryRequest);
     } catch (error) { try { store.close(); } catch {} throw error; }
   }
-  function archiveFor(sourceBinding: Binding): CliArchive {
+  function archiveFor(sourceBinding: Binding, gate: <T>(action: () => T) => T): CliArchive {
     const source = store.sessionSource(sourceBinding);
     return new CliArchive({ ...sandbox, sourceName: basename(source.path), archiveIdentity: source.identity,
-      fixture: { ...sandbox.fixture, ...sourceBinding } }, action => store.withActivity(activity, action));
+      fixture: { ...sandbox.fixture, ...sourceBinding } }, gate);
   }
   try {
     activity = typeof registration === 'string' ? store.claimChild(registration) : store.register(registration);
-    const archive = archiveFor(binding);
+    const archive = archiveFor(binding, action => store.withActivity(activity, action));
     let session: ProbeSession | undefined = diagnosticsOnly ? undefined
       : new ProbeSession(store, activity, { version: API_VERSION, binding, source: archive, transport }, budget, recovery);
     return { store, activity, archive, transport,

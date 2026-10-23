@@ -1,6 +1,6 @@
 # Owner correction and result recovery
 
-Issue: [#15](https://github.com/qsgy-edge/euler/issues/15). This implementation uses a feature branch and PR because it changes CLI behavior, Core admission and durable state. It implements I15–I17 and the Correct contract using synthetic data and disposable schema 19. Older sandboxes are rejected; no production migration is provided.
+Issue: [#15](https://github.com/qsgy-edge/euler/issues/15). This implementation uses a feature branch and PR because it changes CLI behavior, Core admission and durable state. It implements I15–I17 and the Correct contract using synthetic data and disposable schema 21. Older sandboxes are rejected; no production migration is provided.
 
 ## Use the CLI
 
@@ -33,7 +33,7 @@ Owner result and receipt remain immutable in the existing operation/event store.
 
 The model plane is `memory-operation-summary@1`, limited to 2,048 UTF-8 bytes. Fields are `schema`, `operationId`, `kind`, `status`, `records` and a bounded diagnostic `reason`. Each record contains only `recordId`, `revisionId`, `revision`, `lifecycle` and `verification`. No canonical body, source locator, owner receipt or token is copied into this summary. Probe/AgentRun assemblies include the durable summaries and their source identities so the next model request can stop using the previous state. A reused summary identity must match its original archived bytes.
 
-Known long-session limitation: each request currently includes every settled correction summary for its session, including cancelled and superseded previews. Repeated operations can exhaust the context budget and refuse a later short request; restarting the same session preserves this history. Bounded collection selection and window rebuilding belong to [T18](https://github.com/qsgy-edge/euler/issues/18) and remain an explicit evidence gap here. The durable history and per-summary limit are preserved.
+[Context windows](t18-context-windows.md) select whole recent operation summaries and represent older settled results by a bounded archive digest and recovery query. The full canonical and delivery history, including cancelled and superseded previews, survives restart. Per-summary limits and current-head eligibility gates remain unchanged; actual-provider long-session behavior still requires its own configured-route evidence.
 
 ## Controlled model path
 

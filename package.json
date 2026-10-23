@@ -21,7 +21,8 @@
     "evidence:memory-evolution": "node scripts/evidence-memory-evolution.ts",
     "evidence:memory-correction": "node scripts/evidence-memory-correction.ts",
     "evidence:memory-forget": "node scripts/evidence-memory-forget.ts",
-    "evidence:memory-rollback": "node scripts/evidence-memory-rollback.ts"
+    "evidence:memory-rollback": "node scripts/evidence-memory-rollback.ts",
+    "evidence:context": "node scripts/evidence-context.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -13,6 +13,7 @@ import { startCli } from './process-driver.ts';
 import { AGENT_BUDGET, runAgentDemo } from './agent-cli.ts';
 import { deliverMemoryInfo, runInfoDelivery, runInfoQuery, runRememberSession } from './owner-memory.ts';
 import { runHandoffDemo } from './analysis-handoff.ts';
+import { runContextDemo } from './context-cli.ts';
 import { runCaptureDemo, runCaptureDrain } from './capture.ts';
 import { killPoint } from './kill-point.ts';
 import memoryFixture from '../../../fixtures/scoped-memory.json' with { type: 'json' };
@@ -236,7 +237,7 @@ async function main() {
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
   const requestCommands = ['request-status', 'request-seal', 'request-reconcile', 'request-resume', 'request-gap'];
-  check([...requestCommands, 'capture-drain', 'capture-status', 'capture-reconcile', 'handoff', 'capture', 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
+  check([...requestCommands, 'context', 'capture-drain', 'capture-status', 'capture-reconcile', 'handoff', 'capture', 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
   const options = args.values.budget ? JSON.parse(args.values.budget) as Partial<ProbeBudget> : {};
   check(!args.values['wait-child-launch'] || command === 'hold', 'hold-only-option');
   check(Object.keys(options).every(key => key in DEFAULT_BUDGET), 'invalid-budget');
@@ -260,6 +261,7 @@ async function main() {
     return;
   }
   if (command === 'capture-drain') { await runCaptureDrain(sandbox, args.values['capture-config'], probe => deliverMemoryInfo(sandbox, probe)); return runInfoDelivery(sandbox); }
+  if (command === 'context') return runContextDemo(sandbox, args.values.scenario === 'success' ? 'synthetic' : args.values.scenario, args.values['transport-config']);
   if (command === 'handoff') return runHandoffDemo(sandbox, args.values.scenario);
   if (command === 'capture') { await runCaptureDemo(sandbox, args.values.scenario, probe => deliverMemoryInfo(sandbox, probe)); return runInfoDelivery(sandbox); }
   if (command === 'agent') return runAgentDemo(sandbox, args.values.scenario === 'success' ? 'tool' : args.values.scenario,

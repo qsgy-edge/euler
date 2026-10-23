@@ -1,0 +1,14 @@
+{
+  "schema": "t18-context@1",
+  "marker": "RAW-MARKER-T18",
+  "unavailableEventId": "00000000-0000-4000-8000-000000000018",
+  "evidence": "EVIDENCE-T18: Atlas synthetic logging supports a frozen environment field; current repository conditions still require review.",
+  "preference": "Atlas synthetic logging uses UTC timestamps",
+  "approvedSection": "HANDOFF-T18: Inspect Atlas logging against the frozen capability description. Scope: synthetic logging. Non-goal: implementation or network verification. Acceptance: review current source conditions before proposing a change.",
+  "approvedNextSection": "HANDOFF-T18: Inspect Atlas logging and timestamp fields against the frozen capability description. Scope: synthetic logging. Non-goal: implementation or network verification. Acceptance: review current source conditions before proposing a change.",
+  "skillBody": "---\nname: context-check\ndescription: Controlled synthetic context acceptance\n---\nPreserve the exact synthetic evidence marker and distinguish facts, inferences and proposals.\n",
+  "initialGuidance": "Use only the bound synthetic fixture. Report evidence gaps explicitly.\n",
+  "updatedGuidance": "Use only the bound synthetic fixture. Report evidence gaps explicitly. Keep every proposal inert until a separate owner decision.\n",
+  "inference": "This frozen capability description may help the target project; applicability requires current source review.",
+  "unresolved": "Current source conditions and implementation authority remain unverified."
+}
