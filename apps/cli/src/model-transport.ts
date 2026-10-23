@@ -34,11 +34,33 @@ export async function verifyTransportPrerequisites(extraTests: string[] = [], ev
   // Bound the nested file pool while allowing independent durable I/O to overlap.
   const command = ['--test', '--test-concurrency=4', ...tests];
   const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
+  const started = Date.now();
   const result = await new Promise<{ status: number | null; stdout: string; stderr: string }>(resolve => {
-    execFile(process.execPath, command, { cwd: root, encoding: 'utf8', timeout: 120000, maxBuffer: 4_194_304,
-      env, ...(signal ? { signal } : {}) }, (error, stdout, stderr) => resolve({ status: error ? typeof error.code === 'number' ? error.code : null : 0, stdout, stderr }));
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let stdoutBytes = 0, stderrBytes = 0, reportedTests = 0, pending = '';
+    let lastTestHash: string | null = null;
+    const child = execFile(process.execPath, command, { cwd: root, encoding: 'utf8', timeout: 120000, maxBuffer: 4_194_304,
+      env, ...(signal ? { signal } : {}) }, (error, stdout, stderr) => {
+      clearInterval(timer);
+      resolve({ status: error ? typeof error.code === 'number' ? error.code : null : 0, stdout, stderr });
+    });
+    child.stdout?.on('data', (chunk: string) => {
+      stdoutBytes += Buffer.byteLength(chunk);
+      const lines = (pending + chunk).split(/\r?\n/u);
+      pending = lines.pop()!.slice(-2048);
+      for (const line of lines) {
+        const match = line.trim().match(/^(?:ok|not ok) \d+ - (.+)$/u)
+          ?? line.trim().match(/^[✔✖] (.+) \([\d.]+ms\)$/u);
+        if (match) { reportedTests++; lastTestHash = sha256(match[1]!); }
+      }
+    });
+    child.stderr?.on('data', (chunk: string) => { stderrBytes += Buffer.byteLength(chunk); });
+    process.stdout.write(JSON.stringify({ event: event + '-started', command: ['node', ...command], pid: child.pid }) + '\n');
+    timer = setInterval(() => process.stdout.write(JSON.stringify({ event: event + '-progress',
+      elapsedMs: Date.now() - started, stdoutBytes, stderrBytes, reportedTests, lastTestHash }) + '\n'), 10000);
+    timer.unref();
   });
-  process.stdout.write(JSON.stringify({ event, command: ['node', ...command], exitCode: result.status,
+  process.stdout.write(JSON.stringify({ event, command: ['node', ...command], exitCode: result.status, elapsedMs: Date.now() - started,
     outputHash: sha256((result.stdout ?? '') + (result.stderr ?? '')), passed: result.status === 0 }) + '\n');
   signal?.throwIfAborted();
   check(result.status === 0, 'prerequisite-evidence-gap');

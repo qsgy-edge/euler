@@ -85,6 +85,11 @@ for (const gate of ['full', 'skip-expand', 'reject'] as const) test(`context CLI
     } : {}) });
   try {
     const prerequisite = await cli.waitFor('context-prerequisites');
+    const started = cli.observations.find(event => event.event === 'context-prerequisites-started');
+    assert.ok(started && Number.isSafeInteger(started.pid));
+    assert.deepEqual(started.command, prerequisite.command);
+    assert.ok(typeof prerequisite.elapsedMs === 'number' && prerequisite.elapsedMs >= 0);
+    assert.doesNotMatch(JSON.stringify(cli.observations) + cli.stderr(), /synthetic-context-key/);
     assert.equal(prerequisite.passed, gate !== 'reject', JSON.stringify(cli.observations));
     if (gate === 'reject') {
       assert.match((prerequisite.command as string[]).join(' '), /context-prerequisite-fixture/);
