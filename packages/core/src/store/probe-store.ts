@@ -1,7 +1,9 @@
 import { isLiveMemoryOperation, matchesMemoryApproval, memoryOperationSummary, parseCorrectionCommand } from '../context/memory-correction.ts';
 import { parseAnalysisArtifact } from '../context/analysis-artifacts.ts';
+import { assertHistorianReply, compartmentBody, isCompartmentEvidenceGap } from '../context/historian.ts';
+import type { Compartment, CompartmentBody, HistorianBounds } from '../context/historian.ts';
 import type { ExportSelection } from '../context/analysis-artifacts.ts';
-import { replayAgent } from '../context/agent-state.ts';
+import { replayAgent, responseInputIds } from '../context/agent-state.ts';
 import type { AgentEvent, AgentStatus } from '../context/agent-state.ts';
 import { isUntypedRemember, parseMemoryProposal, parseOwnerAgreement, parseOwnerStatement } from '../context/owner-memory.ts';
 import type { OwnerMemoryStatement } from '../context/owner-memory.ts';
@@ -103,7 +105,7 @@ interface MemoryComparisonState {
   relation: MemoryComparison['relation']; replacements: string[]; conflicts: string[]; originHeadId: string;
 }
 export interface CaptureJob {
-  jobId: string; ownerId: string; scope: MemoryScope; source: SourceAck; range: SourceAck[];
+  jobId: string; consumer: 'memory' | 'historian'; ownerId: string; scope: MemoryScope; source: SourceAck; range: SourceAck[];
   stage: 'pending' | 'captured' | 'proposing' | 'verifying' | 'comparing' | 'complete' | 'blocked' | 'unknown'; reason: string | null; record: MemoryRecord | null;
 }
 export interface CaptureLease { jobId: string; activity: Activity; token: string; generation: number; expiresAt: number }
@@ -222,7 +224,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=21), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=22), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -417,8 +419,13 @@ CREATE TABLE memory_applicability (
 CREATE TABLE capture_jobs (
   job_id TEXT PRIMARY KEY, source_event_id TEXT NOT NULL, record_id TEXT UNIQUE REFERENCES memory_records(record_id),
   status TEXT NOT NULL CHECK(status IN ('pending','captured','complete')), payload TEXT NOT NULL, payload_hash TEXT NOT NULL, created_at TEXT NOT NULL,
-  source_owner TEXT NOT NULL REFERENCES sessions(session_id), UNIQUE(source_owner,source_event_id),
-  CHECK((status='pending')=(record_id IS NULL))
+  source_owner TEXT NOT NULL REFERENCES sessions(session_id), consumer TEXT NOT NULL DEFAULT 'memory' CHECK(consumer IN ('memory','historian')),
+  UNIQUE(source_owner,source_event_id,consumer), CHECK((status='pending')=(record_id IS NULL))
+) STRICT;
+CREATE INDEX capture_jobs_consumer ON capture_jobs(source_owner,consumer,json_extract(payload,'$.runId'));
+CREATE TABLE compartments (
+  job_id TEXT PRIMARY KEY REFERENCES capture_jobs(job_id), source_json TEXT NOT NULL,
+  attempt_id TEXT NOT NULL REFERENCES request_attempts(attempt_id), hash TEXT NOT NULL
 ) STRICT;
 CREATE TABLE capture_work (
   job_id TEXT PRIMARY KEY REFERENCES capture_jobs(job_id), stage TEXT NOT NULL CHECK(stage IN ('pending','proposing','verifying','comparing','complete','blocked','unknown')),
@@ -668,6 +675,8 @@ CREATE TRIGGER immutable_memory_events_update BEFORE UPDATE ON memory_events BEG
 CREATE TRIGGER immutable_memory_events_delete BEFORE DELETE ON memory_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_verification_runs_update BEFORE UPDATE ON verification_runs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_verification_runs_delete BEFORE DELETE ON verification_runs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER immutable_compartments_update BEFORE UPDATE ON compartments BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER immutable_compartments_delete BEFORE DELETE ON compartments BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_capture_jobs_update BEFORE UPDATE ON capture_jobs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_capture_jobs_delete BEFORE DELETE ON capture_jobs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_provenance_refs_update BEFORE UPDATE ON provenance_refs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
@@ -677,12 +686,12 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=21;
+PRAGMA user_version=22;
 ` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 `).join('') + ['memory_heads','intent_heads','owner_fences','host_operation_delivery','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
-  'verification_runs','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts','host_info_batches','capture_work'].map(table => `
+  'verification_runs','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts','host_info_batches','capture_work','compartments'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
 `).join('') + ['memory_heads','intent_heads','owner_fences','host_operation_delivery','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts','source_projection_jobs','host_info_batches','capture_work'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
@@ -715,6 +724,7 @@ const HOST_INFO_SELECT = `SELECT b.*, a.payload AS batch_payload, a.payload_hash
 // P0 disposable schema; not migrations/001-initial.sql and not the execution ledger.
 export class ProbeStore {
   readonly #liveCapturePumps = new Map<string, { lease: CaptureLease; runId: string }>();
+  readonly #liveAgentPumps = new Map<string, string>();
   readonly #db: DatabaseSync;
   readonly #storeId: string;
   readonly #binding: Binding;
@@ -748,15 +758,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,21,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,22,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 21, 'unsupported-probe-schema');
+        check(version === 22, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 21 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 22 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -846,7 +856,7 @@ export class ProbeStore {
 
   #readDiscoveryApproval(consent: SourceAck, intent: Intent): MemoryDiscoveryApproval {
     check(sameBinding(consent?.binding, this.#binding) && consent.eventId !== intent.goalInput.eventId, 'discovery-consent-required');
-    this.#validateSource(consent);
+    this.#validateRawSource(consent);
     const source = this.#readSource!(consent);
     check(source.role === 'user', 'discovery-consent-required');
     const text = source.text;
@@ -969,11 +979,13 @@ export class ProbeStore {
         .get(projectId, this.#binding.ownerId), 'source-project-unavailable');
       check(Number.isSafeInteger(offset) && offset >= 0 && Number.isSafeInteger(length) && length > 0 && length <= 4096, 'invalid-range');
       const archive = this.#archiveRef(ref);
+      check(!this.#isCaptureOutput(ref), 'source-derived');
       this.#assertRawSourceAccess(activity, ref);
       const points = Array.from(archive.text);
       check(offset + length <= points.length, 'invalid-range');
       const content = points.slice(offset, offset + length).join('');
       check(Buffer.byteLength(content) <= 16384, 'invalid-source-unit');
+      this.#analysisReferences(archive.text);
       const prior = input.supersedes === undefined ? null : this.#sourceUnit(input.supersedes).unit;
       check(!prior || prior.projectId === projectId && prior.kind === kind, 'source-version-mismatch');
       check(input.approval, 'source-publication-approval-required');
@@ -1035,6 +1047,7 @@ export class ProbeStore {
     check(approval && sameBinding(approval.binding, unit.ref.binding) && approval.eventId !== unit.ref.eventId,
       'source-publication-approval-required');
     const decision = this.#archiveRef(approval);
+    check(!this.#isCaptureOutput(approval), 'source-derived');
     check(decision.role === 'user' && Buffer.byteLength(decision.text) <= 8192, 'source-publication-approval-required');
     let value: Record<string, unknown>;
     try { value = JSON.parse(decision.text) as Record<string, unknown>; }
@@ -1080,6 +1093,7 @@ export class ProbeStore {
     const project = this.#db.prepare('SELECT owner_id FROM projects WHERE project_id=?').get(unit.projectId);
     check(project?.owner_id === this.#binding.ownerId, 'source-evidence-gap');
     this.#publicationApproval(unit);
+    check(!this.#isCaptureOutput(unit.ref), 'source-evidence-gap');
     const raw = this.#archiveRef(unit.ref).text;
     this.#analysisReferences(raw);
     const points = Array.from(raw);
@@ -1097,14 +1111,17 @@ export class ProbeStore {
     check(!this.#checkingAnalysis.has(key) && this.#checkingAnalysis.size < 16, 'analysis-reference-cycle');
     this.#checkingAnalysis.add(key);
     try {
-      this.#archiveRef(parsed.header.task);
+      check(!this.#isCaptureOutput(parsed.header.task), 'source-derived');
       for (const evidence of parsed.header.evidence) {
         const request = evidence.request;
         check(request && Number.isSafeInteger(request.offset) && request.offset >= 0
           && Number.isSafeInteger(request.limit) && request.limit > 0 && request.limit <= 4096, 'analysis-evidence-gap');
         let source: string;
-        if ('ref' in request) source = this.#archiveRef(request.ref).text;
-        else if (this.#db.prepare('SELECT 1 FROM source_units WHERE unit_id=?').get(request.unitId)) source = this.#sourceUnit(request.unitId).text;
+        if ('ref' in request) {
+          check(!this.#isCaptureOutput(request.ref), 'source-derived');
+          source = this.#archiveRef(request.ref).text;
+          this.#analysisReferences(source);
+        } else if (this.#db.prepare('SELECT 1 FROM source_units WHERE unit_id=?').get(request.unitId)) source = this.#sourceUnit(request.unitId).text;
         else {
           this.#proposalForProjects(request.unitId, this.#registeredProjects());
           source = String(this.#db.prepare('SELECT payload FROM evolution_proposals WHERE proposal_id=?').get(request.unitId)!.payload);
@@ -1114,7 +1131,7 @@ export class ProbeStore {
       }
       if (parsed.header.exportInputs) {
         const exported = parsed.header.exportInputs;
-        this.#archiveRef(exported.approval);
+        check(!this.#isCaptureOutput(exported.approval), 'source-derived');
         for (const item of exported.selection) {
           const unit = this.#db.prepare('SELECT unit_id FROM source_units WHERE unit_id=?').get(item.unitId);
           if (unit) check(this.#sourceUnit(item.unitId).unit.contentHash === item.hash, 'analysis-evidence-gap');
@@ -1122,6 +1139,7 @@ export class ProbeStore {
         }
       }
       if (parsed.header.supersedes) {
+        check(!this.#isCaptureOutput(parsed.header.supersedes), 'source-derived');
         const prior = parseAnalysisArtifact(this.#archiveRef(parsed.header.supersedes).text);
         check(prior && prior.header.artifactId === parsed.header.artifactId
           && prior.header.version + 1 === parsed.header.version, 'analysis-version-mismatch');
@@ -1132,6 +1150,7 @@ export class ProbeStore {
   validateAnalysisSource(activity: Activity, ref: SourceAck): void {
     this.withActivity(activity, () => {
       check(sameBinding(ref.binding, this.#binding), 'source-scope-mismatch');
+      check(!this.#isCaptureOutput(ref), 'source-derived');
       this.#analysisReferences(this.#archiveRef(ref).text);
     });
   }
@@ -1141,6 +1160,7 @@ export class ProbeStore {
       check(Array.isArray(selection) && selection.length > 0 && selection.length <= 16
         && new Set(selection.map(item => item.unitId)).size === selection.length, 'invalid-export-selection');
       check(sameBinding(approval?.binding, this.#binding), 'export-approval-required');
+      this.#validateRawSource(approval);
       const decision = this.#archiveRef(approval);
       check(decision.role === 'user', 'export-approval-required');
       let value: { schema?: string; selection?: ExportSelection[] };
@@ -1412,7 +1432,8 @@ export class ProbeStore {
             OR EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='agent/event@v1' AND json_extract(e.payload,'$.event.result.outcome')='unknown'))))
       AND NOT EXISTS(SELECT 1 FROM request_runs child WHERE child.related_run_id=r.run_id)`)
       .all(stream.projectId, stream.principalId, currentRunId ?? '');
-    check(blockers.every(row => row.run_id === relatedRunId || this.#liveCapture(String(row.run_id))), 'request-recovery-required');
+    check(blockers.every(row => row.run_id === relatedRunId || this.#liveCapture(String(row.run_id))
+      || this.#historianParentIsLive(activity, String(row.run_id))), 'request-recovery-required');
   }
 
   authorizeRequestRun(activity: Activity, runId: string, input: { budget: ProbeBudget; intent: { eventId: string; hash: string } | null; relatedRunId: string | null; acceptDuplicateRisk?: boolean }): RequestRun {
@@ -1434,7 +1455,7 @@ export class ProbeStore {
             && (JSON.parse(event.payload) as { evidence: { outcome: string } }).evidence.outcome === 'not-received'))));
         check((!unresolved && !previous.events.some(event => event.kind === 'run-recovery-gap'))
           || input.acceptDuplicateRisk === true, 'duplicate-risk-approval-required');
-        this.#verifyRequestSources(previous.assemblies);
+        this.#verifyRequestSources(previous.assemblies, undefined, null);
       }
       this.#requestRecoveryGate(activity, input.relatedRunId);
       if (input.intent) { uuid(input.intent.eventId); check(input.intent.hash.length === 64, 'invalid-intent-ref'); }
@@ -1640,9 +1661,9 @@ export class ProbeStore {
   requestMaySend(activity: Activity, runId: string): boolean {
     return this.withActivity(activity, () => {
       const status = this.requestStatus(activity, runId);
-      this.#verifyRequestSources(status.assemblies, activity);
       const attempt = status.attempts.find(item => item.outcome === 'unknown-sent');
       const assembly = status.assemblies.find(item => item.assemblyId === attempt?.assemblyId);
+      this.#verifyRequestSources(status.assemblies, activity, assembly?.assemblyId);
       if (assembly) {
         this.#assertAgentContext(activity, status, assembly);
         const projects = assembly.context?.discoveryGrantId ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : undefined;
@@ -1661,7 +1682,13 @@ export class ProbeStore {
       check(!assembly.context, 'context-owner-mismatch'); return;
     }
     check(assembly.context, 'context-identity-required');
-    const current = this.#readAgentLedger(status).cacheEpoch;
+    const agent = this.#readAgentLedger(status);
+    const current = agent.cacheEpoch;
+    for (const selected of agent.windows.at(-1)?.compartments ?? []) {
+      const compartment = this.readCompartment(activity, selected.jobId);
+      check(sameSourceAck(compartment.source, selected.source)
+        && [compartment.source, ...compartment.body.citations].every(ref => assembly.sources.some(source => sameSourceAck(source, ref))), 'compartment-snapshot-stale');
+    }
     const { guidanceAssemblyId, ...epoch } = assembly.context;
     check(current && JSON.stringify(current) === JSON.stringify(epoch), 'cache-epoch-stale');
     if (current.discoveryGrantId) this.#discoveryProjects(activity, current.discoveryGrantId);
@@ -1792,12 +1819,30 @@ export class ProbeStore {
     }
   }
 
-  #verifyRequestSources(assemblies: RequestAssembly[], activity?: Activity): void {
+  #verifyRequestSources(assemblies: (RequestAssembly & { state?: RequestAssemblyState })[], activity?: Activity, currentAssemblyId?: string | null): void {
     for (const assembly of assemblies) for (const source of assembly.sources) {
-      this.#validateSource(source);
-      if (activity) this.#assertRawSourceAccess(activity, source, assembly.context
-        ? assembly.context.discoveryGrantId ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : [this.#binding.projectId]
-        : undefined);
+      let refs = [source], scope: MemoryScope | undefined;
+      // Only settled history can use a published compartment's original raw range.
+      // Undefined keeps strict artifact checks; null denotes a sealed predecessor.
+      if (currentAssemblyId !== undefined && assembly.assemblyId !== currentAssemblyId && assembly.state === 'finished') {
+        const row = this.#db.prepare(`SELECT c.* FROM compartments c JOIN capture_jobs j ON j.job_id=c.job_id
+          WHERE c.job_id=? AND j.source_owner=? AND j.consumer='historian'`).get(source.eventId, source.binding.sessionId);
+        if (row) {
+          const published = JSON.parse(String(row.source_json)) as SourceAck, attemptId = String(row.attempt_id);
+          if (sameSourceAck(source, published)) {
+            check(row.hash === sha256(JSON.stringify({ source: published, attemptId })), 'compartment-integrity');
+            const job = this.#captureJob(source.eventId);
+            check(job.consumer === 'historian' && sameBinding(source.binding, job.source.binding), 'historian-owner-mismatch');
+            refs = job.range; scope = job.scope;
+          }
+        }
+      }
+      for (const ref of refs) {
+        this.#validateSource(ref, undefined, scope);
+        if (activity) this.#assertRawSourceAccess(activity, ref, assembly.context
+          ? assembly.context.discoveryGrantId ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : [this.#binding.projectId]
+          : undefined);
+      }
     }
   }
 
@@ -1821,7 +1866,7 @@ export class ProbeStore {
         && /^[0-9a-f]{64}$/.test(evidence.receiptHash)
         && ['received', 'not-received'].includes(evidence.outcome), 'invalid-reconciliation-evidence');
       if (evidence.outcome === 'not-received') check(senderAbsent, 'attempt-owner-still-live');
-      this.#verifyRequestSources(status.assemblies);
+      this.#verifyRequestSources(status.assemblies, undefined, attempt.assemblyId);
       check(!status.events.some(event => event.attemptId === attemptId && event.kind === 'model/request-attempt-reconciled@v1'), 'attempt-already-reconciled');
       this.#requestEvent(status.run.runId, 'model/request-attempt-reconciled@v1', attemptId, JSON.stringify({
         schema: 'model/request-attempt-reconciled@v1', runId: status.run.runId, attemptId,
@@ -1953,8 +1998,8 @@ export class ProbeStore {
       const ledger = this.requestStatus(activity, runId);
       check(ledger.run.activityId === activity.id && ledger.run.state === 'authorized', 'run-not-admissible');
       this.#requestRecoveryGate(activity, ledger.run.relatedRunId, runId);
-      this.#verifyRequestSources(ledger.assemblies, activity);
       const assembly = ledger.assemblies.at(-1);
+      this.#verifyRequestSources(ledger.assemblies, activity, assembly?.assemblyId);
       if (assembly) this.#assertAgentContext(activity, ledger, assembly);
       const intent = this.readIntent(activity);
       check(assembly && intent?.status === 'active' && intent.eventId === assembly.intent?.eventId && intent.hash === assembly.intent.hash, 'intent-stale');
@@ -1980,6 +2025,13 @@ export class ProbeStore {
         uuid(event.windowId);
         if (event.previousWindowId) uuid(event.previousWindowId);
         for (const source of event.recovery) this.#validateSource(source);
+        check((event.compartments?.length ?? 0) <= 32
+          && new Set(event.compartments?.map(item => item.jobId)).size === (event.compartments?.length ?? 0), 'invalid-compartment-selection');
+        for (const selected of event.compartments ?? []) {
+          const compartment = this.readCompartment(activity, selected.jobId);
+          check(compartment.runId === runId && compartment.endResponse <= event.firstResponse
+            && sameSourceAck(compartment.source, selected.source), 'compartment-boundary-invalid');
+        }
       }
       if (event.kind === 'file-prepared') this.#validateSource(event.admission.source);
       if (event.kind === 'tool-result') this.#validateSource(event.result.source);
@@ -2074,6 +2126,7 @@ export class ProbeStore {
       && sameBinding(intent.binding, this.#binding), 'intent-evidence-gap');
     this.#validateSource(intent.input);
     this.#validateSource(intent.goalInput);
+    check(!this.#isCaptureOutput(intent.input) && !this.#isCaptureOutput(intent.goalInput), 'source-derived');
     return { ...intent, hash: String(row.hash) };
   }
 
@@ -2107,6 +2160,7 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       check(sameBinding(input.binding, this.#binding) && input.status === 'durable', 'source-scope-mismatch');
       this.#validateSource(input);
+      check(!this.#isCaptureOutput(input), 'source-derived');
       check(transition && typeof transition === 'object'
         && Object.keys(transition).every(key => key === 'step' || key === 'status'), 'invalid-transition');
       check(['active', 'paused', 'completed', 'needs-input'].includes(transition.status)
@@ -2151,7 +2205,7 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       check(Object.keys(options).every(key => ['type','scope','appliesTo','claimKey','validFrom','validUntil'].includes(key)), 'invalid-memory-options');
       const scope = this.#validateScope(options.scope);
-      this.#validateSource(input, content, scope);
+      this.#validateRawSource(input, content, scope);
       const { validFrom, validUntil } = memoryValidity(options);
       const appliesTo = this.#normalizeAppliesTo(options.appliesTo);
       const claimKey = options.claimKey ?? content.trim().normalize('NFC');
@@ -2159,7 +2213,7 @@ export class ProbeStore {
       check(['fact', 'preference', 'decision', 'insight', 'episode'].includes(options.type), 'invalid-memory-type');
       const existing = this.#db.prepare(`SELECT r.*,j.payload AS capture_payload,j.payload_hash AS capture_hash FROM capture_jobs j
         JOIN memory_revisions r ON r.record_id=j.record_id AND r.revision=1
-        WHERE j.source_owner=? AND j.source_event_id=?`).get(input.binding.sessionId, input.eventId);
+        WHERE j.source_owner=? AND j.source_event_id=? AND j.consumer='memory'`).get(input.binding.sessionId, input.eventId);
       if (existing) {
         const job = JSON.parse(String(existing.capture_payload));
         check(sha256(String(existing.capture_payload)) === existing.capture_hash && job.schema === 'capture-job@1'
@@ -2217,15 +2271,160 @@ export class ProbeStore {
       }
       const scope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true };
       for (const ref of range) this.#validateSource(ref, undefined, scope);
-      const existing = this.#db.prepare('SELECT job_id FROM capture_jobs WHERE source_owner=? AND source_event_id=?')
+      const existing = this.#db.prepare("SELECT job_id FROM capture_jobs WHERE source_owner=? AND source_event_id=? AND consumer='memory'")
         .get(source.binding.sessionId, source.eventId);
       if (existing) return this.#captureJob(String(existing.job_id));
       const jobId = randomUUID();
       const payload = JSON.stringify({ schema: 'capture-job@1', source, range, scope, ownerId: this.#binding.ownerId,
         recordId: null, lane: 'normal-capture', boundary: attemptId ? 'react-complete' : 'task-complete', runId, reason: 'proposer-required' });
-      this.#db.prepare('INSERT INTO capture_jobs VALUES (?,?,?,?,?,?,?,?)').run(jobId, source.eventId, null, 'pending',
+      this.#db.prepare('INSERT INTO capture_jobs (job_id,source_event_id,record_id,status,payload,payload_hash,created_at,source_owner) VALUES (?,?,?,?,?,?,?,?)').run(jobId, source.eventId, null, 'pending',
         payload, sha256(payload), new Date().toISOString(), source.binding.sessionId);
       return this.#captureJob(jobId);
+    });
+  }
+
+  queueHistorianBoundary(activity: Activity, runId: string, bounds: HistorianBounds): CaptureJob | null {
+    return this.withActivity(activity, () => {
+      check(Number.isSafeInteger(bounds.minBytes) && bounds.minBytes > 0 && Number.isSafeInteger(bounds.maxBytes)
+        && bounds.maxBytes >= bounds.minBytes && bounds.maxBytes <= 100000, 'invalid-historian-bounds');
+      const state = this.agentStatus(activity, runId);
+      if (state.discoveryGrantId || state.terminal && state.terminal !== 'completed') return null;
+      check(state.tools.every(tool => tool.result && tool.result.outcome !== 'unknown'), 'historian-boundary-incomplete');
+      const ledger = this.requestStatus(activity, runId);
+      check(ledger.attempts.every(attempt => attempt.outcome === 'received'), 'historian-boundary-incomplete');
+      const endResponse = state.terminal === 'completed' ? state.responses.length : state.responses.length - 1;
+      if (endResponse <= 0) return null;
+      const previous = this.#db.prepare(`SELECT job_id,payload,payload_hash FROM capture_jobs
+        WHERE source_owner=? AND consumer='historian' AND json_extract(payload,'$.runId')=? ORDER BY rowid DESC LIMIT 1`)
+        .get(this.#binding.sessionId, runId);
+      if (previous) check(sha256(String(previous.payload)) === previous.payload_hash, 'capture-evidence-gap');
+      const firstResponse = previous ? Number(JSON.parse(String(previous.payload)).endResponse) : 0;
+      if (firstResponse === endResponse) return this.#captureJob(String(previous!.job_id));
+      check(firstResponse < endResponse, 'historian-boundary-stale');
+      const range: SourceAck[] = [];
+      const appendResponse = (response: AgentStatus['responses'][number]) => {
+        range.push(response.source);
+        for (const tool of state.tools.filter(tool => tool.attemptId === response.attemptId)) {
+          const file = state.files.find(file => file.admission.callId === tool.callId);
+          if (file) {
+            range.push(file.admission.source);
+            if (file.approvalSource) range.push(file.approvalSource);
+          }
+          range.push(tool.result!.source);
+        }
+      };
+      for (const response of state.responses.slice(firstResponse, endResponse)) {
+        const eventIds = responseInputIds(ledger, response.attemptId);
+        if (!range.length && firstResponse > 0 && eventIds.length) appendResponse(state.responses[firstResponse - 1]!);
+        for (const eventId of eventIds) {
+          const input = state.inputs.find(input => input.source.eventId === eventId);
+          check(input?.state === 'bound-to-assembly', 'historian-source-gap');
+          if (!range.some(ref => sameSourceAck(ref, input.source))) range.push(input.source);
+        }
+        appendResponse(response);
+      }
+      const scope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true };
+      let bytes = 0;
+      for (const ref of range) {
+        check(sameBinding(ref.binding, this.#binding), 'source-scope-mismatch');
+        this.#validateSource(ref, undefined, scope);
+        check(!this.isCaptureOutput(activity, ref), 'historian-raw-required');
+        bytes += Buffer.byteLength(this.#archiveRef(ref).text);
+      }
+      if (bytes < bounds.minBytes && state.terminal !== 'completed' || bytes > bounds.maxBytes) return null;
+      const source = range.at(-1)!, jobId = randomUUID();
+      const payload = JSON.stringify({ schema: 'capture-job@1', source, range, scope, ownerId: this.#binding.ownerId,
+        recordId: null, lane: 'historian', runId, firstResponse, endResponse, rawHash: sha256(JSON.stringify(range)),
+        boundary: state.terminal === 'completed' ? 'task-complete' : 'prefix-complete', reason: 'historian-required' });
+      this.#db.prepare('INSERT INTO capture_jobs VALUES (?,?,?,?,?,?,?,?,?)').run(jobId, source.eventId, null, 'pending',
+        payload, sha256(payload), new Date().toISOString(), source.binding.sessionId, 'historian');
+      return this.#captureJob(jobId);
+    });
+  }
+
+  #historianBody(job: CaptureJob, attemptId: string): CompartmentBody {
+    check(job.consumer === 'historian' && job.source.binding.sessionId === this.#binding.sessionId, 'historian-owner-mismatch');
+    const row = this.#db.prepare('SELECT run_id FROM capture_work WHERE job_id=?').get(job.jobId);
+    check(row?.run_id, 'capture-run-unavailable');
+    const ledger = this.#readProjectRequestLedger(String(row.run_id));
+    const attempt = ledger.attempts.find(item => item.attemptId === attemptId);
+    check(attempt?.outcome === 'received', 'response-not-received');
+    const step = ledger.events.filter(event => event.kind === 'capture/step@v1').map(event => JSON.parse(event.payload))
+      .find(event => event.attemptId === attemptId && event.phase === 'historian' && event.outcome === 'response');
+    check(step && step.inputHash === attempt.payloadHash && step.source.eventId === attemptId, 'historian-attempt-mismatch');
+    const route = JSON.parse(step.route);
+    check(route.role === 'historian' && ['standard','high'].includes(route.actual.capability), 'historian-capability-insufficient');
+    const response = JSON.parse(this.#archiveRef(step.source).text);
+    check(response.stop === 'end' && response.calls.length === 0, 'historian-output-incomplete');
+    const reply: unknown = JSON.parse(response.text);
+    assertHistorianReply(reply);
+    check(reply.result === 'pass', 'historian-negative-result');
+    const payload = JSON.parse(String(this.#db.prepare('SELECT payload FROM capture_jobs WHERE job_id=?').get(job.jobId)!.payload));
+    check(payload.lane === 'historian' && payload.rawHash === sha256(JSON.stringify(job.range)), 'historian-source-gap');
+    const raw = job.range.map(ref => {
+      this.#validateSource(ref, undefined, job.scope);
+      return { ref, ...this.#archiveRef(ref) };
+    });
+    return compartmentBody(raw, payload.runId, reply.summary);
+  }
+
+  prepareCompartment(lease: CaptureLease, attemptId: string): CompartmentBody {
+    return this.withActivity(lease.activity, () => {
+      const job = this.#captureLease(lease, true);
+      return this.#historianBody(job, attemptId);
+    });
+  }
+
+  publishCompartment(lease: CaptureLease, attemptId: string, source: SourceAck): Compartment {
+    return this.withActivity(lease.activity, () => {
+      const job = this.#captureLease(lease, true), body = this.#historianBody(job, attemptId);
+      check(source.eventId === job.jobId && sameBinding(source.binding, job.source.binding), 'historian-owner-mismatch');
+      const stored = this.#archiveRef(source);
+      check(stored.role === 'assistant' && stored.text === JSON.stringify(body), 'compartment-integrity');
+      const hash = sha256(JSON.stringify({ source, attemptId }));
+      const existing = this.#db.prepare('SELECT hash FROM compartments WHERE job_id=?').get(job.jobId);
+      if (existing) check(existing.hash === hash, 'compartment-identity-conflict');
+      else this.#db.prepare('INSERT INTO compartments VALUES (?,?,?,?)').run(job.jobId, JSON.stringify(source), attemptId, hash);
+      this.stopCapture(lease, 'complete', 'compartment-published');
+      return this.readCompartment(lease.activity, job.jobId);
+    });
+  }
+
+  readCompartment(activity: Activity, jobId: string): Compartment {
+    return this.withActivity(activity, () => {
+      const job = this.#captureJob(jobId), row = this.#db.prepare('SELECT * FROM compartments WHERE job_id=?').get(jobId);
+      check(row, 'compartment-unavailable');
+      const source = JSON.parse(String(row.source_json)) as SourceAck, attemptId = String(row.attempt_id);
+      check(row.hash === sha256(JSON.stringify({ source, attemptId })), 'compartment-integrity');
+      const body = this.#historianBody(job, attemptId);
+      check(source.eventId === jobId && sameBinding(source.binding, job.source.binding)
+        && this.#archiveRef(source).text === JSON.stringify(body), 'compartment-integrity');
+      const payload = JSON.parse(String(this.#db.prepare('SELECT payload FROM capture_jobs WHERE job_id=?').get(jobId)!.payload));
+      return { jobId, runId: payload.runId, firstResponse: payload.firstResponse, endResponse: payload.endResponse,
+        rawHash: payload.rawHash, attemptId, source, body };
+    });
+  }
+
+  compartmentsForWindow(activity: Activity, runId: string, throughResponse: number, maxBytes: number) {
+    return this.withActivity(activity, () => {
+      this.agentStatus(activity, runId);
+      const selected: Compartment[] = [], unavailable: { jobId: string; reason: string }[] = [];
+      let bytes = 0;
+      const rows = this.#db.prepare(`SELECT j.job_id FROM capture_jobs j JOIN compartments c ON c.job_id=j.job_id
+        WHERE j.source_owner=? AND j.consumer='historian' AND json_extract(j.payload,'$.runId')=?
+        AND json_extract(j.payload,'$.endResponse')<=? ORDER BY j.rowid DESC LIMIT 32`).all(this.#binding.sessionId, runId, throughResponse);
+      for (const row of rows) {
+        try {
+          const compartment = this.readCompartment(activity, String(row.job_id));
+          const size = Buffer.byteLength(JSON.stringify(compartment.body));
+          if (bytes + size <= maxBytes) { selected.unshift(compartment); bytes += size; }
+        } catch (error) {
+          if (!isCompartmentEvidenceGap(error)
+            && !['ENOENT','EACCES','EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+          unavailable.push({ jobId: String(row.job_id), reason: 'compartment-unavailable' });
+        }
+      }
+      return { selected, unavailable };
     });
   }
 
@@ -2251,7 +2450,7 @@ export class ProbeStore {
       const event = this.#db.prepare('SELECT kind,payload FROM memory_events WHERE event_id=?').get(record.headEventId);
       let source = record.source;
       if (approval) {
-        this.#validateSource(approval, undefined, record.scope);
+        this.#validateRawSource(approval, undefined, record.scope);
         const decision = this.#archiveRef(approval);
         check(decision.role === 'user', 'reverification-approval-required');
         let value: Record<string, unknown>;
@@ -2263,7 +2462,7 @@ export class ProbeStore {
           && value.sourceHash === record.source.hash, 'reverification-approval-required');
         source = approval;
       } else check(event?.kind === 'correct' && record.verification === 'unverified', 'reverification-trigger-required');
-      const existing = this.#db.prepare('SELECT job_id,payload FROM capture_jobs WHERE source_owner=? AND source_event_id=?')
+      const existing = this.#db.prepare("SELECT job_id,payload FROM capture_jobs WHERE source_owner=? AND source_event_id=? AND consumer='memory'")
         .get(source.binding.sessionId, source.eventId);
       if (existing) {
         check(JSON.parse(String(existing.payload)).expectedHead === record.headEventId, 'capture-identity-conflict');
@@ -2274,7 +2473,7 @@ export class ProbeStore {
         .filter((ref, index, refs) => refs.findIndex(other => sameSourceAck(ref, other)) === index);
       const payload = JSON.stringify({ schema: 'capture-job@1', source, range, scope: record.scope,
         ownerId: this.#binding.ownerId, recordId, lane: 'reverification', expectedHead: record.headEventId, reason: 'reverification-required' });
-      this.#db.prepare('INSERT INTO capture_jobs VALUES (?,?,?,?,?,?,?,?)').run(jobId, source.eventId, null, 'pending', payload,
+      this.#db.prepare('INSERT INTO capture_jobs (job_id,source_event_id,record_id,status,payload,payload_hash,created_at,source_owner) VALUES (?,?,?,?,?,?,?,?)').run(jobId, source.eventId, null, 'pending', payload,
         sha256(payload), new Date().toISOString(), source.binding.sessionId);
       return this.#captureJob(jobId);
     });
@@ -2284,15 +2483,16 @@ export class ProbeStore {
     return this.withActivity(activity, () => this.#captureJob(jobId));
   }
 
-  listCaptureJobs(activity: Activity, limit = 16, pendingOnly = false): CaptureJob[] {
+  listCaptureJobs(activity: Activity, limit = 16, pendingOnly = false, consumer: CaptureJob['consumer'] = 'memory'): CaptureJob[] {
     return this.withActivity(activity, () => {
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= 32, 'invalid-capture-limit');
       return this.#db.prepare(`SELECT j.job_id FROM capture_jobs j JOIN sessions s ON s.session_id=j.source_owner
         LEFT JOIN capture_work w ON w.job_id=j.job_id
-        WHERE s.owner_id=? AND s.project_id=? AND (?=0 OR (j.status='pending' AND (w.stage IS NULL OR w.stage IN ('pending','proposing','verifying','comparing'))))
+        WHERE s.owner_id=? AND s.project_id=? AND j.consumer=? AND (?=0 OR (j.status='pending' AND (w.stage IS NULL OR w.stage IN ('pending','proposing','verifying','comparing'))))
           AND (json_extract(j.payload,'$.scope.kind') IS NOT 'session' OR j.source_owner=?)
+          AND (j.consumer='memory' OR j.source_owner=?)
         ORDER BY j.rowid LIMIT ?`)
-        .all(this.#binding.ownerId, this.#binding.projectId, pendingOnly ? 1 : 0, this.#binding.sessionId, limit).map(row => this.#captureJob(String(row.job_id)));
+        .all(this.#binding.ownerId, this.#binding.projectId, consumer, pendingOnly ? 1 : 0, this.#binding.sessionId, this.#binding.sessionId, limit).map(row => this.#captureJob(String(row.job_id)));
     });
   }
 
@@ -2321,13 +2521,13 @@ export class ProbeStore {
     const scope: MemoryScope = payload.scope ?? record?.scope ?? (head ? {
       kind: head.scope_kind as MemoryScopeKind, id: String(head.scope_id), resolved: Boolean(head.scope_resolved) } : null);
     this.#validateScope(scope);
-    return { jobId, ownerId: this.#binding.ownerId, scope: structuredClone(scope), source: payload.source,
+    return { jobId, consumer: row.consumer as CaptureJob['consumer'], ownerId: this.#binding.ownerId, scope: structuredClone(scope), source: payload.source,
       range: payload.range ?? [payload.source], stage: unavailable ? 'blocked' : (work?.stage ?? row.status) as CaptureJob['stage'],
       reason: unavailable ?? (work ? work.reason as string | null : payload.reason ?? null), record };
   }
 
-  deferCaptureJobs(activity: Activity, reason: 'capture-route-unavailable' | 'capture-configuration-unavailable' | 'foreground-run-active' | 'request-recovery-required' | 'prerequisite-evidence-gap' | 'capture-stopped' | 'host-info-recovery-required'): CaptureJob[] {
-    return this.withActivity(activity, () => this.listCaptureJobs(activity, 16, true).map(job => {
+  deferCaptureJobs(activity: Activity, reason: 'capture-route-unavailable' | 'capture-configuration-unavailable' | 'foreground-run-active' | 'request-recovery-required' | 'prerequisite-evidence-gap' | 'capture-stopped' | 'host-info-recovery-required', consumer: CaptureJob['consumer'] = 'memory'): CaptureJob[] {
+    return this.withActivity(activity, () => this.listCaptureJobs(activity, 16, true, consumer).map(job => {
       this.#db.prepare(`INSERT INTO capture_work(job_id,stage,reason,record_id,expected_head_id,lease_until,generation,budget,deadline)
         VALUES (?,'pending',?,?,?,0,1,NULL,0) ON CONFLICT(job_id) DO UPDATE SET reason=excluded.reason
         WHERE capture_work.lease_token IS NULL OR capture_work.lease_until<=?`)
@@ -2344,6 +2544,27 @@ export class ProbeStore {
         throw error;
       }
     });
+  }
+
+  observeAgentPump(activity: Activity, runId: string): () => void {
+    this.withActivity(activity, () => {
+      const run = this.#requestRun(activity, runId);
+      check(run.state === 'authorized' && !this.agentStatus(activity, runId).terminal && !this.#liveAgentPumps.has(runId), 'agent-runtime-mismatch');
+      this.#liveAgentPumps.set(runId, activity.id);
+    });
+    return () => { this.#liveAgentPumps.delete(runId); };
+  }
+
+  #historianParentIsLive(activity: Activity, runId: string): boolean {
+    const stream = this.#readStream(activity.streamId);
+    if (stream.ownerKind !== 'job' || !this.#liveAgentPumps.has(runId)) return false;
+    const job = this.#db.prepare(`SELECT j.payload,w.lease_until,w.lease_activity FROM capture_jobs j
+      JOIN capture_work w ON w.job_id=j.job_id WHERE j.job_id=? AND j.consumer='historian'`).get(stream.ownerId);
+    if (!job || job.lease_activity !== activity.id || Number(job.lease_until) <= Date.now()
+      || JSON.parse(String(job.payload)).runId !== runId) return false;
+    const parent = this.#db.prepare('SELECT activity_id,state FROM request_runs WHERE run_id=?').get(runId);
+    return parent?.state === 'authorized' && parent.activity_id === this.#liveAgentPumps.get(runId)
+      && !this.#db.prepare("SELECT 1 FROM request_events WHERE run_id=? AND kind='run-recovery-gap'").get(runId);
   }
 
   /** Volatile pump lifetime is local to this Store; a restart or another Store has no live exemption. */
@@ -2366,7 +2587,7 @@ export class ProbeStore {
       && Number(row!.lease_until) > Date.now() && Number(row!.deadline) > Date.now();
   }
 
-  pauseCapture(lease: CaptureLease, reason: 'foreground-run-active' | 'host-info-recovery-required' = 'foreground-run-active'): void {
+  pauseCapture(lease: CaptureLease, reason: 'foreground-run-active' | 'host-info-recovery-required' | 'request-recovery-required' | 'historian-publication-pending' = 'foreground-run-active'): void {
     this.withActivity(lease.activity, () => {
       const job = this.#captureLease(lease), runtime = this.captureRuntime(lease);
       check(!runtime.runId || this.requestStatus(lease.activity, runtime.runId).attempts.every(attempt => attempt.outcome !== 'unknown-sent'), 'attempt-reconciliation-required');
@@ -2388,7 +2609,7 @@ export class ProbeStore {
         ? 'additional-scope-evidence-required' : deadline <= now ? 'capture-deadline' : null;
       const capture = JSON.parse(String(this.#db.prepare('SELECT payload FROM capture_jobs WHERE job_id=?').get(jobId)!.payload));
       if (capture.expectedHead && job.stage !== 'comparing' && job.record?.headEventId !== capture.expectedHead) reason = 'memory-stale';
-      try { for (const ref of job.range) this.#validateSource(ref, undefined, job.scope); }
+      try { for (const ref of job.range) this.#validateRawSource(ref, undefined, job.scope); }
       catch { reason = 'source-evidence-gap'; }
       const holder = reason ? null : this.register({ kind: 'job', id: jobId, authorizationId: job.source.eventId });
       const token = holder ? randomUUID() : null;
@@ -2416,7 +2637,7 @@ export class ProbeStore {
       check(ledger.run.state === 'authorized' && !ledger.events.some(event => event.kind === 'run-recovery-gap'), 'late-model-result');
     }
     const job = this.#captureJob(lease.jobId);
-    for (const ref of job.range) this.#validateSource(ref, undefined, job.scope);
+    for (const ref of job.range) this.#validateRawSource(ref, undefined, job.scope);
     if (job.record) check(job.record.headEventId === row.expected_head_id, 'memory-stale');
     return job;
   }
@@ -2424,7 +2645,7 @@ export class ProbeStore {
   captureProposedMemory(lease: CaptureLease, proposal: ProposedMemory, capability: 'basic' | 'standard' | 'high' = 'standard'): CaptureJob {
     return this.withActivity(lease.activity, () => {
       const job = this.#captureLease(lease, true);
-      check(job.stage === 'proposing' && job.record === null, 'capture-stage-mismatch');
+      check(job.consumer === 'memory' && job.stage === 'proposing' && job.record === null, 'capture-stage-mismatch');
       assertProposedMemory(proposal);
       const appliesTo = this.#normalizeAppliesTo(proposal.appliesTo ?? []);
       const { validFrom, validUntil } = memoryValidity(proposal);
@@ -2462,23 +2683,29 @@ export class ProbeStore {
   isCaptureOutput(activity: Activity, ref: SourceAck): boolean {
     return this.withActivity(activity, () => {
       check(sameBinding(ref.binding, this.#binding), 'source-scope-mismatch');
-      const role = this.#archiveRef(ref).role;
-      if (role === 'user') return false;
-      const steps = this.#db.prepare(`SELECT e.payload,e.hash FROM request_events e
-        JOIN capture_work w ON w.run_id=e.run_id JOIN capture_jobs j ON j.job_id=w.job_id
-        JOIN sessions s ON s.session_id=j.source_owner
-        WHERE e.kind='capture/step@v1' AND json_extract(e.payload,'$.source.eventId')=? AND s.owner_id=? AND s.project_id=?`)
-        .all(ref.eventId, this.#binding.ownerId, this.#binding.projectId);
-      if (steps.length) return steps.some(row => {
-        check(sha256(String(row.payload)) === row.hash, 'capture-evidence-gap');
-        return sameSourceAck(JSON.parse(String(row.payload)).source, ref);
-      });
-      // Before the step is recorded, a response uses its already-owned attempt identity.
-      return role === 'assistant' && !!this.#db.prepare(`SELECT 1 FROM request_attempts a
-        JOIN capture_work w ON w.run_id=a.run_id JOIN capture_jobs j ON j.job_id=w.job_id
-        JOIN sessions s ON s.session_id=j.source_owner
-        WHERE a.attempt_id=? AND s.owner_id=? AND s.project_id=?`).get(ref.eventId, this.#binding.ownerId, this.#binding.projectId);
+      return this.#isCaptureOutput(ref);
     });
+  }
+
+  #isCaptureOutput(ref: SourceAck): boolean {
+    this.#archiveRef(ref);
+    // The body uses its durable job identity even before its publication row commits.
+    if (this.#db.prepare(`SELECT 1 FROM capture_jobs
+      WHERE job_id=? AND consumer='historian' AND source_owner=?`).get(ref.eventId, ref.binding.sessionId)) return true;
+    const steps = this.#db.prepare(`SELECT e.payload,e.hash FROM request_events e
+      JOIN capture_work w ON w.run_id=e.run_id JOIN capture_jobs j ON j.job_id=w.job_id
+      JOIN sessions s ON s.session_id=j.source_owner
+      WHERE e.kind='capture/step@v1' AND json_extract(e.payload,'$.source.eventId')=? AND s.owner_id=? AND s.project_id=?`)
+      .all(ref.eventId, ref.binding.ownerId, ref.binding.projectId);
+    if (steps.length) return steps.some(row => {
+      check(sha256(String(row.payload)) === row.hash, 'capture-evidence-gap');
+      return sameBinding(JSON.parse(String(row.payload)).source.binding, ref.binding);
+    });
+    // Before the step is recorded, a response uses its already-owned attempt identity.
+    return !!this.#db.prepare(`SELECT 1 FROM request_attempts a
+      JOIN capture_work w ON w.run_id=a.run_id JOIN capture_jobs j ON j.job_id=w.job_id
+      JOIN sessions s ON s.session_id=j.source_owner
+      WHERE a.attempt_id=? AND s.owner_id=? AND s.project_id=?`).get(ref.eventId, ref.binding.ownerId, ref.binding.projectId);
   }
 
   readCaptureOutput(lease: CaptureLease, ref: SourceAck): { text: string; role?: 'user' | 'assistant' | 'tool' } {
@@ -2517,12 +2744,12 @@ export class ProbeStore {
     });
   }
 
-  recordCaptureStep(lease: CaptureLease, input: { phase: 'proposer' | 'verifier'; kind: 'response' | 'tool';
+  recordCaptureStep(lease: CaptureLease, input: { phase: 'proposer' | 'verifier' | 'historian'; kind: 'response' | 'tool';
     source: SourceAck; attemptId: string; route: string; fallbackOrdinal: number; configHash: string; inputHash: string;
     outcome: 'response' | 'protocol' | 'temporary-unavailable'; callId?: string; failureClass?: string | null; responseHash?: string | null }): void {
     this.withActivity(lease.activity, () => {
       const job = this.#captureLease(lease, input.kind === 'tool');
-      check(input.phase === (job.stage === 'proposing' ? 'proposer' : 'verifier')
+      check(input.phase === (job.consumer === 'historian' ? 'historian' : job.stage === 'proposing' ? 'proposer' : 'verifier')
         && ['response','tool'].includes(input.kind) && ['response','protocol','temporary-unavailable'].includes(input.outcome)
         && Number.isSafeInteger(input.fallbackOrdinal) && input.fallbackOrdinal >= 0 && input.fallbackOrdinal <= 2
         && /^[a-f0-9]{64}$/.test(input.configHash) && /^[a-f0-9]{64}$/.test(input.inputHash), 'invalid-capture-step');
@@ -2544,7 +2771,8 @@ export class ProbeStore {
         outputHash: input.source.contentHash, outcome: input.outcome, callId, failureClass: input.failureClass ?? null,
         transportResponseHash: input.responseHash ?? null, ttftMs: null, cache: null,
         claimHeadEventId: assembly.claimHeadEventId ?? null,
-        promptVersion: 'capture-prompts@2', schemaVersion: 'capture-output@2', adapterVersion: attempt.adapterVersion, modelVersion: 'unknown' }), lease.activity.id);
+        promptVersion: input.phase === 'historian' ? 'historian-prompts@1' : 'capture-prompts@2',
+        schemaVersion: input.phase === 'historian' ? 'historian-output@1' : 'capture-output@2', adapterVersion: attempt.adapterVersion, modelVersion: 'unknown' }), lease.activity.id);
     });
   }
 
@@ -2723,10 +2951,11 @@ export class ProbeStore {
   queueOwnerCapture(activity: Activity, input: SourceAck, noActiveProject = false): { jobId: string; stage: CaptureJob['stage']; reason: string | null } {
     return this.withActivity(activity, () => {
       check(typeof noActiveProject === 'boolean' && input?.binding && sameBinding(input.binding, this.#binding), 'source-scope-mismatch');
+      this.#validateRawSource(input);
       const owner = this.#archiveRef(input);
       check(owner.role === 'user', 'memory-owner-source-required');
       check(isUntypedRemember(owner.text), 'memory-statement-not-explicit');
-      const existing = this.#db.prepare('SELECT * FROM capture_jobs WHERE source_owner=? AND source_event_id=?')
+      const existing = this.#db.prepare("SELECT * FROM capture_jobs WHERE source_owner=? AND source_event_id=? AND consumer='memory'")
         .get(input.binding.sessionId, input.eventId);
       if (existing) {
         const payload = JSON.parse(String(existing.payload));
@@ -2743,7 +2972,7 @@ export class ProbeStore {
       // No guessed type, claim or verified memory: the normal lane owns extraction from this durable job.
       const payload = JSON.stringify({ schema: 'capture-job@1', source: input, range: [input], scope,
         ownerId: this.#binding.ownerId, recordId: null, lane: 'owner-untyped', reason: 'memory-type-required' });
-      this.#db.prepare('INSERT INTO capture_jobs VALUES (?,?,?,?,?,?,?,?)')
+      this.#db.prepare('INSERT INTO capture_jobs (job_id,source_event_id,record_id,status,payload,payload_hash,created_at,source_owner) VALUES (?,?,?,?,?,?,?,?)')
         .run(jobId, input.eventId, null, 'pending', payload, sha256(payload), new Date().toISOString(), input.binding.sessionId);
       return { jobId, stage: 'pending', reason: 'memory-type-required' };
     });
@@ -2756,6 +2985,7 @@ export class ProbeStore {
         && (request.noActiveProject === undefined || request.noActiveProject === true), 'invalid-remember-request');
       const { input } = request;
       check(input && typeof input === 'object' && input.binding && sameBinding(input.binding, this.#binding), 'source-scope-mismatch');
+      this.#validateRawSource(input);
       const owner = this.#archiveRef(input);
       check(owner.role === 'user', 'memory-owner-source-required');
       let statement: OwnerMemoryStatement | null = parseOwnerStatement(owner.text);
@@ -2765,6 +2995,7 @@ export class ProbeStore {
         check(agreement, 'memory-statement-not-explicit');
         const proposal = agreement.proposal;
         check(proposal.binding && sameBinding(proposal.binding, this.#binding) && proposal.eventId !== input.eventId, 'memory-proposal-scope-mismatch');
+        this.#validateRawSource(proposal);
         const proposed = this.#archiveRef(proposal);
         check(proposed.role === 'assistant', 'memory-proposal-role-required');
         statement = parseMemoryProposal(proposed.text);
@@ -2775,7 +3006,7 @@ export class ProbeStore {
         ? { kind: 'session', id: this.#binding.sessionId, resolved: false }
         : { kind: 'project', id: this.#binding.projectId, resolved: true };
       this.#validateScope(scope);
-      const existing = this.#db.prepare('SELECT record_id,payload,payload_hash FROM capture_jobs WHERE source_owner=? AND source_event_id=?')
+      const existing = this.#db.prepare("SELECT record_id,payload,payload_hash FROM capture_jobs WHERE source_owner=? AND source_event_id=? AND consumer='memory'")
         .get(input.binding.sessionId, input.eventId);
       let record: MemoryRecord;
       if (existing) {
@@ -2877,7 +3108,7 @@ export class ProbeStore {
       if (change.kind === 'correct') {
         check(targets.length === 1 && targets[0]!.lifecycle !== 'tombstoned', 'tombstoned-not-actionable');
         check(typeof change.content === 'string' && Buffer.byteLength(change.content) <= 65536, 'invalid-memory-content');
-        this.#validateSource(change.input, undefined, targets[0]!.scope);
+        this.#validateRawSource(change.input, undefined, targets[0]!.scope);
       } else if (change.kind === 'rollback') {
         batch = this.#readActivationBatch(change.batchId);
         check(Array.isArray(change.eventIds) && change.eventIds.length === targets.length
@@ -3031,7 +3262,8 @@ export class ProbeStore {
         check(sha256(payload) === row[`${field}_hash`], 'operation-delivery-evidence-gap');
         const ref = JSON.parse(payload) as SourceAck;
         check(sameBinding(ref.binding, this.#binding), 'operation-delivery-evidence-gap');
-        this.#archiveRef(ref);
+        if (field === 'approval') this.#validateRawSource(ref);
+        else this.#archiveRef(ref);
         return ref;
       };
       return { operationId: presentation.operationId!, summaryEventId: String(row.summary_event_id),
@@ -3042,6 +3274,7 @@ export class ProbeStore {
   recordCorrectionApproval(activity: Activity, token: string, input: SourceAck): void {
     this.withActivity(activity, () => {
       const presentation = this.readMemoryPresentation(activity, token);
+      this.#validateRawSource(input);
       const raw = this.#archiveRef(input);
       const command = parseCorrectionCommand(raw.text);
       check(raw.role === 'user' && sameBinding(input.binding, this.#binding)
@@ -3067,7 +3300,7 @@ export class ProbeStore {
       const presentation = this.readMemoryPresentation(activity, token);
       const result = this.memoryOperationStatus(activity, token);
       if (presentation.kind !== 'correct' || result.status !== 'committed') return false;
-      const job = this.#db.prepare('SELECT payload,payload_hash FROM capture_jobs WHERE source_owner=? AND source_event_id=?')
+      const job = this.#db.prepare("SELECT payload,payload_hash FROM capture_jobs WHERE source_owner=? AND source_event_id=? AND consumer='memory'")
         .get(presentation.input!.binding.sessionId, presentation.input!.eventId);
       if (!job) return false;
       check(sha256(String(job.payload)) === job.payload_hash, 'capture-job-integrity');
@@ -4033,7 +4266,7 @@ export class ProbeStore {
       const current = this.#assertMemoryExpected(recordId, expected);
       check(['pass', 'block', 'evidence-gap'].includes(result), 'invalid-verification');
       check(Array.isArray(evidence), 'invalid-verification');
-      for (const ref of evidence) this.#validateSource(ref, undefined, current.scope);
+      for (const ref of evidence) this.#validateRawSource(ref, undefined, current.scope);
       check(result !== 'pass' || evidence.length > 0, 'verification-evidence-required');
       const evidenceJson = JSON.stringify(evidence);
       const evidenceHash = sha256(evidenceJson);
@@ -4100,7 +4333,7 @@ export class ProbeStore {
           && ledger.attempts[0]!.outcome === 'received')
         && JSON.stringify(baseline.run.budget) === JSON.stringify(treatment.run.budget), 'negative-transfer-evidence-required');
       const responseHash = (ref: SourceAck): string => {
-        this.#validateSource(ref, undefined, current.scope);
+        this.#validateRawSource(ref, undefined, current.scope);
         const raw = this.#archiveRef(ref); check(raw.role === 'assistant', 'negative-transfer-evidence-required');
         const response = JSON.parse(raw.text);
         check(response.stop === 'end' && typeof response.text === 'string' && Array.isArray(response.calls)
@@ -4112,7 +4345,7 @@ export class ProbeStore {
       check(baselineResponseHash === pair.expectedResponseHash && treatmentResponseHash !== pair.expectedResponseHash, 'negative-transfer-evidence-required');
       const before = baseline.assemblies[0]!, after = treatment.assemblies[0]!;
       check(before.sources.length === 1 && after.sources.length === 1, 'negative-transfer-evidence-required');
-      this.#validateSource(before.sources[0]!, undefined, current.scope);
+      this.#validateRawSource(before.sources[0]!, undefined, current.scope);
       const original = this.#archiveRef(before.sources[0]!);
       let canary: { schema?: string; caseId?: string; expectedText?: string };
       try { canary = JSON.parse(original.text) as typeof canary; } catch { throw new Error('negative-transfer-evidence-required'); }
@@ -4125,7 +4358,7 @@ export class ProbeStore {
         && before.route === after.route && before.model === after.model && before.policyHash === after.policyHash
         && before.epoch === after.epoch && JSON.stringify(before.intent) === JSON.stringify(after.intent), 'negative-transfer-evidence-required');
       const payload = (assembly: RequestAssembly, ref: SourceAck): Record<string, unknown> => {
-        this.#validateSource(ref, undefined, current.scope);
+        this.#validateRawSource(ref, undefined, current.scope);
         const text = this.#archiveRef(ref).text;
         check(sha256(text) === assembly.payloadHash && Buffer.byteLength(text) === assembly.byteLength, 'negative-transfer-evidence-required');
         const value = JSON.parse(text) as Record<string, unknown>;
@@ -4192,7 +4425,7 @@ export class ProbeStore {
   recordMemoryFeedback(activity: Activity, recordId: string, expected: MemoryRecord, input: SourceAck):
     { status: 'recorded' | 'no_op'; feedbackId: string; record: MemoryRecord } {
     return this.withActivity(activity, () => {
-      this.#validateSource(input, undefined, expected.scope);
+      this.#validateRawSource(input, undefined, expected.scope);
       const source = this.#archiveRef(input);
       check(source.role === 'user', 'memory-owner-source-required');
       let value: Record<string, unknown>;
@@ -4745,7 +4978,7 @@ export class ProbeStore {
       if (content.trim().normalize('NFC') === '' || content.trim().normalize('NFC') === current.content.trim().normalize('NFC')) {
         return { status: 'no_op', record: current, eventId: null };
       }
-      this.#validateSource(input, content, current.scope);
+      this.#validateRawSource(input, content, current.scope);
       const revisionId = randomUUID();
       const nextEventId = this.#ownerEventId(recordId);
       uuid(nextEventId);
@@ -4767,7 +5000,7 @@ export class ProbeStore {
       const current = this.#assertMemoryExpected(recordId, expected);
       check(current.lifecycle === 'active', 'memory-not-active');
       this.#eligible(current);
-      this.#validateSource(input, content, current.scope);
+      this.#validateRawSource(input, content, current.scope);
       if (content.trim().normalize('NFC') === current.content.trim().normalize('NFC')) return { status: 'no_op', record: current, eventId: null };
       let after = this.#withMemoryHash({ ...current, revisionId: randomUUID(), revision: this.#nextRevision(recordId),
         content, contentHash: sha256(content), source: structuredClone(input), headEventId: randomUUID(), verificationRunId: null });
@@ -4835,7 +5068,7 @@ export class ProbeStore {
         && typeof proposal.expectedChange === 'string' && proposal.expectedChange.length > 0 && Buffer.byteLength(proposal.expectedChange) <= 65536
         && proposal.owner === this.#binding.ownerId, 'invalid-proposal');
       const scope = this.#validateScope(proposal.scope);
-      this.#validateSource(input, undefined, scope);
+      this.#validateRawSource(input, undefined, scope);
       const sourceUnits = proposal.sourceUnits ?? [];
       check(scope.resolved && Array.isArray(proposal.evidenceRefs) && Array.isArray(sourceUnits)
         && proposal.evidenceRefs.length + sourceUnits.length > 0 && proposal.evidenceRefs.length + sourceUnits.length <= 32
@@ -4844,7 +5077,7 @@ export class ProbeStore {
         const { unit } = this.#sourceUnit(unitId);
         check(scope.kind === 'project' && unit.projectId === scope.id, 'source-scope-mismatch');
       }
-      for (const ref of proposal.evidenceRefs) this.#validateSource(ref, undefined, scope);
+      for (const ref of proposal.evidenceRefs) this.#validateRawSource(ref, undefined, scope);
       this.#assertProposalPublication(input, proposal);
       const evaluation = proposal.evaluation;
       check(evaluation?.schema === 'evaluation-contract@1' && ['L0','L1','L2','L3'].includes(evaluation.level)
@@ -4928,7 +5161,7 @@ export class ProbeStore {
       this.#validateScope(value.scope, projects);
       const refs = [value.input, ...value.evidenceRefs];
       this.#checkEvidenceRows('proposal_evidence', 'proposal_id', proposalId, refs);
-      for (const ref of refs) this.#validateSource(ref, undefined, value.scope, projects);
+      for (const ref of refs) this.#validateRawSource(ref, undefined, value.scope, projects);
       const units = this.#db.prepare('SELECT ordinal,unit_id FROM proposal_source_units WHERE proposal_id=? ORDER BY ordinal').all(proposalId);
       check(Array.isArray(value.sourceUnits ?? []) && units.length === (value.sourceUnits?.length ?? 0)
         && units.every((row, i) => row.ordinal === i && row.unit_id === value.sourceUnits![i]), 'proposal-evidence-gap');
@@ -4952,7 +5185,7 @@ export class ProbeStore {
       .run(record.recordId, this.#binding.ownerId, record.claimKey, record.source.binding.sessionId, new Date().toISOString());
     this.#insertRevision(record, context);
     const capturePayload = JSON.stringify({ schema: 'capture-job@1', source: record.source, recordId: record.recordId, ...job });
-    if (!captureJobId) this.#db.prepare('INSERT INTO capture_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    if (!captureJobId) this.#db.prepare('INSERT INTO capture_jobs (job_id,source_event_id,record_id,status,payload,payload_hash,created_at,source_owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
       .run(randomUUID(), record.source.eventId, record.recordId, 'complete', capturePayload, sha256(capturePayload),
         new Date().toISOString(), record.source.binding.sessionId);
     this.#appendMemoryEvent(null, record, 'capture', record.source.eventId, { automatic: true, ...job }, request);
@@ -5091,6 +5324,7 @@ export class ProbeStore {
       const { ref } = request;
       check(sameBinding(ref?.binding, this.#binding), 'source-scope-mismatch');
       this.#validateSource(ref);
+      check(!this.#isCaptureOutput(ref), 'source-derived');
       this.#assertRawSourceAccess(activity, ref);
       const raw = this.#readSource!(ref).text;
       const artifact = parseAnalysisArtifact(raw);
@@ -5210,6 +5444,12 @@ export class ProbeStore {
       check(typeof content === 'string' && content.length > 0 && Buffer.byteLength(content) <= 65536, 'invalid-memory-content');
     }
   }
+  #validateRawSource(input: SourceAck, content?: string, targetScope?: MemoryScope, projects?: readonly string[]): void {
+    this.#validateSource(input, content, targetScope, projects);
+    check(!this.#isCaptureOutput(input), 'source-derived');
+    this.#analysisReferences(this.#archiveRef(input).text);
+  }
+
   #sourceAllowedForScope(binding: Binding, scope: MemoryScope): boolean {
     if (scope.kind === 'project') return binding.projectId === scope.id;
     if (scope.kind === 'session') return binding.sessionId === scope.id;
@@ -5255,12 +5495,12 @@ export class ProbeStore {
     if (sourceChecks.get(key) === 'checked') return;
     sourceChecks.set(key, 'checking');
     try {
-      this.#validateSource(record.source, undefined, record.scope, projects);
+      this.#validateRawSource(record.source, undefined, record.scope, projects);
       this.#checkVerification(record, true, projects, sourceChecks);
       for (const row of this.#db.prepare('SELECT payload,payload_hash FROM provenance_refs WHERE record_id=? AND revision_id=?')
         .all(record.recordId, record.revisionId)) {
         check(sha256(String(row.payload)) === row.payload_hash, 'memory-evidence-gap');
-        this.#validateSource(JSON.parse(String(row.payload)).source as SourceAck, undefined, record.scope, projects);
+        this.#validateRawSource(JSON.parse(String(row.payload)).source as SourceAck, undefined, record.scope, projects);
       }
       sourceChecks.set(key, 'checked');
     } finally {
@@ -5335,7 +5575,7 @@ export class ProbeStore {
     }
   }
   #validateVerificationSource(ref: SourceAck, scope: MemoryScope, sourceUnits: string[], projects: readonly string[] = [this.#binding.projectId]): void {
-    if (this.#sourceAllowedForScope(ref.binding, scope)) { this.#validateSource(ref, undefined, scope, projects); return; }
+    if (this.#sourceAllowedForScope(ref.binding, scope)) { this.#validateRawSource(ref, undefined, scope, projects); return; }
     this.#validateScope(scope, projects);
     const units = sourceUnits.map(id => this.#sourceUnit(id).unit);
     check(scope.kind === 'project' && ref.binding.ownerId === this.#binding.ownerId && ref.binding.hostId === this.#binding.hostId
@@ -5402,7 +5642,7 @@ export class ProbeStore {
   #readMemoryUnsafe(recordId: string, projects: readonly string[] = [this.#binding.projectId]): MemoryRecord {
     const record = this.#readMemoryHead(recordId, projects);
     if (record.verification !== 'stale') {
-      this.#validateSource(record.source, undefined, record.scope, projects);
+      this.#validateRawSource(record.source, undefined, record.scope, projects);
       this.#checkVerification(record, true, projects);
     }
     return record;

@@ -53,6 +53,8 @@ async function receiveModel(run: Pick<AgentRun, 'startModel' | 'maySend'>, reque
 }
 
 export async function pumpAgent(run: AgentRun, host: AgentPump): Promise<AgentStatus> {
+  if (run.status().terminal) return run.status();
+  const release = run.observeExecution();
   const deadline = setTimeout(() => { try { run.stop('deadline'); } catch { /* pump observes the durable failure below */ } }, run.remainingMs());
   try {
     while (!run.status().terminal) {
@@ -116,7 +118,7 @@ export async function pumpAgent(run: AgentRun, host: AgentPump): Promise<AgentSt
     }
   } catch {
     if (!run.status().terminal) run.fail();
-  } finally { clearTimeout(deadline); }
+  } finally { release(); clearTimeout(deadline); }
   return run.status();
 }
 

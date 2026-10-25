@@ -64,6 +64,9 @@ jobs:
       - name: Record context windows and controlled handoff observations
         if: always()
         run: npm run evidence:context
+      - name: Record stable Historian compartment observations
+        if: always()
+        run: npm run evidence:historian
       - uses: actions/upload-artifact@v4
         if: always()
         with:

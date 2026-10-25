@@ -277,7 +277,7 @@ class OwnerMemoryHost {
     const events = this.probe.archive.events();
     let actionable = 0;
     for (const event of events) {
-      if (event.role !== 'user') continue;
+      if (event.role !== 'user' || this.probe.store.isCaptureOutput(this.probe.activity, event.ack)) continue;
       if (isUntypedRemember(event.text)) {
         const queued = this.probe.store.queueOwnerCapture(this.probe.activity, event.ack, this.#noActiveProject);
         report('backfill', queued.stage === 'pending' ? 'needs-input' : 'capture-status', queued.stage === 'complete' ? 'info' : 'warning',

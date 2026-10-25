@@ -42,7 +42,7 @@ function validate(root: string, entry: typeof fixture.cases[number], output: str
   try {
     assert.equal(db.prepare('PRAGMA quick_check').get()!.quick_check, 'ok');
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
-    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 21);
+    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 22);
     const archives = readdirSync(root).filter(name => name.endsWith('.jsonl') && JSON.parse(readFileSync(join(root, name), 'utf8').split('\n')[0]!).schema === 'cli-session@1')
       .map(name => archive(join(root, name)));
     const before = existsSync(join(output, 'source-before.jsonl')) ? archive(join(output, 'source-before.jsonl')) : null;

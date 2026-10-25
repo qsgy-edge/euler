@@ -10,6 +10,8 @@ import { fileToolSchemas, parseFileCall, validateFileCapability } from './file-c
 import type { FileCapability, FileTarget, FilePresentation, FileDecision, FileReceipt, FileFailureReason } from './file-contract.ts';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { searchSessionSources } from './agent-source.ts';
+import { isCompartmentEvidenceGap } from './historian.ts';
+import { responseInputIds } from './agent-state.ts';
 import { guidanceConflicts } from './guidance-conflicts.ts';
 import type { GuidanceOperation } from './guidance-conflicts.ts';
 import type { GuidanceSession, GuidanceTarget, InstructionSnapshot } from './guidance-session.ts';
@@ -25,6 +27,7 @@ export interface AgentHost {
   discoveryGrantId?: string;
   files?: FileCapability;
   memoryCorrections?: boolean;
+  historian?: { bounds: import('./historian.ts').HistorianBounds; onError(error: unknown): void };
   guidance?: { session: GuidanceSession; targets: GuidanceTarget[]; operation: GuidanceOperation };
 }
 export interface NeutralRequest extends ModelRoute {
@@ -34,7 +37,9 @@ export interface NeutralRequest extends ModelRoute {
   p1: { operationSummaries?: ReturnType<ProbeStore['correctionModelSummaries']>;
     operationArchive?: ReturnType<ProbeStore['correctionModelContext']>['operationArchive'];
     activeInputs?: { role: 'user'; content: string }[];
-    recovery?: { runId: string; windowId: string; omittedTurns: number } };
+    recovery?: { runId: string; windowId: string; omittedTurns: number };
+    compartments?: import('./historian.ts').CompartmentBody[];
+    compartmentGaps?: { jobId: string; reason: string }[] };
   p2: { inputs: { role: 'user'; content: string }[]; assistant: ModelReply; results: { callId: string; outcome: string; modelResult: string }[] }[];
   p3: { intent: { goal: string; constraints: string[]; step: string }; messages: { role: 'user'; content: string }[] };
 }
@@ -135,7 +140,8 @@ export class AgentRun {
     }
   }
   #sourceRefs(): SourceAck[] {
-    if (this.#host.source.events) return this.#host.source.events().map(event => event.ack);
+    if (this.#host.source.events) return this.#host.source.events().map(event => event.ack)
+      .filter(ref => !this.#store.isCaptureOutput(this.#activity, ref));
     const state = this.status();
     const refs = [...state.inputs.map(input => input.source), ...state.responses.map(response => response.source),
       ...state.tools.flatMap(tool => tool.result ? [tool.result.source] : []),
@@ -230,21 +236,30 @@ export class AgentRun {
       throw new Error('guidance-stale');
     }
   }
+  observeExecution(): () => void { return this.#store.observeAgentPump(this.#activity, this.runId); }
   #invalidateCache(reason: string): void {
     const current = this.status().cacheEpoch;
     if (current) this.#event({ kind: 'cache-epoch-invalidated', cacheEpoch: current.cacheEpoch, reason });
   }
-  newWindow(reason: 'pressure' | 'explicit' = 'explicit'): string {
+  newWindow(reason: 'pressure' | 'explicit' = 'explicit', selectCompartments = true): string {
+    return this.#openWindow(reason, selectCompartments
+      ? this.#budget.contextLimit - this.#budget.outputReserve - this.#budget.safetyMargin : 0);
+  }
+  #openWindow(reason: 'pressure' | 'explicit', compartmentBytes: number): string {
     check(this.#active() && !this.#inflight && !this.#ready, 'window-not-admissible');
     const state = this.status();
     check(state.tools.every(tool => tool.result), 'unsettled-tool-batch');
     const recovery = [...state.inputs.map(input => input.source), ...state.responses.map(response => response.source),
       ...state.tools.map(tool => tool.result!.source)];
     for (const source of recovery) this.#host.source.read(source);
+    const firstResponse = Math.max(0, state.responses.length - 1);
+    const { selected, unavailable } = this.#store.compartmentsForWindow(this.#activity, this.runId, firstResponse, compartmentBytes);
     this.#invalidateCache('fresh-window');
     const windowId = randomUUID();
     this.#event({ kind: 'window-opened', windowId, previousWindowId: state.windows.at(-1)!.windowId,
-      firstResponse: Math.max(0, state.responses.length - 1), reason, recovery });
+      firstResponse, reason, recovery,
+      ...(selected.length ? { compartments: selected.map(item => ({ jobId: item.jobId, source: item.source })) } : {}),
+      ...(unavailable.length ? { compartmentGaps: unavailable } : {}) });
     this.#host.guidance?.session.newWindow();
     return windowId;
   }
@@ -287,11 +302,7 @@ export class AgentRun {
     const p2 = state.responses.map(response => {
       const refs: SourceAck[] = [response.source];
       turnSources.push(refs);
-      const attempt = ledger.attempts.find(attempt => attempt.attemptId === response.attemptId)!;
-      const bound = ledger.events.filter(event => event.kind === 'agent/event@v1').map(event => JSON.parse(event.payload).event as AgentEvent)
-        .find(event => event.kind === 'bound' && event.assemblyId === attempt.assemblyId);
-      check(bound?.kind === 'bound', 'response-assembly-gap');
-      const inputs = bound.eventIds.map(id => {
+      const inputs = responseInputIds(ledger, response.attemptId).map(id => {
         priorInputs.add(id);
         const source = state.inputs.find(input => input.source.eventId === id)!.source;
         refs.push(source);
@@ -312,6 +323,13 @@ export class AgentRun {
     const operationContext = this.#store.correctionModelContext(this.#activity, this.#budget);
     for (const { delivery } of this.#store.correctionDeliveries(this.#activity)) if (delivery.model) sources.push(delivery.model);
     const window = state.windows.at(-1)!;
+    let compartments: import('./historian.ts').Compartment[];
+    try { compartments = (window.compartments ?? []).map(item => this.#store.readCompartment(this.#activity, item.jobId)); }
+    catch (error) {
+      if (!isCompartmentEvidenceGap(error)) throw error;
+      this.newWindow('pressure', false); return this.nextModel();
+    }
+    for (const compartment of compartments) sources.push(compartment.source, ...compartment.body.citations);
     sources.push(...turnSources.slice(window.firstResponse).flat());
     const retained = new Set(turnSources.slice(window.firstResponse).flat().map(ref => ref.eventId));
     const activeInputs = state.inputs.filter(input => input.mode === 'steer'
@@ -320,11 +338,13 @@ export class AgentRun {
     const selectedSources = [...new Map(sources.map(source => [source.eventId, source])).values()];
     const neutral: NeutralRequest = { schema: 'euler-model@1', ...this.#route, p0,
       p1: { ...(operationSummaries.length ? operationContext : {}),
+        ...(compartments.length ? { compartments: compartments.map(item => item.body) } : {}),
+        ...(window.compartmentGaps?.length ? { compartmentGaps: window.compartmentGaps } : {}),
         ...(activeInputs.length ? { activeInputs: activeInputs.map(input => ({ role: 'user' as const, content: this.#host.source.read(input.source).text })) } : {}),
         ...(window.firstResponse ? { recovery: { runId: this.runId, windowId: window.windowId, omittedTurns: window.firstResponse } } : {}) },
       p2: p2.slice(window.firstResponse), p3 };
     let degradation: RequestAssemblyInput['degradation'] = state.windows.length > 1 ? 'window' : operationContext.operationArchive ? 'compact' : 'none';
-    const encode = () => this.#host.encode ? this.#host.encode(structuredClone(neutral)) : JSON.stringify(neutral);
+    const encode = (value = neutral) => this.#host.encode ? this.#host.encode(structuredClone(value)) : JSON.stringify(value);
     let payload = encode();
     let byteLength = Buffer.byteLength(payload);
     let reserved = byteLength + this.#budget.outputReserve + this.#budget.safetyMargin;
@@ -333,6 +353,15 @@ export class AgentRun {
       payload = encode(); byteLength = Buffer.byteLength(payload);
       reserved = byteLength + this.#budget.outputReserve + this.#budget.safetyMargin;
       degradation = 'selected';
+    }
+    if (reserved > this.#budget.contextLimit && compartments.length) {
+      const mandatory = { ...neutral, p1: { ...neutral.p1 } };
+      delete mandatory.p1.compartments;
+      const remaining = this.#budget.contextLimit - this.#budget.outputReserve - this.#budget.safetyMargin - Buffer.byteLength(encode(mandatory));
+      const selectedBytes = compartments.reduce((total, item) => total + Buffer.byteLength(JSON.stringify(item.body)), 0);
+      // Account for provider encoding overhead and strictly shrink the selected body budget.
+      this.#openWindow('pressure', Math.max(0, Math.min(remaining, selectedBytes - (reserved - this.#budget.contextLimit))));
+      return this.nextModel();
     }
     if (reserved > this.#budget.contextLimit && state.responses.length - window.firstResponse > 1) {
       this.newWindow('pressure');
@@ -611,6 +640,12 @@ export class AgentRun {
         this.#store.queueCaptureBoundary(this.#activity, this.runId, tool.attemptId);
       }
     });
+    if (this.status().tools.every(item => item.result && item.result.outcome !== 'unknown')) this.#queueHistorian();
+  }
+  #queueHistorian(): void {
+    if (!this.#host.historian) return;
+    try { this.#store.queueHistorianBoundary(this.#activity, this.runId, this.#host.historian.bounds); }
+    catch (error) { this.#host.historian.onError(error); }
   }
   #terminal(terminal: RunTerminal): void {
     this.#store.withActivity(this.#activity, () => {
@@ -618,5 +653,6 @@ export class AgentRun {
       this.#store.sealRequestRun(this.#activity, this.runId);
       if (terminal === 'completed') this.#store.queueCaptureBoundary(this.#activity, this.runId);
     });
+    if (terminal === 'completed') this.#queueHistorian();
   }
 }
