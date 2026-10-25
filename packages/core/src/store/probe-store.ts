@@ -2195,7 +2195,7 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       check(Object.keys(options).every(key => ['type','scope','appliesTo','claimKey','validFrom','validUntil'].includes(key)), 'invalid-memory-options');
       const scope = this.#validateScope(options.scope);
-      this.#validateSource(input, content, scope);
+      this.#validateRawSource(input, content, scope);
       const { validFrom, validUntil } = memoryValidity(options);
       const appliesTo = this.#normalizeAppliesTo(options.appliesTo);
       const claimKey = options.claimKey ?? content.trim().normalize('NFC');
@@ -2440,7 +2440,7 @@ export class ProbeStore {
       const event = this.#db.prepare('SELECT kind,payload FROM memory_events WHERE event_id=?').get(record.headEventId);
       let source = record.source;
       if (approval) {
-        this.#validateSource(approval, undefined, record.scope);
+        this.#validateRawSource(approval, undefined, record.scope);
         const decision = this.#archiveRef(approval);
         check(decision.role === 'user', 'reverification-approval-required');
         let value: Record<string, unknown>;
@@ -2599,7 +2599,7 @@ export class ProbeStore {
         ? 'additional-scope-evidence-required' : deadline <= now ? 'capture-deadline' : null;
       const capture = JSON.parse(String(this.#db.prepare('SELECT payload FROM capture_jobs WHERE job_id=?').get(jobId)!.payload));
       if (capture.expectedHead && job.stage !== 'comparing' && job.record?.headEventId !== capture.expectedHead) reason = 'memory-stale';
-      try { for (const ref of job.range) this.#validateSource(ref, undefined, job.scope); }
+      try { for (const ref of job.range) this.#validateRawSource(ref, undefined, job.scope); }
       catch { reason = 'source-evidence-gap'; }
       const holder = reason ? null : this.register({ kind: 'job', id: jobId, authorizationId: job.source.eventId });
       const token = holder ? randomUUID() : null;
@@ -2627,7 +2627,7 @@ export class ProbeStore {
       check(ledger.run.state === 'authorized' && !ledger.events.some(event => event.kind === 'run-recovery-gap'), 'late-model-result');
     }
     const job = this.#captureJob(lease.jobId);
-    for (const ref of job.range) this.#validateSource(ref, undefined, job.scope);
+    for (const ref of job.range) this.#validateRawSource(ref, undefined, job.scope);
     if (job.record) check(job.record.headEventId === row.expected_head_id, 'memory-stale');
     return job;
   }
@@ -2941,6 +2941,7 @@ export class ProbeStore {
   queueOwnerCapture(activity: Activity, input: SourceAck, noActiveProject = false): { jobId: string; stage: CaptureJob['stage']; reason: string | null } {
     return this.withActivity(activity, () => {
       check(typeof noActiveProject === 'boolean' && input?.binding && sameBinding(input.binding, this.#binding), 'source-scope-mismatch');
+      this.#validateRawSource(input);
       const owner = this.#archiveRef(input);
       check(owner.role === 'user', 'memory-owner-source-required');
       check(isUntypedRemember(owner.text), 'memory-statement-not-explicit');
@@ -2974,6 +2975,7 @@ export class ProbeStore {
         && (request.noActiveProject === undefined || request.noActiveProject === true), 'invalid-remember-request');
       const { input } = request;
       check(input && typeof input === 'object' && input.binding && sameBinding(input.binding, this.#binding), 'source-scope-mismatch');
+      this.#validateRawSource(input);
       const owner = this.#archiveRef(input);
       check(owner.role === 'user', 'memory-owner-source-required');
       let statement: OwnerMemoryStatement | null = parseOwnerStatement(owner.text);
@@ -2983,6 +2985,7 @@ export class ProbeStore {
         check(agreement, 'memory-statement-not-explicit');
         const proposal = agreement.proposal;
         check(proposal.binding && sameBinding(proposal.binding, this.#binding) && proposal.eventId !== input.eventId, 'memory-proposal-scope-mismatch');
+        this.#validateRawSource(proposal);
         const proposed = this.#archiveRef(proposal);
         check(proposed.role === 'assistant', 'memory-proposal-role-required');
         statement = parseMemoryProposal(proposed.text);
@@ -3095,7 +3098,7 @@ export class ProbeStore {
       if (change.kind === 'correct') {
         check(targets.length === 1 && targets[0]!.lifecycle !== 'tombstoned', 'tombstoned-not-actionable');
         check(typeof change.content === 'string' && Buffer.byteLength(change.content) <= 65536, 'invalid-memory-content');
-        this.#validateSource(change.input, undefined, targets[0]!.scope);
+        this.#validateRawSource(change.input, undefined, targets[0]!.scope);
       } else if (change.kind === 'rollback') {
         batch = this.#readActivationBatch(change.batchId);
         check(Array.isArray(change.eventIds) && change.eventIds.length === targets.length
@@ -4251,7 +4254,7 @@ export class ProbeStore {
       const current = this.#assertMemoryExpected(recordId, expected);
       check(['pass', 'block', 'evidence-gap'].includes(result), 'invalid-verification');
       check(Array.isArray(evidence), 'invalid-verification');
-      for (const ref of evidence) this.#validateSource(ref, undefined, current.scope);
+      for (const ref of evidence) this.#validateRawSource(ref, undefined, current.scope);
       check(result !== 'pass' || evidence.length > 0, 'verification-evidence-required');
       const evidenceJson = JSON.stringify(evidence);
       const evidenceHash = sha256(evidenceJson);
@@ -4318,7 +4321,7 @@ export class ProbeStore {
           && ledger.attempts[0]!.outcome === 'received')
         && JSON.stringify(baseline.run.budget) === JSON.stringify(treatment.run.budget), 'negative-transfer-evidence-required');
       const responseHash = (ref: SourceAck): string => {
-        this.#validateSource(ref, undefined, current.scope);
+        this.#validateRawSource(ref, undefined, current.scope);
         const raw = this.#archiveRef(ref); check(raw.role === 'assistant', 'negative-transfer-evidence-required');
         const response = JSON.parse(raw.text);
         check(response.stop === 'end' && typeof response.text === 'string' && Array.isArray(response.calls)
@@ -4330,7 +4333,7 @@ export class ProbeStore {
       check(baselineResponseHash === pair.expectedResponseHash && treatmentResponseHash !== pair.expectedResponseHash, 'negative-transfer-evidence-required');
       const before = baseline.assemblies[0]!, after = treatment.assemblies[0]!;
       check(before.sources.length === 1 && after.sources.length === 1, 'negative-transfer-evidence-required');
-      this.#validateSource(before.sources[0]!, undefined, current.scope);
+      this.#validateRawSource(before.sources[0]!, undefined, current.scope);
       const original = this.#archiveRef(before.sources[0]!);
       let canary: { schema?: string; caseId?: string; expectedText?: string };
       try { canary = JSON.parse(original.text) as typeof canary; } catch { throw new Error('negative-transfer-evidence-required'); }
@@ -4343,7 +4346,7 @@ export class ProbeStore {
         && before.route === after.route && before.model === after.model && before.policyHash === after.policyHash
         && before.epoch === after.epoch && JSON.stringify(before.intent) === JSON.stringify(after.intent), 'negative-transfer-evidence-required');
       const payload = (assembly: RequestAssembly, ref: SourceAck): Record<string, unknown> => {
-        this.#validateSource(ref, undefined, current.scope);
+        this.#validateRawSource(ref, undefined, current.scope);
         const text = this.#archiveRef(ref).text;
         check(sha256(text) === assembly.payloadHash && Buffer.byteLength(text) === assembly.byteLength, 'negative-transfer-evidence-required');
         const value = JSON.parse(text) as Record<string, unknown>;
@@ -4410,7 +4413,7 @@ export class ProbeStore {
   recordMemoryFeedback(activity: Activity, recordId: string, expected: MemoryRecord, input: SourceAck):
     { status: 'recorded' | 'no_op'; feedbackId: string; record: MemoryRecord } {
     return this.withActivity(activity, () => {
-      this.#validateSource(input, undefined, expected.scope);
+      this.#validateRawSource(input, undefined, expected.scope);
       const source = this.#archiveRef(input);
       check(source.role === 'user', 'memory-owner-source-required');
       let value: Record<string, unknown>;
@@ -4963,7 +4966,7 @@ export class ProbeStore {
       if (content.trim().normalize('NFC') === '' || content.trim().normalize('NFC') === current.content.trim().normalize('NFC')) {
         return { status: 'no_op', record: current, eventId: null };
       }
-      this.#validateSource(input, content, current.scope);
+      this.#validateRawSource(input, content, current.scope);
       const revisionId = randomUUID();
       const nextEventId = this.#ownerEventId(recordId);
       uuid(nextEventId);
@@ -4985,7 +4988,7 @@ export class ProbeStore {
       const current = this.#assertMemoryExpected(recordId, expected);
       check(current.lifecycle === 'active', 'memory-not-active');
       this.#eligible(current);
-      this.#validateSource(input, content, current.scope);
+      this.#validateRawSource(input, content, current.scope);
       if (content.trim().normalize('NFC') === current.content.trim().normalize('NFC')) return { status: 'no_op', record: current, eventId: null };
       let after = this.#withMemoryHash({ ...current, revisionId: randomUUID(), revision: this.#nextRevision(recordId),
         content, contentHash: sha256(content), source: structuredClone(input), headEventId: randomUUID(), verificationRunId: null });
@@ -5053,7 +5056,7 @@ export class ProbeStore {
         && typeof proposal.expectedChange === 'string' && proposal.expectedChange.length > 0 && Buffer.byteLength(proposal.expectedChange) <= 65536
         && proposal.owner === this.#binding.ownerId, 'invalid-proposal');
       const scope = this.#validateScope(proposal.scope);
-      this.#validateSource(input, undefined, scope);
+      this.#validateRawSource(input, undefined, scope);
       const sourceUnits = proposal.sourceUnits ?? [];
       check(scope.resolved && Array.isArray(proposal.evidenceRefs) && Array.isArray(sourceUnits)
         && proposal.evidenceRefs.length + sourceUnits.length > 0 && proposal.evidenceRefs.length + sourceUnits.length <= 32
@@ -5062,7 +5065,7 @@ export class ProbeStore {
         const { unit } = this.#sourceUnit(unitId);
         check(scope.kind === 'project' && unit.projectId === scope.id, 'source-scope-mismatch');
       }
-      for (const ref of proposal.evidenceRefs) this.#validateSource(ref, undefined, scope);
+      for (const ref of proposal.evidenceRefs) this.#validateRawSource(ref, undefined, scope);
       this.#assertProposalPublication(input, proposal);
       const evaluation = proposal.evaluation;
       check(evaluation?.schema === 'evaluation-contract@1' && ['L0','L1','L2','L3'].includes(evaluation.level)
@@ -5146,7 +5149,7 @@ export class ProbeStore {
       this.#validateScope(value.scope, projects);
       const refs = [value.input, ...value.evidenceRefs];
       this.#checkEvidenceRows('proposal_evidence', 'proposal_id', proposalId, refs);
-      for (const ref of refs) this.#validateSource(ref, undefined, value.scope, projects);
+      for (const ref of refs) this.#validateRawSource(ref, undefined, value.scope, projects);
       const units = this.#db.prepare('SELECT ordinal,unit_id FROM proposal_source_units WHERE proposal_id=? ORDER BY ordinal').all(proposalId);
       check(Array.isArray(value.sourceUnits ?? []) && units.length === (value.sourceUnits?.length ?? 0)
         && units.every((row, i) => row.ordinal === i && row.unit_id === value.sourceUnits![i]), 'proposal-evidence-gap');
@@ -5429,6 +5432,11 @@ export class ProbeStore {
       check(typeof content === 'string' && content.length > 0 && Buffer.byteLength(content) <= 65536, 'invalid-memory-content');
     }
   }
+  #validateRawSource(input: SourceAck, content?: string, targetScope?: MemoryScope, projects?: readonly string[]): void {
+    this.#validateSource(input, content, targetScope, projects);
+    check(!this.#isCaptureOutput(input), 'source-derived');
+  }
+
   #sourceAllowedForScope(binding: Binding, scope: MemoryScope): boolean {
     if (scope.kind === 'project') return binding.projectId === scope.id;
     if (scope.kind === 'session') return binding.sessionId === scope.id;
@@ -5474,12 +5482,12 @@ export class ProbeStore {
     if (sourceChecks.get(key) === 'checked') return;
     sourceChecks.set(key, 'checking');
     try {
-      this.#validateSource(record.source, undefined, record.scope, projects);
+      this.#validateRawSource(record.source, undefined, record.scope, projects);
       this.#checkVerification(record, true, projects, sourceChecks);
       for (const row of this.#db.prepare('SELECT payload,payload_hash FROM provenance_refs WHERE record_id=? AND revision_id=?')
         .all(record.recordId, record.revisionId)) {
         check(sha256(String(row.payload)) === row.payload_hash, 'memory-evidence-gap');
-        this.#validateSource(JSON.parse(String(row.payload)).source as SourceAck, undefined, record.scope, projects);
+        this.#validateRawSource(JSON.parse(String(row.payload)).source as SourceAck, undefined, record.scope, projects);
       }
       sourceChecks.set(key, 'checked');
     } finally {
@@ -5554,7 +5562,7 @@ export class ProbeStore {
     }
   }
   #validateVerificationSource(ref: SourceAck, scope: MemoryScope, sourceUnits: string[], projects: readonly string[] = [this.#binding.projectId]): void {
-    if (this.#sourceAllowedForScope(ref.binding, scope)) { this.#validateSource(ref, undefined, scope, projects); return; }
+    if (this.#sourceAllowedForScope(ref.binding, scope)) { this.#validateRawSource(ref, undefined, scope, projects); return; }
     this.#validateScope(scope, projects);
     const units = sourceUnits.map(id => this.#sourceUnit(id).unit);
     check(scope.kind === 'project' && ref.binding.ownerId === this.#binding.ownerId && ref.binding.hostId === this.#binding.hostId
@@ -5621,7 +5629,7 @@ export class ProbeStore {
   #readMemoryUnsafe(recordId: string, projects: readonly string[] = [this.#binding.projectId]): MemoryRecord {
     const record = this.#readMemoryHead(recordId, projects);
     if (record.verification !== 'stale') {
-      this.#validateSource(record.source, undefined, record.scope, projects);
+      this.#validateRawSource(record.source, undefined, record.scope, projects);
       this.#checkVerification(record, true, projects);
     }
     return record;
