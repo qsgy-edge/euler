@@ -1447,7 +1447,7 @@ export class ProbeStore {
             && (JSON.parse(event.payload) as { evidence: { outcome: string } }).evidence.outcome === 'not-received'))));
         check((!unresolved && !previous.events.some(event => event.kind === 'run-recovery-gap'))
           || input.acceptDuplicateRisk === true, 'duplicate-risk-approval-required');
-        this.#verifyRequestSources(previous.assemblies);
+        this.#verifyRequestSources(previous.assemblies, undefined, null);
       }
       this.#requestRecoveryGate(activity, input.relatedRunId);
       if (input.intent) { uuid(input.intent.eventId); check(input.intent.hash.length === 64, 'invalid-intent-ref'); }
@@ -1653,9 +1653,9 @@ export class ProbeStore {
   requestMaySend(activity: Activity, runId: string): boolean {
     return this.withActivity(activity, () => {
       const status = this.requestStatus(activity, runId);
-      this.#verifyRequestSources(status.assemblies, activity);
       const attempt = status.attempts.find(item => item.outcome === 'unknown-sent');
       const assembly = status.assemblies.find(item => item.assemblyId === attempt?.assemblyId);
+      this.#verifyRequestSources(status.assemblies, activity, assembly?.assemblyId);
       if (assembly) {
         this.#assertAgentContext(activity, status, assembly);
         const projects = assembly.context?.discoveryGrantId ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : undefined;
@@ -1811,12 +1811,30 @@ export class ProbeStore {
     }
   }
 
-  #verifyRequestSources(assemblies: RequestAssembly[], activity?: Activity): void {
+  #verifyRequestSources(assemblies: (RequestAssembly & { state?: RequestAssemblyState })[], activity?: Activity, currentAssemblyId?: string | null): void {
     for (const assembly of assemblies) for (const source of assembly.sources) {
-      this.#validateSource(source);
-      if (activity) this.#assertRawSourceAccess(activity, source, assembly.context
-        ? assembly.context.discoveryGrantId ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : [this.#binding.projectId]
-        : undefined);
+      let refs = [source], scope: MemoryScope | undefined;
+      // Only settled history can use a published compartment's original raw range.
+      // Undefined keeps strict artifact checks; null denotes a sealed predecessor.
+      if (currentAssemblyId !== undefined && assembly.assemblyId !== currentAssemblyId && assembly.state === 'finished') {
+        const row = this.#db.prepare(`SELECT c.* FROM compartments c JOIN capture_jobs j ON j.job_id=c.job_id
+          WHERE c.job_id=? AND j.source_owner=? AND j.consumer='historian'`).get(source.eventId, source.binding.sessionId);
+        if (row) {
+          const published = JSON.parse(String(row.source_json)) as SourceAck, attemptId = String(row.attempt_id);
+          if (sameSourceAck(source, published)) {
+            check(row.hash === sha256(JSON.stringify({ source: published, attemptId })), 'compartment-integrity');
+            const job = this.#captureJob(source.eventId);
+            check(job.consumer === 'historian' && sameBinding(source.binding, job.source.binding), 'historian-owner-mismatch');
+            refs = job.range; scope = job.scope;
+          }
+        }
+      }
+      for (const ref of refs) {
+        this.#validateSource(ref, undefined, scope);
+        if (activity) this.#assertRawSourceAccess(activity, ref, assembly.context
+          ? assembly.context.discoveryGrantId ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : [this.#binding.projectId]
+          : undefined);
+      }
     }
   }
 
@@ -1840,7 +1858,7 @@ export class ProbeStore {
         && /^[0-9a-f]{64}$/.test(evidence.receiptHash)
         && ['received', 'not-received'].includes(evidence.outcome), 'invalid-reconciliation-evidence');
       if (evidence.outcome === 'not-received') check(senderAbsent, 'attempt-owner-still-live');
-      this.#verifyRequestSources(status.assemblies);
+      this.#verifyRequestSources(status.assemblies, undefined, attempt.assemblyId);
       check(!status.events.some(event => event.attemptId === attemptId && event.kind === 'model/request-attempt-reconciled@v1'), 'attempt-already-reconciled');
       this.#requestEvent(status.run.runId, 'model/request-attempt-reconciled@v1', attemptId, JSON.stringify({
         schema: 'model/request-attempt-reconciled@v1', runId: status.run.runId, attemptId,
@@ -1972,8 +1990,8 @@ export class ProbeStore {
       const ledger = this.requestStatus(activity, runId);
       check(ledger.run.activityId === activity.id && ledger.run.state === 'authorized', 'run-not-admissible');
       this.#requestRecoveryGate(activity, ledger.run.relatedRunId, runId);
-      this.#verifyRequestSources(ledger.assemblies, activity);
       const assembly = ledger.assemblies.at(-1);
+      this.#verifyRequestSources(ledger.assemblies, activity, assembly?.assemblyId);
       if (assembly) this.#assertAgentContext(activity, ledger, assembly);
       const intent = this.readIntent(activity);
       check(assembly && intent?.status === 'active' && intent.eventId === assembly.intent?.eventId && intent.hash === assembly.intent.hash, 'intent-stale');

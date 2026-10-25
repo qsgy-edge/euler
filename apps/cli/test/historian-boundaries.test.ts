@@ -162,26 +162,145 @@ test('a received response survives reopening before artifact publication without
   } finally { reopened?.close(); if (!closed) value.probe.close(); value.release(); rmSync(value.sandbox.root, { recursive: true, force: true }); }
 });
 
-test('a damaged optional compartment falls back to a raw window with an explicit gap', () => {
+for (const previouslySelected of [false, true])
+  test(`a damaged compartment permits a raw-window send, previously selected=${previouslySelected}`, () => {
+    const value = setup(true), path = join(value.sandbox.root, 'session.jsonl');
+    let saved: Buffer | undefined;
+    try {
+      const { run } = consumer(value);
+      deliver(value, run, JSON.stringify({ result: 'pass', summary: 'A faithful synthetic summary.' }));
+      const compartment = value.probe.store.readCompartment(value.probe.activity, value.job.jobId);
+      if (previouslySelected) {
+        value.agent.newWindow();
+        const selected = deliver(value, value.agent, { text: 'Continue after selection.', calls: [{ id: 'after-selection',
+          name: 'controlled.echo', arguments: { text: 'continuation' } }], stop: 'tools' });
+        assert.match(JSON.stringify(JSON.parse(selected.payload).p1.compartments), /A faithful synthetic summary/);
+        const assembly = value.probe.store.requestStatus(value.probe.activity, value.agent.runId).assemblies
+          .find(item => item.assemblyId === selected.assemblyId)!;
+        assert(assembly.sources.some(source => source.eventId === compartment.source.eventId));
+        value.agent.startTool('after-selection'); value.agent.finishTool('after-selection', 'Confirmed continuation result.');
+      }
+      saved = readFileSync(path);
+      const lines = saved.toString('utf8').trimEnd().split('\n');
+      const index = lines.findIndex(line => JSON.parse(line).eventId === compartment.source.eventId);
+      assert.ok(index > 0); lines[index] = lines[index]!.replace('A faithful', 'X faithful');
+      writeFileSync(path, lines.join('\n') + '\n');
+      value.agent.newWindow();
+      const next = value.agent.nextModel()!;
+      const payload = JSON.parse(next.payload);
+      assert.equal(payload.p1.compartments, undefined);
+      assert.equal(payload.p1.compartmentGaps[0].jobId, value.job.jobId);
+      assert.equal(payload.p2.length, 1);
+      const current = value.probe.store.requestStatus(value.probe.activity, value.agent.runId).assemblies
+        .find(item => item.assemblyId === next.assemblyId)!;
+      assert(current.sources.every(source => source.eventId !== compartment.source.eventId));
+      for (const source of current.sources) assert.doesNotThrow(() => value.probe.archive.read(source));
+      const attempt = value.agent.startModel(next, next.payload);
+      assert.equal(value.agent.maySend(attempt.attemptId, next.payload), true);
+      value.probe.transport.send(next.payload, attempt);
+      value.agent.finishModel(attempt.attemptId, { text: 'Continue with the raw window.', calls: [
+        { id: 'raw-window-tool', name: 'controlled.echo', arguments: { text: 'raw continuation' } }], stop: 'tools' });
+      value.agent.startTool('raw-window-tool'); value.agent.finishTool('raw-window-tool', 'Raw continuation complete.');
+      deliver(value, value.agent, 'Completed with the raw window.');
+      assert.equal(value.agent.status().terminal, 'completed');
+    } finally { if (saved) writeFileSync(path, saved); value.close(); }
+  });
+
+test('a selected compartment that changes after preparation is rejected before any send', () => {
   const value = setup(true), path = join(value.sandbox.root, 'session.jsonl');
-  let saved: Buffer | undefined;
+  try {
+    const { run } = consumer(value);
+    deliver(value, run, JSON.stringify({ result: 'pass', summary: 'A faithful synthetic summary.' }));
+    value.agent.newWindow();
+    const next = value.agent.nextModel()!, count = value.probe.transport.count;
+    writeFileSync(path, readFileSync(path, 'utf8').replaceAll('A faithful synthetic summary.', 'X faithful synthetic summary.'));
+    assert.throws(() => {
+      const attempt = value.agent.startModel(next, next.payload);
+      if (value.agent.maySend(attempt.attemptId, next.payload)) value.probe.transport.send(next.payload, attempt);
+    }, /source-evidence-gap|compartment-integrity/);
+    assert.equal(value.probe.transport.count, count);
+  } finally { value.close(); }
+});
+
+test('historical raw corruption still blocks a prepared fresh-window send', () => {
+  const value = setup(true), path = join(value.sandbox.root, 'session.jsonl');
   try {
     const { run } = consumer(value);
     deliver(value, run, JSON.stringify({ result: 'pass', summary: 'A faithful synthetic summary.' }));
     const compartment = value.probe.store.readCompartment(value.probe.activity, value.job.jobId);
-    saved = readFileSync(path);
-    const lines = saved.toString('utf8').trimEnd().split('\n');
+    value.agent.newWindow();
+    deliver(value, value.agent, { text: 'Continue after selection.', calls: [{ id: 'after-selection', name: 'controlled.echo', arguments: { text: 'continuation' } }], stop: 'tools' });
+    value.agent.startTool('after-selection'); value.agent.finishTool('after-selection', 'Confirmed continuation.');
+    const lines = readFileSync(path, 'utf8').trimEnd().split('\n');
     const index = lines.findIndex(line => JSON.parse(line).eventId === compartment.source.eventId);
-    assert.ok(index > 0); lines[index] = lines[index]!.replace('A faithful', 'X faithful');
+    lines[index] = lines[index]!.replace('A faithful', 'X faithful');
     writeFileSync(path, lines.join('\n') + '\n');
     value.agent.newWindow();
-    const next = value.agent.nextModel()!;
-    const payload = JSON.parse(next.payload);
-    assert.equal(payload.p1.compartments, undefined);
-    assert.equal(payload.p1.compartmentGaps[0].jobId, value.job.jobId);
-    assert.equal(payload.p2.length, 1);
-    writeFileSync(path, saved); saved = undefined; value.agent.cancel();
-  } finally { if (saved) writeFileSync(path, saved); value.close(); }
+    const next = value.agent.nextModel()!, attempt = value.agent.startModel(next, next.payload), count = value.probe.transport.count;
+    const raw = value.job.range.find(source => value.probe.archive.read(source).role === 'assistant')!;
+    const rawIndex = lines.findIndex(line => JSON.parse(line).eventId === raw.eventId);
+    lines[rawIndex] = lines[rawIndex]!.replaceAll('Raw intermediate observations.', 'Bad intermediate observations.');
+    writeFileSync(path, lines.join('\n') + '\n');
+    assert.throws(() => {
+      if (value.agent.maySend(attempt.attemptId, next.payload)) value.probe.transport.send(next.payload, attempt);
+    }, /source-evidence-gap/);
+    assert.equal(value.probe.transport.count, count);
+  } finally { value.close(); }
+});
+
+test('a settled run with a damaged historical compartment can recover after reopening', () => {
+  const value = setup(true), path = join(value.sandbox.root, 'session.jsonl');
+  let reopened: ReturnType<typeof openProbe> | undefined, closed = false;
+  try {
+    const { run } = consumer(value);
+    deliver(value, run, JSON.stringify({ result: 'pass', summary: 'A faithful synthetic summary.' }));
+    value.agent.newWindow(); deliver(value, value.agent, 'The original task is complete.');
+    writeFileSync(path, readFileSync(path, 'utf8').replaceAll('A faithful synthetic summary.', 'X faithful synthetic summary.'));
+    value.release(); value.probe.close(); closed = true;
+    reopened = openProbe(value.sandbox, budget, undefined, undefined, undefined, true);
+    const { capability: _capability, ...agentRoute } = route;
+    const agent = new AgentRun(reopened.store, reopened.activity, { binding: bindingOf(value.sandbox), source: reopened.archive }, agentRoute, budget,
+      { recovery: { relatedRunId: value.agent.runId, acceptDuplicateRisk: false } });
+    agent.receive(randomUUID(), 'Continue from the archived raw evidence.');
+    deliver({ probe: reopened }, agent, { text: 'Read the original source.', calls: [{ id: 'restore', name: 'source.expand',
+      arguments: { eventId: value.job.range[0]!.eventId, offset: 0, limit: 4096 } }], stop: 'tools' });
+    agent.startTool('restore');
+    const result = agent.coreToolResult('restore')!;
+    assert.equal(result.outcome, 'success'); assert.match(result.modelResult, /exact value 47/);
+    agent.finishTool('restore', result.modelResult);
+    deliver({ probe: reopened }, agent, 'Recovered original value 47.');
+    assert.equal(agent.status().terminal, 'completed');
+  } finally {
+    reopened?.close(); if (!closed) value.probe.close(); value.release();
+    rmSync(value.sandbox.root, { recursive: true, force: true });
+  }
+});
+
+for (const historical of [false, true]) test('unknown reconciliation preserves current dependencies, damaged compartment historical=' + historical, () => {
+  const value = setup(true), path = join(value.sandbox.root, 'session.jsonl');
+  try {
+    const { run } = consumer(value);
+    deliver(value, run, JSON.stringify({ result: 'pass', summary: 'A faithful synthetic summary.' }));
+    value.agent.newWindow();
+    if (historical) {
+      deliver(value, value.agent, { text: 'Continue after selection.', calls: [{ id: 'after-selection', name: 'controlled.echo', arguments: { text: 'continuation' } }], stop: 'tools' });
+      value.agent.startTool('after-selection'); value.agent.finishTool('after-selection', 'Confirmed continuation.');
+      writeFileSync(path, readFileSync(path, 'utf8').replaceAll('A faithful synthetic summary.', 'X faithful synthetic summary.'));
+      value.agent.newWindow();
+    }
+    const request = value.agent.nextModel()!, attempt = value.agent.startModel(request, request.payload);
+    assert.equal(value.agent.maySend(attempt.attemptId, request.payload), true);
+    value.probe.transport.send(request.payload, attempt);
+    if (!historical) writeFileSync(path, readFileSync(path, 'utf8').replaceAll('A faithful synthetic summary.', 'X faithful synthetic summary.'));
+    const count = value.probe.transport.count;
+    value.agent.fail();
+    if (historical) {
+      const ledger = value.probe.store.reconcileRequestAttempt(value.probe.activity, attempt.attemptId);
+      assert.equal(ledger.events.filter(event => event.attemptId === attempt.attemptId && event.kind === 'model/request-attempt-reconciled@v1').length, 1);
+      assert.equal(ledger.attempts.find(item => item.attemptId === attempt.attemptId)!.outcome, 'unknown-sent');
+    } else assert.throws(() => value.probe.store.reconcileRequestAttempt(value.probe.activity, attempt.attemptId), /source-evidence-gap/);
+    assert.equal(value.probe.transport.count, count);
+  } finally { value.close(); }
 });
 
 test('another Store cannot borrow a live parent pump to start a Historian request', () => {

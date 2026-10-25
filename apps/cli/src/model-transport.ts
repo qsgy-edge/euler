@@ -145,7 +145,7 @@ export class HttpModelTransport {
     }
     check(!body.includes(credential), 'response-contained-credential');
     let reply: ModelReply, failure: CaptureFailure | undefined;
-    let usage: ModelReply['usage'], modelHash: string | undefined;
+    let usage: ModelReply['usage'], modelHash: string | undefined, responseText: string | undefined;
     try {
       const data = JSON.parse(body) as { model?: unknown; usage?: { prompt_tokens?: unknown; completion_tokens?: unknown }; choices?: { finish_reason?: string; message?: { role?: string; content?: unknown; tool_calls?: unknown } }[] };
       check(data && typeof data === 'object', 'invalid-provider-response');
@@ -156,6 +156,8 @@ export class HttpModelTransport {
       check(Array.isArray(data.choices) && data.choices.length === 1 && data.choices[0], 'invalid-provider-response');
       const choice = data.choices[0]!, message = choice.message;
       check(message?.role === 'assistant' && (message.content === null || typeof message.content === 'string'), 'invalid-provider-message');
+      responseText = message.content ?? '';
+      check(!responseText.includes(credential), 'response-contained-credential');
       const toolCalls = message.tool_calls ?? [];
       check(Array.isArray(toolCalls) && toolCalls.length <= 128, 'invalid-provider-tools');
       const calls = toolCalls.map((call: { id?: unknown; type?: unknown; function?: { name?: unknown; arguments?: unknown } }) => {
@@ -177,7 +179,7 @@ export class HttpModelTransport {
       if (!(error instanceof SyntaxError) && !(error instanceof Error &&
         ['invalid-provider-response','invalid-provider-message','invalid-provider-tools','invalid-provider-tool','unsupported-stop-reason'].includes(error.message))) throw error;
       failure = 'protocol';
-      reply = { text: 'Provider response violated the configured protocol.', calls: [], stop: 'error' };
+      reply = { text: responseText ?? 'Provider response violated the configured protocol.', calls: [], stop: 'error' };
     }
     yield { kind: 'complete', responseHash, ...(failure ? { failure } : {}),
       reply: { ...reply, ...(usage ? { usage } : {}), ...(modelHash ? { modelHash } : {}) } };
