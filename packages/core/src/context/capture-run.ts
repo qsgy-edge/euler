@@ -229,8 +229,15 @@ export class CaptureRun {
     this.#store.captureRuntime(this.#lease);
     check(reply && typeof reply.text === 'string' && Array.isArray(reply.calls)
       && ['end','tools','length','error'].includes(reply.stop) && (reply.calls.length > 0) === (reply.stop === 'tools'), 'invalid-model-response');
+    let historianNegative: 'block' | 'evidence-gap' | null = null;
+    if (inflight.phase === 'historian') {
+      try {
+        const verdict = (JSON.parse(reply.text) as { result?: unknown } | null)?.result;
+        if (verdict === 'block' || verdict === 'evidence-gap') historianNegative = verdict;
+      } catch (error) { if (!(error instanceof SyntaxError)) throw error; }
+    }
     if (reply.calls.length > 16) {
-      reply = { ...reply, text: 'Capture response exceeded the tool-call limit.', calls: [], stop: 'error' };
+      reply = { ...reply, text: historianNegative ? reply.text : 'Capture response exceeded the tool-call limit.', calls: [], stop: 'error' };
       transport = { ...transport, failure: 'protocol' };
     }
     const calls = reply.calls.map(call => {
@@ -261,7 +268,8 @@ export class CaptureRun {
         } else outcome = 'protocol';
       }
     }
-    if (inflight.phase === 'historian' && calls.length) outcome = 'protocol';
+    if (historianNegative) outcome = 'response';
+    else if (inflight.phase === 'historian' && calls.length) outcome = 'protocol';
     const source = this.#source.append(attemptId, JSON.stringify(clean), 'assistant');
     const applied = this.#store.withActivity(this.#lease.activity, () => {
       this.#store.finishRequestAttempt(this.#lease.activity, { attemptId, outcome: 'received', usage: { count: 1,
@@ -271,17 +279,16 @@ export class CaptureRun {
         fallbackOrdinal: inflight.ordinal, configHash: this.#configHash, inputHash: inflight.attempt.payloadHash, outcome,
         failureClass: transport.failure ?? (outcome === 'protocol' ? 'structured-output' : null), responseHash: transport.responseHash ?? null });
       if (!this.#acceptResult() || outcome !== 'response') return false;
+      if (historianNegative) {
+        this.#store.stopCapture(this.#lease, 'blocked', `historian-${historianNegative}`);
+        this.#store.sealRequestRun(this.#lease.activity, this.runId);
+        return false;
+      }
       if (reply.stop === 'error' || reply.stop === 'length') {
         this.#store.stopCapture(this.#lease, 'blocked', reply.stop === 'length' ? 'output-incomplete' : 'provider-unavailable'); return;
       }
-      if (!calls.length) {
-        if (inflight.phase === 'historian') {
-          const verdict = parsed as HistorianReply;
-          if (verdict.result !== 'pass') {
-            this.#store.stopCapture(this.#lease, 'blocked', `historian-${verdict.result}`);
-            this.#store.sealRequestRun(this.#lease.activity, this.runId);
-          }
-        } else if (inflight.phase === 'proposer') {
+      if (!calls.length && inflight.phase !== 'historian') {
+        if (inflight.phase === 'proposer') {
           if (parsed === null) this.#store.stopCapture(this.#lease, 'complete', 'no-reusable-claim');
           else {
             const captured = this.#store.captureProposedMemory(this.#lease, parsed as ProposedMemory, this.#config.proposer![inflight.ordinal]!.capability);

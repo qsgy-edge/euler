@@ -83,17 +83,26 @@ function deliver(value: { probe: ReturnType<typeof openProbe> }, run: CaptureRun
   return request;
 }
 
-for (const result of ['block','evidence-gap']) test('a Historian ' + result + ' never uses the configured fallback or publishes a compartment', () => {
-  const value = setup();
-  try {
-    const { run } = consumer(value);
-    deliver(value, run, JSON.stringify({ result, reason: 'synthetic-negative' }));
-    assert.equal(run.status().stage, 'blocked');
-    assert.equal(run.nextModel(), null);
-    assert.equal(value.probe.transport.count, 1);
-    assert.throws(() => value.probe.store.readCompartment(value.probe.activity, value.job.jobId), /compartment-unavailable/);
-  } finally { value.close(); }
-});
+for (const result of ['block','evidence-gap']) for (const toolCount of [0, 1, 17])
+  test(`a Historian ${result} with ${toolCount} calls never uses fallback or publishes a compartment`, () => {
+    const value = setup();
+    try {
+      const { run, lease } = consumer(value);
+      const text = JSON.stringify({ result, reason: 'synthetic-negative' });
+      deliver(value, run, { text, calls: Array.from({ length: toolCount }, (_, index) => ({
+        id: 'unexpected-' + index, name: 'source.search', arguments: { query: 'synthetic' } })), stop: toolCount ? 'tools' : 'end' });
+      assert.equal(run.status().stage, 'blocked');
+      assert.equal(run.status().reason, 'historian-' + result);
+      assert.equal(run.nextModel(), null);
+      assert.equal(value.probe.transport.count, 1);
+      const ledger = value.probe.store.requestStatus(lease.activity, run.runId);
+      assert.equal(ledger.attempts.length, 1);
+      assert.equal(ledger.events.filter(event => event.kind === 'capture/step@v1' && JSON.parse(event.payload).kind === 'tool').length, 0);
+      const output = value.probe.archive.lookup(ledger.attempts[0]!.attemptId)!;
+      assert.equal(JSON.parse(value.probe.archive.read(output).text).text, text);
+      assert.throws(() => value.probe.store.readCompartment(value.probe.activity, value.job.jobId), /compartment-unavailable/);
+    } finally { value.close(); }
+  });
 
 test('structured output failure uses a configured fallback with the original raw input and no previous summary', () => {
   const value = setup();
