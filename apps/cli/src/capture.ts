@@ -10,7 +10,8 @@ import type { Sandbox } from './sandbox.ts';
 type Probe = ReturnType<typeof openProbe>;
 
 /** One explicitly configured test route, with independent role contexts and no ambient credential discovery. */
-export function createCaptureWorker(path?: string, onFailure?: (error: unknown) => void, recoverInfo?: () => boolean) {
+export function createCaptureWorker(path?: string, onFailure?: (error: unknown) => void, recoverInfo?: () => boolean,
+  consumer: CaptureJob['consumer'] = 'memory') {
   let configured: ReturnType<typeof configuredTransport> | null = null, setupError: unknown;
   if (path) {
     try { configured = configuredTransport(path); check(configured.captureCapability, 'capture-capability-required'); }
@@ -19,30 +20,32 @@ export function createCaptureWorker(path?: string, onFailure?: (error: unknown) 
   let prerequisites = false;
   const run = async (probe: Probe, foregroundActive = false, signal?: AbortSignal): Promise<CaptureJob[]> => {
     const report = (jobs: CaptureJob[]) => {
-      console.log(JSON.stringify({ event: 'capture-queue', jobs: jobs.map(job => ({ jobId: job.jobId, stage: job.stage,
+      console.log(JSON.stringify({ event: 'capture-queue', consumer, jobs: jobs.map(job => ({ jobId: job.jobId, stage: job.stage,
         reason: job.reason, recordId: job.record?.recordId ?? null, verification: job.record?.verification ?? null,
         lifecycle: job.record?.lifecycle ?? null, level: job.stage === 'unknown' ? 'error'
           : job.stage === 'blocked' || job.stage === 'pending' && job.reason ? 'warning' : 'info' })) }));
       return jobs;
     };
-    if (!probe.store.listCaptureJobs(probe.activity, 1, true).length) return [];
-    if (!path) return report(probe.store.deferCaptureJobs(probe.activity, 'capture-route-unavailable'));
-    if (setupError) { report(probe.store.deferCaptureJobs(probe.activity, 'capture-configuration-unavailable')); throw setupError; }
-    if (foregroundActive) return report(probe.store.deferCaptureJobs(probe.activity, 'foreground-run-active'));
-    if (probe.store.captureDrainBlocked(probe.activity)) return report(probe.store.deferCaptureJobs(probe.activity, 'request-recovery-required'));
-    if (recoverInfo?.() === false) return report(probe.store.deferCaptureJobs(probe.activity, 'host-info-recovery-required'));
+    const defer = (reason: Parameters<Probe['store']['deferCaptureJobs']>[1]) => report(probe.store.deferCaptureJobs(probe.activity, reason, consumer));
+    if (!probe.store.listCaptureJobs(probe.activity, 1, true, consumer).length) return [];
+    if (!path) return defer('capture-route-unavailable');
+    if (setupError) { defer('capture-configuration-unavailable'); throw setupError; }
+    if (consumer === 'memory' && foregroundActive) return defer('foreground-run-active');
+    if (consumer === 'memory' && probe.store.captureDrainBlocked(probe.activity)) return defer('request-recovery-required');
+    if (recoverInfo?.() === false) return defer('host-info-recovery-required');
     if (!prerequisites) {
-      try { await verifyTransportPrerequisites(['capture','capture-run','capture-failure','capture-pump','capture-http-protocol','analysis-proposal','proposal-approval'], 'capture-prerequisites', signal); }
-      catch (error) { report(probe.store.deferCaptureJobs(probe.activity, signal?.aborted ? 'capture-stopped' : 'prerequisite-evidence-gap')); throw error; }
+      try { await verifyTransportPrerequisites(['capture','capture-run','capture-failure','capture-pump','capture-http-protocol','analysis-proposal','proposal-approval',
+        ...(consumer === 'historian' ? ['historian'] : [])], `${consumer === 'historian' ? 'historian' : 'capture'}-prerequisites`, signal); }
+      catch (error) { defer(signal?.aborted ? 'capture-stopped' : 'prerequisite-evidence-gap'); throw error; }
       prerequisites = true;
     }
     signal?.throwIfAborted();
-    if (probe.store.captureDrainBlocked(probe.activity)) return report(probe.store.deferCaptureJobs(probe.activity, 'foreground-run-active'));
+    if (consumer === 'memory' && probe.store.captureDrainBlocked(probe.activity)) return defer('foreground-run-active');
     const selected = configured!, capability = selected.captureCapability!;
     const route = { provider: selected.model.provider, model: selected.model.id, route: selected.model.baseUrl,
       authNamespace: selected.authNamespace, capability };
     return report(await drainCaptures(probe, { batch: 16, deadlineMs: Math.min(30000, selected.budget.wallClockMs), budget: selected.budget,
-      config: { proposer: [route], verifier: [route] }, encode: selected.transport.encode.bind(selected.transport), adapterVersion: 'capture-http@1',
+      config: consumer === 'historian' ? { historian: [route] } : { proposer: [route], verifier: [route] }, encode: selected.transport.encode.bind(selected.transport), adapterVersion: 'capture-http@1',
       ...(signal ? { signal } : {}),
       host: { stream: selected.transport.stream.bind(selected.transport), ...(recoverInfo ? { recoverInfo } : {}) } }));
   };
@@ -58,8 +61,8 @@ export function createCaptureWorker(path?: string, onFailure?: (error: unknown) 
   };
 }
 
-export function scheduleCaptures(probe: Probe, path: string | undefined, recoverInfo: () => boolean) {
-  const worker = createCaptureWorker(path, reportCaptureFailure, recoverInfo), abort = new AbortController();
+export function scheduleCaptures(probe: Probe, path: string | undefined, recoverInfo: () => boolean, consumer: CaptureJob['consumer'] = 'memory') {
+  const worker = createCaptureWorker(path, reportCaptureFailure, recoverInfo, consumer), abort = new AbortController();
   let pending = false, foreground = false, running: Promise<void> | undefined;
   const kick = (foregroundActive = false) => {
     if (abort.signal.aborted) return;
@@ -97,19 +100,25 @@ export async function drainCaptures(probe: Probe, options: { batch: number; dead
     && Number.isSafeInteger(options.deadlineMs) && options.deadlineMs > 0 && options.deadlineMs <= 30000, 'invalid-capture-drain');
   const deadline = Date.now() + options.deadlineMs;
   const results: CaptureJob[] = [];
-  const jobs = options.jobId ? [probe.store.readCaptureJob(probe.activity, options.jobId)] : probe.store.listCaptureJobs(probe.activity, options.batch, true);
+  const consumer = options.config.historian ? 'historian' : 'memory';
+  const jobs = options.jobId ? [probe.store.readCaptureJob(probe.activity, options.jobId)] : probe.store.listCaptureJobs(probe.activity, options.batch, true, consumer);
   for (const job of jobs) {
-    if (options.signal?.aborted || probe.store.captureDrainBlocked(probe.activity)) break;
+    check(job.consumer === consumer, 'capture-consumer-config-mismatch');
+    if (options.signal?.aborted || consumer === 'memory' && probe.store.captureDrainBlocked(probe.activity)) break;
     if (Date.now() >= deadline) break;
     let result = job;
     // Each role or fixed comparison gets an isolated lease; all requests consume the same job budget.
     for (let phase = 0; phase <= options.budget.maxModelAttempts && Date.now() < deadline; phase++) {
       if (options.host.recoverInfo?.() === false) {
-        const deferred = probe.store.deferCaptureJobs(probe.activity, 'host-info-recovery-required');
+        const deferred = probe.store.deferCaptureJobs(probe.activity, 'host-info-recovery-required', consumer);
         return [...results, ...deferred.filter(item => !results.some(previous => previous.jobId === item.jobId))];
       }
       const lease = probe.store.claimCaptureJob(probe.activity, job.jobId, options.budget, Math.max(1, deadline - Date.now()));
       if (!lease) { result = probe.store.readCaptureJob(probe.activity, job.jobId); break; }
+      if (probe.store.captureDrainBlocked(lease.activity, probe.store.captureRuntime(lease).runId ?? undefined)) {
+        probe.store.pauseCapture(lease, 'request-recovery-required');
+        result = probe.store.readCaptureJob(probe.activity, job.jobId); break;
+      }
       const run = new CaptureRun(probe.store, lease, probe.archive, options.config, options.encode, options.adapterVersion);
       result = await pumpCapture(run, options.host, options.signal);
       if (result.reason === 'host-info-recovery-required' && ['proposing','verifying','comparing'].includes(result.stage)) return [...results, result];

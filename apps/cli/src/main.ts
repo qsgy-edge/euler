@@ -14,6 +14,7 @@ import { AGENT_BUDGET, runAgentDemo } from './agent-cli.ts';
 import { deliverMemoryInfo, runInfoDelivery, runInfoQuery, runRememberSession } from './owner-memory.ts';
 import { runHandoffDemo } from './analysis-handoff.ts';
 import { runContextDemo } from './context-cli.ts';
+import { runHistorianDemo, runHistorianDrain } from './historian.ts';
 import { runCaptureDemo, runCaptureDrain } from './capture.ts';
 import { killPoint } from './kill-point.ts';
 import memoryFixture from '../../../fixtures/scoped-memory.json' with { type: 'json' };
@@ -227,7 +228,7 @@ async function main() {
   const args = parseArgs({ allowPositionals: true, options: {
     sandbox: { type: 'string' }, scenario: { type: 'string', default: 'success' }, budget: { type: 'string' },
     request: { type: 'string' }, job: { type: 'string' }, record: { type: 'string' }, reservation: { type: 'string' },
-    'transport-config': { type: 'string' }, 'capture-config': { type: 'string' }, interactive: { type: 'boolean', default: false },
+    'transport-config': { type: 'string' }, 'capture-config': { type: 'string' }, 'historian-config': { type: 'string' }, interactive: { type: 'boolean', default: false },
     attempt: { type: 'string' },
     'accept-duplicate-risk': { type: 'boolean', default: false },
     'wait-child-launch': { type: 'boolean', default: false },
@@ -237,14 +238,15 @@ async function main() {
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
   const requestCommands = ['request-status', 'request-seal', 'request-reconcile', 'request-resume', 'request-gap'];
-  check([...requestCommands, 'context', 'capture-drain', 'capture-status', 'capture-reconcile', 'handoff', 'capture', 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
+  check([...requestCommands, 'historian', 'historian-drain', 'context', 'capture-drain', 'capture-status', 'capture-reconcile', 'handoff', 'capture', 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
   const options = args.values.budget ? JSON.parse(args.values.budget) as Partial<ProbeBudget> : {};
   check(!args.values['wait-child-launch'] || command === 'hold', 'hold-only-option');
   check(Object.keys(options).every(key => key in DEFAULT_BUDGET), 'invalid-budget');
   const budget = { ...DEFAULT_BUDGET, ...options };
   if (['run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'remember', 'info', 'hold', 'task', 'maintain', 'maintenance-status'].includes(command)) check(args.values.sandbox, 'sandbox-required');
-  if (['capture-drain','capture-status','capture-reconcile'].includes(command)) check(args.values.sandbox, 'sandbox-required');
+  if (['historian-drain','capture-drain','capture-status','capture-reconcile'].includes(command)) check(args.values.sandbox, 'sandbox-required');
   check(!args.values['capture-config'] || ['agent','remember','capture-drain'].includes(command), 'capture-config-command-required');
+  check(!args.values['historian-config'] || ['agent','historian-drain'].includes(command), 'historian-config-command-required');
   if (command === 'capture-reconcile') check(args.values.job, 'capture-identity-required');
   if (['capture','handoff'].includes(command)) check(!args.values['transport-config'], 'capture-real-route-unavailable');
   if (requestCommands.includes(command)) check(args.values.sandbox && args.values.request, 'request-identity-required');
@@ -261,12 +263,15 @@ async function main() {
     return;
   }
   if (command === 'capture-drain') { await runCaptureDrain(sandbox, args.values['capture-config'], probe => deliverMemoryInfo(sandbox, probe)); return runInfoDelivery(sandbox); }
+  if (command === 'historian') return runHistorianDemo(sandbox, args.values.scenario === 'success' ? 'synthetic' : args.values.scenario, args.values['transport-config']);
+  if (command === 'historian-drain') return runHistorianDrain(sandbox, args.values['historian-config'], args.values.request);
   if (command === 'context') return runContextDemo(sandbox, args.values.scenario === 'success' ? 'synthetic' : args.values.scenario, args.values['transport-config']);
   if (command === 'handoff') return runHandoffDemo(sandbox, args.values.scenario);
   if (command === 'capture') { await runCaptureDemo(sandbox, args.values.scenario, probe => deliverMemoryInfo(sandbox, probe)); return runInfoDelivery(sandbox); }
   if (command === 'agent') return runAgentDemo(sandbox, args.values.scenario === 'success' ? 'tool' : args.values.scenario,
     { ...AGENT_BUDGET, ...options }, { interactive: args.values.interactive,
       ...(args.values['capture-config'] ? { captureConfig: args.values['capture-config'] } : {}),
+      ...(args.values['historian-config'] ? { historianConfig: args.values['historian-config'] } : {}),
       ...(args.values['transport-config'] ? { transportConfig: args.values['transport-config'] } : {}),
       ...(args.values.request ? { recovery: { relatedRunId: args.values.request, acceptDuplicateRisk: args.values['accept-duplicate-risk'] } } : {}) });
   if (command === 'agent-status') {

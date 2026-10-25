@@ -26,6 +26,8 @@ Owner corrections use the actual CLI input, complete previews and live approval 
 
 [Context windows and analysis handoff](docs/implementation/t18-context-windows.md) preserve current intent, exact guidance, complete recent tool pairs and bounded operation state. Run `npm run demo -- context --scenario synthetic` or `npm run evidence:context`; an explicitly configured real route uses the same guarded loop.
 
+[Stable Historian compartments](docs/implementation/t19-historian-compartments.md) bind each summary to a fixed raw range, retain exact decisions/results/citations, and enter context only at a complete window boundary. Run `npm run demo -- historian` or `npm run evidence:historian` for the controlled generation and recovery path.
+
 Full X-card acceptance, real provider dispatch, production schema/host acceptance, migration, and MC cutover remain unverified. CI and host results must be read from the artifact for the specific implementation and platform; this repository is not production-ready.
 
 - [Euler v1 implementation specification](docs/architecture/issues/15-euler-v1-spec.md)

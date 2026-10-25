@@ -14,7 +14,7 @@ import { openProbe } from './probe.ts';
 import { pumpAgent } from './agent-pump.ts';
 import type { AgentPump } from './agent-pump.ts';
 import { configuredTransport, verifyTransportPrerequisites } from './model-transport.ts';
-import { scheduleCaptures } from './capture.ts';
+import { scheduleCaptures, reportCaptureFailure } from './capture.ts';
 import { deliverMemoryInfo } from './owner-memory.ts';
 import fixture from '../../../fixtures/controlled-agent.json' with { type: 'json' };
 
@@ -23,7 +23,7 @@ export const AGENT_BUDGET: ProbeBudget = { version: 'probe-budget@1', contextLim
 const emit = (event: string, data: Record<string, unknown>) => process.stdout.write(JSON.stringify({ event, ...data }) + '\n');
 
 export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: ProbeBudget, options: {
-  transportConfig?: string; captureConfig?: string; interactive?: boolean; recovery?: RequestRecovery;
+  transportConfig?: string; captureConfig?: string; historianConfig?: string; interactive?: boolean; recovery?: RequestRecovery;
 } = {}): Promise<void> {
   check(['plain', 'tool', 'files', 'budget', 'cancel', 'failure', 'unknown', 'real'].includes(scenario), 'invalid-agent-scenario');
   if (scenario === 'real' && !options.transportConfig) {
@@ -34,8 +34,9 @@ export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: P
   if (scenario === 'budget') budget = { ...budget, maxModelAttempts: 1 };
   const probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
   const capture = scheduleCaptures(probe, options.captureConfig, () => deliverMemoryInfo(sandbox, probe));
+  const historian = options.historianConfig ? scheduleCaptures(probe, options.historianConfig, () => deliverMemoryInfo(sandbox, probe), 'historian') : undefined;
   deliverMemoryInfo(sandbox, probe);
-  capture.kick(true);
+  capture.kick(true); historian?.kick(true);
   const transport = configured?.transport;
   const route = configured ? { provider: configured.model.provider, model: configured.model.id, route: configured.model.baseUrl, authNamespace: configured.authNamespace }
     : { provider: 'fake', model: 'controlled', route: 'fixture', authNamespace: 'synthetic' };
@@ -48,6 +49,7 @@ export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: P
   }
   let run = new AgentRun(probe.store, probe.activity, { binding: bindingOf(sandbox), source: probe.archive,
     ...(files ? { files } : {}),
+    ...(historian ? { historian: { bounds: { minBytes: 4096, maxBytes: 60000 }, onError: reportCaptureFailure } } : {}),
     ...(transport ? { encode: transport.encode.bind(transport) } : {}) }, route, budget, options.recovery ? { recovery: options.recovery } : {});
   let pendingApproval: { token: string; decide: (decision: FileDecision) => void } | undefined;
   let lines: ReturnType<typeof createInterface> | undefined;
@@ -79,10 +81,10 @@ export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: P
       yield { kind: 'partial', reply };
       yield { kind: 'complete', reply };
     },
-    async cooperate() { capture.kick(true); },
+    async cooperate() { capture.kick(true); historian?.kick(true); },
     async execute(call) { return String(call.arguments.text); },
   };
-  const cancel = () => { run.cancel(); void capture.close(); };
+  const cancel = () => { run.cancel(); void capture.close(); void historian?.close(); };
   process.on('SIGINT', cancel);
   try {
     run.receive(randomUUID(), scenario === 'files' ? filesFixture.input : scenario === 'plain' ? fixture.plain : fixture.tool);
@@ -115,9 +117,9 @@ export async function runAgentDemo(sandbox: Sandbox, scenario: string, budget: P
         sourceMechanism: 'CLI JSONL + SQLite WAL FULL', realProvider: Boolean(transport) });
       if (status.terminal !== 'completed') process.exitCode = 1;
       const next = run.followUp();
-      if (!next) { await capture.flush(); break; }
+      if (!next) { await historian?.flush(); await capture.flush(); break; }
       run = next;
       capture.kick(true);
     }
-  } finally { lines?.close(); process.off('SIGINT', cancel); await capture.close(); probe.close(); }
+  } finally { lines?.close(); process.off('SIGINT', cancel); await historian?.close(); await capture.close(); probe.close(); }
 }

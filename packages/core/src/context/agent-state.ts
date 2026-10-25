@@ -16,7 +16,8 @@ export interface ToolFact { callId: string; name: string; argumentsHash: string;
 export type AgentEvent =
   | { kind: 'opened'; route: ModelRoute; files?: FileCapability; discoveryGrantId?: string; guidanceRunId?: string }
   | { kind: 'source-access'; sourceEventId: string; binding: Binding; discoveryGrantId: string }
-  | { kind: 'window-opened'; windowId: string; previousWindowId: string | null; firstResponse: number; reason: 'initial' | 'pressure' | 'explicit'; recovery: SourceAck[] }
+  | { kind: 'window-opened'; windowId: string; previousWindowId: string | null; firstResponse: number; reason: 'initial' | 'pressure' | 'explicit'; recovery: SourceAck[];
+      compartments?: { jobId: string; source: SourceAck }[]; compartmentGaps?: { jobId: string; reason: string }[] }
   | ({ kind: 'cache-epoch-opened' } & RequestContext)
   | { kind: 'cache-epoch-invalidated'; cacheEpoch: string; reason: string }
   | { kind: 'input'; source: SourceAck; mode: 'steer' | 'follow-up' | 'queue' }

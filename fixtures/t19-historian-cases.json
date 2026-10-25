@@ -1,0 +1,7 @@
+{
+  "input": "Synthetic decision: preserve the Windows-only scope and exact result 47.",
+  "narrative": "Synthetic intermediate inspection with recoverable details. ",
+  "repeat": 160,
+  "result": "Result: 47. Citation: fixture.ts:19. Applies only to Windows.",
+  "summary": "The first synthetic observation completed within the Windows-only boundary."
+}

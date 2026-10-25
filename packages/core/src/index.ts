@@ -3,6 +3,7 @@ export type { CorrectionInput, CorrectionCommand, CorrectionReply } from './cont
 export { AnalysisArtifacts, parseAnalysisArtifact } from './context/analysis-artifacts.ts';
 export type { AnalysisArtifact, AnalysisHeader, ArtifactEvidence, ReportInput, HandoffInput, ExportSelection } from './context/analysis-artifacts.ts';
 export { CaptureRun } from './context/capture-run.ts';
+export type { HistorianBounds, HistorianReply, CompartmentBody, Compartment } from './context/historian.ts';
 export type { CaptureConfig, CaptureRoute, CaptureFailure } from './context/capture-run.ts';
 export { GuidanceSession } from './context/guidance-session.ts';
 export type { GuidanceConfig, GuidanceTarget, GuidanceAssembly, InstructionSnapshot, GuidanceBlock, GuidanceScope, SkillReference } from './context/guidance-session.ts';
