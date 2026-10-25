@@ -23,6 +23,7 @@ const PREFIX = '<!-- euler-analysis-artifact@1 ';
 export function parseAnalysisArtifact(text: string): { header: AnalysisHeader; body: string; bodyOffset: number } | null {
   if (!text.startsWith(PREFIX)) return null;
   const split = text.indexOf(' -->\n\n');
+  if (split === -1) return null;
   check(split >= PREFIX.length && split <= 32768, 'analysis-artifact-integrity');
   let header: AnalysisHeader;
   try { header = JSON.parse(text.slice(PREFIX.length, split)) as AnalysisHeader; }

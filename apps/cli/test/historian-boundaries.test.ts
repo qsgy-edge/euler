@@ -618,15 +618,46 @@ test('analysis version history remains usable beyond the evidence nesting limit'
   } finally { value.close(); }
 });
 
-test('an owner task can contain literal analysis syntax without becoming an artifact', () => {
-  const sandbox = createSandbox(), probe = openProbe(sandbox);
+for (const suffix of ['explain this literal prefix', '{"schema":"analysis-artifact@1"'])
+  test('literal analysis text remains usable through source, memory and Historian: ' + suffix, () => {
+    const sandbox = createSandbox(), probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
+    try {
+      const { capability: _capability, ...agentRoute } = route;
+      const agent = new AgentRun(probe.store, probe.activity, { binding: bindingOf(sandbox), source: probe.archive }, agentRoute, budget);
+      const text = '<!-- euler-analysis-artifact@1 ' + suffix, input = agent.receive(randomUUID(), text);
+      const intent = probe.store.transitionIntent(probe.activity, null, input, { status: 'active', step: 'explain' }, text);
+      assert.equal(probe.store.readIntent(probe.activity)!.goal, text);
+      assert.equal(probe.store.recoverIntent(probe.activity)!.eventId, intent.eventId);
+      deliver({ probe }, agent, { text: 'The prefix is ordinary literal text.', calls: [], stop: 'end' });
+      const job = probe.store.queueHistorianBoundary(probe.activity, agent.runId, { minBytes: 1, maxBytes: 60000 })!;
+      assert.ok(job);
+      const lease = probe.store.claimCaptureJob(probe.activity, job.jobId, budget, 30000);
+      assert.ok(lease, 'literal raw input must remain claimable');
+      const historian = new CaptureRun(probe.store, lease, probe.archive, { historian: [route] });
+      deliver({ probe }, historian, JSON.stringify({ result: 'pass', summary: 'A literal prefix was explained.' }));
+      assert.equal(probe.store.readCompartment(probe.activity, job.jobId).body.decisions.find(item => item.eventId === input.eventId)!.text, text);
+      assert.equal(probe.store.expandSource(probe.activity, { ref: input, offset: 0, limit: text.length }).text, text);
+      const memory = probe.store.captureMemory(probe.activity, input, 'The analysis marker can be discussed literally.',
+        { type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [] });
+      assert.equal(memory.status, 'committed');
+      assert.deepEqual(probe.store.readMemory(probe.activity, memory.record!.recordId).source, input);
+      const partial = probe.archive.append(randomUUID(), text, 'assistant');
+      assert.throws(() => new AnalysisArtifacts(probe.store, probe.activity, probe.archive).read(partial), /analysis-artifact-integrity/);
+    } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+  });
+
+for (const damage of ['header', 'body'] as const) test('a framed analysis document still rejects invalid ' + damage, () => {
+  const value = setup();
   try {
-    const text = '<!-- euler-analysis-artifact@1 explain this literal prefix';
-    const input = probe.archive.append(randomUUID(), text);
-    const intent = probe.store.transitionIntent(probe.activity, null, input, { status: 'active', step: 'explain' }, text);
-    assert.equal(probe.store.readIntent(probe.activity)!.goal, text);
-    assert.equal(probe.store.recoverIntent(probe.activity)!.eventId, intent.eventId);
-  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+    const { store, activity, archive } = value.probe, artifacts = new AnalysisArtifacts(store, activity, archive);
+    const document = artifacts.saveHandoff({ eventId: randomUUID(), title: 'Synthetic document', markdown: 'Exact original body.', evidence: [] });
+    const text = damage === 'header' ? '<!-- euler-analysis-artifact@1 not-json -->\n\nExact original body.'
+      : archive.read(document.ref).text + ' changed';
+    const input = archive.append(randomUUID(), text, 'assistant');
+    assert.throws(() => artifacts.read(input), /analysis-artifact-integrity/);
+    assert.throws(() => store.captureMemory(activity, input, 'Synthetic claim.',
+      { type: 'fact', scope: { kind: 'project', id: value.sandbox.fixture.projectId, resolved: true }, appliesTo: [] }), /analysis-artifact-integrity/);
+  } finally { value.close(); }
 });
 
 test('a compartment cannot be republished as a raw project source unit', () => {
