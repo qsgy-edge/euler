@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { AgentRun, CaptureRun, DEFAULT_BUDGET } from '@euler/core';
-import type { CaptureConfig, ModelReply } from '@euler/core';
+import { AgentRun, CaptureRun, DEFAULT_BUDGET, fileIdentity } from '@euler/core';
+import type { CaptureConfig, FileCapability, ModelReply } from '@euler/core';
 import { createSandbox, bindingOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 import { approvedSourceUnit } from './support/source-publication.ts';
@@ -73,7 +74,7 @@ function consumer(value: ReturnType<typeof setup>, config: CaptureConfig = { his
   const lease = value.probe.store.claimCaptureJob(value.probe.activity, value.job.jobId, budget, 30000)!;
   return { lease, run: new CaptureRun(value.probe.store, lease, value.probe.archive, config, undefined, 'capture-counting@1') };
 }
-function deliver(value: ReturnType<typeof setup>, run: CaptureRun | AgentRun, text: string | ModelReply) {
+function deliver(value: { probe: ReturnType<typeof openProbe> }, run: CaptureRun | AgentRun, text: string | ModelReply) {
   const request = run.nextModel()!; assert.ok(request);
   const attempt = run.startModel(request, request.payload);
   assert.equal(run.maySend(attempt.attemptId, request.payload), true);
@@ -185,17 +186,18 @@ test('another Store cannot borrow a live parent pump to start a Historian reques
   } finally { peer.close(); value.close(); }
 });
 
-for (const damaged of [false, true]) test('raw recovery excludes background replies and compartment bodies, damaged=' + damaged, () => {
+for (const corruption of ['none', 'text', 'user', 'tool']) test('raw recovery excludes background replies and compartment bodies, corruption=' + corruption, () => {
   const value = setup(), path = join(value.sandbox.root, 'session.jsonl');
   try {
     const { run } = consumer(value);
     deliver(value, run, JSON.stringify({ result: 'pass', summary: 'UNIQUEDERIVEDSUMMARY' }));
     const compartment = value.probe.store.readCompartment(value.probe.activity, value.job.jobId);
-    if (damaged) {
+    if (corruption !== 'none') {
       const lines = readFileSync(path, 'utf8').trimEnd().split('\n');
       for (const eventId of [compartment.source.eventId, compartment.attemptId]) {
         const index = lines.findIndex(line => JSON.parse(line).eventId === eventId);
-        lines[index] = lines[index]!.replace('UNIQUEDERIVEDSUMMARY', 'DAMAGEDDERIVEDSUMMARY');
+        if (corruption === 'text') lines[index] = lines[index]!.replace('UNIQUEDERIVEDSUMMARY', 'DAMAGEDDERIVEDSUMMARY');
+        else lines[index] = JSON.stringify({ ...JSON.parse(lines[index]!), role: corruption });
       }
       writeFileSync(path, lines.join('\n') + '\n');
     }
@@ -257,4 +259,41 @@ test('an approval keeps its preceding complete proposal across incremental raw b
     const compartment = value.probe.store.readCompartment(value.probe.activity, job.jobId);
     assert.equal(compartment.body.decisions.find(item => item.eventId === approval.eventId)!.precedingResponse, preceding);
   } finally { value.close(); }
+});
+
+test('an actual file approval and its presentation remain mandatory raw evidence', () => {
+  const sandbox = createSandbox(), root = realpathSync.native(mkdtempSync(join(tmpdir(), 'euler-historian-files-')));
+  const probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
+  try {
+    const binding = bindingOf(sandbox), { capability: _capability, ...agentRoute } = route;
+    const source = probe.archive.append(randomUUID(), 'Owner binds this disposable synthetic file root; each write needs separate approval.', 'user');
+    const files: FileCapability = { schema: 'file-capability@1', grantId: randomUUID(), binding,
+      root: { path: root, identity: fileIdentity(root) }, source };
+    const agent = new AgentRun(probe.store, probe.activity, { binding, source: probe.archive, files }, agentRoute, budget);
+    agent.receive(randomUUID(), 'Write the synthetic approved fixture.');
+    deliver({ probe }, agent, { text: 'Write this exact content.', calls: [{ id: 'write', name: 'file.write',
+      arguments: { path: 'approved.txt', content: 'EXACT APPROVED CONTENT' } }], stop: 'tools' });
+    const target = { path: join(root, 'approved.txt'), parent: files.root, identity: null };
+    const presentation = agent.presentFile('write', target)!;
+    agent.decideFile(presentation, 'approved');
+    assert.ok(agent.startTool('write'));
+    writeFileSync(target.path, presentation.content, { flag: 'wx' });
+    agent.finishFile('write', { identity: fileIdentity(target.path), byteLength: Buffer.byteLength(presentation.content) });
+    assert.equal(readFileSync(target.path, 'utf8'), presentation.content);
+    deliver({ probe }, agent, { text: 'Approved write completed.', calls: [], stop: 'end' });
+    const job = probe.store.queueHistorianBoundary(probe.activity, agent.runId, { minBytes: 1, maxBytes: 60000 })!;
+    const file = agent.status().files[0]!, result = agent.status().tools[0]!.result!;
+    for (const ref of [file.admission.source, file.approvalSource!, result.source])
+      assert.ok(job.range.some(item => item.eventId === ref.eventId), 'complete file decision and result must share the raw range');
+    const lease = probe.store.claimCaptureJob(probe.activity, job.jobId, budget, 30000)!;
+    const historian = new CaptureRun(probe.store, lease, probe.archive, { historian: [route] }, undefined, 'capture-counting@1');
+    deliver({ probe }, historian, JSON.stringify({ result: 'pass', summary: 'A synthetic approved file write.' }));
+    const body = probe.store.readCompartment(probe.activity, job.jobId).body;
+    assert.equal(body.decisions.find(item => item.eventId === file.approvalSource!.eventId)!.text, probe.archive.read(file.approvalSource!).text);
+    assert.equal(body.results.find(item => item.eventId === file.admission.source.eventId)!.text, probe.archive.read(file.admission.source).text);
+    assert.ok(body.citations.some(ref => ref.eventId === file.approvalSource!.eventId));
+    assert.ok(body.citations.some(ref => ref.eventId === file.admission.source.eventId));
+  } finally {
+    probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); rmSync(root, { recursive: true, force: true });
+  }
 });

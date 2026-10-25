@@ -11,6 +11,7 @@ import type { FileCapability, FileTarget, FilePresentation, FileDecision, FileRe
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { searchSessionSources } from './agent-source.ts';
 import { isCompartmentEvidenceGap } from './historian.ts';
+import { responseInputIds } from './agent-state.ts';
 import { guidanceConflicts } from './guidance-conflicts.ts';
 import type { GuidanceOperation } from './guidance-conflicts.ts';
 import type { GuidanceSession, GuidanceTarget, InstructionSnapshot } from './guidance-session.ts';
@@ -298,11 +299,7 @@ export class AgentRun {
     const p2 = state.responses.map(response => {
       const refs: SourceAck[] = [response.source];
       turnSources.push(refs);
-      const attempt = ledger.attempts.find(attempt => attempt.attemptId === response.attemptId)!;
-      const bound = ledger.events.filter(event => event.kind === 'agent/event@v1').map(event => JSON.parse(event.payload).event as AgentEvent)
-        .find(event => event.kind === 'bound' && event.assemblyId === attempt.assemblyId);
-      check(bound?.kind === 'bound', 'response-assembly-gap');
-      const inputs = bound.eventIds.map(id => {
+      const inputs = responseInputIds(ledger, response.attemptId).map(id => {
         priorInputs.add(id);
         const source = state.inputs.find(input => input.source.eventId === id)!.source;
         refs.push(source);

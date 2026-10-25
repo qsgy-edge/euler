@@ -1,4 +1,4 @@
-import type { RequestContext } from '../store/request-ledger.ts';
+import type { RequestContext, RequestStatus } from '../store/request-ledger.ts';
 import type { Binding, SourceAck } from '../contracts.ts';
 import { check } from '../contracts.ts';
 import type { FileAdmission, FileReceipt, FileCapability, FileFailureReason } from './file-contract.ts';
@@ -43,6 +43,16 @@ export interface AgentStatus {
   files: { admission: FileAdmission; approved: boolean; approvalSource?: SourceAck; reconciled?: FileReceipt; failureReason?: FileFailureReason }[];
   responses: { attemptId: string; source: SourceAck }[];
 }
+export function responseInputIds(ledger: RequestStatus, attemptId: string): string[] {
+  const attempt = ledger.attempts.find(item => item.attemptId === attemptId);
+  check(attempt, 'response-assembly-gap');
+  const bound = ledger.events.filter(event => event.kind === 'agent/event@v1')
+    .map(event => JSON.parse(event.payload).event as AgentEvent)
+    .find(event => event.kind === 'bound' && event.assemblyId === attempt.assemblyId);
+  check(bound?.kind === 'bound', 'response-assembly-gap');
+  return bound.eventIds;
+}
+
 export function replayAgent(events: AgentEvent[], attempts: number): AgentStatus {
   const state: AgentStatus = { terminal: null, attempts, discoveryGrantId: null, guidanceRunId: null, windows: [], cacheEpoch: null, invalidEpochs: [], inputs: [], responses: [], tools: [], files: [] };
   check(events[0]?.kind === 'opened', 'agent-evidence-gap');

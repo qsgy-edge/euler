@@ -3,7 +3,7 @@ import { parseAnalysisArtifact } from '../context/analysis-artifacts.ts';
 import { assertHistorianReply, compartmentBody, isCompartmentEvidenceGap } from '../context/historian.ts';
 import type { Compartment, CompartmentBody, HistorianBounds } from '../context/historian.ts';
 import type { ExportSelection } from '../context/analysis-artifacts.ts';
-import { replayAgent } from '../context/agent-state.ts';
+import { replayAgent, responseInputIds } from '../context/agent-state.ts';
 import type { AgentEvent, AgentStatus } from '../context/agent-state.ts';
 import { isUntypedRemember, parseMemoryProposal, parseOwnerAgreement, parseOwnerStatement } from '../context/owner-memory.ts';
 import type { OwnerMemoryStatement } from '../context/owner-memory.ts';
@@ -2274,21 +2274,26 @@ export class ProbeStore {
       if (firstResponse === endResponse) return this.#captureJob(String(previous!.job_id));
       check(firstResponse < endResponse, 'historian-boundary-stale');
       const range: SourceAck[] = [];
-      for (const response of state.responses.slice(firstResponse, endResponse)) {
-        const attempt = ledger.attempts.find(item => item.attemptId === response.attemptId)!;
-        const bound = ledger.events.filter(event => event.kind === 'agent/event@v1').map(event => JSON.parse(event.payload).event as AgentEvent)
-          .find(event => event.kind === 'bound' && event.assemblyId === attempt.assemblyId);
-        check(bound?.kind === 'bound', 'response-assembly-gap');
-        if (!range.length && firstResponse > 0 && bound.eventIds.length) {
-          const preceding = state.responses[firstResponse - 1]!;
-          range.push(preceding.source, ...state.tools.filter(tool => tool.attemptId === preceding.attemptId).map(tool => tool.result!.source));
+      const appendResponse = (response: AgentStatus['responses'][number]) => {
+        range.push(response.source);
+        for (const tool of state.tools.filter(tool => tool.attemptId === response.attemptId)) {
+          const file = state.files.find(file => file.admission.callId === tool.callId);
+          if (file) {
+            range.push(file.admission.source);
+            if (file.approvalSource) range.push(file.approvalSource);
+          }
+          range.push(tool.result!.source);
         }
-        for (const eventId of bound.eventIds) {
+      };
+      for (const response of state.responses.slice(firstResponse, endResponse)) {
+        const eventIds = responseInputIds(ledger, response.attemptId);
+        if (!range.length && firstResponse > 0 && eventIds.length) appendResponse(state.responses[firstResponse - 1]!);
+        for (const eventId of eventIds) {
           const input = state.inputs.find(input => input.source.eventId === eventId);
           check(input?.state === 'bound-to-assembly', 'historian-source-gap');
           if (!range.some(ref => sameSourceAck(ref, input.source))) range.push(input.source);
         }
-        range.push(response.source, ...state.tools.filter(tool => tool.attemptId === response.attemptId).map(tool => tool.result!.source));
+        appendResponse(response);
       }
       const scope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true };
       let bytes = 0;
@@ -2655,10 +2660,9 @@ export class ProbeStore {
   }
 
   #isCaptureOutput(ref: SourceAck): boolean {
-    const role = this.#archiveRef(ref).role;
-    if (role === 'user') return false;
+    this.#archiveRef(ref);
     // The body uses its durable job identity even before its publication row commits.
-    if (role === 'assistant' && this.#db.prepare(`SELECT 1 FROM capture_jobs
+    if (this.#db.prepare(`SELECT 1 FROM capture_jobs
       WHERE job_id=? AND consumer='historian' AND source_owner=?`).get(ref.eventId, ref.binding.sessionId)) return true;
     const steps = this.#db.prepare(`SELECT e.payload,e.hash FROM request_events e
       JOIN capture_work w ON w.run_id=e.run_id JOIN capture_jobs j ON j.job_id=w.job_id
@@ -2670,7 +2674,7 @@ export class ProbeStore {
       return sameBinding(JSON.parse(String(row.payload)).source.binding, ref.binding);
     });
     // Before the step is recorded, a response uses its already-owned attempt identity.
-    return role === 'assistant' && !!this.#db.prepare(`SELECT 1 FROM request_attempts a
+    return !!this.#db.prepare(`SELECT 1 FROM request_attempts a
       JOIN capture_work w ON w.run_id=a.run_id JOIN capture_jobs j ON j.job_id=w.job_id
       JOIN sessions s ON s.session_id=j.source_owner
       WHERE a.attempt_id=? AND s.owner_id=? AND s.project_id=?`).get(ref.eventId, ref.binding.ownerId, ref.binding.projectId);
