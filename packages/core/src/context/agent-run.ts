@@ -242,6 +242,10 @@ export class AgentRun {
     if (current) this.#event({ kind: 'cache-epoch-invalidated', cacheEpoch: current.cacheEpoch, reason });
   }
   newWindow(reason: 'pressure' | 'explicit' = 'explicit', selectCompartments = true): string {
+    return this.#openWindow(reason, selectCompartments
+      ? this.#budget.contextLimit - this.#budget.outputReserve - this.#budget.safetyMargin : 0);
+  }
+  #openWindow(reason: 'pressure' | 'explicit', compartmentBytes: number): string {
     check(this.#active() && !this.#inflight && !this.#ready, 'window-not-admissible');
     const state = this.status();
     check(state.tools.every(tool => tool.result), 'unsettled-tool-batch');
@@ -249,13 +253,12 @@ export class AgentRun {
       ...state.tools.map(tool => tool.result!.source)];
     for (const source of recovery) this.#host.source.read(source);
     const firstResponse = Math.max(0, state.responses.length - 1);
-    const { selected, unavailable } = this.#store.compartmentsForWindow(this.#activity, this.runId, firstResponse,
-      Math.floor((this.#budget.contextLimit - this.#budget.outputReserve - this.#budget.safetyMargin) / 3));
+    const { selected, unavailable } = this.#store.compartmentsForWindow(this.#activity, this.runId, firstResponse, compartmentBytes);
     this.#invalidateCache('fresh-window');
     const windowId = randomUUID();
     this.#event({ kind: 'window-opened', windowId, previousWindowId: state.windows.at(-1)!.windowId,
       firstResponse, reason, recovery,
-      ...(selectCompartments && selected.length ? { compartments: selected.map(item => ({ jobId: item.jobId, source: item.source })) } : {}),
+      ...(selected.length ? { compartments: selected.map(item => ({ jobId: item.jobId, source: item.source })) } : {}),
       ...(unavailable.length ? { compartmentGaps: unavailable } : {}) });
     this.#host.guidance?.session.newWindow();
     return windowId;
@@ -341,7 +344,7 @@ export class AgentRun {
         ...(window.firstResponse ? { recovery: { runId: this.runId, windowId: window.windowId, omittedTurns: window.firstResponse } } : {}) },
       p2: p2.slice(window.firstResponse), p3 };
     let degradation: RequestAssemblyInput['degradation'] = state.windows.length > 1 ? 'window' : operationContext.operationArchive ? 'compact' : 'none';
-    const encode = () => this.#host.encode ? this.#host.encode(structuredClone(neutral)) : JSON.stringify(neutral);
+    const encode = (value = neutral) => this.#host.encode ? this.#host.encode(structuredClone(value)) : JSON.stringify(value);
     let payload = encode();
     let byteLength = Buffer.byteLength(payload);
     let reserved = byteLength + this.#budget.outputReserve + this.#budget.safetyMargin;
@@ -352,7 +355,13 @@ export class AgentRun {
       degradation = 'selected';
     }
     if (reserved > this.#budget.contextLimit && compartments.length) {
-      this.newWindow('pressure', false); return this.nextModel();
+      const mandatory = { ...neutral, p1: { ...neutral.p1 } };
+      delete mandatory.p1.compartments;
+      const remaining = this.#budget.contextLimit - this.#budget.outputReserve - this.#budget.safetyMargin - Buffer.byteLength(encode(mandatory));
+      const selectedBytes = compartments.reduce((total, item) => total + Buffer.byteLength(JSON.stringify(item.body)), 0);
+      // Account for provider encoding overhead and strictly shrink the selected body budget.
+      this.#openWindow('pressure', Math.max(0, Math.min(remaining, selectedBytes - (reserved - this.#budget.contextLimit))));
+      return this.nextModel();
     }
     if (reserved > this.#budget.contextLimit && state.responses.length - window.firstResponse > 1) {
       this.newWindow('pressure');
