@@ -5,8 +5,8 @@ import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from '
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { AgentRun, CaptureRun, DEFAULT_BUDGET, encodeOwnerAgreement, fileIdentity } from '@euler/core';
-import type { CaptureConfig, FileCapability, ModelReply } from '@euler/core';
+import { AgentRun, AnalysisArtifacts, CaptureRun, DEFAULT_BUDGET, encodeOwnerAgreement, fileIdentity, sha256 } from '@euler/core';
+import type { AnalysisHeader, CaptureConfig, FileCapability, ModelReply, SourceAck } from '@euler/core';
 import { createSandbox, bindingOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 import { pumpCapture } from '../src/agent-pump.ts';
@@ -459,6 +459,174 @@ test('the real owner CLI skips corrupted derived backfill and still accepts genu
     assert.equal(results.some(event => event.level === 'error' || event.content === 'forged-derived-marker'), false);
     assert.deepEqual(results.filter(event => event.status === 'activated').map(event => event.content), ['original-owner-marker', 'next-owner-marker']);
   } finally { if (!closed) value.probe.close(); value.release(); rmSync(value.sandbox.root, { recursive: true, force: true }); }
+});
+
+for (const target of ['body', 'reply'] as const) for (const boundary of ['publication', 'discovery', 'export', 'intent', 'operation'] as const)
+  test('derived identities cannot authorize ' + boundary + ': ' + target, () => {
+    const value = setup();
+    try {
+      const { store, activity, archive } = value.probe;
+      const { run } = consumer(value);
+      deliver(value, run, JSON.stringify({ result: 'pass', summary: 'Synthetic summary.' }));
+      const compartment = store.readCompartment(activity, value.job.jobId);
+      const intent = store.readIntent(activity)!;
+      const projectId = value.sandbox.fixture.projectId;
+      const raw = archive.append(randomUUID(), 'Original synthetic source.');
+      const publication = approvedSourceUnit(value.probe, { ref: raw, projectId, kind: 'source', offset: 0, length: 10 });
+      let text = '', invoke: (input: SourceAck) => unknown;
+      switch (boundary) {
+        case 'publication':
+          text = archive.read(publication.approval).text;
+          invoke = input => store.publishSourceUnit(activity, { ...publication, approval: input });
+          break;
+        case 'discovery':
+          text = JSON.stringify({ schema: 'memory-discovery-approval@1', intentId: intent.intentId, goalEventId: intent.goalInput.eventId,
+            projectIds: [projectId], targets: {}, maxResults: 10, maxBytes: 131072 });
+          invoke = input => store.authorizeMemoryDiscovery(activity, input, [projectId], 10);
+          break;
+        case 'export': {
+          const unit = store.publishSourceUnit(activity, publication), selection = [{ unitId: unit.unitId, hash: unit.contentHash }];
+          text = JSON.stringify({ schema: 'analysis-export-approval@1', selection });
+          invoke = input => store.renderAnalysisExport(activity, selection, input);
+          break;
+        }
+        case 'intent':
+          text = 'Synthetic owner task progress.';
+          invoke = input => store.transitionIntent(activity, intent.eventId, input, { status: 'active', step: 'analysis' });
+          break;
+        case 'operation': {
+          const record = store.rememberMemory(activity, { input: archive.append(randomUUID(), '记住偏好：keep-owner-approval'), hostInfo: 'durable' }).record;
+          const preview = store.previewMemoryOperation(activity, store.inspectMemoryPresentation(activity, [record.recordId]).token, { kind: 'forget' });
+          store.registerCorrectionDelivery(activity, preview.token);
+          text = 'commit ' + preview.token + ' forget';
+          invoke = input => store.recordCorrectionApproval(activity, preview.token, input);
+          break;
+        }
+      }
+      const eventId = target === 'body' ? compartment.source.eventId : compartment.attemptId;
+      const path = join(value.sandbox.root, 'session.jsonl'), lines = readFileSync(path, 'utf8').trimEnd().split('\n');
+      const index = lines.findIndex(line => JSON.parse(line).eventId === eventId);
+      assert.ok(index > 0); lines[index] = JSON.stringify({ ...JSON.parse(lines[index]!), role: 'user', text });
+      writeFileSync(path, lines.join('\n') + '\n');
+      const input = archive.lookup(eventId)!;
+      assert.equal(store.isCaptureOutput(activity, input), true);
+      assert.throws(() => invoke(input), /^Error: source-derived$/u);
+      assert.equal(store.readIntent(activity)!.eventId, intent.eventId);
+      assert.doesNotThrow(() => invoke(archive.append(randomUUID(), text, 'user')));
+    } finally { value.close(); }
+  });
+
+for (const target of ['body', 'reply', 'original'] as const) for (const depth of [1, 2])
+  test('analysis evidence follows original identity through ' + depth + ' wrapper(s): ' + target, () => {
+    const value = setup();
+    try {
+      const { store, activity, archive } = value.probe;
+      const { run } = consumer(value);
+      deliver(value, run, JSON.stringify({ result: 'pass', summary: 'Synthetic summary.' }));
+      const compartment = store.readCompartment(activity, value.job.jobId);
+      const intent = store.readIntent(activity)!, projectId = value.sandbox.fixture.projectId;
+      let ref = target === 'original' ? value.job.range[0]!
+        : archive.lookup(target === 'body' ? compartment.source.eventId : compartment.attemptId)!;
+      assert.equal(store.isCaptureOutput(activity, ref), target !== 'original');
+      let bodyOffset = 0;
+      const body = 'Synthetic analysis handoff.';
+      for (let layer = 0; layer < depth; layer++) {
+        const excerpt = Array.from(archive.read(ref).text).slice(0, 10).join('');
+        const artifactId = randomUUID();
+        const header = { schema: 'analysis-artifact@1', kind: 'handoff', artifactId, version: 1,
+          task: intent.goalInput, intentId: intent.intentId, supersedes: null, bodyHash: sha256(body), requestHash: sha256('synthetic-input'),
+          evidence: [{ request: { ref, offset: 0, limit: 10 }, hash: sha256(excerpt), projectId }], coverage: { projects: [projectId], complete: false } };
+        const prefix = '<!-- euler-analysis-artifact@1 ' + JSON.stringify(header) + ' -->\n\n';
+        ref = archive.append(artifactId, prefix + body, 'assistant');
+        bodyOffset = Array.from(prefix).length;
+      }
+      const publication = approvedSourceUnit(value.probe, { ref, projectId, kind: 'report-section', offset: bodyOffset, length: body.length });
+      if (target !== 'original') {
+        assert.throws(() => store.validateAnalysisSource(activity, ref), /^Error: source-derived$/u);
+        assert.throws(() => store.publishSourceUnit(activity, publication), /^Error: source-derived$/u);
+        assert.throws(() => store.captureMemory(activity, ref, body, { type: 'preference',
+          scope: { kind: 'project', id: projectId, resolved: true }, appliesTo: [] }), /^Error: source-derived$/u);
+        store.drainSourceProjection(activity);
+        assert.equal(store.searchSources(activity, { query: 'handoff' }).results.length, 0);
+      } else {
+        assert.doesNotThrow(() => store.validateAnalysisSource(activity, ref));
+        const unit = store.publishSourceUnit(activity, publication);
+        assert.equal(store.captureMemory(activity, ref, body, { type: 'preference',
+          scope: { kind: 'project', id: projectId, resolved: true }, appliesTo: [] }).record.lifecycle, 'candidate');
+        const proposal = { target: 'synthetic-guidance', expectedChange: 'Use original evidence.', owner: value.sandbox.fixture.ownerId,
+          scope: { kind: 'project' as const, id: projectId, resolved: true }, evidenceRefs: [], sourceUnits: [unit.unitId],
+          evaluation: { schema: 'evaluation-contract@1' as const, level: 'L0' as const, assertions: ['Original evidence only.'] } };
+        const approval = archive.append(randomUUID(), JSON.stringify({ schema: 'analysis-proposal-approval@1', proposal }));
+        assert.equal(store.saveEvolutionProposal(activity, approval, proposal).sourceUnits![0], unit.unitId);
+      }
+    } finally { value.close(); }
+  });
+
+for (const target of ['body', 'reply'] as const) for (const field of ['task', 'supersedes', 'export'] as const)
+  test('analysis metadata cannot reuse derived ' + field + ': ' + target, () => {
+    const value = setup();
+    try {
+      const { store, activity, archive } = value.probe;
+      const { run } = consumer(value);
+      deliver(value, run, JSON.stringify({ result: 'pass', summary: 'Synthetic summary.' }));
+      const compartment = store.readCompartment(activity, value.job.jobId), intent = store.readIntent(activity)!;
+      const body = 'Synthetic handoff body.', projectId = value.sandbox.fixture.projectId;
+      const header: AnalysisHeader = { schema: 'analysis-artifact@1', kind: 'handoff', artifactId: randomUUID(), version: 1,
+        task: intent.goalInput, intentId: intent.intentId, supersedes: null, bodyHash: sha256(body), requestHash: sha256('synthetic-input'),
+        evidence: [], coverage: { projects: [], complete: false } };
+      let text = 'Synthetic task reference.', role: 'user' | 'assistant' = 'user';
+      let selection: { unitId: string; hash: string }[] = [];
+      if (field === 'supersedes') {
+        text = '<!-- euler-analysis-artifact@1 ' + JSON.stringify(header) + ' -->\n\n' + body;
+        role = 'assistant'; header.version = 2;
+      } else if (field === 'export') {
+        const source = archive.append(randomUUID(), 'Original selected source.');
+        const unit = store.publishSourceUnit(activity, approvedSourceUnit(value.probe, { ref: source, projectId, kind: 'source', offset: 0, length: 10 }));
+        selection = [{ unitId: unit.unitId, hash: unit.contentHash }];
+        text = JSON.stringify({ schema: 'analysis-export-approval@1', selection });
+        header.kind = 'export';
+      }
+      const eventId = target === 'body' ? compartment.source.eventId : compartment.attemptId;
+      const path = join(value.sandbox.root, 'session.jsonl'), lines = readFileSync(path, 'utf8').trimEnd().split('\n');
+      const index = lines.findIndex(line => JSON.parse(line).eventId === eventId);
+      assert.ok(index > 0); lines[index] = JSON.stringify({ ...JSON.parse(lines[index]!), role, text });
+      writeFileSync(path, lines.join('\n') + '\n');
+      const derived = archive.lookup(eventId)!;
+      assert.equal(store.isCaptureOutput(activity, derived), true);
+      if (field === 'task') header.task = derived;
+      else if (field === 'supersedes') header.supersedes = derived;
+      else header.exportInputs = { selection, approval: derived };
+      const prefix = '<!-- euler-analysis-artifact@1 ' + JSON.stringify(header) + ' -->\n\n';
+      const wrapper = archive.append(randomUUID(), prefix + body, 'assistant');
+      assert.throws(() => store.validateAnalysisSource(activity, wrapper), /^Error: source-derived$/u);
+      assert.throws(() => store.publishSourceUnit(activity, approvedSourceUnit(value.probe, { ref: wrapper, projectId,
+        kind: 'report-section', offset: Array.from(prefix).length, length: body.length })), /^Error: source-derived$/u);
+    } finally { value.close(); }
+  });
+
+test('analysis version history remains usable beyond the evidence nesting limit', () => {
+  const value = setup();
+  try {
+    const { store, activity, archive } = value.probe, artifacts = new AnalysisArtifacts(store, activity, archive);
+    let prior = artifacts.saveHandoff({ eventId: randomUUID(), title: 'Synthetic history', markdown: 'Original v1', evidence: [] });
+    for (let version = 2; version <= 20; version++) prior = artifacts.saveHandoff({ eventId: randomUUID(), title: 'Synthetic history',
+      markdown: 'Original v' + version, evidence: [], supersedes: prior.ref });
+    assert.equal(artifacts.read(prior.ref).version, 20);
+    const unit = store.publishSourceUnit(activity, approvedSourceUnit(value.probe, { ref: prior.ref, projectId: value.sandbox.fixture.projectId,
+      kind: 'report-section', offset: prior.bodyOffset, length: prior.body.length }));
+    assert.equal(unit.contentHash, sha256('Original v20'));
+  } finally { value.close(); }
+});
+
+test('an owner task can contain literal analysis syntax without becoming an artifact', () => {
+  const sandbox = createSandbox(), probe = openProbe(sandbox);
+  try {
+    const text = '<!-- euler-analysis-artifact@1 explain this literal prefix';
+    const input = probe.archive.append(randomUUID(), text);
+    const intent = probe.store.transitionIntent(probe.activity, null, input, { status: 'active', step: 'explain' }, text);
+    assert.equal(probe.store.readIntent(probe.activity)!.goal, text);
+    assert.equal(probe.store.recoverIntent(probe.activity)!.eventId, intent.eventId);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
 test('a compartment cannot be republished as a raw project source unit', () => {

@@ -856,7 +856,7 @@ export class ProbeStore {
 
   #readDiscoveryApproval(consent: SourceAck, intent: Intent): MemoryDiscoveryApproval {
     check(sameBinding(consent?.binding, this.#binding) && consent.eventId !== intent.goalInput.eventId, 'discovery-consent-required');
-    this.#validateSource(consent);
+    this.#validateRawSource(consent);
     const source = this.#readSource!(consent);
     check(source.role === 'user', 'discovery-consent-required');
     const text = source.text;
@@ -985,6 +985,7 @@ export class ProbeStore {
       check(offset + length <= points.length, 'invalid-range');
       const content = points.slice(offset, offset + length).join('');
       check(Buffer.byteLength(content) <= 16384, 'invalid-source-unit');
+      this.#analysisReferences(archive.text);
       const prior = input.supersedes === undefined ? null : this.#sourceUnit(input.supersedes).unit;
       check(!prior || prior.projectId === projectId && prior.kind === kind, 'source-version-mismatch');
       check(input.approval, 'source-publication-approval-required');
@@ -1046,6 +1047,7 @@ export class ProbeStore {
     check(approval && sameBinding(approval.binding, unit.ref.binding) && approval.eventId !== unit.ref.eventId,
       'source-publication-approval-required');
     const decision = this.#archiveRef(approval);
+    check(!this.#isCaptureOutput(approval), 'source-derived');
     check(decision.role === 'user' && Buffer.byteLength(decision.text) <= 8192, 'source-publication-approval-required');
     let value: Record<string, unknown>;
     try { value = JSON.parse(decision.text) as Record<string, unknown>; }
@@ -1109,14 +1111,17 @@ export class ProbeStore {
     check(!this.#checkingAnalysis.has(key) && this.#checkingAnalysis.size < 16, 'analysis-reference-cycle');
     this.#checkingAnalysis.add(key);
     try {
-      this.#archiveRef(parsed.header.task);
+      check(!this.#isCaptureOutput(parsed.header.task), 'source-derived');
       for (const evidence of parsed.header.evidence) {
         const request = evidence.request;
         check(request && Number.isSafeInteger(request.offset) && request.offset >= 0
           && Number.isSafeInteger(request.limit) && request.limit > 0 && request.limit <= 4096, 'analysis-evidence-gap');
         let source: string;
-        if ('ref' in request) source = this.#archiveRef(request.ref).text;
-        else if (this.#db.prepare('SELECT 1 FROM source_units WHERE unit_id=?').get(request.unitId)) source = this.#sourceUnit(request.unitId).text;
+        if ('ref' in request) {
+          check(!this.#isCaptureOutput(request.ref), 'source-derived');
+          source = this.#archiveRef(request.ref).text;
+          this.#analysisReferences(source);
+        } else if (this.#db.prepare('SELECT 1 FROM source_units WHERE unit_id=?').get(request.unitId)) source = this.#sourceUnit(request.unitId).text;
         else {
           this.#proposalForProjects(request.unitId, this.#registeredProjects());
           source = String(this.#db.prepare('SELECT payload FROM evolution_proposals WHERE proposal_id=?').get(request.unitId)!.payload);
@@ -1126,7 +1131,7 @@ export class ProbeStore {
       }
       if (parsed.header.exportInputs) {
         const exported = parsed.header.exportInputs;
-        this.#archiveRef(exported.approval);
+        check(!this.#isCaptureOutput(exported.approval), 'source-derived');
         for (const item of exported.selection) {
           const unit = this.#db.prepare('SELECT unit_id FROM source_units WHERE unit_id=?').get(item.unitId);
           if (unit) check(this.#sourceUnit(item.unitId).unit.contentHash === item.hash, 'analysis-evidence-gap');
@@ -1134,6 +1139,7 @@ export class ProbeStore {
         }
       }
       if (parsed.header.supersedes) {
+        check(!this.#isCaptureOutput(parsed.header.supersedes), 'source-derived');
         const prior = parseAnalysisArtifact(this.#archiveRef(parsed.header.supersedes).text);
         check(prior && prior.header.artifactId === parsed.header.artifactId
           && prior.header.version + 1 === parsed.header.version, 'analysis-version-mismatch');
@@ -1144,6 +1150,7 @@ export class ProbeStore {
   validateAnalysisSource(activity: Activity, ref: SourceAck): void {
     this.withActivity(activity, () => {
       check(sameBinding(ref.binding, this.#binding), 'source-scope-mismatch');
+      check(!this.#isCaptureOutput(ref), 'source-derived');
       this.#analysisReferences(this.#archiveRef(ref).text);
     });
   }
@@ -1153,6 +1160,7 @@ export class ProbeStore {
       check(Array.isArray(selection) && selection.length > 0 && selection.length <= 16
         && new Set(selection.map(item => item.unitId)).size === selection.length, 'invalid-export-selection');
       check(sameBinding(approval?.binding, this.#binding), 'export-approval-required');
+      this.#validateRawSource(approval);
       const decision = this.#archiveRef(approval);
       check(decision.role === 'user', 'export-approval-required');
       let value: { schema?: string; selection?: ExportSelection[] };
@@ -2118,6 +2126,7 @@ export class ProbeStore {
       && sameBinding(intent.binding, this.#binding), 'intent-evidence-gap');
     this.#validateSource(intent.input);
     this.#validateSource(intent.goalInput);
+    check(!this.#isCaptureOutput(intent.input) && !this.#isCaptureOutput(intent.goalInput), 'source-derived');
     return { ...intent, hash: String(row.hash) };
   }
 
@@ -2151,6 +2160,7 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       check(sameBinding(input.binding, this.#binding) && input.status === 'durable', 'source-scope-mismatch');
       this.#validateSource(input);
+      check(!this.#isCaptureOutput(input), 'source-derived');
       check(transition && typeof transition === 'object'
         && Object.keys(transition).every(key => key === 'step' || key === 'status'), 'invalid-transition');
       check(['active', 'paused', 'completed', 'needs-input'].includes(transition.status)
@@ -3252,7 +3262,8 @@ export class ProbeStore {
         check(sha256(payload) === row[`${field}_hash`], 'operation-delivery-evidence-gap');
         const ref = JSON.parse(payload) as SourceAck;
         check(sameBinding(ref.binding, this.#binding), 'operation-delivery-evidence-gap');
-        this.#archiveRef(ref);
+        if (field === 'approval') this.#validateRawSource(ref);
+        else this.#archiveRef(ref);
         return ref;
       };
       return { operationId: presentation.operationId!, summaryEventId: String(row.summary_event_id),
@@ -3263,6 +3274,7 @@ export class ProbeStore {
   recordCorrectionApproval(activity: Activity, token: string, input: SourceAck): void {
     this.withActivity(activity, () => {
       const presentation = this.readMemoryPresentation(activity, token);
+      this.#validateRawSource(input);
       const raw = this.#archiveRef(input);
       const command = parseCorrectionCommand(raw.text);
       check(raw.role === 'user' && sameBinding(input.binding, this.#binding)
@@ -5435,6 +5447,7 @@ export class ProbeStore {
   #validateRawSource(input: SourceAck, content?: string, targetScope?: MemoryScope, projects?: readonly string[]): void {
     this.#validateSource(input, content, targetScope, projects);
     check(!this.#isCaptureOutput(input), 'source-derived');
+    this.#analysisReferences(this.#archiveRef(input).text);
   }
 
   #sourceAllowedForScope(binding: Binding, scope: MemoryScope): boolean {
