@@ -16,6 +16,10 @@ export interface Compartment {
   rawHash: string; attemptId: string; source: SourceAck; body: CompartmentBody;
 }
 
+export function isCompartmentEvidenceGap(error: unknown): boolean {
+  return error instanceof Error && /^(source-|archive-|compartment-|historian-|capture-evidence-gap)/.test(error.message);
+}
+
 export function assertHistorianReply(value: unknown): asserts value is HistorianReply {
   check(value !== null && typeof value === 'object' && !Array.isArray(value), 'invalid-historian-output');
   const reply = value as HistorianReply;

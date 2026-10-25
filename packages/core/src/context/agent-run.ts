@@ -10,6 +10,7 @@ import { fileToolSchemas, parseFileCall, validateFileCapability } from './file-c
 import type { FileCapability, FileTarget, FilePresentation, FileDecision, FileReceipt, FileFailureReason } from './file-contract.ts';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import { searchSessionSources } from './agent-source.ts';
+import { isCompartmentEvidenceGap } from './historian.ts';
 import { guidanceConflicts } from './guidance-conflicts.ts';
 import type { GuidanceOperation } from './guidance-conflicts.ts';
 import type { GuidanceSession, GuidanceTarget, InstructionSnapshot } from './guidance-session.ts';
@@ -138,7 +139,8 @@ export class AgentRun {
     }
   }
   #sourceRefs(): SourceAck[] {
-    if (this.#host.source.events) return this.#host.source.events().map(event => event.ack);
+    if (this.#host.source.events) return this.#host.source.events().map(event => event.ack)
+      .filter(ref => !this.#store.isCaptureOutput(this.#activity, ref));
     const state = this.status();
     const refs = [...state.inputs.map(input => input.source), ...state.responses.map(response => response.source),
       ...state.tools.flatMap(tool => tool.result ? [tool.result.source] : []),
@@ -324,7 +326,7 @@ export class AgentRun {
     let compartments: import('./historian.ts').Compartment[];
     try { compartments = (window.compartments ?? []).map(item => this.#store.readCompartment(this.#activity, item.jobId)); }
     catch (error) {
-      if (!(error instanceof Error) || !/^(source-|archive-|compartment-|historian-|capture-evidence-gap)/.test(error.message)) throw error;
+      if (!isCompartmentEvidenceGap(error)) throw error;
       this.newWindow('pressure', false); return this.nextModel();
     }
     for (const compartment of compartments) sources.push(compartment.source, ...compartment.body.citations);

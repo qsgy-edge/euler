@@ -60,7 +60,7 @@ export async function runHistorianDemo(sandbox: Sandbox, scenario: string, confi
       authNamespace: configured.authNamespace, capability: configured.captureCapability! }
       : { ...agentRoute, model: 'historian-fixture', capability: 'standard' as const };
     let sends = 0;
-    const abort = new AbortController();
+    const abort = new AbortController(), responseLost = new Error('synthetic-response-lost');
     try {
       await drainCaptures(probe, { jobId: job.jobId, batch: 1, deadlineMs: Math.min(30000, budget.wallClockMs), budget,
         config: { historian: scenario === 'protocol' ? [route, { ...route, model: 'fallback-fixture' }] : [route] },
@@ -77,7 +77,7 @@ export async function runHistorianDemo(sandbox: Sandbox, scenario: string, confi
           }
           const attempt = send(request.payload); probe.transport.send(request.payload, attempt); sends++;
           console.log(JSON.stringify({ event: 'historian-request', request, attemptId: attempt.attemptId }));
-          if (scenario === 'unknown') throw new Error('synthetic-response-lost');
+          if (scenario === 'unknown') throw responseLost;
           if (scenario === 'cancel') { abort.abort(new Error('capture-stopped')); signal.throwIfAborted(); }
           const text = scenario === 'protocol' && sends === 1 ? 'invalid fixture output'
             : scenario === 'block' || scenario === 'evidence-gap' ? JSON.stringify({ result: scenario, reason: 'synthetic-negative' })
@@ -85,7 +85,8 @@ export async function runHistorianDemo(sandbox: Sandbox, scenario: string, confi
           yield { kind: 'complete', reply: { text, calls: [], stop: 'end' } };
         } } });
     } catch (error) {
-      if (!['unknown','cancel'].includes(scenario)) throw error;
+      if (!(scenario === 'unknown' && error === responseLost)
+        && !(scenario === 'cancel' && abort.signal.aborted && error === abort.signal.reason)) throw error;
     }
     const result = probe.store.readCaptureJob(probe.activity, job.jobId);
     check(run.status().cacheEpoch!.cacheEpoch === initialEpoch, 'historian-generated-prefix-changed');

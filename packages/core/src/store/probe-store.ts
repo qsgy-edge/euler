@@ -1,6 +1,6 @@
 import { isLiveMemoryOperation, matchesMemoryApproval, memoryOperationSummary, parseCorrectionCommand } from '../context/memory-correction.ts';
 import { parseAnalysisArtifact } from '../context/analysis-artifacts.ts';
-import { assertHistorianReply, compartmentBody } from '../context/historian.ts';
+import { assertHistorianReply, compartmentBody, isCompartmentEvidenceGap } from '../context/historian.ts';
 import type { Compartment, CompartmentBody, HistorianBounds } from '../context/historian.ts';
 import type { ExportSelection } from '../context/analysis-artifacts.ts';
 import { replayAgent } from '../context/agent-state.ts';
@@ -979,6 +979,7 @@ export class ProbeStore {
         .get(projectId, this.#binding.ownerId), 'source-project-unavailable');
       check(Number.isSafeInteger(offset) && offset >= 0 && Number.isSafeInteger(length) && length > 0 && length <= 4096, 'invalid-range');
       const archive = this.#archiveRef(ref);
+      check(!this.#isCaptureOutput(ref), 'source-derived');
       this.#assertRawSourceAccess(activity, ref);
       const points = Array.from(archive.text);
       check(offset + length <= points.length, 'invalid-range');
@@ -1090,6 +1091,7 @@ export class ProbeStore {
     const project = this.#db.prepare('SELECT owner_id FROM projects WHERE project_id=?').get(unit.projectId);
     check(project?.owner_id === this.#binding.ownerId, 'source-evidence-gap');
     this.#publicationApproval(unit);
+    check(!this.#isCaptureOutput(unit.ref), 'source-evidence-gap');
     const raw = this.#archiveRef(unit.ref).text;
     this.#analysisReferences(raw);
     const points = Array.from(raw);
@@ -2277,6 +2279,10 @@ export class ProbeStore {
         const bound = ledger.events.filter(event => event.kind === 'agent/event@v1').map(event => JSON.parse(event.payload).event as AgentEvent)
           .find(event => event.kind === 'bound' && event.assemblyId === attempt.assemblyId);
         check(bound?.kind === 'bound', 'response-assembly-gap');
+        if (!range.length && firstResponse > 0 && bound.eventIds.length) {
+          const preceding = state.responses[firstResponse - 1]!;
+          range.push(preceding.source, ...state.tools.filter(tool => tool.attemptId === preceding.attemptId).map(tool => tool.result!.source));
+        }
         for (const eventId of bound.eventIds) {
           const input = state.inputs.find(input => input.source.eventId === eventId);
           check(input?.state === 'bound-to-assembly', 'historian-source-gap');
@@ -2380,8 +2386,7 @@ export class ProbeStore {
           const size = Buffer.byteLength(JSON.stringify(compartment.body));
           if (bytes + size <= maxBytes) { selected.unshift(compartment); bytes += size; }
         } catch (error) {
-          const reason = error instanceof Error ? error.message : '';
-          if (!/^(source-|archive-|compartment-|historian-|capture-evidence-gap)/.test(reason)
+          if (!isCompartmentEvidenceGap(error)
             && !['ENOENT','EACCES','EPERM'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
           unavailable.push({ jobId: String(row.job_id), reason: 'compartment-unavailable' });
         }
@@ -2645,26 +2650,30 @@ export class ProbeStore {
   isCaptureOutput(activity: Activity, ref: SourceAck): boolean {
     return this.withActivity(activity, () => {
       check(sameBinding(ref.binding, this.#binding), 'source-scope-mismatch');
-      const role = this.#archiveRef(ref).role;
-      if (role === 'user') return false;
-      // The body uses its durable job identity even before its publication row commits.
-      if (role === 'assistant' && this.#db.prepare(`SELECT 1 FROM capture_jobs
-        WHERE job_id=? AND consumer='historian' AND source_owner=?`).get(ref.eventId, ref.binding.sessionId)) return true;
-      const steps = this.#db.prepare(`SELECT e.payload,e.hash FROM request_events e
-        JOIN capture_work w ON w.run_id=e.run_id JOIN capture_jobs j ON j.job_id=w.job_id
-        JOIN sessions s ON s.session_id=j.source_owner
-        WHERE e.kind='capture/step@v1' AND json_extract(e.payload,'$.source.eventId')=? AND s.owner_id=? AND s.project_id=?`)
-        .all(ref.eventId, this.#binding.ownerId, this.#binding.projectId);
-      if (steps.length) return steps.some(row => {
-        check(sha256(String(row.payload)) === row.hash, 'capture-evidence-gap');
-        return sameSourceAck(JSON.parse(String(row.payload)).source, ref);
-      });
-      // Before the step is recorded, a response uses its already-owned attempt identity.
-      return role === 'assistant' && !!this.#db.prepare(`SELECT 1 FROM request_attempts a
-        JOIN capture_work w ON w.run_id=a.run_id JOIN capture_jobs j ON j.job_id=w.job_id
-        JOIN sessions s ON s.session_id=j.source_owner
-        WHERE a.attempt_id=? AND s.owner_id=? AND s.project_id=?`).get(ref.eventId, this.#binding.ownerId, this.#binding.projectId);
+      return this.#isCaptureOutput(ref);
     });
+  }
+
+  #isCaptureOutput(ref: SourceAck): boolean {
+    const role = this.#archiveRef(ref).role;
+    if (role === 'user') return false;
+    // The body uses its durable job identity even before its publication row commits.
+    if (role === 'assistant' && this.#db.prepare(`SELECT 1 FROM capture_jobs
+      WHERE job_id=? AND consumer='historian' AND source_owner=?`).get(ref.eventId, ref.binding.sessionId)) return true;
+    const steps = this.#db.prepare(`SELECT e.payload,e.hash FROM request_events e
+      JOIN capture_work w ON w.run_id=e.run_id JOIN capture_jobs j ON j.job_id=w.job_id
+      JOIN sessions s ON s.session_id=j.source_owner
+      WHERE e.kind='capture/step@v1' AND json_extract(e.payload,'$.source.eventId')=? AND s.owner_id=? AND s.project_id=?`)
+      .all(ref.eventId, ref.binding.ownerId, ref.binding.projectId);
+    if (steps.length) return steps.some(row => {
+      check(sha256(String(row.payload)) === row.hash, 'capture-evidence-gap');
+      return sameBinding(JSON.parse(String(row.payload)).source.binding, ref.binding);
+    });
+    // Before the step is recorded, a response uses its already-owned attempt identity.
+    return role === 'assistant' && !!this.#db.prepare(`SELECT 1 FROM request_attempts a
+      JOIN capture_work w ON w.run_id=a.run_id JOIN capture_jobs j ON j.job_id=w.job_id
+      JOIN sessions s ON s.session_id=j.source_owner
+      WHERE a.attempt_id=? AND s.owner_id=? AND s.project_id=?`).get(ref.eventId, ref.binding.ownerId, ref.binding.projectId);
   }
 
   readCaptureOutput(lease: CaptureLease, ref: SourceAck): { text: string; role?: 'user' | 'assistant' | 'tool' } {
@@ -5278,6 +5287,7 @@ export class ProbeStore {
       const { ref } = request;
       check(sameBinding(ref?.binding, this.#binding), 'source-scope-mismatch');
       this.#validateSource(ref);
+      check(!this.#isCaptureOutput(ref), 'source-derived');
       this.#assertRawSourceAccess(activity, ref);
       const raw = this.#readSource!(ref).text;
       const artifact = parseAnalysisArtifact(raw);

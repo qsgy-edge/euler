@@ -1,7 +1,5 @@
 # Stable Historian compartments
 
-Issue: #19. Delivery: `feat/t19-historian-compartments` + PR because this changes Core execution, context selection, the disposable schema and required checks. Base: `146c7bd4453e5713c88124b7b522af3771bc19ec`.
-
 The authority is v1 I05/I08–I10, Ticket 13 D4/D5, and the Historian portions of X-04/X-07/X-14. The implementation uses the previously approved Core public operation/result boundary and actual CLI/HTTP entry points. No formal behavior amendment is required; the tests and evidence runner extend the existing harness.
 
 ## Run and inspect
@@ -31,7 +29,7 @@ Core derives input from admitted owner inputs, archived complete model responses
 
 A separate `historian` consumer uses the existing `capture_jobs`, `capture_work`, job-owned execution stream, leases, frozen budget and request barriers. Memory capture remains a separate consumer. Range boundaries advance only over original Agent events; background model output and published compartment bodies are never selected as the next raw range. Repeating a boundary reuses its existing job, and a completed job never generates another summary. Source, owner, session, project, raw hash, route and attempt identities come from Core and actual transport observations.
 
-The model returns a bounded summary or an explicit negative result. Harness copies exact owner inputs, their preceding response when present, tool-result envelopes, final task results and immutable citations from the raw range. These mandatory anchors and the session/project/run applicability envelope cannot be rewritten by the summary response. This conservative representation can be larger than a wholly lossy summary; it falls back to raw windows when it does not fit. Model summary text remains untrusted historical context, and semantic fidelity still needs real-provider evaluation.
+The model returns a bounded summary or an explicit negative result. Harness copies exact owner inputs, their preceding response when present, tool-result envelopes, final task results and immutable citations from the raw range. Leading inputs at an incremental boundary also retain the preceding complete response and its tool results as raw dependencies, so an approval keeps its proposal across segments. These mandatory anchors and the session/project/run applicability envelope cannot be rewritten by the summary response. This conservative representation can be larger than a wholly lossy summary; it falls back to raw windows when it does not fit. Model summary text remains untrusted historical context, and semantic fidelity still needs real-provider evaluation.
 
 A complete model reply is archived and its attempt settled before publication. Only a validated result produces a structured `compartment@1` archive entry and an immutable `compartments` metadata row. A failed/incomplete result has no published locator. The deterministic publication event identity permits replay after a received response but before publication without another model call. Its durable job identity marks the body as derived even if the process dies before the publication row commits. Unknown attempts remain unknown after receiver reconciliation and cannot be retried by reopening or taking over a lease.
 
@@ -41,7 +39,7 @@ A volatile Store-local observation ties a live foreground pump to the exact Hist
 
 Generating a compartment creates no frontend window or epoch event. `AgentRun.newWindow()` selects published local compartments only at a settled complete boundary, within a bounded portion of the context budget. The window freezes their job/source identities. The new assembly includes the structured bodies, exact active instructions and intent, the latest complete pair, and raw recovery anchors. Prefix changes then create a new epoch. Old sent payloads and receipts remain immutable.
 
-Assembly, started and send gates recheck the selected compartment and its raw dependencies. Missing/corrupt optional bodies are reported as compartment gaps and use a raw window; corruption after assembly prevents sending the stale snapshot. Additional pressure can drop optional compartments at a new boundary. Mandatory content and cumulative run budgets retain T18 behavior. Exact parameters, wording and citations remain recoverable through the original `source.search/source.expand` path; summary text does not substitute for the referenced raw bytes.
+Assembly, started and send gates recheck the selected compartment and its raw dependencies. Missing/corrupt optional bodies are reported as compartment gaps and use a raw window; corruption after assembly prevents sending the stale snapshot. Additional pressure can drop optional compartments at a new boundary. Mandatory content and cumulative run budgets retain T18 behavior. Exact parameters, wording and citations remain recoverable through the original `source.search/source.expand` path. Session searches exclude background outputs; raw expansion and project source publication reject their identities, including damaged or unpublished compartment bodies. Summary text does not substitute for the referenced raw bytes.
 
 ## Ownership and evidence
 

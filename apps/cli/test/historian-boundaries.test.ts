@@ -7,6 +7,7 @@ import { AgentRun, CaptureRun, DEFAULT_BUDGET } from '@euler/core';
 import type { CaptureConfig, ModelReply } from '@euler/core';
 import { createSandbox, bindingOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
+import { approvedSourceUnit } from './support/source-publication.ts';
 
 
 test('a missing raw source blocks the Historian before a model request', () => {
@@ -72,12 +73,12 @@ function consumer(value: ReturnType<typeof setup>, config: CaptureConfig = { his
   const lease = value.probe.store.claimCaptureJob(value.probe.activity, value.job.jobId, budget, 30000)!;
   return { lease, run: new CaptureRun(value.probe.store, lease, value.probe.archive, config, undefined, 'capture-counting@1') };
 }
-function deliver(value: ReturnType<typeof setup>, run: CaptureRun, text: string) {
+function deliver(value: ReturnType<typeof setup>, run: CaptureRun | AgentRun, text: string | ModelReply) {
   const request = run.nextModel()!; assert.ok(request);
   const attempt = run.startModel(request, request.payload);
   assert.equal(run.maySend(attempt.attemptId, request.payload), true);
   value.probe.transport.send(request.payload, attempt);
-  run.finishModel(attempt.attemptId, { text, calls: [], stop: 'end' });
+  run.finishModel(attempt.attemptId, typeof text === 'string' ? { text, calls: [], stop: 'end' } : text);
   return request;
 }
 
@@ -182,4 +183,78 @@ test('another Store cannot borrow a live parent pump to start a Historian reques
     peer.store.stopCapture(lease, 'blocked', 'request-recovery-required');
     value.agent.cancel();
   } finally { peer.close(); value.close(); }
+});
+
+for (const damaged of [false, true]) test('raw recovery excludes background replies and compartment bodies, damaged=' + damaged, () => {
+  const value = setup(), path = join(value.sandbox.root, 'session.jsonl');
+  try {
+    const { run } = consumer(value);
+    deliver(value, run, JSON.stringify({ result: 'pass', summary: 'UNIQUEDERIVEDSUMMARY' }));
+    const compartment = value.probe.store.readCompartment(value.probe.activity, value.job.jobId);
+    if (damaged) {
+      const lines = readFileSync(path, 'utf8').trimEnd().split('\n');
+      for (const eventId of [compartment.source.eventId, compartment.attemptId]) {
+        const index = lines.findIndex(line => JSON.parse(line).eventId === eventId);
+        lines[index] = lines[index]!.replace('UNIQUEDERIVEDSUMMARY', 'DAMAGEDDERIVEDSUMMARY');
+      }
+      writeFileSync(path, lines.join('\n') + '\n');
+    }
+    const { capability: _capability, ...agentRoute } = route;
+    const agent = new AgentRun(value.probe.store, value.probe.activity,
+      { binding: bindingOf(value.sandbox), source: value.probe.archive }, agentRoute, budget);
+    agent.receive(randomUUID(), 'Restore the archived exact values.');
+    deliver(value, agent, { text: 'Search the archive.', calls: [{ id: 'search', name: 'source.search',
+      arguments: { query: 'DERIVEDSUMMARY' } }], stop: 'tools' });
+    agent.startTool('search');
+    const searched = agent.coreToolResult('search')!;
+    assert.equal(searched.outcome, 'success');
+    const hits = JSON.parse(searched.modelResult).results as { eventId: string }[];
+    assert.equal(hits.some(hit => [compartment.source.eventId, compartment.attemptId].includes(hit.eventId)), false);
+    agent.finishTool('search', searched.modelResult);
+    const refs = [compartment.source, value.probe.archive.lookup(compartment.attemptId)!, value.job.range[0]!];
+    deliver(value, agent, { text: 'Recover exact raw evidence.', calls: refs.map((ref, index) => ({
+      id: 'expand-' + index, name: 'source.expand', arguments: { eventId: ref.eventId, offset: 0, limit: 4096 } })), stop: 'tools' });
+    for (let index = 0; index < refs.length; index++) {
+      const id = 'expand-' + index;
+      agent.startTool(id); const result = agent.coreToolResult(id)!;
+      assert.equal(result.outcome, index < 2 ? 'failure' : 'success');
+      if (index < 2) assert.match(result.modelResult, /source-derived/);
+      else assert.match(result.modelResult, /exact value 47/);
+      agent.finishTool(id, result.modelResult);
+    }
+    agent.cancel();
+  } finally { value.close(); }
+});
+
+test('a compartment cannot be republished as a raw project source unit', () => {
+  const value = setup();
+  try {
+    const { run } = consumer(value);
+    deliver(value, run, JSON.stringify({ result: 'pass', summary: 'A synthetic summary.' }));
+    const compartment = value.probe.store.readCompartment(value.probe.activity, value.job.jobId);
+    const input = approvedSourceUnit(value.probe, { ref: compartment.source, kind: 'source',
+      projectId: bindingOf(value.sandbox).projectId, offset: 0, length: 64 });
+    assert.throws(() => value.probe.store.publishSourceUnit(value.probe.activity, input), /source-derived/);
+  } finally { value.close(); }
+});
+
+test('an approval keeps its preceding complete proposal across incremental raw boundaries', () => {
+  const value = setup(true);
+  try {
+    const proposal = value.agent.status().responses.at(-1)!.source;
+    const preceding = value.probe.archive.read(proposal).text;
+    const approval = value.agent.receive(randomUUID(), '同意');
+    let job = value.job;
+    for (const id of ['approved', 'continue']) {
+      deliver(value, value.agent, { text: 'Continue the approved task.', calls: [{ id, name: 'controlled.echo', arguments: { text: id } }], stop: 'tools' });
+      value.agent.startTool(id); value.agent.finishTool(id, 'Synthetic completed observation.');
+      job = value.probe.store.queueHistorianBoundary(value.probe.activity, value.agent.runId, { minBytes: 1, maxBytes: 30000 })!;
+    }
+    value.agent.cancel();
+    assert.ok(job.range.some(ref => ref.eventId === proposal.eventId));
+    const { run } = consumer({ ...value, job });
+    deliver(value, run, JSON.stringify({ result: 'pass', summary: 'The owner accepted the preceding proposal.' }));
+    const compartment = value.probe.store.readCompartment(value.probe.activity, job.jobId);
+    assert.equal(compartment.body.decisions.find(item => item.eventId === approval.eventId)!.precedingResponse, preceding);
+  } finally { value.close(); }
 });
