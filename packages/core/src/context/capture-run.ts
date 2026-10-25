@@ -386,6 +386,12 @@ export class CaptureRun {
   }
 
   fail(error?: unknown): CaptureJob {
+    if (!this.#inflight && this.#phase === 'historian' && this.remainingMs() > 0 && this.status().stage === 'proposing'
+      && this.#steps().some(step => step.phase === 'historian' && step.kind === 'response' && step.outcome === 'response')) {
+      this.#store.pauseCapture(this.#lease, 'historian-publication-pending');
+      this.#paused = true;
+      return this.status();
+    }
     const reason = error instanceof Error && /^[a-z][a-z0-9-]{1,80}$/.test(error.message) ? error.message
       : this.#inflight ? 'attempt-reconciliation-required' : 'capture-protocol-failed';
     return this.#store.stopCapture(this.#lease, this.#inflight ? 'unknown' : 'blocked', reason);

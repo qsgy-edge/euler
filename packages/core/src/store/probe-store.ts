@@ -2577,7 +2577,7 @@ export class ProbeStore {
       && Number(row!.lease_until) > Date.now() && Number(row!.deadline) > Date.now();
   }
 
-  pauseCapture(lease: CaptureLease, reason: 'foreground-run-active' | 'host-info-recovery-required' | 'request-recovery-required' = 'foreground-run-active'): void {
+  pauseCapture(lease: CaptureLease, reason: 'foreground-run-active' | 'host-info-recovery-required' | 'request-recovery-required' | 'historian-publication-pending' = 'foreground-run-active'): void {
     this.withActivity(lease.activity, () => {
       const job = this.#captureLease(lease), runtime = this.captureRuntime(lease);
       check(!runtime.runId || this.requestStatus(lease.activity, runtime.runId).attempts.every(attempt => attempt.outcome !== 'unknown-sent'), 'attempt-reconciliation-required');

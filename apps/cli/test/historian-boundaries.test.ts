@@ -8,6 +8,7 @@ import { AgentRun, CaptureRun, DEFAULT_BUDGET, fileIdentity } from '@euler/core'
 import type { CaptureConfig, FileCapability, ModelReply } from '@euler/core';
 import { createSandbox, bindingOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
+import { pumpCapture } from '../src/agent-pump.ts';
 import { approvedSourceUnit } from './support/source-publication.ts';
 
 
@@ -136,29 +137,46 @@ test('an unknown Historian attempt is reconciled without a second model request 
   } finally { value.close(); }
 });
 
-test('a received response survives reopening before artifact publication without another lossy generation', () => {
-  const value = setup();
+for (const afterAppend of [false, true]) test(`the Historian pump resumes publication without another send after an append failure, written=${afterAppend}`, async () => {
+  const value = setup(), failure = new Error('synthetic-publication-interrupted');
   let reopened: ReturnType<typeof openProbe> | undefined, closed = false;
   try {
     const lease = value.probe.store.claimCaptureJob(value.probe.activity, value.job.jobId, budget, 30000)!;
+    const deadline = value.probe.store.captureRuntime(lease).deadline;
     const source = new Proxy(value.probe.archive, { get(target, key) {
       if (key === 'append') return (id: string, ...args: Parameters<typeof target.append> extends [string, ...infer T] ? T : never) => {
-        if (id === value.job.jobId) throw new Error('synthetic-publication-interrupted');
-        return target.append(id, ...args);
+        if (id !== value.job.jobId) return target.append(id, ...args);
+        if (afterAppend) target.append(id, ...args);
+        throw failure;
       };
       const field = Reflect.get(target, key, target); return typeof field === 'function' ? field.bind(target) : field;
     } });
     const run = new CaptureRun(value.probe.store, lease, source, { historian: [route] });
-    assert.throws(() => deliver(value, run, JSON.stringify({ result: 'pass', summary: 'A faithful synthetic summary.' })), /synthetic-publication-interrupted/);
-    value.probe.store.pauseCapture(lease);
+    await assert.rejects(pumpCapture(run, { async *stream(request, _signal, send) {
+      const attempt = send(request.payload); value.probe.transport.send(request.payload, attempt);
+      yield { kind: 'complete', reply: { text: JSON.stringify({ result: 'pass', summary: 'A faithful synthetic summary.' }), calls: [], stop: 'end' } };
+    } }), error => error === failure);
+    const attempts = value.probe.store.requestStatus(lease.activity, run.runId).attempts;
+    assert.equal(attempts.length, 1); assert.equal(attempts[0]!.outcome, 'received');
+    assert.equal(value.probe.transport.count, 1);
+    assert.equal(Boolean(value.probe.archive.lookup(value.job.jobId)), afterAppend);
+    assert.throws(() => value.probe.store.readCompartment(value.probe.activity, value.job.jobId), /compartment-unavailable/);
+    assert.equal(run.nextModel(), null);
     value.probe.close(); closed = true;
     reopened = openProbe(value.sandbox, budget, undefined, undefined, undefined, true);
-    const next = reopened.store.claimCaptureJob(reopened.activity, value.job.jobId, budget, 30000)!;
+    for (const ref of value.job.range) reopened.archive.read(ref);
+    const savedReply = JSON.parse(reopened.archive.read(reopened.archive.lookup(attempts[0]!.attemptId)!).text);
+    assert.equal(JSON.parse(savedReply.text).result, 'pass');
+    const next = reopened.store.claimCaptureJob(reopened.activity, value.job.jobId, budget, 30000);
+    assert.ok(next, 'the saved response must remain claimable for publication');
+    assert.equal(reopened.store.captureRuntime(next).deadline, deadline);
     const recovered = new CaptureRun(reopened.store, next, reopened.archive, { historian: [route] });
-    assert.equal(recovered.nextModel(), null);
-    assert.equal(recovered.status().stage, 'complete');
+    assert.equal(recovered.runId, run.runId);
+    assert.equal((await pumpCapture(recovered, { async *stream() { assert.fail('publication recovery must not call a model'); } })).stage, 'complete');
+    assert.equal(reopened.transport.count, 0);
     assert.equal(reopened.store.requestStatus(next.activity, recovered.runId).attempts.length, 1);
     assert.equal(reopened.store.readCompartment(reopened.activity, value.job.jobId).body.summary, 'A faithful synthetic summary.');
+    assert.equal(reopened.archive.events().filter(event => event.ack.eventId === value.job.jobId).length, 1);
   } finally { reopened?.close(); if (!closed) value.probe.close(); value.release(); rmSync(value.sandbox.root, { recursive: true, force: true }); }
 });
 
