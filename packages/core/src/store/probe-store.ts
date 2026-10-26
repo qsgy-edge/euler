@@ -1868,28 +1868,33 @@ export class ProbeStore {
   }
 
   #verifyRequestSources(assemblies: (RequestAssembly & { state?: RequestAssemblyState })[], activity?: Activity, currentAssemblyId?: string | null): void {
-    for (const assembly of assemblies) for (const source of assembly.sources) {
-      let refs = [source], scope: MemoryScope | undefined;
-      // Only settled history can use a published compartment's original raw range.
-      // Undefined keeps strict artifact checks; null denotes a sealed predecessor.
-      if (currentAssemblyId !== undefined && assembly.assemblyId !== currentAssemblyId && assembly.state === 'finished') {
-        const row = this.#db.prepare(`SELECT c.* FROM compartments c JOIN capture_jobs j ON j.job_id=c.job_id
-          WHERE c.job_id=? AND j.source_owner=? AND j.consumer='historian'`).get(source.eventId, source.binding.sessionId);
-        if (row) {
-          const published = JSON.parse(String(row.source_json)) as SourceAck, attemptId = String(row.attempt_id);
-          if (sameSourceAck(source, published)) {
-            check(row.hash === sha256(JSON.stringify({ source: published, attemptId })), 'compartment-integrity');
-            const job = this.#captureJob(source.eventId);
-            check(job.consumer === 'historian' && sameBinding(source.binding, job.source.binding), 'historian-owner-mismatch');
-            refs = job.range; scope = job.scope;
+    for (const assembly of assemblies) {
+      let projects: string[] | undefined;
+      for (const source of assembly.sources) {
+        let refs = [source], scope: MemoryScope | undefined;
+        // Only settled history can use a published compartment's original raw range.
+        // Undefined keeps strict artifact checks; null denotes a sealed predecessor.
+        if (currentAssemblyId !== undefined && assembly.assemblyId !== currentAssemblyId && assembly.state === 'finished') {
+          const row = this.#db.prepare(`SELECT c.* FROM compartments c JOIN capture_jobs j ON j.job_id=c.job_id
+            WHERE c.job_id=? AND j.source_owner=? AND j.consumer='historian'`).get(source.eventId, source.binding.sessionId);
+          if (row) {
+            const published = JSON.parse(String(row.source_json)) as SourceAck, attemptId = String(row.attempt_id);
+            if (sameSourceAck(source, published)) {
+              check(row.hash === sha256(JSON.stringify({ source: published, attemptId })), 'compartment-integrity');
+              const job = this.#captureJob(source.eventId);
+              check(job.consumer === 'historian' && sameBinding(source.binding, job.source.binding), 'historian-owner-mismatch');
+              refs = job.range; scope = job.scope;
+            }
           }
         }
-      }
-      for (const ref of refs) {
-        this.#validateSource(ref, undefined, scope);
-        if (activity) this.#assertRawSourceAccess(activity, ref, assembly.context
-          ? assembly.context.discoveryGrantId ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : [this.#binding.projectId]
-          : undefined);
+        for (const ref of refs) {
+          this.#validateSource(ref, undefined, scope);
+          if (activity) {
+            if (assembly.context && !projects) projects = assembly.context.discoveryGrantId
+              ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : [this.#binding.projectId];
+            this.#assertRawSourceAccess(activity, ref, projects);
+          }
+        }
       }
     }
   }
