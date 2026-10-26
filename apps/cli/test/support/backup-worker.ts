@@ -3,10 +3,11 @@ import fs from 'node:fs';
 import sqlite from 'node:sqlite';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
-import { ProbeStore, ProbeSession, API_VERSION, DEFAULT_BUDGET } from '@euler/core';
+import { ProbeStore, ProbeSession, API_VERSION, DEFAULT_BUDGET, type Binding } from '@euler/core';
 import { openSandbox, bindingOf, resourcesOf, createSandboxSession } from '../../src/sandbox.ts';
 import { openProbe } from '../../src/probe.ts';
 import { backupSandbox, restoreSandboxSnapshot } from '../../src/backup.ts';
+import { seedBackupOperations, corruptBackupOperation } from './backup-operations.ts';
 
 const [root, action, value] = process.argv.slice(2);
 const sandbox = openSandbox(root!);
@@ -14,7 +15,39 @@ function crash(point: string): never {
   fs.writeSync(1, JSON.stringify({ event: 'snapshot-crash', point }) + '\n');
   process.kill(process.pid, 'SIGKILL'); throw new Error('process-was-not-killed');
 }
-if (action === 'migration-checkpoint') {
+if (action === 'seed-operations') {
+  const bindings = [bindingOf(sandbox), { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID(), branchId: randomUUID() }];
+  createSandboxSession(sandbox, bindings[1]!);
+  console.log(JSON.stringify(bindings.map(binding => {
+    const probe = openProbe(sandbox, undefined, undefined, binding, undefined, true);
+    try { return { binding, saved: seedBackupOperations(probe, binding.projectId) }; } finally { probe.close(); }
+  })));
+} else if (action === 'corrupt-operations') {
+  const { token, fault } = JSON.parse(value!) as { token: string; fault: string };
+  corruptBackupOperation(sandbox.root, token, fault);
+  console.log(JSON.stringify({ token, fault }));
+} else if (action === 'advance-operations' || action === 'read-operations') {
+  const requests = JSON.parse(value!) as { binding: Binding; committedToken: string; pendingToken: string; receiptId: string }[];
+  console.log(JSON.stringify(requests.map((request, index) => {
+    const probe = openProbe(sandbox, undefined, undefined, request.binding, undefined, true);
+    try {
+      const { store, activity } = probe;
+      if (action === 'advance-operations') {
+        const pending = store.readMemoryPresentation(activity, request.pendingToken);
+        store.acknowledgeMemoryPresentation(activity, pending.token, pending.hash);
+        return store.commitMemoryOperation(activity, pending.token);
+      }
+      const foreign = requests[1 - index]!;
+      const rejected = (read: () => unknown) => { try { return { result: read() }; } catch (error) { return { error: (error as Error).message }; } };
+      return { binding: request.binding, presentation: store.readMemoryPresentation(activity, request.committedToken),
+        result: store.memoryOperationStatus(activity, request.committedToken), pending: store.memoryOperationStatus(activity, request.pendingToken),
+        delivery: store.correctionDelivery(activity, request.committedToken), summaries: store.correctionModelSummaries(activity),
+        foreign: { presentation: rejected(() => store.readMemoryPresentation(activity, foreign.committedToken)),
+          operation: store.memoryOperationStatus(activity, foreign.committedToken), receipt: rejected(() => store.readOwnerReceipt(activity, foreign.receiptId)) },
+        sends: probe.transport.count };
+    } finally { probe.close(); }
+  })));
+} else if (action === 'migration-checkpoint') {
   console.log(JSON.stringify(await backupSandbox(sandbox, 'migration')));
 } else if (action === 'queue-capture') {
   const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);

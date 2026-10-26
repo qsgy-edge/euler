@@ -6,6 +6,8 @@ import { arch, release, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createSandbox } from '../apps/cli/src/sandbox.ts';
+import type { Binding } from '@euler/core';
+import type { seedBackupOperations } from '../apps/cli/test/support/backup-operations.ts';
 
 const hash = (value: string | Uint8Array) => createHash('sha256').update(value).digest('hex');
 const fixturePath = 'fixtures/t20-backup-cases.json';
@@ -44,6 +46,7 @@ for (const scenario of fixture.cases) {
     let infoBatches: string[] | undefined, laterInfo: string | undefined, handoff: unknown, intent: unknown;
     let feedback: { recordId: string; feedbackId: string; input: unknown } | undefined, captureJobId: string | undefined;
     let unclaimedJob: { jobId: string } | undefined;
+    let memoryOperations: { binding: Binding; saved: ReturnType<typeof seedBackupOperations> }[] | undefined, operationRequest: string | undefined;
     if (scenario.startsWith('owner-info')) {
       infoBatches = cli('setup','remember',[],'success','记住偏好：包管理器使用 pnpm\n记住决定：本项目使用 SQLite WAL\nstop\n')
         .filter(e => e.event === 'remember-result' && e.status === 'activated').map(e => e.batchId);
@@ -57,6 +60,11 @@ for (const scenario of fixture.cases) {
         feedback = run('feedback-seeded',['apps/cli/test/support/backup-worker.ts',sandbox.root,'seed-feedback',recordId])[0];
       }
     } else cli('setup', 'run');
+    if (scenario.startsWith('operations')) {
+      memoryOperations = run('operations-seeded', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'seed-operations'])[0];
+      operationRequest = JSON.stringify(memoryOperations!.map(({ binding, saved }) => ({ binding,
+        committedToken: saved.committed.token, pendingToken: saved.pending.token, receiptId: saved.result.receiptIds[0] })));
+    }
     if (scenario === 'intent-metadata-corruption') intent = run('intent-before',['apps/cli/test/support/backup-worker.ts',sandbox.root,'read-intent'])[0];
     if (scenario.endsWith('unclaimed-job-missing')) {
       const action = scenario.startsWith('historian-') ? 'unclaimed-historian' : 'queue-capture';
@@ -173,6 +181,22 @@ for (const scenario of fixture.cases) {
         assert.equal(damaged.prepare('DELETE FROM capture_jobs WHERE job_id=?').run(unclaimedJob.jobId).changes,1);
       } finally { damaged.close(); }
       cpSync(sandbox.root,join(path,'damaged-sandbox'),{recursive:true});
+    }
+    if (memoryOperations) {
+      if (scenario === 'operations') {
+        const advanced = run('operations-advanced', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'advance-operations',operationRequest!])[0];
+        assert.ok(advanced.every((result: { status: string }) => result.status === 'committed'));
+      } else {
+        const fault = scenario.slice('operations-'.length);
+        const reason = fault === 'presentation-hash' ? 'invalid-presentation-identity' : fault === 'presentation-target' ? 'presentation-evidence-gap'
+          : fault.startsWith('operation-') ? 'operation-evidence-gap' : fault === 'model-summary' ? 'operation-summary-mismatch' : 'operation-delivery-evidence-gap';
+        run('operation-damaged', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'corrupt-operations',
+          JSON.stringify({ token: memoryOperations[0]!.saved.committed.token, fault })]);
+        cpSync(sandbox.root,join(path,'damaged-sandbox'),{recursive:true});
+        run('operation-reader-rejected', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'read-operations',operationRequest!], 'error');
+        assert.ok(readFileSync(join(path,'operation-reader-rejected.stderr.txt'),'utf8').includes(reason));
+        assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason, reason);
+      }
     }
     if (scenario === 'canonical-corruption') {
       const db = new DatabaseSync(join(sandbox.root, 'probe.sqlite'));
@@ -336,6 +360,17 @@ for (const scenario of fixture.cases) {
         assert.ok(readFileSync(join(plan.original.path, receiver.name),'utf8').includes(unknown.attemptId!));
       }
     } finally { db.close(); }
+    if (memoryOperations) {
+      const recovered = run('operations-recovered', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'read-operations',operationRequest!])[0];
+      for (const [index, { saved: before }] of memoryOperations.entries()) {
+        const actual = recovered[index];
+        assert.deepEqual(actual.presentation, before.committed); assert.deepEqual(actual.result, before.result);
+        assert.equal(actual.pending.status,'pending'); assert.deepEqual(actual.delivery,before.delivery); assert.deepEqual(actual.summaries,[before.summary]);
+        assert.equal(actual.foreign.presentation.error,'invalid-presentation-identity');
+        assert.equal(actual.foreign.operation.status,'invalid_identity'); assert.equal(actual.foreign.receipt.error,'invalid-memory-scope');
+        assert.equal(actual.sends,0);
+      }
+    }
     if (handoff) {
       const result = run('handoff-verified',['apps/cli/test/support/backup-handoff-worker.ts',sandbox.root,'verify',JSON.stringify(handoff)])[0];
       assert.deepEqual(result.versions,[1,2]); assert.equal(result.privateReadsRejected,4);
@@ -383,7 +418,7 @@ for (const scenario of fixture.cases) {
   }
 }
 const contractTestCommand = ['--test','--test-concurrency=1','--test-reporter=tap',
-  'apps/cli/test/backup.test.ts','apps/cli/test/backup-inventory.test.ts','apps/cli/test/backup-recovery.test.ts','apps/cli/test/backup-integrity.test.ts','apps/cli/test/backup-content.test.ts'];
+  'apps/cli/test/backup.test.ts','apps/cli/test/backup-inventory.test.ts','apps/cli/test/backup-recovery.test.ts','apps/cli/test/backup-integrity.test.ts','apps/cli/test/backup-content.test.ts','apps/cli/test/backup-operations.test.ts'];
 const contractTestResult = spawnSync(process.execPath, contractTestCommand, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
 writeFileSync(join(directory,'contract-tests.stdout.tap'),contractTestResult.stdout ?? '');
 writeFileSync(join(directory,'contract-tests.stderr.txt'),contractTestResult.stderr ?? '');

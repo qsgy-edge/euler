@@ -3235,55 +3235,57 @@ export class ProbeStore {
   }
 
   readMemoryPresentation(activity: Activity, token: string): MemoryPresentation {
-    return this.withActivity(activity, () => {
-      const row = this.#db.prepare('SELECT * FROM host_presentations WHERE token=? AND session_id=? AND branch_id=?')
-        .get(token, this.#binding.sessionId, this.#binding.branchId);
-      check(row && sha256(String(row.payload)) === row.payload_hash, 'invalid-presentation-identity');
-      const value = JSON.parse(String(row.payload)) as Omit<MemoryPresentation, 'hash'>;
-      check(value.schema === 'memory-presentation@1' && value.presentationId === row.presentation_id && value.token === row.token
-        && value.sessionId === row.session_id && value.branchId === row.branch_id && value.epoch === row.epoch && value.ordinal === row.ordinal
-        && value.kind === row.kind && value.operationId === row.operation_id && value.originatingPresentationId === row.originating_id
-        && value.supersedesOperationId === row.supersedes_operation_id && value.batchId === row.batch_id && value.batchDigest === row.batch_digest
-        && Array.isArray(value.eventIds) && Array.isArray(value.updateEventIds)
-        && value.updateEventIds.length === (value.kind === 'inspect' ? 0 : value.targets.length)
-        && value.eventIds.length === (value.kind === 'rollback' ? value.targets.length : 0)
-        && (value.kind === 'correct' ? typeof value.content === 'string' && value.input !== null && value.targets.length === 1
-          : value.content === null && value.input === null),
-      'presentation-evidence-gap');
-      if (value.operationId) {
-        const operation = this.#db.prepare('SELECT presentation_hash FROM pending_operations WHERE operation_id=? AND presentation_id=?')
-          .get(value.operationId, value.presentationId);
-        check(operation?.presentation_hash === row.payload_hash, 'presentation-evidence-gap');
+    return this.withActivity(activity, () => this.#readMemoryPresentation(token));
+  }
+
+  #readMemoryPresentation(token: string, binding: Binding = this.#binding): MemoryPresentation {
+    const row = this.#db.prepare('SELECT * FROM host_presentations WHERE token=? AND session_id=? AND branch_id=?')
+      .get(token, binding.sessionId, binding.branchId);
+    check(row && sha256(String(row.payload)) === row.payload_hash, 'invalid-presentation-identity');
+    const value = JSON.parse(String(row.payload)) as Omit<MemoryPresentation, 'hash'>;
+    check(value.schema === 'memory-presentation@1' && value.presentationId === row.presentation_id && value.token === row.token
+      && value.sessionId === row.session_id && value.branchId === row.branch_id && value.epoch === row.epoch && value.ordinal === row.ordinal
+      && value.kind === row.kind && value.operationId === row.operation_id && value.originatingPresentationId === row.originating_id
+      && value.supersedesOperationId === row.supersedes_operation_id && value.batchId === row.batch_id && value.batchDigest === row.batch_digest
+      && Array.isArray(value.eventIds) && Array.isArray(value.updateEventIds)
+      && value.updateEventIds.length === (value.kind === 'inspect' ? 0 : value.targets.length)
+      && value.eventIds.length === (value.kind === 'rollback' ? value.targets.length : 0)
+      && (value.kind === 'correct' ? typeof value.content === 'string' && value.input !== null && value.targets.length === 1
+        : value.content === null && value.input === null),
+    'presentation-evidence-gap');
+    if (value.operationId) {
+      const operation = this.#db.prepare('SELECT presentation_hash FROM pending_operations WHERE operation_id=? AND presentation_id=?')
+        .get(value.operationId, value.presentationId);
+      check(operation?.presentation_hash === row.payload_hash, 'presentation-evidence-gap');
+    }
+    const targets = this.#db.prepare('SELECT * FROM presentation_targets WHERE presentation_id=? ORDER BY ordinal').all(value.presentationId);
+    check(targets.length === value.targets.length && targets.length > 0, 'presentation-evidence-gap');
+    for (const [index, target] of value.targets.entries()) {
+      const stored = targets[index]!;
+      if (value.kind !== 'inspect') uuid(value.updateEventIds[index]!);
+      check(stored.ordinal === index && stored.record_id === target.recordId && stored.revision_id === target.revisionId
+        && stored.head_event_id === target.headEventId && stored.lifecycle === target.lifecycle && stored.verification === target.verification
+        && stored.scope_kind === target.scope.kind && stored.scope_id === target.scope.id
+        && stored.selected_event_id === (value.eventIds[index] ?? null) && stored.update_event_id === (value.updateEventIds[index] ?? null)
+        && stored.snapshot === this.#snapshotBytes(target)
+        && stored.snapshot_hash === target.hash && target.hash === sha256(String(stored.snapshot)), 'presentation-evidence-gap');
+      if (value.kind !== 'rollback') {
+        const event = this.#db.prepare('SELECT after_snapshot FROM memory_events WHERE event_id=? AND record_id=?').get(target.headEventId, target.recordId);
+        check(event?.after_snapshot === stored.snapshot, 'presentation-evidence-gap');
       }
-      const targets = this.#db.prepare('SELECT * FROM presentation_targets WHERE presentation_id=? ORDER BY ordinal').all(value.presentationId);
-      check(targets.length === value.targets.length && targets.length > 0, 'presentation-evidence-gap');
-      for (const [index, target] of value.targets.entries()) {
-        const stored = targets[index]!;
-        if (value.kind !== 'inspect') uuid(value.updateEventIds[index]!);
-        check(stored.ordinal === index && stored.record_id === target.recordId && stored.revision_id === target.revisionId
-          && stored.head_event_id === target.headEventId && stored.lifecycle === target.lifecycle && stored.verification === target.verification
-          && stored.scope_kind === target.scope.kind && stored.scope_id === target.scope.id
-          && stored.selected_event_id === (value.eventIds[index] ?? null) && stored.update_event_id === (value.updateEventIds[index] ?? null)
-          && stored.snapshot === this.#snapshotBytes(target)
-          && stored.snapshot_hash === target.hash && target.hash === sha256(String(stored.snapshot)), 'presentation-evidence-gap');
-        if (value.kind !== 'rollback') {
-          const event = this.#db.prepare('SELECT after_snapshot FROM memory_events WHERE event_id=? AND record_id=?').get(target.headEventId, target.recordId);
-          check(event?.after_snapshot === stored.snapshot, 'presentation-evidence-gap');
-        }
-      }
-      if (value.batchId) {
-        // Read the immutable presentation independently of later canonical damage. Commit
-        // revalidates the live batch inside its transaction and durably settles stale selections.
-        check(typeof value.batchPayload === 'string' && sha256(value.batchPayload) === value.batchDigest, 'batch-evidence-gap');
-        const batch = JSON.parse(value.batchPayload);
-        check(batch.schema === 'activation-batch@1' && batch.batchId === value.batchId
-          && batch.ownerId === this.#binding.ownerId && Array.isArray(batch.events) && batch.events.length > 0
-          && new Set(value.eventIds).size === value.eventIds.length && new Set(value.targets.map(target => target.recordId)).size === value.targets.length
-          && value.eventIds.every((eventId, index) => batch.events.some((event: { eventId: string; recordId: string }) =>
-            event.eventId === eventId && event.recordId === value.targets[index]!.recordId)), 'batch-evidence-gap');
-      }
-      return { ...value, hash: String(row.payload_hash) };
-    });
+    }
+    if (value.batchId) {
+      // Read the immutable presentation independently of later canonical damage. Commit
+      // revalidates the live batch inside its transaction and durably settles stale selections.
+      check(typeof value.batchPayload === 'string' && sha256(value.batchPayload) === value.batchDigest, 'batch-evidence-gap');
+      const batch = JSON.parse(value.batchPayload);
+      check(batch.schema === 'activation-batch@1' && batch.batchId === value.batchId
+        && batch.ownerId === binding.ownerId && Array.isArray(batch.events) && batch.events.length > 0
+        && new Set(value.eventIds).size === value.eventIds.length && new Set(value.targets.map(target => target.recordId)).size === value.targets.length
+        && value.eventIds.every((eventId, index) => batch.events.some((event: { eventId: string; recordId: string }) =>
+          event.eventId === eventId && event.recordId === value.targets[index]!.recordId)), 'batch-evidence-gap');
+    }
+    return { ...value, hash: String(row.payload_hash) };
   }
 
   // Durable output acknowledgement only. The synthetic driver supplies it after
@@ -3301,18 +3303,24 @@ export class ProbeStore {
       const row = this.#db.prepare(`SELECT o.* FROM pending_operations o JOIN host_presentations p ON p.presentation_id=o.presentation_id
         WHERE p.token=? AND p.session_id=? AND p.branch_id=?`).get(token, this.#binding.sessionId, this.#binding.branchId);
       if (!row) return { status: 'invalid_identity', operationId: null, receiptIds: [], expected: [], current: [], reason: 'unknown-token' };
-      const presentation = this.readMemoryPresentation(activity, token);
-      if (row.state === 'pending') return { status: 'pending', operationId: presentation.operationId,
-        receiptIds: [], expected: presentation.targets, current: [], reason: null };
-      check(sha256(String(row.result)) === row.result_hash, 'operation-evidence-gap');
-      const result = JSON.parse(String(row.result)) as MemoryOperationResult;
-      check(result.status === row.state && result.operationId === row.operation_id
-        && JSON.stringify(result.expected) === JSON.stringify(presentation.targets), 'operation-evidence-gap');
-      const receipts = this.#db.prepare('SELECT receipt_id FROM memory_events WHERE operation_id=? ORDER BY origin_seq').all(result.operationId!);
-      check(JSON.stringify(result.receiptIds) === JSON.stringify(receipts.map(event => event.receipt_id)), 'operation-evidence-gap');
+      const result = this.#readMemoryOperation(row, this.readMemoryPresentation(activity, token));
       for (const id of result.receiptIds) this.readOwnerReceipt(activity, id);
       return result;
     });
+  }
+
+  #readMemoryOperation(row: Record<string, unknown>, presentation: MemoryPresentation): MemoryOperationResult {
+    check(row.operation_id === presentation.operationId && row.presentation_id === presentation.presentationId
+      && row.session_id === presentation.sessionId && row.presentation_hash === presentation.hash, 'operation-evidence-gap');
+    if (row.state === 'pending') return { status: 'pending', operationId: presentation.operationId,
+      receiptIds: [], expected: presentation.targets, current: [], reason: null };
+    check(sha256(String(row.result)) === row.result_hash, 'operation-evidence-gap');
+    const result = JSON.parse(String(row.result)) as MemoryOperationResult;
+    check(result.status === row.state && result.operationId === row.operation_id
+      && JSON.stringify(result.expected) === JSON.stringify(presentation.targets), 'operation-evidence-gap');
+    const receipts = this.#db.prepare('SELECT receipt_id FROM memory_events WHERE operation_id=? ORDER BY origin_seq').all(result.operationId!);
+    check(JSON.stringify(result.receiptIds) === JSON.stringify(receipts.map(event => event.receipt_id)), 'operation-evidence-gap');
+    return result;
   }
 
   registerCorrectionDelivery(activity: Activity, token: string) {
@@ -3326,23 +3334,24 @@ export class ProbeStore {
   }
 
   correctionDelivery(activity: Activity, token: string) {
-    return this.withActivity(activity, () => {
-      const presentation = this.readMemoryPresentation(activity, token);
-      const row = this.#db.prepare('SELECT * FROM host_operation_delivery WHERE operation_id=?').get(presentation.operationId!);
-      check(row, 'operation-delivery-missing');
-      const source = (field: 'approval' | 'model'): SourceAck | null => {
-        if (row[`${field}_source`] === null) return null;
-        const payload = String(row[`${field}_source`]);
-        check(sha256(payload) === row[`${field}_hash`], 'operation-delivery-evidence-gap');
-        const ref = JSON.parse(payload) as SourceAck;
-        check(sameBinding(ref.binding, this.#binding), 'operation-delivery-evidence-gap');
-        if (field === 'approval') this.#validateRawSource(ref);
-        else this.#archiveRef(ref);
-        return ref;
-      };
-      return { operationId: presentation.operationId!, summaryEventId: String(row.summary_event_id),
-        ownerDelivered: row.owner_ack === 1, approval: source('approval'), model: source('model') };
-    });
+    return this.withActivity(activity, () => this.#readCorrectionDelivery(this.readMemoryPresentation(activity, token)));
+  }
+
+  #readCorrectionDelivery(presentation: MemoryPresentation, binding: Binding = this.#binding) {
+    const row = this.#db.prepare('SELECT * FROM host_operation_delivery WHERE operation_id=?').get(presentation.operationId!);
+    check(row, 'operation-delivery-missing');
+    const source = (field: 'approval' | 'model'): SourceAck | null => {
+      if (row[`${field}_source`] === null) return null;
+      const payload = String(row[`${field}_source`]);
+      check(sha256(payload) === row[`${field}_hash`], 'operation-delivery-evidence-gap');
+      const ref = JSON.parse(payload) as SourceAck;
+      check(sameBinding(ref.binding, binding), 'operation-delivery-evidence-gap');
+      if (field === 'approval') this.#validateRawSource(ref, undefined, { kind: 'project', id: binding.projectId, resolved: true }, [binding.projectId], binding);
+      else this.#archiveRef(ref);
+      return ref;
+    };
+    return { operationId: presentation.operationId!, summaryEventId: String(row.summary_event_id),
+      ownerDelivered: row.owner_ack === 1, approval: source('approval'), model: source('model') };
   }
 
   recordCorrectionApproval(activity: Activity, token: string, input: SourceAck): void {
@@ -3412,12 +3421,16 @@ export class ProbeStore {
   }
 
   correctionModelSummaries(activity: Activity) {
-    return this.withActivity(activity, () => this.correctionDeliveries(activity).map(({ token, delivery }) => {
-      check(delivery.ownerDelivered && delivery.model, 'operation-presentation-recovery-required');
-      const summary = this.correctionSummary(activity, token);
-      check(this.#archiveRef(delivery.model).text === JSON.stringify(summary), 'operation-summary-mismatch');
-      return summary;
-    }));
+    return this.withActivity(activity, () => this.correctionDeliveries(activity).map(({ token, result, delivery }) =>
+      this.#readCorrectionModelSummary(this.readMemoryPresentation(activity, token), result, delivery)));
+  }
+
+  #readCorrectionModelSummary(presentation: MemoryPresentation, result: MemoryOperationResult,
+    delivery: { ownerDelivered: boolean; model: SourceAck | null }) {
+    check(delivery.ownerDelivered && delivery.model, 'operation-presentation-recovery-required');
+    const summary = memoryOperationSummary(presentation, result);
+    check(this.#archiveRef(delivery.model).text === JSON.stringify(summary), 'operation-summary-mismatch');
+    return summary;
   }
 
   correctionModelContext(activity: Activity, budget: Pick<ProbeBudget, 'contextLimit' | 'outputReserve' | 'safetyMargin'>, selection: 'bounded' | 'latest' = 'bounded') {
@@ -3523,16 +3536,22 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       uuid(receiptId);
       const row = this.#db.prepare('SELECT * FROM memory_events WHERE receipt_id=?').get(receiptId);
-      check(row && sha256(String(row.receipt_payload)) === row.receipt_hash, 'receipt-evidence-gap');
+      check(row, 'receipt-evidence-gap');
+      const receipt = this.#readOwnerReceipt(row);
       const record = this.#readMemoryUnsafe(String(row.record_id));
       this.#validateScope(record.scope);
-      const receipt = JSON.parse(String(row.receipt_payload)) as OwnerReceipt;
-      check(receipt.schema === 'owner-receipt@1' && receipt.receiptId === receiptId
-        && receipt.operationId === (row.operation_id ?? row.event_id) && receipt.kind === row.kind
-        && receipt.outcome === 'committed' && JSON.stringify(JSON.parse(String(row.payload)).ownerReceipt) === row.receipt_payload,
-      'receipt-evidence-gap');
       return receipt;
     });
+  }
+
+  #readOwnerReceipt(row: Record<string, unknown>): OwnerReceipt {
+    check(sha256(String(row.receipt_payload)) === row.receipt_hash, 'receipt-evidence-gap');
+    const receipt = JSON.parse(String(row.receipt_payload)) as OwnerReceipt;
+    check(receipt.schema === 'owner-receipt@1' && receipt.receiptId === row.receipt_id
+      && receipt.operationId === (row.operation_id ?? row.event_id) && receipt.kind === row.kind
+      && receipt.outcome === 'committed' && JSON.stringify(JSON.parse(String(row.payload)).ownerReceipt) === row.receipt_payload,
+    'receipt-evidence-gap');
+    return receipt;
   }
 
   /** One owner-facing receipt derived from the immutable, atomically committed member receipts. */
@@ -5908,9 +5927,21 @@ export class ProbeStore {
     }
     for (const row of this.#db.prepare('SELECT record_id FROM memory_records').all()) this.#replayMemoryHead(String(row.record_id));
     for (const row of this.#db.prepare('SELECT * FROM feedback_events').all()) this.#readFeedbackReceipt(row);
+    for (const row of this.#db.prepare('SELECT * FROM memory_events WHERE receipt_id IS NOT NULL').all()) this.#readOwnerReceipt(row);
     for (const session of this.#db.prepare('SELECT * FROM sessions').all()) {
       const binding: Binding = { ownerId: String(session.owner_id), hostId: String(session.host_id), projectId: String(session.project_id),
         sessionId: String(session.session_id), branchId: String(session.branch_id) };
+      for (const row of this.#db.prepare('SELECT token FROM host_presentations WHERE session_id=?').all(binding.sessionId))
+        this.#readMemoryPresentation(String(row.token), binding);
+      for (const row of this.#db.prepare(`SELECT o.*,p.token FROM pending_operations o
+        JOIN host_presentations p ON p.presentation_id=o.presentation_id WHERE o.session_id=?`).all(binding.sessionId)) {
+        const presentation = this.#readMemoryPresentation(String(row.token), binding);
+        const result = this.#readMemoryOperation(row, presentation);
+        if (this.#db.prepare('SELECT 1 FROM host_operation_delivery WHERE operation_id=?').get(presentation.operationId!)) {
+          const delivery = this.#readCorrectionDelivery(presentation, binding);
+          if (delivery.model) this.#readCorrectionModelSummary(presentation, result, delivery);
+        }
+      }
       const latest = this.#replayIntent(binding);
       const head = this.#db.prepare('SELECT event_id FROM intent_heads WHERE session_id=? AND branch_id=?').get(binding.sessionId, binding.branchId);
       check((head?.event_id ?? null) === (latest?.eventId ?? null), 'intent-evidence-gap');

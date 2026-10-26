@@ -7,6 +7,7 @@
     "restore-ENOSPC", "restore-EROFS", "discard-preparation", "recovery-cleanup-state",
     "ENOSPC", "EROFS", "canonical-corruption", "typed-head-corruption", "intent-metadata-corruption", "info-outbox-corruption", "capture-metadata-corruption", "feedback-metadata-corruption", "batch-manifest-corruption", "source-metadata-corruption", "proposal-metadata-corruption", "projection-memory", "projection-source",
     "historian-publication-corruption", "historian-range-corruption", "historian-stage-corruption",
+    "operations", "operations-presentation-hash", "operations-presentation-target", "operations-operation-hash", "operations-operation-receipts", "operations-approval-hash", "operations-model-hash", "operations-model-summary",
     "migration-success", "migration-before-commit", "migration-after-commit"
   ]
 }
