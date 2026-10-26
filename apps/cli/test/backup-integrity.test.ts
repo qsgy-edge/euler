@@ -112,6 +112,22 @@ test('backup rejects a valid SQLite memory head whose typed lifecycle contradict
   } finally {rmSync(sandbox.root,{recursive:true,force:true});}
 });
 
+test('backup rejects an Intent whose typed status disagrees with its archived snapshot',()=>{
+  const sandbox=createSandbox();
+  try {
+    const seeded=cli(sandbox.root,'run'); assert.equal(seeded.status,0,seeded.stdout+seeded.stderr);
+    const db=new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+    try {
+      db.exec('DROP TRIGGER immutable_intent_update');
+      assert.equal(db.prepare("UPDATE intent_events SET status='paused' WHERE event_id IN (SELECT event_id FROM intent_heads)").run().changes,1);
+    } finally {db.close();}
+    const probe=openProbe(sandbox,undefined,undefined,undefined,undefined,true);
+    try {assert.throws(()=>probe.store.readIntent(probe.activity),/intent-evidence-gap/);} finally {probe.close();}
+    const backed=cli(sandbox.root,'backup'); assert.equal(backed.status,1);
+    assert.equal(backed.events.find(event=>event.event==='error').reason,'intent-evidence-gap');
+  } finally {rmSync(sandbox.root,{recursive:true,force:true});}
+});
+
 test('backup rejects an activation batch whose manifest cannot be read',()=>{
   const sandbox=createSandbox();
   try {
@@ -127,6 +143,36 @@ test('backup rejects an activation batch whose manifest cannot be read',()=>{
     try {assert.throws(()=>probe.store.readActivationBatch(probe.activity,batchId),/batch-evidence-gap/);} finally {probe.close();}
     const backed=cli(sandbox.root,'backup'); assert.equal(backed.status,1);
     assert.equal(backed.events.find(event=>event.event==='error').reason,'batch-evidence-gap');
+  } finally {rmSync(sandbox.root,{recursive:true,force:true});}
+});
+
+for (const fault of ['digest','events','event','owner','scope','missing']) test(`backup rejects a corrupt unregistered Info outbox: ${fault}`,()=>{
+  const sandbox=createSandbox();
+  try {
+    const seeded=cli(sandbox.root,'memory'); assert.equal(seeded.status,0,seeded.stdout+seeded.stderr);
+    const db=new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+    try {
+      db.exec('DROP TRIGGER immutable_projection_jobs_update');
+      const job=db.prepare("SELECT * FROM projection_jobs WHERE kind='host-info' LIMIT 1").get()!;
+      if(fault==='digest') db.prepare("UPDATE projection_jobs SET payload_hash='broken' WHERE job_id=?").run(job.job_id!);
+      else if(fault==='events') {
+        const payload=JSON.stringify({...JSON.parse(String(job.payload)),events:[]});
+        db.prepare('UPDATE projection_jobs SET payload=?,payload_hash=? WHERE job_id=?').run(payload,sha256(payload),job.job_id!);
+      } else if(fault==='event') {
+        const event=db.prepare("SELECT event_id FROM memory_events WHERE batch_id IS NULL LIMIT 1").get()!;
+        db.prepare('UPDATE projection_jobs SET event_id=? WHERE job_id=?').run(event.event_id!,job.job_id!);
+      } else if(fault==='missing') {
+        db.exec('DROP TRIGGER immutable_projection_jobs_delete');
+        db.prepare('DELETE FROM projection_jobs WHERE job_id=?').run(job.job_id!);
+      } else db.prepare(`UPDATE projection_jobs SET ${fault==='owner'?'owner_id':'scope_id'}=? WHERE job_id=?`).run(randomUUID(),job.job_id!);
+    } finally {db.close();}
+    const probe=openProbe(sandbox,undefined,undefined,undefined,undefined,true);
+    try {
+      if(['digest','events','event'].includes(fault)) assert.throws(()=>probe.store.registerHostInfo(probe.activity),/outbox-evidence-gap/);
+      else assert.deepEqual(probe.store.registerHostInfo(probe.activity).pending,[]);
+    } finally {probe.close();}
+    const backed=cli(sandbox.root,'backup'); assert.equal(backed.status,1);
+    assert.equal(backed.events.find(event=>event.event==='error').reason,'outbox-evidence-gap');
   } finally {rmSync(sandbox.root,{recursive:true,force:true});}
 });
 
@@ -149,6 +195,47 @@ test('backup rejects Info metadata that disagrees with its frozen activation bat
   } finally {rmSync(sandbox.root,{recursive:true,force:true});}
 });
 
+test('backup rejects capture metadata that its owner can no longer read',()=>{
+  const sandbox=createSandbox();
+  try {
+    const seeded=cli(sandbox.root,'memory'); assert.equal(seeded.status,0,seeded.stdout+seeded.stderr);
+    const db=new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+    let jobId:string;
+    try {
+      jobId=String(db.prepare('SELECT job_id FROM capture_jobs LIMIT 1').get()!.job_id);
+      db.exec('DROP TRIGGER immutable_capture_jobs_update');
+      db.prepare("UPDATE capture_jobs SET payload_hash='broken' WHERE job_id=?").run(jobId);
+    } finally {db.close();}
+    const probe=openProbe(sandbox,undefined,undefined,undefined,undefined,true);
+    try {assert.throws(()=>probe.store.readCaptureJob(probe.activity,jobId),/capture-evidence-gap/);} finally {probe.close();}
+    const backed=cli(sandbox.root,'backup'); assert.equal(backed.status,1);
+    assert.equal(backed.events.find(event=>event.event==='error').reason,'capture-evidence-gap');
+  } finally {rmSync(sandbox.root,{recursive:true,force:true});}
+});
+
+test('backup rejects feedback whose receipt cannot be read',()=>{
+  const sandbox=createSandbox();
+  try {
+    const seeded=cli(sandbox.root,'memory'); assert.equal(seeded.status,0,seeded.stdout+seeded.stderr);
+    const record=seeded.events.find(event=>event.event==='memory-result').activated.record;
+    const writer=openProbe(sandbox,undefined,undefined,undefined,undefined,true);
+    try {
+      const input=writer.archive.append(randomUUID(),JSON.stringify({schema:'memory-feedback@1',kind:'user_helpful',
+        recordId:record.recordId,revisionId:record.revisionId,headEventId:record.headEventId}));
+      assert.equal(writer.store.recordMemoryFeedback(writer.activity,record.recordId,record,input).status,'recorded');
+    } finally {writer.close();}
+    const db=new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+    try {
+      db.exec('DROP TRIGGER immutable_feedback_events_update');
+      assert.equal(db.prepare("UPDATE feedback_events SET payload_hash='broken' WHERE kind='user_helpful'").run().changes,1);
+    } finally {db.close();}
+    const probe=openProbe(sandbox,undefined,undefined,undefined,undefined,true);
+    try {assert.throws(()=>probe.store.readMemoryFeedback(probe.activity,record.recordId),/feedback-evidence-gap/);} finally {probe.close();}
+    const backed=cli(sandbox.root,'backup'); assert.equal(backed.status,1);
+    assert.equal(backed.events.find(event=>event.event==='error').reason,'feedback-evidence-gap');
+  } finally {rmSync(sandbox.root,{recursive:true,force:true});}
+});
+
 test('store-wide checks preserve foreign project batches and session-scoped memory access',()=>{
   const sandbox=createSandbox();
   try {
@@ -158,6 +245,10 @@ test('store-wide checks preserve foreign project batches and session-scoped memo
     try {
       const input=origin.archive.append(randomUUID(),'记住决定：本项目编译目标使用 ES2024');
       assert.equal(origin.store.rememberMemory(origin.activity,{input,hostInfo:'durable'}).status,'activated');
+      assert.equal(origin.store.registerHostInfo(origin.activity).pending.length,1);
+      const intent=origin.store.transitionIntent(origin.activity,null,input,{step:'capture',status:'active'},'记住决定：本项目编译目标使用 ES2024');
+      const done=origin.archive.append(randomUUID(),'Complete the other project task.');
+      origin.store.transitionIntent(origin.activity,intent.eventId,done,{step:'complete',status:'completed'});
       const source=origin.archive.append(randomUUID(),'Synthetic session-only source.');
       recordId=origin.store.captureMemory(origin.activity,source,'Session-only fact.',{type:'fact',
         scope:{kind:'session',id:binding.sessionId,resolved:false},appliesTo:[]}).record.recordId;
@@ -165,6 +256,10 @@ test('store-wide checks preserve foreign project batches and session-scoped memo
     const other=openProbe(sandbox,undefined,undefined,undefined,undefined,true);
     try {
       assert.throws(()=>other.store.readMemory(other.activity,recordId),/invalid-memory-scope/);
+      assert.equal(other.store.readIntent(other.activity),null);
+      assert.equal(other.store.recoverIntent(other.activity),null);
+      assert.deepEqual(other.store.registerHostInfo(other.activity).pending,[]);
+      assert.deepEqual(other.store.pendingMemoryProjections(other.activity),[]);
       other.store.auditStore(other.activity);
     } finally {other.close();}
   } finally {rmSync(sandbox.root,{recursive:true,force:true});}

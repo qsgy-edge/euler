@@ -2161,7 +2161,7 @@ export class ProbeStore {
     });
   }
 
-  #readIntentSnapshot(row: Record<string, unknown>): Intent {
+  #readIntentSnapshot(row: Record<string, unknown>, binding: Binding = this.#binding): Intent {
     const snapshot = String(row.snapshot);
     check(sha256(snapshot) === row.hash, 'intent-evidence-gap');
     const intent = JSON.parse(snapshot) as Omit<Intent, 'hash'>;
@@ -2173,30 +2173,36 @@ export class ProbeStore {
       && intent.goalInput.eventId === row.goal_input_event_id && intent.goalInput.hash === row.goal_input_hash
       && intent.goalInput.contentHash === row.goal_input_content_hash
       && intent.goalInput.locator === row.goal_input_locator && intent.goalInput.byteLength === row.goal_input_bytes
-      && sameBinding(intent.input.binding, this.#binding) && sameBinding(intent.goalInput.binding, this.#binding)
-      && sameBinding(intent.binding, this.#binding), 'intent-evidence-gap');
-    this.#validateSource(intent.input);
-    this.#validateSource(intent.goalInput);
+      && sameBinding(intent.input.binding, binding) && sameBinding(intent.goalInput.binding, binding)
+      && sameBinding(intent.binding, binding), 'intent-evidence-gap');
+    const scope: MemoryScope = { kind: 'project', id: binding.projectId, resolved: true };
+    this.#validateSource(intent.input, undefined, scope, [binding.projectId], binding);
+    this.#validateSource(intent.goalInput, undefined, scope, [binding.projectId], binding);
     check(!this.#isCaptureOutput(intent.input) && !this.#isCaptureOutput(intent.goalInput), 'source-derived');
     return { ...intent, hash: String(row.hash) };
   }
 
+  #replayIntent(binding: Binding): Intent | null {
+    const rows = this.#db.prepare('SELECT * FROM intent_events WHERE session_id=? AND branch_id=? ORDER BY version')
+      .all(binding.sessionId, binding.branchId);
+    let latest: Intent | null = null;
+    for (const [index, row] of rows.entries()) {
+      check(row.version === index + 1 && row.expected_event_id === (latest?.eventId ?? null), 'intent-evidence-gap');
+      const next = this.#readIntentSnapshot(row, binding);
+      const newTask = latest && next.intentId !== latest.intentId;
+      check(!latest || (JSON.stringify(next.constraints) === JSON.stringify(latest.constraints)
+        && (newTask ? latest.status === 'completed' && next.status === 'active'
+          && JSON.stringify(next.goalInput) === JSON.stringify(next.input)
+          && sha256(next.goal) === next.input.contentHash && this.#archiveRef(next.input).role === 'user'
+          : next.goal === latest.goal && JSON.stringify(next.goalInput) === JSON.stringify(latest.goalInput))), 'intent-evidence-gap');
+      latest = next;
+    }
+    return latest;
+  }
+
   recoverIntent(activity: Activity): Intent | null {
     return this.withActivity(activity, () => {
-      const rows = this.#db.prepare('SELECT * FROM intent_events WHERE session_id=? AND branch_id=? ORDER BY version')
-        .all(this.#binding.sessionId, this.#binding.branchId);
-      let latest: Intent | null = null;
-      for (const [index, row] of rows.entries()) {
-        check(row.version === index + 1 && row.expected_event_id === (latest?.eventId ?? null), 'intent-evidence-gap');
-        const next = this.#readIntentSnapshot(row);
-        const newTask = latest && next.intentId !== latest.intentId;
-        check(!latest || (JSON.stringify(next.constraints) === JSON.stringify(latest.constraints)
-          && (newTask ? latest.status === 'completed' && next.status === 'active'
-            && JSON.stringify(next.goalInput) === JSON.stringify(next.input)
-            && sha256(next.goal) === next.input.contentHash && this.#archiveRef(next.input).role === 'user'
-            : next.goal === latest.goal && JSON.stringify(next.goalInput) === JSON.stringify(latest.goalInput))), 'intent-evidence-gap');
-        latest = next;
-      }
+      const latest = this.#replayIntent(this.#binding);
       const head = this.#db.prepare('SELECT event_id FROM intent_heads WHERE session_id=? AND branch_id=?')
         .get(this.#binding.sessionId, this.#binding.branchId);
       if (!head && latest) {
@@ -2551,7 +2557,7 @@ export class ProbeStore {
     });
   }
 
-  #captureJob(jobId: string, binding: Binding = this.#binding): CaptureJob {
+  #readCaptureJobMetadata(jobId: string, binding: Binding) {
     uuid(jobId);
     const row = this.#db.prepare('SELECT * FROM capture_jobs WHERE job_id=?').get(jobId);
     check(row && sha256(String(row.payload)) === row.payload_hash, 'capture-evidence-gap');
@@ -2559,6 +2565,11 @@ export class ProbeStore {
     check(payload.schema === 'capture-job@1' && payload.source?.binding?.ownerId === binding.ownerId
       && payload.source.binding.projectId === binding.projectId && payload.source.eventId === row.source_event_id
       && payload.source.binding.sessionId === row.source_owner, 'capture-evidence-gap');
+    return { row, payload };
+  }
+
+  #captureJob(jobId: string, binding: Binding = this.#binding): CaptureJob {
+    const { row, payload } = this.#readCaptureJobMetadata(jobId, binding);
     const work = this.#db.prepare('SELECT * FROM capture_work WHERE job_id=?').get(jobId);
     const recordId = work?.record_id ?? row.record_id ?? payload.recordId;
     let record: MemoryRecord | null = null, unavailable: string | null = null;
@@ -3566,12 +3577,8 @@ export class ProbeStore {
         ORDER BY j.rowid LIMIT ?`).all(this.#binding.ownerId, ...this.#scopeParameters(), limit);
       const receipts: SearchProjectionReceipt[] = [];
       for (const job of jobs) {
-        const payload = String(job.payload);
-        check(sha256(payload) === job.payload_hash, 'outbox-evidence-gap');
-        const manifest = JSON.parse(payload) as { schema: string; kind: string; events: unknown[] };
-        check(manifest.schema === 'memory-outbox@1' && manifest.kind === 'search' && manifest.events.length === 1, 'outbox-evidence-gap');
-        const event = manifest.events[0] as { eventId?: string; recordId?: string };
-        check(event.eventId === job.event_id && typeof event.recordId === 'string', 'outbox-evidence-gap');
+        this.#validateMemoryOutbox(job);
+        const event = JSON.parse(String(job.payload)).events[0] as { recordId: string };
         const record = this.#readMemoryHead(event.recordId);
         const generation = Number(job.projection_rowid);
         const exposure = memoryProjectionExposure(record);
@@ -4189,19 +4196,39 @@ export class ProbeStore {
       WHERE owner_id=? AND ${this.#visibleScopeSql('projection_jobs')} ORDER BY rowid`)
       .all(this.#binding.ownerId, ...this.#scopeParameters())
       .map(row => {
-        check(sha256(String(row.payload)) === row.payload_hash, 'outbox-evidence-gap');
-        const manifest = JSON.parse(String(row.payload));
-        const event = this.#db.prepare('SELECT payload FROM memory_events WHERE event_id=?').get(String(row.event_id));
-        check(event && manifest.schema === 'memory-outbox@1' && manifest.kind === row.kind && manifest.batchId === row.batch_id,
-          'outbox-evidence-gap');
-        if (row.kind === 'host-info') {
-          const batch = this.#readActivationBatch(String(row.batch_id));
-          check(JSON.stringify(manifest.events) === JSON.stringify(JSON.parse(batch.payload).events)
-            && manifest.events[0].eventId === row.event_id, 'outbox-evidence-gap');
-        } else check(manifest.events.length === 1 && JSON.stringify(manifest.events[0]) === event.payload, 'outbox-evidence-gap');
+        this.#validateMemoryOutbox(row);
         return { jobId: String(row.job_id), kind: String(row.kind), eventId: String(row.event_id), batchId: row.batch_id,
           payload: String(row.payload), digest: String(row.payload_hash) };
       }));
+  }
+
+  #validateMemoryOutbox(row: Record<string, unknown>, projects: readonly string[] = [this.#binding.projectId]): ActivationBatch | null {
+    check(sha256(String(row.payload)) === row.payload_hash, 'outbox-evidence-gap');
+    const manifest = JSON.parse(String(row.payload));
+    const event = this.#db.prepare(`SELECT e.payload,e.payload_hash,e.batch_id,e.record_id,r.owner_id FROM memory_events e
+      JOIN memory_records r ON r.record_id=e.record_id WHERE e.event_id=?`).get(String(row.event_id));
+    check(event && sha256(String(event.payload)) === event.payload_hash && manifest.schema === 'memory-outbox@1'
+      && manifest.kind === row.kind && manifest.batchId === row.batch_id && row.batch_id === event.batch_id
+      && row.owner_id === event.owner_id, 'outbox-evidence-gap');
+    const memoryEvent = JSON.parse(String(event.payload));
+    check(memoryEvent.schema === 'memory-event@1' && memoryEvent.eventId === row.event_id
+      && memoryEvent.recordId === event.record_id, 'outbox-evidence-gap');
+    const scope = memoryEvent.after.scope as MemoryScope;
+    check(row.scope_kind === scope.kind && row.scope_id === scope.id, 'outbox-evidence-gap');
+    if (row.kind === 'host-info') {
+      const batch = this.#readActivationBatch(String(row.batch_id), projects);
+      check(JSON.stringify(manifest.events) === JSON.stringify(JSON.parse(batch.payload).events)
+        && batch.events[0]?.eventId === row.event_id, 'outbox-evidence-gap');
+      const info = this.#db.prepare('SELECT * FROM host_info_batches WHERE batch_id=?').get(batch.batchId);
+      if (info) {
+        check(info.job_id === row.job_id && info.owner_id === batch.ownerId, 'host-info-evidence-gap');
+        this.#assertHostInfoBatch(batch, { digest: String(info.digest), memberCount: Number(info.member_count),
+          scope: { kind: info.scope_kind as MemoryScopeKind, id: String(info.scope_id), resolved: true } });
+      }
+      return batch;
+    }
+    check(row.kind === 'search' && manifest.events.length === 1 && JSON.stringify(manifest.events[0]) === event.payload, 'outbox-evidence-gap');
+    return null;
   }
 
   readMemory(activity: Activity, recordId: string): MemoryRecord {
@@ -4516,18 +4543,21 @@ export class ProbeStore {
     });
   }
 
+  #readFeedbackReceipt(row: Record<string, unknown>) {
+    check(sha256(String(row.payload)) === row.payload_hash, 'feedback-evidence-gap');
+    const payload = JSON.parse(String(row.payload));
+    check(payload.schema === 'memory-feedback-receipt@1' && payload.feedbackId === row.feedback_id && payload.kind === row.kind
+      && payload.recordId === row.record_id && payload.revisionId === row.revision_id && payload.headEventId === row.head_event_id, 'feedback-evidence-gap');
+    return { feedbackId: String(row.feedback_id), kind: String(row.kind), revisionId: String(row.revision_id),
+      headEventId: String(row.head_event_id), evidence: payload.evidence as unknown, hash: String(row.payload_hash) };
+  }
+
   readMemoryFeedback(activity: Activity, recordId: string) {
     return this.withActivity(activity, () => {
       this.#readMemoryHead(recordId);
       const events = this.#db.prepare(`SELECT * FROM feedback_events WHERE record_id=?
-        AND json_extract(payload,'$.observingProjectId')=? ORDER BY rowid`).all(recordId, this.#binding.projectId).map(row => {
-        check(sha256(String(row.payload)) === row.payload_hash, 'feedback-evidence-gap');
-        const payload = JSON.parse(String(row.payload));
-        check(payload.schema === 'memory-feedback-receipt@1' && payload.feedbackId === row.feedback_id && payload.kind === row.kind
-          && payload.recordId === recordId && payload.revisionId === row.revision_id && payload.headEventId === row.head_event_id, 'feedback-evidence-gap');
-        return { feedbackId: String(row.feedback_id), kind: String(row.kind), revisionId: String(row.revision_id),
-          headEventId: String(row.head_event_id), evidence: payload.evidence as unknown, hash: String(row.payload_hash) };
-      });
+        AND json_extract(payload,'$.observingProjectId')=? ORDER BY rowid`).all(recordId, this.#binding.projectId)
+        .map(row => this.#readFeedbackReceipt(row));
       const runs = this.#db.prepare(`SELECT DISTINCT a.run_id FROM request_assemblies a JOIN request_runs r ON r.run_id=a.run_id
         JOIN execution_streams s ON s.stream_id=r.stream_id JOIN json_each(a.used_memories) u
         WHERE s.principal_id=? AND s.project_id=? AND json_extract(u.value,'$.recordId')=?`)
@@ -4847,12 +4877,7 @@ export class ProbeStore {
         WHERE j.kind='host-info' AND b.batch_id IS NULL AND j.owner_id=? AND ${this.#visibleScopeSql('j')}
         ORDER BY j.rowid LIMIT ?`).all(this.#binding.ownerId, ...this.#scopeParameters(), HOST_INFO_REGISTER_LIMIT + 1);
       for (const job of jobs.slice(0, HOST_INFO_REGISTER_LIMIT)) {
-        check(sha256(String(job.payload)) === job.payload_hash, 'outbox-evidence-gap');
-        const manifest = JSON.parse(String(job.payload)) as { schema: string; kind: string; batchId: string; events: unknown[] };
-        const batch = this.#readActivationBatch(String(job.batch_id));
-        check(manifest.schema === 'memory-outbox@1' && manifest.kind === 'host-info' && manifest.batchId === job.batch_id
-          && JSON.stringify(manifest.events) === JSON.stringify(JSON.parse(batch.payload).events)
-          && batch.events[0]?.eventId === job.event_id, 'outbox-evidence-gap');
+        const batch = this.#validateMemoryOutbox(job)!;
         this.#db.prepare(`INSERT INTO host_info_batches(batch_id,job_id,owner_id,scope_kind,scope_id,digest,member_count,delivery,read_state,registered_at)
           VALUES (?,?,?,?,?,?,?,'pending','unread',?)`).run(batch.batchId, String(job.job_id), this.#binding.ownerId,
           batch.scope.kind, batch.scope.id, batch.digest, batch.events.length, new Date().toISOString());
@@ -4948,8 +4973,9 @@ export class ProbeStore {
       deliveredAt: text(row.delivered_at), read: row.read_state as HostInfo['read'], readAt: text(row.read_at) };
   }
 
-  #assertHostInfoBatch(batch: ActivationBatch, info: Pick<HostInfo, 'digest' | 'memberCount'>): void {
-    check(batch.digest === info.digest && batch.events.length === info.memberCount, 'host-info-evidence-gap');
+  #assertHostInfoBatch(batch: ActivationBatch, info: Pick<HostInfo, 'digest' | 'memberCount' | 'scope'>): void {
+    check(batch.digest === info.digest && batch.events.length === info.memberCount
+      && batch.scope.kind === info.scope.kind && batch.scope.id === info.scope.id, 'host-info-evidence-gap');
   }
 
   #readActivationBatch(batchId: string, projects: readonly string[] = [this.#binding.projectId]): ActivationBatch {
@@ -5853,20 +5879,19 @@ export class ProbeStore {
     ]) for (const row of this.#db.prepare(`SELECT ${column} AS value FROM ${table}`).all()) sources(JSON.parse(String(row.value)));
     for (const row of this.#db.prepare('SELECT unit_id FROM source_units').all()) this.#sourceUnit(String(row.unit_id));
     const projects = this.#registeredProjects();
-    for (const row of this.#db.prepare('SELECT batch_id FROM activation_batches').all()) {
-      const batch = this.#readActivationBatch(String(row.batch_id), projects);
-      const info = this.#db.prepare('SELECT digest,member_count FROM host_info_batches WHERE batch_id=?').get(batch.batchId);
-      if (info) this.#assertHostInfoBatch(batch, { digest: String(info.digest), memberCount: Number(info.member_count) });
-    }
+    for (const row of this.#db.prepare('SELECT * FROM projection_jobs').all()) this.#validateMemoryOutbox(row, projects);
+    check(!this.#db.prepare(`SELECT 1 FROM activation_batches b WHERE NOT EXISTS
+      (SELECT 1 FROM projection_jobs j WHERE j.kind='host-info' AND j.batch_id=b.batch_id) LIMIT 1`).get(), 'outbox-evidence-gap');
     for (const row of this.#db.prepare('SELECT proposal_id,payload FROM evolution_proposals').all()) {
       const binding = (JSON.parse(String(row.payload)).input as SourceAck).binding;
       this.sessionSource(binding);
       this.#proposalForProjects(String(row.proposal_id), projects, binding);
     }
-    for (const row of this.#db.prepare('SELECT j.job_id,j.payload FROM capture_jobs j JOIN compartments c ON c.job_id=j.job_id').all()) {
+    for (const row of this.#db.prepare('SELECT job_id,payload FROM capture_jobs').all()) {
       const binding = (JSON.parse(String(row.payload)).source as SourceAck).binding;
       this.sessionSource(binding);
-      this.#readCompartment(String(row.job_id), binding);
+      this.#readCaptureJobMetadata(String(row.job_id), binding);
+      if (this.#db.prepare('SELECT 1 FROM compartments WHERE job_id=?').get(row.job_id!)) this.#readCompartment(String(row.job_id), binding);
     }
     for (const row of this.#db.prepare('SELECT stream_id FROM execution_streams').all()) {
       this.#readStream(String(row.stream_id));
@@ -5877,13 +5902,13 @@ export class ProbeStore {
       this.#readRequestLedger(this.#requestRun({ streamId: String(row.stream_id) }, String(row.run_id)));
     }
     for (const row of this.#db.prepare('SELECT record_id FROM memory_records').all()) this.#replayMemoryHead(String(row.record_id));
-    for (const session of this.#db.prepare('SELECT session_id,branch_id FROM sessions').all()) {
-      const events = this.#db.prepare('SELECT * FROM intent_events WHERE session_id=? AND branch_id=? ORDER BY version')
-        .all(session.session_id!, session.branch_id!);
-      check(events.every((event, index) => event.version === index + 1 && sha256(String(event.snapshot)) === event.hash
-        && event.expected_event_id === (events[index - 1]?.event_id ?? null)), 'intent-evidence-gap');
-      const head = this.#db.prepare('SELECT event_id FROM intent_heads WHERE session_id=? AND branch_id=?').get(session.session_id!, session.branch_id!);
-      check((head?.event_id ?? null) === (events.at(-1)?.event_id ?? null), 'intent-evidence-gap');
+    for (const row of this.#db.prepare('SELECT * FROM feedback_events').all()) this.#readFeedbackReceipt(row);
+    for (const session of this.#db.prepare('SELECT * FROM sessions').all()) {
+      const binding: Binding = { ownerId: String(session.owner_id), hostId: String(session.host_id), projectId: String(session.project_id),
+        sessionId: String(session.session_id), branchId: String(session.branch_id) };
+      const latest = this.#replayIntent(binding);
+      const head = this.#db.prepare('SELECT event_id FROM intent_heads WHERE session_id=? AND branch_id=?').get(binding.sessionId, binding.branchId);
+      check((head?.event_id ?? null) === (latest?.eventId ?? null), 'intent-evidence-gap');
     }
     return sqliteHealth;
   }

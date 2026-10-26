@@ -39,17 +39,24 @@ for (const scenario of fixture.cases) {
   const cli = (name: string, command: string, args: string[] = [], expected: 'success' | 'error' = 'success', input?: string) =>
     run(name, ['apps/cli/src/main.ts', command, '--sandbox', sandbox.root, ...args], expected, input);
   try {
-    const setup = scenario.startsWith('historian-') ? 'historian' : ['projection-memory','proposal-metadata-corruption','typed-head-corruption','batch-manifest-corruption'].includes(scenario) ? 'memory'
+    const setup = scenario.startsWith('historian-') ? 'historian' : ['projection-memory','proposal-metadata-corruption','typed-head-corruption','batch-manifest-corruption','info-outbox-corruption','capture-metadata-corruption','feedback-metadata-corruption'].includes(scenario) ? 'memory'
       : ['projection-source','source-metadata-corruption'].includes(scenario) ? 'handoff' : scenario;
-    let infoBatches: string[] | undefined, laterInfo: string | undefined, handoff: unknown;
+    let infoBatches: string[] | undefined, laterInfo: string | undefined, handoff: unknown, intent: unknown;
+    let feedback: { recordId: string; feedbackId: string } | undefined, captureJobId: string | undefined;
     if (scenario.startsWith('owner-info')) {
       infoBatches = cli('setup','remember',[],'success','记住偏好：包管理器使用 pnpm\n记住决定：本项目使用 SQLite WAL\nstop\n')
         .filter(e => e.event === 'remember-result' && e.status === 'activated').map(e => e.batchId);
       assert.equal(infoBatches.length,2);
       assert.equal(cli('first-read','info',['--batch',infoBatches[0]!]).find(e => e.event === 'info-read').read,'read');
     } else if (scenario === 'handoff-versions') handoff = run('setup',['apps/cli/test/support/backup-handoff-worker.ts',sandbox.root,'seed'])[0];
-    else if (['memory','handoff','historian'].includes(setup)) cli('setup', setup, ['--scenario','synthetic']);
-    else cli('setup', 'run');
+    else if (['memory','handoff','historian'].includes(setup)) {
+      const seeded = cli('setup', setup, ['--scenario','synthetic']);
+      if (scenario === 'feedback-metadata-corruption') {
+        const recordId = seeded.find(event => event.event === 'memory-result').activated.record.recordId;
+        feedback = run('feedback-seeded',['apps/cli/test/support/backup-worker.ts',sandbox.root,'seed-feedback',recordId])[0];
+      }
+    } else cli('setup', 'run');
+    if (scenario === 'intent-metadata-corruption') intent = run('intent-before',['apps/cli/test/support/backup-worker.ts',sandbox.root,'read-intent'])[0];
     let unknown: Record<string, string> | undefined;
     if (scenario === 'unknown-before') unknown = run('unknown-before', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'unknown'])[0];
     if (['ENOSPC','EROFS'].includes(scenario)) {
@@ -154,6 +161,32 @@ for (const scenario of fixture.cases) {
       try { db.exec("DROP TRIGGER immutable_request_events_update; UPDATE request_events SET hash='broken' WHERE seq=1"); } finally { db.close(); }
       assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason, 'ledger-evidence-gap');
       assert.equal(cli('blocked-run','run',[],'error').find(e => e.event === 'error').reason, 'store-integrity-failed');
+    }
+    if (['intent-metadata-corruption','info-outbox-corruption','capture-metadata-corruption','feedback-metadata-corruption'].includes(scenario)) {
+      const damaged = new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+      let reason: string;
+      try {
+        if (scenario === 'intent-metadata-corruption') {
+          damaged.exec('DROP TRIGGER immutable_intent_update');
+          assert.equal(damaged.prepare("UPDATE intent_events SET status='paused' WHERE event_id IN (SELECT event_id FROM intent_heads)").run().changes,1);
+          reason = 'intent-evidence-gap';
+        } else if (scenario === 'info-outbox-corruption') {
+          damaged.exec('DROP TRIGGER immutable_projection_jobs_update');
+          assert.ok(Number(damaged.prepare("UPDATE projection_jobs SET payload_hash='broken' WHERE kind='host-info'").run().changes)>0);
+          reason = 'outbox-evidence-gap';
+        } else if (scenario === 'capture-metadata-corruption') {
+          captureJobId = String(damaged.prepare('SELECT job_id FROM capture_jobs LIMIT 1').get()!.job_id);
+          damaged.exec('DROP TRIGGER immutable_capture_jobs_update');
+          damaged.prepare("UPDATE capture_jobs SET payload_hash='broken' WHERE job_id=?").run(captureJobId);
+          reason = 'capture-evidence-gap';
+        } else {
+          damaged.exec('DROP TRIGGER immutable_feedback_events_update');
+          assert.equal(damaged.prepare("UPDATE feedback_events SET payload_hash='broken' WHERE feedback_id=?").run(feedback!.feedbackId).changes,1);
+          reason = 'feedback-evidence-gap';
+        }
+      } finally { damaged.close(); }
+      cpSync(sandbox.root,join(path,'damaged-sandbox'),{recursive:true});
+      assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason,reason);
     }
     if (scenario === 'owner-info-metadata-corruption') {
       const damaged = new DatabaseSync(join(sandbox.root,'probe.sqlite'));
@@ -293,6 +326,13 @@ for (const scenario of fixture.cases) {
       const listed = cli('restored-info','info').find(e => e.event==='info-list');
       assert.deepEqual([listed.pending,listed.unread],[0,1]);
     }
+    if (intent) assert.deepEqual(run('intent-verified',['apps/cli/test/support/backup-worker.ts',sandbox.root,'read-intent'])[0],intent);
+    if (captureJobId) assert.equal(run('capture-verified',['apps/cli/test/support/backup-worker.ts',sandbox.root,'read-capture',captureJobId])[0].jobId,captureJobId);
+    if (feedback) assert.equal(run('feedback-verified',['apps/cli/test/support/backup-worker.ts',sandbox.root,'read-feedback',feedback.recordId])[0].events[0].feedbackId,feedback.feedbackId);
+    if (scenario === 'info-outbox-corruption') {
+      const listed = cli('restored-info','info').find(e => e.event === 'info-list');
+      assert.deepEqual([listed.pending,listed.unread],[0,1]);
+    }
     if (expectedOutput) {
       assert.deepEqual(cli('maintenance-inventory','maintenance-status').find(e => e.event === 'maintenance-status').controlledFiles,[expectedOutput]);
       assert.equal(readFileSync(join(outputRoot!,'result.md'),'utf8'),'EULER-T20 controlled project output');
@@ -311,7 +351,7 @@ for (const scenario of fixture.cases) {
   }
 }
 const contractTestCommand = ['--test','--test-concurrency=1','--test-reporter=tap',
-  'apps/cli/test/backup.test.ts','apps/cli/test/backup-inventory.test.ts','apps/cli/test/backup-recovery.test.ts'];
+  'apps/cli/test/backup.test.ts','apps/cli/test/backup-inventory.test.ts','apps/cli/test/backup-recovery.test.ts','apps/cli/test/backup-integrity.test.ts'];
 const contractTestResult = spawnSync(process.execPath, contractTestCommand, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
 writeFileSync(join(directory,'contract-tests.stdout.tap'),contractTestResult.stdout ?? '');
 writeFileSync(join(directory,'contract-tests.stderr.txt'),contractTestResult.stderr ?? '');

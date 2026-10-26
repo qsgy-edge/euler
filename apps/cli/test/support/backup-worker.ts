@@ -22,6 +22,21 @@ if (action === 'migration-checkpoint') {
     const source = probe.archive.append(randomUUID(), 'Canonical append remains available while the projection is damaged.');
     console.log(JSON.stringify({ event: 'canonical-appended', source, health: probe.store.fence().health }));
   } finally { probe.close(); }
+} else if (['seed-feedback','read-feedback','read-capture','read-intent'].includes(action!)) {
+  const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    let result: unknown;
+    if (action === 'seed-feedback') {
+      const record = probe.store.readMemory(probe.activity, value!);
+      const input = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-feedback@1', kind: 'user_helpful',
+        recordId: record.recordId, revisionId: record.revisionId, headEventId: record.headEventId }));
+      const feedback = probe.store.recordMemoryFeedback(probe.activity, record.recordId, record, input);
+      result = { recordId: record.recordId, feedbackId: feedback.feedbackId, input };
+    } else if (action === 'read-feedback') result = probe.store.readMemoryFeedback(probe.activity, value!);
+    else if (action === 'read-capture') result = probe.store.readCaptureJob(probe.activity, value!);
+    else result = probe.store.readIntent(probe.activity);
+    console.log(JSON.stringify(result));
+  } finally { probe.close(); }
 } else if (action === 'repair-projection') {
   const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
   try {
