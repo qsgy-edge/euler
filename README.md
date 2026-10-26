@@ -28,6 +28,8 @@ Owner corrections use the actual CLI input, complete previews and live approval 
 
 [Stable Historian compartments](docs/implementation/t19-historian-compartments.md) bind each summary to a fixed raw range, retain exact decisions/results/citations, and enter context only at a complete window boundary. Run `npm run demo -- historian` or `npm run evidence:historian` for the controlled generation and recovery path.
 
+[Verified snapshots and recovery gaps](docs/implementation/t20-backup-recovery.md) retain the latest two changed daily backups, preserve damaged originals, and block restored old streams. Run `npm run evidence:backup` for CLI, crash, capacity and forward-migration-copy observations.
+
 Full X-card acceptance, real provider dispatch, production schema/host acceptance, migration, and MC cutover remain unverified. CI and host results must be read from the artifact for the specific implementation and platform; this repository is not production-ready.
 
 - [Euler v1 implementation specification](docs/architecture/issues/15-euler-v1-spec.md)

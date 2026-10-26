@@ -13,6 +13,11 @@ export interface FileAdmission {
   operation: 'file.read' | 'file.write'; rawPath: string; parts: string[]; root: BoundFile; target: FileTarget;
   cleanup: 'host-project-resource'; source: SourceAck;
 }
+export interface ControlledFile {
+  runId: string; callId: string; ownerId: string; projectId: string;
+  root: BoundFile; parent: BoundFile; path: string; identity: FileIdentity | null; source: SourceAck;
+  responsibility: FileAdmission['cleanup']; started: boolean; state: 'recorded' | 'no_effect' | 'unknown' | 'not_started';
+}
 export type FileFailureReason = 'file-output-too-large' | 'file-invalid-utf8' | 'file-create-conflict' | 'file-create-denied';
 export interface FileReceipt { identity: FileIdentity; byteLength: number; text?: string }
 export interface FilePresentation { token: string; callId: string; path: string; existingIdentity: FileIdentity | null; content: string }

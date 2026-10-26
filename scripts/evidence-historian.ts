@@ -36,7 +36,7 @@ for (const scenario of scenarios) {
     cpSync(root, join(path, 'sandbox'), { recursive: true }); copied = true;
     const db = new DatabaseSync(join(path, 'sandbox', 'probe.sqlite'), { readOnly: true });
     try {
-      assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 22);
+      assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 23);
       const row = db.prepare('SELECT * FROM capture_jobs WHERE job_id=?').get(result.jobId)!;
       assert.equal(row.consumer, 'historian'); assert.equal(row.payload_hash, hash(String(row.payload)));
       const job = JSON.parse(String(row.payload)); assert.equal(job.rawHash, hash(JSON.stringify(job.range)));

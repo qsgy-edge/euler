@@ -67,6 +67,9 @@ jobs:
       - name: Record stable Historian compartment observations
         if: always()
         run: npm run evidence:historian
+      - name: Record verified snapshot and recovery gap observations
+        if: always()
+        run: npm run evidence:backup
       - uses: actions/upload-artifact@v4
         if: always()
         with:

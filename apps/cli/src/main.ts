@@ -14,6 +14,7 @@ import { AGENT_BUDGET, runAgentDemo } from './agent-cli.ts';
 import { deliverMemoryInfo, runInfoDelivery, runInfoQuery, runRememberSession } from './owner-memory.ts';
 import { runHandoffDemo } from './analysis-handoff.ts';
 import { runContextDemo } from './context-cli.ts';
+import { backupSandbox, listSandboxBackups, restoreSandboxSnapshot, runNewRecoverySession } from './backup.ts';
 import { runHistorianDemo, runHistorianDrain } from './historian.ts';
 import { runCaptureDemo, runCaptureDrain } from './capture.ts';
 import { killPoint } from './kill-point.ts';
@@ -229,7 +230,7 @@ async function main() {
     sandbox: { type: 'string' }, scenario: { type: 'string', default: 'success' }, budget: { type: 'string' },
     request: { type: 'string' }, job: { type: 'string' }, record: { type: 'string' }, reservation: { type: 'string' },
     'transport-config': { type: 'string' }, 'capture-config': { type: 'string' }, 'historian-config': { type: 'string' }, interactive: { type: 'boolean', default: false },
-    attempt: { type: 'string' },
+    attempt: { type: 'string' }, snapshot: { type: 'string' },
     'accept-duplicate-risk': { type: 'boolean', default: false },
     'wait-child-launch': { type: 'boolean', default: false },
     'host-info': { type: 'string', default: 'durable' }, 'no-active-project': { type: 'boolean', default: false },
@@ -238,12 +239,15 @@ async function main() {
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
   const requestCommands = ['request-status', 'request-seal', 'request-reconcile', 'request-resume', 'request-gap'];
-  check([...requestCommands, 'historian', 'historian-drain', 'context', 'capture-drain', 'capture-status', 'capture-reconcile', 'handoff', 'capture', 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
+  const snapshotCommands = ['backup', 'backups', 'restore-snapshot', 'recovery-new-session'];
+  check([...snapshotCommands, ...requestCommands, 'historian', 'historian-drain', 'context', 'capture-drain', 'capture-status', 'capture-reconcile', 'handoff', 'capture', 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
   const options = args.values.budget ? JSON.parse(args.values.budget) as Partial<ProbeBudget> : {};
   check(!args.values['wait-child-launch'] || command === 'hold', 'hold-only-option');
   check(Object.keys(options).every(key => key in DEFAULT_BUDGET), 'invalid-budget');
   const budget = { ...DEFAULT_BUDGET, ...options };
   if (['run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'remember', 'info', 'hold', 'task', 'maintain', 'maintenance-status'].includes(command)) check(args.values.sandbox, 'sandbox-required');
+  if (snapshotCommands.includes(command)) check(args.values.sandbox, 'sandbox-required');
+  if (command === 'restore-snapshot') check(args.values.snapshot, 'snapshot-required');
   if (['historian-drain','capture-drain','capture-status','capture-reconcile'].includes(command)) check(args.values.sandbox, 'sandbox-required');
   check(!args.values['capture-config'] || ['agent','remember','capture-drain'].includes(command), 'capture-config-command-required');
   check(!args.values['historian-config'] || ['agent','historian-drain'].includes(command), 'historian-config-command-required');
@@ -254,6 +258,10 @@ async function main() {
   if (command === 'archive-failure' || args.values.scenario === 'archive-failure') check(!args.values.sandbox, 'fault-requires-fresh-sandbox');
   const sandbox = args.values.sandbox ? openSandbox(args.values.sandbox) : createSandbox();
   emit('sandbox', { root: sandbox.root, storeId: sandbox.storeId, fixtureDigest: sandbox.fixtureDigest, mode: 'synthetic-only' });
+  if (command === 'backup') { emit('backup-result', await backupSandbox(sandbox)); return; }
+  if (command === 'backups') { emit('backups', { snapshots: listSandboxBackups(sandbox) }); return; }
+  if (command === 'restore-snapshot') { emit('snapshot-restored', await restoreSandboxSnapshot(sandbox, args.values.snapshot!)); return; }
+  if (command === 'recovery-new-session') { emit('recovery-new-session', runNewRecoverySession(sandbox)); return; }
   if (command === 'capture-status' || command === 'capture-reconcile') {
     const probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
     try {
@@ -309,7 +317,9 @@ async function main() {
         const text = probe.archive.read(source).text;
         const receipt = probe.session.dispatch(probe.session.prepare(source.eventId, text));
         emit('request-resumed', { relatedRunId: status.run.runId, receipt });
-      } else emit('request-status', { ...status, warning: status.attempts.some(attempt => attempt.outcome === 'unknown-sent')
+      } else emit('request-status', { ...status, warning: status.recovery
+        ? 'Recovered from snapshot with a gap. This old stream is blocked; start a new session.'
+        : status.attempts.some(attempt => attempt.outcome === 'unknown-sent')
         ? 'Unknown delivery: repeating work may duplicate cost or side effects. Reconcile or explicitly accept this risk for a linked new run.' : null });
     } finally { probe.close(); }
     return;

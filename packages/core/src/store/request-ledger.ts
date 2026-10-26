@@ -1,6 +1,7 @@
 import { CORE_TOOLS, sha256 } from '../contracts.ts';
 import type { ProbeBudget, SourceAck } from '../contracts.ts';
 import type { AttemptOwnership, ExecutionStream } from './probe-store.ts';
+import type { SnapshotRecoveryReceipt } from './snapshot-recovery.ts';
 
 // T06 / I11 / Ticket 09 §13-16: durable, recoverable request ledger facts.
 // The ledger stores only references, hashes, budgets and states — never request
@@ -75,7 +76,7 @@ export interface RequestStatus {
   events: RequestEvent[];
   assemblies: (RequestAssembly & { state: RequestAssemblyState })[];
   attempts: RequestAttempt[];
-  revoked: boolean; sealed: boolean;
+  revoked: boolean; sealed: boolean; recovery?: SnapshotRecoveryReceipt;
 }
 
 export function chargedRequestTokens(status: Pick<RequestStatus, 'run' | 'events' | 'attempts'>): number {

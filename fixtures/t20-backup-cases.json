@@ -1,0 +1,9 @@
+{
+  "schema": "t20-backup-cases@1",
+  "synthetic": true,
+  "cases": [
+    "memory", "handoff", "historian", "project-output-before", "project-output-after", "unknown-before", "unknown-after",
+    "crash-carrier", "crash-database", "ENOSPC", "EROFS", "canonical-corruption",
+    "migration-success", "migration-before-commit", "migration-after-commit"
+  ]
+}
