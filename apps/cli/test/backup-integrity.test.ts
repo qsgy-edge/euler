@@ -77,6 +77,48 @@ for (const field of ['publication-hash','raw-range-hash','publication-stage']) t
   } finally {rmSync(sandbox.root,{recursive:true,force:true});}
 });
 
+test('backup rejects provenance that forget cannot read',()=>{
+  const sandbox=createSandbox();
+  try {
+    const seeded=cli(sandbox.root,'memory'); assert.equal(seeded.status,0,seeded.stdout+seeded.stderr);
+    const record=seeded.events.find(event=>event.event==='memory-result').activated.record;
+    const db=new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+    try {
+      db.exec('DROP TRIGGER immutable_provenance_refs_update');
+      assert.ok(Number(db.prepare("UPDATE provenance_refs SET payload_hash='broken' WHERE record_id=?").run(record.recordId).changes)>0);
+      assert.equal(db.prepare('PRAGMA quick_check').get()!.quick_check,'ok');
+      assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(),[]);
+    } finally {db.close();}
+    const probe=openProbe(sandbox,undefined,undefined,undefined,undefined,true);
+    try {assert.throws(()=>probe.store.forgetMemory(probe.activity,record.recordId,record),/memory-evidence-gap/);} finally {probe.close();}
+    const backed=cli(sandbox.root,'backup'); assert.equal(backed.status,1);
+    assert.equal(backed.events.find(event=>event.event==='error').reason,'memory-evidence-gap');
+  } finally {rmSync(sandbox.root,{recursive:true,force:true});}
+});
+
+for (const fault of ['identity','source']) test(`backup rejects corrupt provenance ${fault}`,()=>{
+  const sandbox=createSandbox();
+  try {
+    const seeded=cli(sandbox.root,'memory'); assert.equal(seeded.status,0,seeded.stdout+seeded.stderr);
+    const db=new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+    try {
+      db.exec('DROP TRIGGER immutable_provenance_refs_update');
+      const row=db.prepare('SELECT * FROM provenance_refs LIMIT 1').get()!;
+      if(fault==='identity') db.prepare('UPDATE provenance_refs SET owner_id=? WHERE ref_id=?').run(randomUUID(),row.ref_id!);
+      else {
+        const source={...JSON.parse(String(row.source_json)),contentHash:'0'.repeat(64)};
+        const payload=JSON.stringify({...JSON.parse(String(row.payload)),source});
+        db.prepare('UPDATE provenance_refs SET source_json=?,content_hash=?,payload=?,payload_hash=? WHERE ref_id=?')
+          .run(JSON.stringify(source),source.contentHash,payload,sha256(payload),row.ref_id!);
+      }
+      assert.equal(db.prepare('PRAGMA quick_check').get()!.quick_check,'ok');
+      assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(),[]);
+    } finally {db.close();}
+    const backed=cli(sandbox.root,'backup'); assert.equal(backed.status,1);
+    assert.equal(backed.events.find(event=>event.event==='error').reason,fault==='identity'?'memory-evidence-gap':'source-evidence-gap');
+  } finally {rmSync(sandbox.root,{recursive:true,force:true});}
+});
+
 for (const table of ['source_units','evolution_proposals']) test(`backup rejects corrupt ${table} owner metadata`,()=>{
   const sandbox=createSandbox();
   try {

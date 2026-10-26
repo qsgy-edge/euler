@@ -8,6 +8,8 @@ import { openSandbox, bindingOf, resourcesOf, createSandboxSession } from '../..
 import { openProbe } from '../../src/probe.ts';
 import { backupSandbox, restoreSandboxSnapshot } from '../../src/backup.ts';
 import { seedBackupOperations, corruptBackupOperation } from './backup-operations.ts';
+import { compareCandidate, verifiedCandidate } from './memory-evolution.ts';
+import { approvedSourceUnit, saveApprovedProposal } from './source-publication.ts';
 
 const [root, action, value] = process.argv.slice(2);
 const sandbox = openSandbox(root!);
@@ -15,7 +17,56 @@ function crash(point: string): never {
   fs.writeSync(1, JSON.stringify({ event: 'snapshot-crash', point }) + '\n');
   process.kill(process.pid, 'SIGKILL'); throw new Error('process-was-not-killed');
 }
-if (action === 'seed-operations') {
+function seedCanonicalState() {
+  const binding = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID(), branchId: randomUUID() };
+  createSandboxSession(sandbox, binding);
+  const probe = openProbe(sandbox, undefined, undefined, binding, undefined, true);
+  try {
+    const { store, activity, archive } = probe;
+    const workspaceId = randomUUID(); store.bindWorkspace(activity, workspaceId, [binding.projectId]);
+    const goal = archive.append(randomUUID(), 'Preserve canonical recovery relationships');
+    const transition = { status: 'active' as const, step: 'inspect' };
+    const intent = store.transitionIntent(activity, null, goal, transition, 'Preserve canonical recovery relationships');
+    const first = verifiedCandidate(probe, '本项目在 Windows 使用 PowerShell', { appliesTo: ['platform:win32'] }).record!;
+    store.promoteMemory(activity, first.recordId, first);
+    const second = verifiedCandidate(probe, '本项目在 Linux 使用 Bash', { appliesTo: ['platform:linux'] });
+    store.promoteMemory(activity, second.record!.recordId, second.record!); compareCandidate(probe, second.jobId, 'distinct');
+    const records = [first.recordId, second.record!.recordId].map(id => store.readMemory(activity, id));
+    const input = archive.append(randomUUID(), JSON.stringify({ schema: 'memory-feedback@1', kind: 'user_helpful',
+      recordId: records[0]!.recordId, revisionId: records[0]!.revisionId, headEventId: records[0]!.headEventId }));
+    const feedback = store.recordMemoryFeedback(activity, records[0]!.recordId, records[0]!, input);
+    const text = 'Atlas bounded canonical source', ref = archive.append(randomUUID(), text);
+    const publication = approvedSourceUnit(probe, { ref, projectId: binding.projectId, kind: 'source', offset: 0, length: text.length });
+    const unit = store.publishSourceUnit(activity, publication);
+    const proposalInput = { target: 'canonical.md', expectedChange: 'Keep local logs', owner: binding.ownerId,
+      scope: { kind: 'project' as const, id: binding.projectId, resolved: true }, evidenceRefs: [ref],
+      evaluation: { schema: 'evaluation-contract@1' as const, level: 'L0' as const, assertions: ['Keep the log'] } };
+    const proposal = saveApprovedProposal(probe, proposalInput);
+    store.drainSourceProjection(activity);
+    const consent = archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1', intentId: intent.intentId,
+      goalEventId: intent.goalInput.eventId, projectIds: [binding.projectId], targets: {}, maxResults: 8, maxBytes: 131072 }));
+    const { grantId } = store.authorizeMemoryDiscovery(activity, consent, [binding.projectId], 8);
+    const query = { query: 'Atlas', grantId, queryId: randomUUID() }, page = store.searchSources(activity, query);
+    return { binding, workspaceId, intent, transition, records, feedbackId: feedback.feedbackId, publication, unit, proposalInput, proposal, query, page };
+  } finally { probe.close(); }
+}
+if (action === 'seed-canonical-state') {
+  console.log(JSON.stringify(seedCanonicalState()));
+} else if (action === 'read-canonical-state') {
+  const saved = JSON.parse(value!) as ReturnType<typeof seedCanonicalState>;
+  const probe = openProbe(sandbox, undefined, undefined, saved.binding, undefined, true);
+  try {
+    const { store, activity } = probe;
+    let grantError: string | null = null;
+    try { store.assertMemoryDiscovery(activity, saved.query.grantId); } catch (error) { grantError = (error as Error).message; }
+    console.log(JSON.stringify({ records: saved.records.map(record => store.readMemory(activity, record.recordId)),
+      feedback: store.readMemoryFeedback(activity, saved.records[0]!.recordId), grantError,
+      membership: store.guidanceMembership(activity, [saved.binding.projectId]),
+      intent: store.transitionIntent(activity, null, saved.intent.input, saved.transition, saved.intent.goal),
+      unit: store.publishSourceUnit(activity, saved.publication),
+      proposal: store.saveEvolutionProposal(activity, saved.proposal.input, saved.proposalInput), sends: probe.transport.count }));
+  } finally { probe.close(); }
+} else if (action === 'seed-operations') {
   const bindings = [bindingOf(sandbox), { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID(), branchId: randomUUID() }];
   createSandboxSession(sandbox, bindings[1]!);
   console.log(JSON.stringify(bindings.map(binding => {
@@ -47,6 +98,28 @@ if (action === 'seed-operations') {
         sends: probe.transport.count };
     } finally { probe.close(); }
   })));
+} else if (action === 'seed-provenance') {
+  const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const first = probe.archive.append(randomUUID(), '记住偏好：使用 pnpm');
+    const initial = probe.store.rememberMemory(probe.activity, { input: first, hostInfo: 'durable' });
+    const again = probe.archive.append(randomUUID(), '记住偏好：使用 pnpm');
+    const repeated = probe.store.rememberMemory(probe.activity, { input: again, hostInfo: 'durable' });
+    const content = '使用 pnpm 并保留原始构建日志';
+    const updated = probe.archive.append(randomUUID(), content);
+    const correction = probe.store.correctMemory(probe.activity, initial.record.recordId, initial.record, updated, content);
+    console.log(JSON.stringify({ initial, repeated, correction, sources: [updated, first, again] }));
+  } finally { probe.close(); }
+} else if (action === 'forget-provenance') {
+  const binding = { ...bindingOf(sandbox), sessionId: randomUUID(), branchId: randomUUID() };
+  createSandboxSession(sandbox, binding);
+  const probe = openProbe(sandbox, undefined, undefined, binding, undefined, true);
+  try {
+    const record = probe.store.readMemory(probe.activity, value!);
+    const result = probe.store.forgetMemory(probe.activity, value!, record);
+    const event = probe.store.inspectMemory(probe.activity, value!).history.find(event => event.eventId === result.eventId)!;
+    console.log(JSON.stringify({ result, sources: JSON.parse(event.payload).suppression.sources, sends: probe.transport.count }));
+  } finally { probe.close(); }
 } else if (action === 'migration-checkpoint') {
   console.log(JSON.stringify(await backupSandbox(sandbox, 'migration')));
 } else if (action === 'queue-capture') {

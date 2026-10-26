@@ -46,6 +46,9 @@ for (const scenario of fixture.cases) {
     let infoBatches: string[] | undefined, laterInfo: string | undefined, handoff: unknown, intent: unknown;
     let feedback: { recordId: string; feedbackId: string; input: unknown } | undefined, captureJobId: string | undefined;
     let unclaimedJob: { jobId: string } | undefined;
+    let provenance: { correction: { record: { recordId: string } }; sources: unknown[] } | undefined;
+    let canonical: { binding: Binding; workspaceId: string; records: unknown[]; intent: unknown; unit: unknown;
+      proposal: unknown; feedbackId: string } | undefined;
     let memoryOperations: { binding: Binding; saved: ReturnType<typeof seedBackupOperations> }[] | undefined, operationRequest: string | undefined;
     if (scenario.startsWith('owner-info')) {
       infoBatches = cli('setup','remember',[],'success','记住偏好：包管理器使用 pnpm\n记住决定：本项目使用 SQLite WAL\nstop\n')
@@ -60,6 +63,10 @@ for (const scenario of fixture.cases) {
         feedback = run('feedback-seeded',['apps/cli/test/support/backup-worker.ts',sandbox.root,'seed-feedback',recordId])[0];
       }
     } else cli('setup', 'run');
+    if (scenario === 'canonical-state') canonical = run('canonical-seeded',
+      ['apps/cli/test/support/backup-worker.ts',sandbox.root,'seed-canonical-state'])[0];
+    if (scenario.startsWith('provenance')) provenance = run('provenance-seeded',
+      ['apps/cli/test/support/backup-worker.ts',sandbox.root,'seed-provenance'])[0];
     if (scenario.startsWith('operations')) {
       memoryOperations = run('operations-seeded', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'seed-operations'])[0];
       operationRequest = JSON.stringify(memoryOperations!.map(({ binding, saved }) => ({ binding,
@@ -197,6 +204,27 @@ for (const scenario of fixture.cases) {
         assert.ok(readFileSync(join(path,'operation-reader-rejected.stderr.txt'),'utf8').includes(reason));
         assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason, reason);
       }
+    }
+    if (scenario.startsWith('provenance-')) {
+      const fault = scenario.slice('provenance-'.length), damaged = new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+      try {
+        damaged.exec('DROP TRIGGER immutable_provenance_refs_update');
+        const row = damaged.prepare('SELECT * FROM provenance_refs WHERE record_id=? ORDER BY rowid LIMIT 1')
+          .get(provenance!.correction.record.recordId)!;
+        if (fault === 'digest') damaged.prepare("UPDATE provenance_refs SET payload_hash='broken' WHERE ref_id=?").run(row.ref_id!);
+        else if (fault === 'identity') damaged.prepare("UPDATE provenance_refs SET owner_id='different-owner' WHERE ref_id=?").run(row.ref_id!);
+        else {
+          const source = { ...JSON.parse(String(row.source_json)), contentHash: '0'.repeat(64) };
+          const payload = JSON.stringify({ ...JSON.parse(String(row.payload)), source });
+          damaged.prepare('UPDATE provenance_refs SET source_json=?,content_hash=?,payload=?,payload_hash=? WHERE ref_id=?')
+            .run(JSON.stringify(source), source.contentHash, payload, hash(payload), row.ref_id!);
+        }
+        assert.equal(damaged.prepare('PRAGMA quick_check').get()!.quick_check,'ok');
+        assert.deepEqual(damaged.prepare('PRAGMA foreign_key_check').all(),[]);
+      } finally { damaged.close(); }
+      cpSync(sandbox.root,join(path,'damaged-sandbox'),{recursive:true});
+      assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason,
+        fault === 'source' ? 'source-evidence-gap' : 'memory-evidence-gap');
     }
     if (scenario === 'canonical-corruption') {
       const db = new DatabaseSync(join(sandbox.root, 'probe.sqlite'));
@@ -371,6 +399,20 @@ for (const scenario of fixture.cases) {
         assert.equal(actual.sends,0);
       }
     }
+    if (canonical) {
+      const actual = run('canonical-recovered', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'read-canonical-state',JSON.stringify(canonical)])[0];
+      assert.deepEqual(actual.records,canonical.records); assert.deepEqual(actual.intent,canonical.intent);
+      assert.deepEqual(actual.unit,canonical.unit); assert.deepEqual(actual.proposal,canonical.proposal);
+      assert.equal(actual.feedback.events.find((event: { feedbackId: string }) => event.feedbackId===canonical!.feedbackId).kind,'user_helpful');
+      assert.deepEqual(actual.membership.projects,[{projectId:canonical.binding.projectId,workspaceId:canonical.workspaceId}]);
+      assert.equal(actual.grantError,'discovery-not-authorized'); assert.equal(actual.sends,0);
+    }
+    if (provenance) {
+      const recovered = run('provenance-forgotten', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'forget-provenance',
+        provenance.correction.record.recordId])[0];
+      assert.equal(recovered.result.status,'committed'); assert.equal(recovered.result.record.lifecycle,'tombstoned');
+      assert.deepEqual(recovered.sources,provenance.sources); assert.equal(recovered.sends,0);
+    }
     if (handoff) {
       const result = run('handoff-verified',['apps/cli/test/support/backup-handoff-worker.ts',sandbox.root,'verify',JSON.stringify(handoff)])[0];
       assert.deepEqual(result.versions,[1,2]); assert.equal(result.privateReadsRejected,4);
@@ -418,13 +460,15 @@ for (const scenario of fixture.cases) {
   }
 }
 const contractTestCommand = ['--test','--test-concurrency=1','--test-reporter=tap',
-  'apps/cli/test/backup.test.ts','apps/cli/test/backup-inventory.test.ts','apps/cli/test/backup-recovery.test.ts','apps/cli/test/backup-integrity.test.ts','apps/cli/test/backup-content.test.ts','apps/cli/test/backup-operations.test.ts'];
-const contractTestResult = spawnSync(process.execPath, contractTestCommand, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  'apps/cli/test/backup.test.ts','apps/cli/test/backup-inventory.test.ts','apps/cli/test/backup-recovery.test.ts','apps/cli/test/backup-integrity.test.ts','apps/cli/test/backup-content.test.ts','apps/cli/test/backup-operations.test.ts','apps/cli/test/backup-relations.test.ts'];
+const relationEvidence = join(directory,'canonical-relations');
+const contractTestResult = spawnSync(process.execPath, contractTestCommand, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024,
+  env: { ...process.env, EULER_BACKUP_RELATIONS_EVIDENCE: relationEvidence } });
 writeFileSync(join(directory,'contract-tests.stdout.tap'),contractTestResult.stdout ?? '');
 writeFileSync(join(directory,'contract-tests.stderr.txt'),contractTestResult.stderr ?? '');
 const contractTests = { command: [process.execPath,...contractTestCommand], exitCode: contractTestResult.status,
   signal: contractTestResult.signal, error: contractTestResult.error?.message ?? null,
-  stdout: 'contract-tests.stdout.tap', stderr: 'contract-tests.stderr.txt' };
+  stdout: 'contract-tests.stdout.tap', stderr: 'contract-tests.stderr.txt', fixtures: 'canonical-relations' };
 if (contractTestResult.status !== 0 || contractTestResult.error) failed = true;
 function files(path: string, prefix = ''): string[] {
   return readdirSync(path, { withFileTypes: true }).flatMap(entry => entry.isDirectory()

@@ -11,6 +11,7 @@ export interface SnapshotRecoveryReceipt {
 export interface SnapshotRecoveryPlan {
   operationId: string; snapshot: StoreSnapshot; original: BoundFile; stage: BoundFile;
   originals: SnapshotFile[]; controlledFiles: ControlledFile[]; receipt: SnapshotRecoveryReceipt;
+  owners: { kind: 'session' | 'job' | 'maintenance' | 'migration'; ownerId: string }[];
 }
 export interface SnapshotRecoveryPreparation {
   operationId: string; snapshot: StoreSnapshot; original: { path: string; identity: BoundFile['identity'] | null };

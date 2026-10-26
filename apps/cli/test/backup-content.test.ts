@@ -17,6 +17,12 @@ function cli(root: string, command: string, ...args: string[]) {
   return events;
 }
 
+function worker(root: string, action: string, value?: string) {
+  const result = spawnSync(process.execPath, ['apps/cli/test/support/backup-worker.ts',root,action,...(value?[value]:[])], { encoding: 'utf8' });
+  assert.equal(result.status,0,result.stdout+result.stderr);
+  return JSON.parse(result.stdout);
+}
+
 test('recovery preserves report versions and project-scoped handoff without exposing the mixed report', () => {
   const sandbox = createSandbox();
   try {
@@ -66,6 +72,35 @@ for (const consumer of ['memory','historian']) test(`recovery blocks a snapshot-
       assert.equal(fresh.transport.count, 0);
     } finally { fresh.close(); }
   } finally { rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('recovery preserves canonical relationships and exact request identities while revoking discovery grants', () => {
+  const sandbox = createSandbox();
+  try {
+    const before = worker(sandbox.root,'seed-canonical-state');
+    const saved = cli(sandbox.root,'backup').find(event=>event.event==='backup-result').snapshot;
+    cli(sandbox.root,'restore-snapshot','--snapshot',saved.id);
+    const after = worker(sandbox.root,'read-canonical-state',JSON.stringify(before));
+    assert.deepEqual(after.records,before.records); assert.deepEqual(after.intent,before.intent);
+    assert.deepEqual(after.unit,before.unit); assert.deepEqual(after.proposal,before.proposal);
+    assert.equal(after.feedback.events.find((event: { feedbackId: string }) => event.feedbackId===before.feedbackId).kind,'user_helpful');
+    assert.deepEqual(after.membership.projects,[{projectId:before.binding.projectId,workspaceId:before.workspaceId}]);
+    assert.equal(after.grantError,'discovery-not-authorized'); assert.equal(after.sends,0);
+  } finally { rmSync(sandbox.root,{recursive:true,force:true}); }
+});
+
+test('restored memory keeps provenance from earlier revisions when forgotten by a fresh session', () => {
+  const sandbox = createSandbox();
+  try {
+    const original = worker(sandbox.root,'seed-provenance');
+    assert.equal(original.initial.status,'activated'); assert.equal(original.repeated.status,'no_op');
+    assert.equal(original.correction.record.revision,2);
+    const saved = cli(sandbox.root,'backup').find(event=>event.event==='backup-result').snapshot;
+    cli(sandbox.root,'restore-snapshot','--snapshot',saved.id);
+    const forgotten = worker(sandbox.root,'forget-provenance',original.correction.record.recordId);
+    assert.equal(forgotten.result.status,'committed'); assert.equal(forgotten.result.record.lifecycle,'tombstoned');
+    assert.deepEqual(forgotten.sources,original.sources); assert.equal(forgotten.sends,0);
+  } finally { rmSync(sandbox.root,{recursive:true,force:true}); }
 });
 
 for (const scenario of ['memory', 'handoff', 'historian']) test(`snapshot recovery preserves ${scenario} bodies, references and published identities`, () => {
