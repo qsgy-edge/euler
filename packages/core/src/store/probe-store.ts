@@ -4870,7 +4870,7 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       const info = this.#hostInfoRow(batchId);
       const batch = this.#readActivationBatch(batchId);
-      check(batch.digest === info.digest && batch.events.length === info.memberCount, 'host-info-evidence-gap');
+      this.#assertHostInfoBatch(batch, info);
       const members = batch.events.map(event => {
         try {
           const current = this.#readMemoryUnsafe(event.recordId);
@@ -4946,6 +4946,10 @@ export class ProbeStore {
       scope: { kind: row.scope_kind as MemoryScopeKind, id: String(row.scope_id), resolved: true }, memberCount: Number(row.member_count),
       delivery: row.delivery as HostInfo['delivery'], entryId: text(row.entry_id), entryHash: text(row.entry_hash),
       deliveredAt: text(row.delivered_at), read: row.read_state as HostInfo['read'], readAt: text(row.read_at) };
+  }
+
+  #assertHostInfoBatch(batch: ActivationBatch, info: Pick<HostInfo, 'digest' | 'memberCount'>): void {
+    check(batch.digest === info.digest && batch.events.length === info.memberCount, 'host-info-evidence-gap');
   }
 
   #readActivationBatch(batchId: string, projects: readonly string[] = [this.#binding.projectId]): ActivationBatch {
@@ -5849,7 +5853,11 @@ export class ProbeStore {
     ]) for (const row of this.#db.prepare(`SELECT ${column} AS value FROM ${table}`).all()) sources(JSON.parse(String(row.value)));
     for (const row of this.#db.prepare('SELECT unit_id FROM source_units').all()) this.#sourceUnit(String(row.unit_id));
     const projects = this.#registeredProjects();
-    for (const row of this.#db.prepare('SELECT batch_id FROM activation_batches').all()) this.#readActivationBatch(String(row.batch_id), projects);
+    for (const row of this.#db.prepare('SELECT batch_id FROM activation_batches').all()) {
+      const batch = this.#readActivationBatch(String(row.batch_id), projects);
+      const info = this.#db.prepare('SELECT digest,member_count FROM host_info_batches WHERE batch_id=?').get(batch.batchId);
+      if (info) this.#assertHostInfoBatch(batch, { digest: String(info.digest), memberCount: Number(info.member_count) });
+    }
     for (const row of this.#db.prepare('SELECT proposal_id,payload FROM evolution_proposals').all()) {
       const binding = (JSON.parse(String(row.payload)).input as SourceAck).binding;
       this.sessionSource(binding);

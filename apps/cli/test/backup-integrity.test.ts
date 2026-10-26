@@ -130,6 +130,25 @@ test('backup rejects an activation batch whose manifest cannot be read',()=>{
   } finally {rmSync(sandbox.root,{recursive:true,force:true});}
 });
 
+test('backup rejects Info metadata that disagrees with its frozen activation batch',()=>{
+  const sandbox=createSandbox();
+  try {
+    const seeded=runBackupCli(sandbox.root,'remember',[],'记住偏好：使用独立目录\nstop\n');
+    assert.equal(seeded.status,0,seeded.stdout+seeded.stderr);
+    const batchId=seeded.events.find(event=>event.event==='remember-result' && event.status==='activated').batchId;
+    const db=new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+    try {
+      db.function('euler_store_writer',()=>1);
+      db.exec('DROP TRIGGER guarded_host_info_update');
+      db.prepare('UPDATE host_info_batches SET member_count=member_count+1 WHERE batch_id=?').run(batchId);
+    } finally {db.close();}
+    const probe=openProbe(sandbox,undefined,undefined,undefined,undefined,true);
+    try {assert.throws(()=>probe.store.readHostInfo(probe.activity,batchId),/host-info-evidence-gap/);} finally {probe.close();}
+    const backed=cli(sandbox.root,'backup'); assert.equal(backed.status,1);
+    assert.equal(backed.events.find(event=>event.event==='error').reason,'host-info-evidence-gap');
+  } finally {rmSync(sandbox.root,{recursive:true,force:true});}
+});
+
 test('store-wide checks preserve foreign project batches and session-scoped memory access',()=>{
   const sandbox=createSandbox();
   try {

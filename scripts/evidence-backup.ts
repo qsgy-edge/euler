@@ -42,7 +42,7 @@ for (const scenario of fixture.cases) {
     const setup = scenario.startsWith('historian-') ? 'historian' : ['projection-memory','proposal-metadata-corruption','typed-head-corruption','batch-manifest-corruption'].includes(scenario) ? 'memory'
       : ['projection-source','source-metadata-corruption'].includes(scenario) ? 'handoff' : scenario;
     let infoBatches: string[] | undefined, laterInfo: string | undefined, handoff: unknown;
-    if (scenario === 'owner-info') {
+    if (scenario.startsWith('owner-info')) {
       infoBatches = cli('setup','remember',[],'success','记住偏好：包管理器使用 pnpm\n记住决定：本项目使用 SQLite WAL\nstop\n')
         .filter(e => e.event === 'remember-result' && e.status === 'activated').map(e => e.batchId);
       assert.equal(infoBatches.length,2);
@@ -154,6 +154,15 @@ for (const scenario of fixture.cases) {
       try { db.exec("DROP TRIGGER immutable_request_events_update; UPDATE request_events SET hash='broken' WHERE seq=1"); } finally { db.close(); }
       assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason, 'ledger-evidence-gap');
       assert.equal(cli('blocked-run','run',[],'error').find(e => e.event === 'error').reason, 'store-integrity-failed');
+    }
+    if (scenario === 'owner-info-metadata-corruption') {
+      const damaged = new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+      try {
+        damaged.function('euler_store_writer',()=>1); damaged.exec('DROP TRIGGER guarded_host_info_update');
+        assert.equal(damaged.prepare('UPDATE host_info_batches SET member_count=member_count+1 WHERE batch_id=?').run(infoBatches![0]!).changes,1);
+      } finally { damaged.close(); }
+      cpSync(sandbox.root,join(path,'damaged-sandbox'),{recursive:true});
+      assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason,'host-info-evidence-gap');
     }
     if (scenario === 'typed-head-corruption') {
       const damaged = new DatabaseSync(join(sandbox.root,'probe.sqlite'));
