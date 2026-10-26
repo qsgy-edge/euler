@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { arch, release, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -38,7 +38,9 @@ for (const scenario of fixture.cases) {
   const cli = (name: string, command: string, args: string[] = [], expected: 'success' | 'error' = 'success') =>
     run(name, ['apps/cli/src/main.ts', command, '--sandbox', sandbox.root, ...args], expected);
   try {
-    if (['memory','handoff','historian'].includes(scenario)) cli('setup', scenario, ['--scenario','synthetic']);
+    const setup = scenario.startsWith('historian-') ? 'historian' : scenario === 'projection-memory' ? 'memory'
+      : scenario === 'projection-source' ? 'handoff' : scenario;
+    if (['memory','handoff','historian'].includes(setup)) cli('setup', setup, ['--scenario','synthetic']);
     else cli('setup', 'run');
     let unknown: Record<string, string> | undefined;
     if (scenario === 'unknown-before') unknown = run('unknown-before', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'unknown'])[0];
@@ -48,13 +50,39 @@ for (const scenario of fixture.cases) {
       assert.equal(hash(readFileSync(join(sandbox.root, 'session.jsonl'))), original);
       assert.deepEqual(cli('failed-backups', 'backups').find(e => e.event === 'backups').snapshots, []);
     }
+    if (scenario.startsWith('projection-')) {
+      const lane = scenario.slice('projection-'.length);
+      run('indexed', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'repair-projection',lane]);
+      const canonical = (db: DatabaseSync) => hash(JSON.stringify(['request_events','memory_events','source_units','evolution_proposals']
+        .map(table => [table, db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all()])));
+      const damaged = new DatabaseSync(join(sandbox.root, 'probe.sqlite'));
+      let before: string;
+      try {
+        before = canonical(damaged); damaged.function('euler_store_writer', () => 1); damaged.exec('PRAGMA ignore_check_constraints=ON');
+        assert.ok(Number(damaged.prepare('UPDATE search_documents SET projection_generation=0').run().changes) > 0);
+      } finally { damaged.close(); }
+      cpSync(sandbox.root, join(path, 'damaged-sandbox'), { recursive: true });
+      assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason,'store-integrity-failed');
+      assert.equal(run('projection-repaired',['apps/cli/test/support/backup-worker.ts',sandbox.root,'repair-projection',lane])[0].health,'healthy');
+      const repaired = new DatabaseSync(join(sandbox.root, 'probe.sqlite'), { readOnly: true });
+      try {
+        assert.equal(canonical(repaired),before); assert.equal(repaired.prepare('PRAGMA quick_check').get()!.quick_check,'ok');
+        assert.equal(repaired.prepare('SELECT count(*) AS n FROM search_documents WHERE projection_generation<1').get()!.n,0);
+      } finally { repaired.close(); }
+    }
+    let cleaned: { operationId: string; path: string } | undefined;
+    if (scenario === 'recovery-cleanup-state') {
+      const initial = cli('initial-backup','backup').find(e => e.event === 'backup-result').snapshot;
+      const first = cli('initial-recovery','restore-snapshot',['--snapshot',initial.id]).find(e => e.event === 'snapshot-restored');
+      cleaned = { operationId: first.receipt.operationId, path: first.original.path };
+    }
     const createOutput = () => {
       outputRoot = realpathSync.native(mkdtempSync(join(tmpdir(),'euler-t20-output-')));
       return run('project-output',['apps/cli/test/support/backup-file-worker.ts',sandbox.root,outputRoot])[0].controlledFiles[0];
     };
     let expectedOutput: unknown;
     if (scenario === 'project-output-before') expectedOutput = createOutput();
-    const saved = scenario.startsWith('migration-')
+    const saved = scenario.startsWith('migration-') || cleaned
       ? run('backup', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'migration-checkpoint'])[0].snapshot
       : cli('backup', 'backup').find(e => e.event === 'backup-result').snapshot;
     assert.ok(saved?.id);
@@ -71,6 +99,10 @@ for (const scenario of fixture.cases) {
       snapshotEpoch = Number(snapshotDb.prepare('SELECT epoch FROM owner_fences').get()!.epoch);
       for (const event of snapshotDb.prepare('SELECT payload,hash FROM request_events').all()) assert.equal(hash(String(event.payload)), event.hash);
     } finally { snapshotDb.close(); }
+    if (cleaned) {
+      run('original-discarded',['apps/cli/test/support/backup-worker.ts',sandbox.root,'discard-recovery',cleaned.operationId]);
+      assert.equal(existsSync(cleaned.path),false);
+    }
     if (scenario === 'unknown-after') unknown = run('unknown-after', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'unknown'])[0];
     if (scenario === 'project-output-after') expectedOutput = createOutput();
     if (scenario.startsWith('migration-')) {
@@ -96,16 +128,43 @@ for (const scenario of fixture.cases) {
       assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason, 'ledger-evidence-gap');
       assert.equal(cli('blocked-run','run',[],'error').find(e => e.event === 'error').reason, 'store-integrity-failed');
     }
+    if (scenario.startsWith('historian-') && scenario.endsWith('-corruption')) {
+      const damaged = new DatabaseSync(join(sandbox.root, 'probe.sqlite'));
+      try {
+        if (scenario === 'historian-publication-corruption') damaged.exec("DROP TRIGGER immutable_compartments_update; UPDATE compartments SET hash='broken'");
+        else if (scenario === 'historian-stage-corruption') {
+          damaged.function('euler_store_writer',()=>1);
+          damaged.exec("UPDATE capture_work SET stage='pending' WHERE job_id IN (SELECT job_id FROM compartments)");
+        } else {
+          damaged.exec('DROP TRIGGER immutable_capture_jobs_update');
+          const row = damaged.prepare('SELECT j.job_id,j.payload FROM capture_jobs j JOIN compartments c ON c.job_id=j.job_id').get()!;
+          const payload = JSON.stringify({ ...JSON.parse(String(row.payload)),rawHash:'broken' });
+          damaged.prepare('UPDATE capture_jobs SET payload=?,payload_hash=? WHERE job_id=?').run(payload,hash(payload),row.job_id!);
+        }
+      } finally { damaged.close(); }
+      cpSync(sandbox.root, join(path,'damaged-sandbox'), { recursive: true });
+      assert.match(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason,/compartment-integrity|historian-source-gap/);
+    }
     let operationId: string | undefined;
-    if (scenario.startsWith('crash-')) {
-      const point = scenario.slice('crash-'.length);
-      assert.equal(run('interrupted', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'restore-crash',point], 'kill')[0].point, point);
+    if (scenario.startsWith('crash-') || scenario.startsWith('restore-') || scenario === 'discard-preparation') {
+      const capacity = scenario.startsWith('restore-');
+      const point = scenario === 'discard-preparation' ? 'preparation' : scenario.slice(scenario.indexOf('-') + 1);
+      const originalHash = hash(readFileSync(join(sandbox.root,'session.jsonl')));
+      assert.equal(run('interrupted', ['apps/cli/test/support/backup-worker.ts',sandbox.root,capacity?'restore-failure':'restore-crash',point], capacity?'success':'kill')[0].point, point);
       const db = new DatabaseSync(join(sandbox.root, 'probe.sqlite'), { readOnly: true });
       try {
-        operationId = String(db.prepare("SELECT operation_id FROM store_restores WHERE state='prepared'").get()!.operation_id);
+        const pending = db.prepare("SELECT operation_id,state FROM store_restores WHERE state IN ('preparing','prepared')").get()!;
+        operationId = String(pending.operation_id);
         assert.notEqual(db.prepare('SELECT state FROM owner_fences').get()!.state, 'open');
+        if (['directory','preparation','ENOSPC','EROFS'].includes(point)) {
+          assert.equal(pending.state,'preparing'); assert.equal(hash(readFileSync(join(sandbox.root,'session.jsonl'))),originalHash);
+        }
       } finally { db.close(); }
       cpSync(sandbox.root, join(path, 'interrupted-sandbox'), { recursive: true });
+      if (scenario === 'discard-preparation') {
+        const manifest = run('preparation-discarded',['apps/cli/test/support/backup-worker.ts',sandbox.root,'discard-recovery',operationId!])[0];
+        assert.equal(existsSync(manifest.directory.path),false); operationId = undefined;
+      }
     }
     const restored = cli('restored','restore-snapshot',['--snapshot',saved.id]).find(e => e.event === 'snapshot-restored');
     assert.equal(restored.receipt.schema, 'store/recovered-from-snapshot@v1');
@@ -126,6 +185,16 @@ for (const scenario of fixture.cases) {
       assert.equal(pending.state, 'complete'); assert.equal(hash(String(pending.payload)), pending.digest);
       const plan = JSON.parse(String(pending.payload));
       for (const file of plan.originals) assert.equal(hash(readFileSync(join(plan.original.path, file.name))), file.hash);
+      if (cleaned) {
+        assert.equal(db.prepare('SELECT original_deleted FROM store_restores WHERE operation_id=?').get(cleaned.operationId)!.original_deleted,1);
+        assert.equal(existsSync(cleaned.path),false);
+      }
+      for (const published of db.prepare('SELECT c.*,j.payload,w.run_id,w.stage FROM compartments c JOIN capture_jobs j USING(job_id) JOIN capture_work w USING(job_id)').all()) {
+        const source = JSON.parse(String(published.source_json)), attemptId = String(published.attempt_id), job = JSON.parse(String(published.payload));
+        assert.equal(published.hash,hash(JSON.stringify({ source,attemptId }))); assert.equal(published.stage,'complete');
+        assert.equal(job.rawHash,hash(JSON.stringify(job.range)));
+        assert.ok(attempts.some(attempt => attempt.attempt_id===attemptId && attempt.run_id===published.run_id && attempt.outcome==='received'));
+      }
       if (unknown) {
         assert.ok(db.prepare("SELECT 1 FROM store_recovered_owners WHERE kind='job' AND owner_id=?").get(unknown.jobId!));
         const attempt = db.prepare('SELECT outcome FROM request_attempts WHERE attempt_id=?').get(unknown.attemptId!);

@@ -8,14 +8,14 @@ import type { AgentEvent, AgentStatus } from '../context/agent-state.ts';
 import { isUntypedRemember, parseMemoryProposal, parseOwnerAgreement, parseOwnerStatement } from '../context/owner-memory.ts';
 import type { OwnerMemoryStatement } from '../context/owner-memory.ts';
 import { randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { userInfo } from 'node:os';
 import { DatabaseSync, backup } from 'node:sqlite';
 import { checkSqliteSnapshot, deleteSnapshot, inspectSnapshotFiles, removeSnapshotFiles, snapshotBytes, snapshotDataHash, syncSnapshotDirectory, syncSnapshotFile, verifySnapshot, writeSnapshotFile } from './snapshots.ts';
 import type { SnapshotFile, StoreSnapshot, SnapshotCleanupManifest } from './snapshots.ts';
-import { restoreFile } from './snapshot-recovery.ts';
-import type { SnapshotRecoveryPlan, SnapshotRecoveryReceipt } from './snapshot-recovery.ts';
+import { recoveryFileNames, restoreFile } from './snapshot-recovery.ts';
+import type { SnapshotRecoveryPlan, SnapshotRecoveryPreparation, SnapshotRecoveryReceipt } from './snapshot-recovery.ts';
 import type { ControlledFile } from '../context/file-contract.ts';
 import { check, sameBinding, sha256, uuid, validateBudget } from '../contracts.ts';
 import type { Binding, ProbeBudget, SourceAck, SourceExcerpt } from '../contracts.ts';
@@ -263,12 +263,12 @@ CREATE TABLE store_recovered_owners (
   PRIMARY KEY(kind,owner_id)
 ) STRICT;
 CREATE TABLE store_restores (
-  operation_id TEXT PRIMARY KEY, snapshot_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','complete')),
+  operation_id TEXT PRIMARY KEY, snapshot_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('preparing','prepared','complete','cancelled')),
   payload TEXT NOT NULL, digest TEXT NOT NULL, cleanup TEXT, cleanup_digest TEXT,
   original_deleted INTEGER NOT NULL DEFAULT 0 CHECK(original_deleted IN (0,1)),
-  CHECK((cleanup IS NULL)=(cleanup_digest IS NULL)), CHECK(original_deleted=0 OR state='complete')
+  CHECK((cleanup IS NULL)=(cleanup_digest IS NULL)), CHECK(original_deleted=0 OR state IN ('complete','cancelled'))
 ) STRICT;
-CREATE UNIQUE INDEX one_pending_restore ON store_restores(state) WHERE state='prepared';
+CREATE UNIQUE INDEX one_pending_restore ON store_restores((1)) WHERE state IN ('preparing','prepared');
 CREATE TABLE maintenance_residuals (
   store_id TEXT NOT NULL REFERENCES owner_fences(store_id), path TEXT NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('expected','unexpected','unknown')), observed_at TEXT NOT NULL,
@@ -1454,14 +1454,14 @@ export class ProbeStore {
     return { recovery: JSON.parse(String(row.receipt)) as SnapshotRecoveryReceipt };
   }
 
-  #assertStreamRecovered(streamId: string): void {
+  #assertStreamNotRecovered(streamId: string): void {
     const stream = this.#readStream(streamId);
     check(!this.#db.prepare('SELECT 1 FROM store_recovered_owners WHERE kind=? AND owner_id=?').get(stream.ownerKind, stream.ownerId),
       'recovered-stream-blocked');
   }
 
   #requestRecoveryGate(activity: Activity, relatedRunId: string | null, currentRunId?: string): void {
-    this.#assertStreamRecovered(activity.streamId);
+    this.#assertStreamNotRecovered(activity.streamId);
     const stream = this.#readStream(activity.streamId);
     // An unrelated session or already-open run must not bypass an unresolved
     // request in the same principal/project. An explicit recovery successor
@@ -1483,7 +1483,7 @@ export class ProbeStore {
 
   authorizeRequestRun(activity: Activity, runId: string, input: { budget: ProbeBudget; intent: { eventId: string; hash: string } | null; relatedRunId: string | null; acceptDuplicateRisk?: boolean }): RequestRun {
     return this.withActivity(activity, () => {
-      this.#assertStreamRecovered(activity.streamId);
+      this.#assertStreamNotRecovered(activity.streamId);
       uuid(runId);
       validateBudget(input.budget);
       if (input.relatedRunId) {
@@ -1894,7 +1894,7 @@ export class ProbeStore {
 
   reconcileRequestAttempt(activity: Activity, attemptId: string): RequestStatus {
     return this.withActivity(activity, () => {
-      this.#assertStreamRecovered(activity.streamId);
+      this.#assertStreamNotRecovered(activity.streamId);
       uuid(attemptId);
       const row = this.#db.prepare('SELECT run_id FROM request_attempts WHERE attempt_id=?').get(attemptId);
       check(row, 'unknown-attempt');
@@ -1938,11 +1938,11 @@ export class ProbeStore {
     return this.withActivity(activity, () => this.#readRequestLedger(this.#requestRun(activity, runId)));
   }
 
-  #readProjectRequestLedger(runId: string): RequestStatus {
+  #readProjectRequestLedger(runId: string, binding: Binding = this.#binding): RequestStatus {
     const row = this.#db.prepare(`SELECT r.stream_id FROM request_runs r
       JOIN execution_streams s ON s.stream_id=r.stream_id
       WHERE r.run_id=? AND s.principal_id=? AND s.project_id=?`)
-      .get(runId, this.#binding.ownerId, this.#binding.projectId);
+      .get(runId, binding.ownerId, binding.projectId);
     check(row, 'request-scope-mismatch');
     return this.#readRequestLedger(this.#requestRun({ streamId: String(row.stream_id) }, runId));
   }
@@ -2122,11 +2122,24 @@ export class ProbeStore {
     });
   }
 
+  #repairProjection<T>(activity: Activity, action: () => T): T {
+    const repaired = this.#withAdmission(activity, () => ({ result: action(), failedHealth: this.fence().health === 'failed' }), false);
+    if (repaired.failedHealth) this.#withAdmission(activity, () => {
+      this.#checkStoreIntegrity();
+      this.#db.prepare("UPDATE owner_fences SET health='healthy' WHERE store_id=?").run(this.#storeId);
+    }, false);
+    return repaired.result;
+  }
+
   withActivity<T>(activity: Activity, action: () => T): T {
+    return this.#withAdmission(activity, action, true);
+  }
+
+  #withAdmission<T>(activity: Activity, action: () => T, requireHealthy: boolean): T {
     return this.#transaction(() => {
       const fence = this.fence();
       const row = this.#db.prepare('SELECT * FROM owner_activities WHERE id=?').get(activity.id);
-      check(fence.health === 'healthy', 'store-integrity-failed');
+      if (requireHealthy) check(fence.health === 'healthy', 'store-integrity-failed');
       check(fence.state === 'open' && fence.epoch === activity.epoch && row
         && row.incarnation === processIdentity.incarnation && row.pid === process.pid && row.store_id === this.#storeId
         && row.root_path === this.#resources.root.path && row.root_dev === this.#resources.root.identity.dev
@@ -2391,11 +2404,12 @@ export class ProbeStore {
     });
   }
 
-  #historianBody(job: CaptureJob, attemptId: string): CompartmentBody {
-    check(job.consumer === 'historian' && job.source.binding.sessionId === this.#binding.sessionId, 'historian-owner-mismatch');
+  #historianBody(job: CaptureJob, attemptId: string, binding: Binding = this.#binding): CompartmentBody {
+    check(job.consumer === 'historian' && job.source.binding.sessionId === binding.sessionId, 'historian-owner-mismatch');
     const row = this.#db.prepare('SELECT run_id FROM capture_work WHERE job_id=?').get(job.jobId);
     check(row?.run_id, 'capture-run-unavailable');
-    const ledger = this.#readProjectRequestLedger(String(row.run_id));
+    const ledger = this.#readProjectRequestLedger(String(row.run_id), binding);
+    check(ledger.run.ownerKind === 'job' && ledger.run.ownerId === job.jobId, 'historian-owner-mismatch');
     const attempt = ledger.attempts.find(item => item.attemptId === attemptId);
     check(attempt?.outcome === 'received', 'response-not-received');
     const step = ledger.events.filter(event => event.kind === 'capture/step@v1').map(event => JSON.parse(event.payload))
@@ -2411,7 +2425,7 @@ export class ProbeStore {
     const payload = JSON.parse(String(this.#db.prepare('SELECT payload FROM capture_jobs WHERE job_id=?').get(job.jobId)!.payload));
     check(payload.lane === 'historian' && payload.rawHash === sha256(JSON.stringify(job.range)), 'historian-source-gap');
     const raw = job.range.map(ref => {
-      this.#validateSource(ref, undefined, job.scope);
+      this.#validateSource(ref, undefined, job.scope, [binding.projectId], binding);
       return { ref, ...this.#archiveRef(ref) };
     });
     return compartmentBody(raw, payload.runId, reply.summary);
@@ -2440,18 +2454,20 @@ export class ProbeStore {
   }
 
   readCompartment(activity: Activity, jobId: string): Compartment {
-    return this.withActivity(activity, () => {
-      const job = this.#captureJob(jobId), row = this.#db.prepare('SELECT * FROM compartments WHERE job_id=?').get(jobId);
-      check(row, 'compartment-unavailable');
-      const source = JSON.parse(String(row.source_json)) as SourceAck, attemptId = String(row.attempt_id);
-      check(row.hash === sha256(JSON.stringify({ source, attemptId })), 'compartment-integrity');
-      const body = this.#historianBody(job, attemptId);
-      check(source.eventId === jobId && sameBinding(source.binding, job.source.binding)
-        && this.#archiveRef(source).text === JSON.stringify(body), 'compartment-integrity');
-      const payload = JSON.parse(String(this.#db.prepare('SELECT payload FROM capture_jobs WHERE job_id=?').get(jobId)!.payload));
-      return { jobId, runId: payload.runId, firstResponse: payload.firstResponse, endResponse: payload.endResponse,
-        rawHash: payload.rawHash, attemptId, source, body };
-    });
+    return this.withActivity(activity, () => this.#readCompartment(jobId, this.#binding));
+  }
+
+  #readCompartment(jobId: string, binding: Binding): Compartment {
+    const job = this.#captureJob(jobId, binding), row = this.#db.prepare('SELECT * FROM compartments WHERE job_id=?').get(jobId);
+    check(row, 'compartment-unavailable');
+    const source = JSON.parse(String(row.source_json)) as SourceAck, attemptId = String(row.attempt_id);
+    check(job.stage === 'complete' && row.hash === sha256(JSON.stringify({ source, attemptId })), 'compartment-integrity');
+    const body = this.#historianBody(job, attemptId, binding);
+    check(source.eventId === jobId && sameBinding(source.binding, job.source.binding)
+      && this.#archiveRef(source).text === JSON.stringify(body), 'compartment-integrity');
+    const payload = JSON.parse(String(this.#db.prepare('SELECT payload FROM capture_jobs WHERE job_id=?').get(jobId)!.payload));
+    return { jobId, runId: payload.runId, firstResponse: payload.firstResponse, endResponse: payload.endResponse,
+      rawHash: payload.rawHash, attemptId, source, body };
   }
 
   compartmentsForWindow(activity: Activity, runId: string, throughResponse: number, maxBytes: number) {
@@ -2546,13 +2562,13 @@ export class ProbeStore {
     });
   }
 
-  #captureJob(jobId: string): CaptureJob {
+  #captureJob(jobId: string, binding: Binding = this.#binding): CaptureJob {
     uuid(jobId);
     const row = this.#db.prepare('SELECT * FROM capture_jobs WHERE job_id=?').get(jobId);
     check(row && sha256(String(row.payload)) === row.payload_hash, 'capture-evidence-gap');
     const payload = JSON.parse(String(row.payload));
-    check(payload.schema === 'capture-job@1' && payload.source?.binding?.ownerId === this.#binding.ownerId
-      && payload.source.binding.projectId === this.#binding.projectId && payload.source.eventId === row.source_event_id
+    check(payload.schema === 'capture-job@1' && payload.source?.binding?.ownerId === binding.ownerId
+      && payload.source.binding.projectId === binding.projectId && payload.source.eventId === row.source_event_id
       && payload.source.binding.sessionId === row.source_owner, 'capture-evidence-gap');
     const work = this.#db.prepare('SELECT * FROM capture_work WHERE job_id=?').get(jobId);
     const recordId = work?.record_id ?? row.record_id ?? payload.recordId;
@@ -2570,10 +2586,10 @@ export class ProbeStore {
       ? this.#db.prepare('SELECT scope_kind,scope_id,scope_resolved FROM memory_heads WHERE record_id=?').get(String(recordId)) : null;
     const scope: MemoryScope = payload.scope ?? record?.scope ?? (head ? {
       kind: head.scope_kind as MemoryScopeKind, id: String(head.scope_id), resolved: Boolean(head.scope_resolved) } : null);
-    this.#validateScope(scope);
+    this.#validateScope(scope, [binding.projectId], binding);
     if ((work?.stage ?? row.status) !== 'complete'
       && this.#db.prepare("SELECT 1 FROM store_recovered_owners WHERE kind='job' AND owner_id=?").get(jobId)) unavailable = 'recovered_with_gap';
-    return { jobId, consumer: row.consumer as CaptureJob['consumer'], ownerId: this.#binding.ownerId, scope: structuredClone(scope), source: payload.source,
+    return { jobId, consumer: row.consumer as CaptureJob['consumer'], ownerId: binding.ownerId, scope: structuredClone(scope), source: payload.source,
       range: payload.range ?? [payload.source], stage: unavailable ? 'blocked' : (work?.stage ?? row.status) as CaptureJob['stage'],
       reason: unavailable ?? (work ? work.reason as string | null : payload.reason ?? null), record };
   }
@@ -3592,7 +3608,7 @@ export class ProbeStore {
   }
 
   rebuildSearchProjection(activity: Activity): SearchProjectionReceipt[] {
-    return this.withActivity(activity, () => {
+    return this.#repairProjection(activity, () => {
       const canonical = this.#db.prepare(`SELECT record_id FROM memory_heads
         WHERE ${this.#visibleScopeSql('memory_heads')}`).all(...this.#scopeParameters());
       this.#db.prepare(`DELETE FROM search_documents WHERE (owner_kind='memory' AND owner_id=? AND ${this.#visibleScopeSql('search_documents')})
@@ -3649,7 +3665,7 @@ export class ProbeStore {
   }
 
   rebuildSourceProjection(activity: Activity): number {
-    return this.withActivity(activity, () => {
+    return this.#repairProjection(activity, () => {
       const projectId = this.#binding.projectId;
       const sources = this.#db.prepare('SELECT unit_id FROM source_units WHERE owner_id=? AND project_id=? ORDER BY rowid')
         .all(this.#binding.ownerId, projectId);
@@ -5487,10 +5503,11 @@ export class ProbeStore {
   }
 
   #validateSource(input: SourceAck, content?: string,
-    targetScope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true }, projects: readonly string[] = [this.#binding.projectId]): void {
+    targetScope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true }, projects: readonly string[] = [this.#binding.projectId],
+    binding: Binding = this.#binding): void {
     check(input?.schema === 'cli-source-ack@1' && input.status === 'durable'
-      && input.binding.ownerId === this.#binding.ownerId && input.binding.hostId === this.#binding.hostId, 'source-scope-mismatch');
-    this.#validateScope(targetScope, projects);
+      && input.binding.ownerId === binding.ownerId && input.binding.hostId === binding.hostId, 'source-scope-mismatch');
+    this.#validateScope(targetScope, projects, binding);
     check(this.#sourceAllowedForScope(input.binding, targetScope), 'source-scope-mismatch');
     this.#archiveRef(input);
     if (content !== undefined) {
@@ -5511,17 +5528,17 @@ export class ProbeStore {
       WHERE m.workspace_id=? AND m.project_id=? AND w.owner_id=?`).get(scope.id, binding.projectId, this.#binding.ownerId));
   }
 
-  #validateScope(scope: MemoryScope, projects: readonly string[] = [this.#binding.projectId]): MemoryScope {
+  #validateScope(scope: MemoryScope, projects: readonly string[] = [this.#binding.projectId], binding: Binding = this.#binding): MemoryScope {
     check(scope && ['project', 'workspace', 'personal', 'session'].includes(scope.kind) && typeof scope.id === 'string', 'invalid-memory-scope');
     uuid(scope.id);
     check(Object.keys(scope).every(key => ['kind','id','resolved'].includes(key)) && typeof scope.resolved === 'boolean', 'invalid-memory-scope');
     if (scope.kind === 'project') check(projects.includes(scope.id) && scope.resolved, 'invalid-memory-scope');
-    if (scope.kind === 'personal') check(scope.id === this.#binding.ownerId && scope.resolved, 'invalid-memory-scope');
-    if (scope.kind === 'session') check(scope.id === this.#binding.sessionId && !scope.resolved, 'invalid-memory-scope');
+    if (scope.kind === 'personal') check(scope.id === binding.ownerId && scope.resolved, 'invalid-memory-scope');
+    if (scope.kind === 'session') check(scope.id === binding.sessionId && !scope.resolved, 'invalid-memory-scope');
     if (scope.kind === 'workspace') {
       check(scope.resolved && this.#db.prepare(`SELECT 1 FROM workspace_projects m JOIN workspaces w ON w.workspace_id=m.workspace_id
         WHERE m.workspace_id=? AND m.project_id IN (${projects.map(() => '?').join(',')}) AND w.owner_id=?`)
-        .get(scope.id, ...projects, this.#binding.ownerId), 'workspace-unavailable');
+        .get(scope.id, ...projects, binding.ownerId), 'workspace-unavailable');
     }
     return structuredClone(scope);
   }
@@ -5837,6 +5854,11 @@ export class ProbeStore {
       ['compartments','source_json'], ['source_units','payload'], ['evolution_proposals','payload'],
       ['feedback_events','payload'], ['activation_batches','payload'], ['host_presentations','payload'],
     ]) for (const row of this.#db.prepare(`SELECT ${column} AS value FROM ${table}`).all()) sources(JSON.parse(String(row.value)));
+    for (const row of this.#db.prepare('SELECT j.job_id,j.payload FROM capture_jobs j JOIN compartments c ON c.job_id=j.job_id').all()) {
+      const binding = (JSON.parse(String(row.payload)).source as SourceAck).binding;
+      this.sessionSource(binding);
+      this.#readCompartment(String(row.job_id), binding);
+    }
     for (const row of this.#db.prepare('SELECT stream_id FROM execution_streams').all()) {
       this.#readStream(String(row.stream_id));
       const events = this.#db.prepare('SELECT seq FROM execution_events WHERE stream_id=? ORDER BY seq').all(row.stream_id!);
@@ -5992,7 +6014,7 @@ export class ProbeStore {
     check(!manifest.recoveryId, 'snapshot-cleanup-kind-mismatch');
     const settled = this.#transaction(() => {
       check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
-      check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state='prepared'").get(), 'snapshot-recovery-in-progress');
+      check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state IN ('preparing','prepared')").get(), 'snapshot-recovery-in-progress');
       const row = this.#db.prepare('SELECT * FROM store_snapshots WHERE snapshot_id=?').get(manifest.snapshotId);
       check(row, 'snapshot-not-found');
       if (row.state === 'deleted') return true;
@@ -6015,16 +6037,17 @@ export class ProbeStore {
   recoveryCleanupManifest(coordinator: string, operationId: string): SnapshotCleanupManifest {
     return this.#transaction(() => {
       check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
-      const row = this.#db.prepare("SELECT * FROM store_restores WHERE operation_id=? AND state='complete' AND original_deleted=0").get(operationId);
+      const row = this.#db.prepare("SELECT * FROM store_restores WHERE operation_id=? AND state IN ('preparing','complete') AND original_deleted=0").get(operationId);
       check(row, 'recovery-original-unavailable');
       if (row.cleanup) {
         check(sha256(String(row.cleanup)) === row.cleanup_digest, 'snapshot-cleanup-evidence-gap');
         return JSON.parse(String(row.cleanup)) as SnapshotCleanupManifest;
       }
-      const plan = this.#readRecoveryPlan(row);
-      const files = inspectSnapshotFiles(plan.original, [...plan.originals.map(file => file.name),
-        'restore.sqlite','restore.sqlite-wal','restore.sqlite-shm','restore.sqlite-journal']);
-      const value = { schema: 'snapshot-cleanup@1' as const, snapshotId: plan.snapshot.id, recoveryId: operationId, directory: plan.original, files };
+      const plan = row.state === 'preparing' ? this.#bindRecoveryPreparation(coordinator, row) : this.#readRecoveryPlan(row);
+      check(plan.original.identity, 'snapshot-recovery-evidence-gap');
+      const directory = { path: plan.original.path, identity: plan.original.identity };
+      const files = inspectSnapshotFiles(directory, recoveryFileNames(plan));
+      const value = { schema: 'snapshot-cleanup@1' as const, snapshotId: plan.snapshot.id, recoveryId: operationId, directory, files };
       return { ...value, digest: sha256(JSON.stringify(value)) };
     });
   }
@@ -6033,8 +6056,9 @@ export class ProbeStore {
     check(manifest.recoveryId, 'snapshot-cleanup-kind-mismatch');
     const settled = this.#transaction(() => {
       check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
-      check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state='prepared'").get(), 'snapshot-recovery-in-progress');
-      const row = this.#db.prepare("SELECT * FROM store_restores WHERE operation_id=? AND state='complete'").get(manifest.recoveryId!);
+      check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state='prepared' OR (state='preparing' AND operation_id!=?)")
+        .get(manifest.recoveryId!), 'snapshot-recovery-in-progress');
+      const row = this.#db.prepare("SELECT * FROM store_restores WHERE operation_id=? AND state IN ('preparing','complete','cancelled')").get(manifest.recoveryId!);
       check(row, 'recovery-original-unavailable');
       if (row.original_deleted === 1) return true;
       check(JSON.stringify(this.recoveryCleanupManifest(coordinator, manifest.recoveryId!)) === JSON.stringify(manifest), 'snapshot-cleanup-stale');
@@ -6048,7 +6072,8 @@ export class ProbeStore {
     this.#transaction(() => {
       check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
       removeSnapshotFiles(manifest); syncSnapshotDirectory(this.#resources.root.path);
-      this.#db.prepare('UPDATE store_restores SET original_deleted=1,cleanup=NULL,cleanup_digest=NULL WHERE operation_id=?').run(manifest.recoveryId!);
+      this.#db.prepare(`UPDATE store_restores SET original_deleted=1,cleanup=NULL,cleanup_digest=NULL,
+        state=CASE WHEN state='preparing' THEN 'cancelled' ELSE state END WHERE operation_id=?`).run(manifest.recoveryId!);
     });
   }
 
@@ -6063,58 +6088,110 @@ export class ProbeStore {
     return plan;
   }
 
-  async restoreSnapshot(coordinator: string, snapshotId: string): Promise<{ receipt: SnapshotRecoveryReceipt; original: BoundFile }> {
-    uuid(snapshotId);
-    const plan = this.#transaction(() => {
-      const fence = this.#assertCoordinator(coordinator);
-      check(fence.state === 'exclusive', 'maintenance-not-exclusive');
-      const pending = this.#db.prepare("SELECT * FROM store_restores WHERE state='prepared'").get();
+  #readRecoveryPreparation(row: Record<string, unknown>): SnapshotRecoveryPreparation {
+    check(sha256(String(row.payload)) === row.digest, 'snapshot-recovery-evidence-gap');
+    const preparation = JSON.parse(String(row.payload)) as SnapshotRecoveryPreparation;
+    check(preparation.operationId === row.operation_id && preparation.snapshot.id === row.snapshot_id
+      && preparation.original.path === join(this.#resources.root.path, `recovery-${preparation.operationId}`), 'snapshot-recovery-evidence-gap');
+    if (preparation.original.identity && !row.cleanup) sameFile(preparation.original.path, preparation.original.identity);
+    return preparation;
+  }
+
+  #bindRecoveryPreparation(coordinator: string, row: Record<string, unknown>): SnapshotRecoveryPreparation {
+    return this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      const preparation = this.#readRecoveryPreparation(row);
+      if (!preparation.original.identity) {
+        if (!existsSync(preparation.original.path)) mkdirSync(preparation.original.path, { mode: 0o700 });
+        const stat = lstatSync(preparation.original.path);
+        check(stat.isDirectory() && !stat.isSymbolicLink(), 'snapshot-inventory-mismatch');
+        preparation.original.identity = fileIdentity(preparation.original.path);
+        inspectSnapshotFiles({ path: preparation.original.path, identity: preparation.original.identity }, recoveryFileNames(preparation));
+        syncSnapshotDirectory(this.#resources.root.path);
+        const payload = JSON.stringify(preparation);
+        this.#db.prepare('UPDATE store_restores SET payload=?,digest=? WHERE operation_id=?')
+          .run(payload, sha256(payload), preparation.operationId);
+      }
+      return preparation;
+    });
+  }
+
+  #prepareRecovery(coordinator: string, snapshotId: string): SnapshotRecoveryPlan {
+    const row = this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      const pending = this.#db.prepare("SELECT * FROM store_restores WHERE state IN ('preparing','prepared')").get();
       if (pending) {
         check(pending.snapshot_id === snapshotId, 'snapshot-recovery-in-progress');
-        return this.#readRecoveryPlan(pending);
+        check(!pending.cleanup, 'snapshot-cleanup-in-progress');
+        return pending;
       }
       const saved = this.#db.prepare("SELECT manifest,digest FROM store_snapshots WHERE snapshot_id=? AND state='ready'").get(snapshotId);
       check(saved && sha256(String(saved.manifest)) === saved.digest, 'snapshot-not-recoverable');
       const snapshot = JSON.parse(String(saved.manifest)) as StoreSnapshot;
       check(snapshot.storeId === this.#storeId && JSON.stringify(snapshot.root) === JSON.stringify(this.#resources.root), 'snapshot-store-mismatch');
       verifySnapshot(snapshot);
-      for (const file of snapshot.files) sameFile(file.source.path, file.source.identity);
-      const operationId = randomUUID(), path = join(this.#resources.root.path, `recovery-${operationId}`);
-      mkdirSync(path, { mode: 0o700 });
-      const original = { path, identity: fileIdentity(path) };
-      const originals: SnapshotFile[] = [];
-      const save = (source: BoundFile, name: string, role: SnapshotFile['role']) => {
-        const bytes = snapshotBytes(source);
-        writeSnapshotFile(join(path, name), bytes);
-        originals.push({ source, name, role, hash: sha256(bytes), bytes: bytes.length });
-      };
-      save(this.#resources.store, 'store.sqlite', 'source');
-      for (const suffix of ['-wal']) {
-        const sidecar = this.#resources.store.path + suffix;
-        if (existsSync(sidecar)) save({ path: sidecar, identity: fileIdentity(sidecar) }, `store.sqlite${suffix}`, 'source');
-      }
-      for (const file of snapshot.files) save(file.source, file.name, file.role);
-      for (const row of this.#db.prepare('SELECT source_path,source_dev,source_ino FROM sessions WHERE store_id=?').all(this.#storeId)) {
-        if (!originals.some(file => file.source.path === row.source_path)) save({ path: String(row.source_path),
-          identity: { dev: String(row.source_dev), ino: String(row.source_ino) } }, `later-source-${originals.length}`, 'source');
+      const files: SnapshotRecoveryPreparation['files'] = [
+        { source: this.#resources.store, name: 'store.sqlite', role: 'source' },
+        ...snapshot.files.map(({ source, name, role }) => ({ source, name, role })),
+      ];
+      for (const session of this.#db.prepare('SELECT source_path,source_dev,source_ino FROM sessions WHERE store_id=?').all(this.#storeId)) {
+        if (!files.some(file => file.source.path === session.source_path)) files.push({ source: { path: String(session.source_path),
+          identity: { dev: String(session.source_dev), ino: String(session.source_ino) } }, name: `later-source-${files.length}`, role: 'source' });
       }
       const controlledFiles = this.#controlledFiles().filter(file => file.started && file.state !== 'no_effect');
       for (const file of controlledFiles) {
         check(file.state === 'recorded' && file.identity, 'file-cleanup-evidence-gap');
         sameFile(file.root.path, file.root.identity); sameFile(file.parent.path, file.parent.identity);
-        if (!originals.some(item => item.source.path === file.path)) save({ path: file.path, identity: file.identity },
-          `later-output-${originals.length}`, 'project-output');
+        if (!files.some(item => item.source.path === file.path)) files.push({ source: { path: file.path, identity: file.identity },
+          name: `later-output-${files.length}`, role: 'project-output' });
       }
-      const stagePath = join(path, 'restore.sqlite');
-      writeSnapshotFile(stagePath, '');
-      const result: SnapshotRecoveryPlan = { operationId, snapshot, original, originals, controlledFiles,
-        stage: { path: stagePath, identity: fileIdentity(stagePath) },
+      for (const file of files) sameFile(file.source.path, file.source.identity);
+      const operationId = randomUUID();
+      const preparation: SnapshotRecoveryPreparation = { operationId, snapshot, files, controlledFiles,
+        original: { path: join(this.#resources.root.path, `recovery-${operationId}`), identity: null },
         receipt: { schema: 'store/recovered-from-snapshot@v1', operationId, outcome: 'recovered_with_gap', createdAt: new Date().toISOString() } };
-      syncSnapshotDirectory(path); syncSnapshotDirectory(this.#resources.root.path);
-      const payload = JSON.stringify(result);
-      this.#db.prepare("INSERT INTO store_restores(operation_id,snapshot_id,state,payload,digest) VALUES (?,?,'prepared',?,?)").run(operationId, snapshotId, payload, sha256(payload));
-      return result;
+      const payload = JSON.stringify(preparation);
+      this.#db.prepare("INSERT INTO store_restores(operation_id,snapshot_id,state,payload,digest) VALUES (?,?,'preparing',?,?)")
+        .run(operationId, snapshotId, payload, sha256(payload));
+      return this.#db.prepare('SELECT * FROM store_restores WHERE operation_id=?').get(operationId)!;
     });
+    if (row.state === 'prepared') return this.#readRecoveryPlan(row);
+    const preparation = this.#bindRecoveryPreparation(coordinator, row);
+    return this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      check(preparation.original.identity, 'snapshot-recovery-evidence-gap');
+      const original = { path: preparation.original.path, identity: preparation.original.identity };
+      verifySnapshot(preparation.snapshot);
+      inspectSnapshotFiles(original, recoveryFileNames(preparation));
+      const write = (name: string, bytes: Uint8Array | string) => {
+        const path = join(original.path, name);
+        if (existsSync(path)) restoreFile({ path, identity: fileIdentity(path) }, typeof bytes === 'string' ? Buffer.from(bytes) : bytes);
+        else writeSnapshotFile(path, bytes);
+      };
+      const originals: SnapshotFile[] = [];
+      const save = (file: SnapshotRecoveryPreparation['files'][number]) => {
+        const bytes = snapshotBytes(file.source); write(file.name, bytes);
+        originals.push({ ...file, hash: sha256(bytes), bytes: bytes.length });
+      };
+      for (const file of preparation.files) save(file);
+      const wal = this.#resources.store.path + '-wal';
+      if (existsSync(wal)) save({ source: { path: wal, identity: fileIdentity(wal) }, name: 'store.sqlite-wal', role: 'source' });
+      else if (existsSync(join(original.path, 'store.sqlite-wal'))) unlinkSync(join(original.path, 'store.sqlite-wal'));
+      write('restore.sqlite', '');
+      const stagePath = join(original.path, 'restore.sqlite');
+      const plan: SnapshotRecoveryPlan = { operationId: preparation.operationId, snapshot: preparation.snapshot, original, originals,
+        controlledFiles: preparation.controlledFiles, receipt: preparation.receipt, stage: { path: stagePath, identity: fileIdentity(stagePath) } };
+      syncSnapshotDirectory(original.path);
+      const payload = JSON.stringify(plan);
+      this.#db.prepare("UPDATE store_restores SET state='prepared',payload=?,digest=? WHERE operation_id=? AND state='preparing'")
+        .run(payload, sha256(payload), plan.operationId);
+      return plan;
+    });
+  }
+
+  async restoreSnapshot(coordinator: string, snapshotId: string): Promise<{ receipt: SnapshotRecoveryReceipt; original: BoundFile }> {
+    uuid(snapshotId);
+    const plan = this.#prepareRecovery(coordinator, snapshotId);
     this.#transaction(() => {
       check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
       verifySnapshot(plan.snapshot);
@@ -6128,6 +6205,7 @@ export class ProbeStore {
           stage.prepare(`INSERT OR IGNORE INTO ${table} (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`)
             .run(...Object.values(row) as (string | number | null)[]);
         };
+        stage.exec('DELETE FROM store_restores');
         for (const table of ['store_recovery_events', 'store_recovered_owners', 'store_restores']) {
           for (const row of this.#db.prepare(`SELECT * FROM ${table}`).all()) copy(table, row);
         }
@@ -6274,7 +6352,7 @@ export class ProbeStore {
             : tool.started ? 'unknown' : 'not_started' };
       });
     });
-    for (const row of this.#db.prepare('SELECT * FROM store_restores').all()) {
+    for (const row of this.#db.prepare("SELECT * FROM store_restores WHERE state IN ('prepared','complete')").all()) {
       for (const file of this.#readRecoveryPlan(row).controlledFiles) {
         if (!files.some(current => current.runId === file.runId && current.callId === file.callId)) files.push(file);
       }
@@ -6290,7 +6368,10 @@ export class ProbeStore {
     const known = new Set(['sandbox.json', 'counting-receiver.jsonl', 'owner-info.jsonl', ...sourceNames, basename(this.#resources.store.path),
       `${basename(this.#resources.store.path)}-wal`, `${basename(this.#resources.store.path)}-shm`]);
     const snapshots = this.#db.prepare("SELECT * FROM store_snapshots WHERE state!='deleted'").all();
-    const recoveries = this.#db.prepare('SELECT * FROM store_restores').all().map(row => this.#readRecoveryPlan(row));
+    const recoveries = this.#db.prepare("SELECT * FROM store_restores WHERE state IN ('prepared','complete')").all().map(row => this.#readRecoveryPlan(row));
+    const preparations = this.#db.prepare("SELECT * FROM store_restores WHERE state='preparing'").all().map(row => this.#readRecoveryPreparation(row));
+    for (const preparation of preparations) if (preparation.original.identity) snapshots.push({
+      directory: preparation.original.path, dev: preparation.original.identity.dev, ino: preparation.original.identity.ino });
     for (const recovery of recoveries) {
       if (this.#db.prepare('SELECT original_deleted FROM store_restores WHERE operation_id=?').get(recovery.operationId)!.original_deleted === 0) {
         snapshots.push({ directory: recovery.original.path, dev: recovery.original.identity.dev, ino: recovery.original.identity.ino });
@@ -6310,9 +6391,11 @@ export class ProbeStore {
           const snapshot = snapshots.find(row => basename(String(row.directory)) === path);
           if (snapshot?.snapshot_id) this.#snapshotFiles(snapshot);
           const recovery = recoveries.find(plan => basename(plan.original.path) === path);
-          if (snapshot && recovery) inspectSnapshotFiles(recovery.original, [...recovery.originals.map(file => file.name),
-            'restore.sqlite','restore.sqlite-wal','restore.sqlite-shm','restore.sqlite-journal']);
-          const expected = snapshot ? stat.isDirectory() && !stat.isSymbolicLink()
+          if (snapshot && recovery) inspectSnapshotFiles(recovery.original, recoveryFileNames(recovery));
+          const preparation = preparations.find(item => basename(item.original.path) === path);
+          if (preparation) inspectSnapshotFiles({ path: preparation.original.path, identity: preparation.original.identity
+            ?? { dev: stat.dev.toString(), ino: stat.ino.toString() } }, recoveryFileNames(preparation));
+          const expected = preparation && !preparation.original.identity ? stat.isDirectory() && !stat.isSymbolicLink() : snapshot ? stat.isDirectory() && !stat.isSymbolicLink()
             && snapshot.dev === stat.dev.toString() && snapshot.ino === stat.ino.toString()
             : known.has(path) && identityMatches && stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n;
           entries.push({ path, state: expected ? 'expected' : 'unexpected', observedAt,
@@ -6351,7 +6434,7 @@ export class ProbeStore {
     const released = this.#transaction(() => {
       const fence = this.#assertCoordinator(coordinator);
       check(fence.state === 'exclusive', 'maintenance-not-exclusive');
-      check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state='prepared'").get(), 'snapshot-recovery-in-progress');
+      check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state IN ('preparing','prepared')").get(), 'snapshot-recovery-in-progress');
       if (!this.acquireMaintenance(coordinator).acquired) return null;
       return this.#reopenMaintenance();
     });
@@ -6363,7 +6446,7 @@ export class ProbeStore {
   cancelMaintenance(coordinator: string): Fence {
     return this.#transaction(() => {
       this.#assertCoordinator(coordinator);
-      check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state='prepared'").get(), 'snapshot-recovery-in-progress');
+      check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state IN ('preparing','prepared')").get(), 'snapshot-recovery-in-progress');
       return this.#reopenMaintenance();
     });
   }

@@ -3,7 +3,10 @@
   "synthetic": true,
   "cases": [
     "memory", "handoff", "historian", "project-output-before", "project-output-after", "unknown-before", "unknown-after",
-    "crash-carrier", "crash-database", "ENOSPC", "EROFS", "canonical-corruption",
+    "crash-carrier", "crash-database", "crash-directory", "crash-preparation",
+    "restore-ENOSPC", "restore-EROFS", "discard-preparation", "recovery-cleanup-state",
+    "ENOSPC", "EROFS", "canonical-corruption", "projection-memory", "projection-source",
+    "historian-publication-corruption", "historian-range-corruption", "historian-stage-corruption",
     "migration-success", "migration-before-commit", "migration-after-commit"
   ]
 }

@@ -12,6 +12,15 @@ export interface SnapshotRecoveryPlan {
   operationId: string; snapshot: StoreSnapshot; original: BoundFile; stage: BoundFile;
   originals: SnapshotFile[]; controlledFiles: ControlledFile[]; receipt: SnapshotRecoveryReceipt;
 }
+export interface SnapshotRecoveryPreparation {
+  operationId: string; snapshot: StoreSnapshot; original: { path: string; identity: BoundFile['identity'] | null };
+  files: Pick<SnapshotFile, 'source' | 'name' | 'role'>[]; controlledFiles: ControlledFile[]; receipt: SnapshotRecoveryReceipt;
+}
+export function recoveryFileNames(recovery: SnapshotRecoveryPlan | SnapshotRecoveryPreparation): string[] {
+  const files = 'originals' in recovery ? recovery.originals : recovery.files;
+  return [...files.map(file => file.name), 'store.sqlite-wal',
+    'restore.sqlite', 'restore.sqlite-wal', 'restore.sqlite-shm', 'restore.sqlite-journal'];
+}
 
 /** Existing resources keep their identity; interruption is resumed under the closed Store fence. */
 export function restoreFile(file: BoundFile, bytes: Uint8Array): void {

@@ -86,6 +86,13 @@ export function snapshotDataHash(db: DatabaseSync, files: SnapshotFile[]): strin
   return sha256(JSON.stringify({ rows, files: files.map(({ source, role, hash, bytes }) => ({ source, role, hash, bytes })) }));
 }
 
+function verifySnapshotFile(path: string, expected: { hash: string; bytes: number }): void {
+  const stat = lstatSync(path);
+  check(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1, 'unsafe-snapshot-file');
+  const bytes = readFileSync(path);
+  check(bytes.length === expected.bytes && sha256(bytes) === expected.hash, 'snapshot-content-mismatch');
+}
+
 export function verifySnapshot(snapshot: StoreSnapshot): void {
   sameFile(snapshot.root.path, snapshot.root.identity);
   sameFile(snapshot.directory.path, snapshot.directory.identity);
@@ -95,10 +102,7 @@ export function verifySnapshot(snapshot: StoreSnapshot): void {
   check(manifest === JSON.stringify(snapshot) + '\n', 'snapshot-manifest-mismatch');
   for (const item of [{ name: 'store.sqlite', ...snapshot.database }, ...snapshot.files]) {
     check(!item.name.includes('/') && !item.name.includes('\\'), 'snapshot-inventory-mismatch');
-    const path = join(snapshot.directory.path, item.name), stat = lstatSync(path);
-    check(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1, 'unsafe-snapshot-file');
-    const bytes = readFileSync(path);
-    check(bytes.length === item.bytes && sha256(bytes) === item.hash, 'snapshot-content-mismatch');
+    verifySnapshotFile(join(snapshot.directory.path, item.name), item);
   }
   const db = new DatabaseSync(join(snapshot.directory.path, 'store.sqlite'), { readOnly: true });
   try { checkSqliteSnapshot(db); } finally { db.close(); }
@@ -115,10 +119,7 @@ export function deleteSnapshot(snapshot: StoreSnapshot): void {
   for (const name of readdirSync(snapshot.directory.path)) {
     const item = expected.get(name);
     check(item, 'snapshot-inventory-mismatch');
-    const path = join(snapshot.directory.path, name), stat = lstatSync(path);
-    check(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1, 'unsafe-snapshot-file');
-    const bytes = readFileSync(path);
-    check(bytes.length === item.bytes && sha256(bytes) === item.hash, 'snapshot-content-mismatch');
+    verifySnapshotFile(join(snapshot.directory.path, name), item);
   }
   for (const name of readdirSync(snapshot.directory.path)) {
     sameFile(snapshot.directory.path, snapshot.directory.identity);

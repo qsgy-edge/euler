@@ -3,8 +3,8 @@ import fs from 'node:fs';
 import sqlite from 'node:sqlite';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
-import { ProbeSession, API_VERSION } from '@euler/core';
-import { openSandbox, bindingOf, createSandboxSession } from '../../src/sandbox.ts';
+import { ProbeStore, ProbeSession, API_VERSION } from '@euler/core';
+import { openSandbox, bindingOf, resourcesOf, createSandboxSession } from '../../src/sandbox.ts';
 import { openProbe } from '../../src/probe.ts';
 import { backupSandbox, restoreSandboxSnapshot } from '../../src/backup.ts';
 
@@ -16,6 +16,23 @@ function crash(point: string): never {
 }
 if (action === 'migration-checkpoint') {
   console.log(JSON.stringify(await backupSandbox(sandbox, 'migration')));
+} else if (action === 'repair-projection') {
+  const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    if (value === 'memory') probe.store.rebuildSearchProjection(probe.activity);
+    else if (value === 'source') probe.store.rebuildSourceProjection(probe.activity);
+    else throw new Error('invalid-projection-lane');
+    console.log(JSON.stringify({ event: 'projection-rebuilt', health: probe.store.fence().health }));
+  } finally { probe.close(); }
+} else if (action === 'discard-recovery') {
+  const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox)), coordinator = randomUUID();
+  try {
+    store.beginMaintenance(coordinator);
+    if (!store.acquireMaintenance(coordinator).acquired) throw new Error('maintenance-residuals-or-participants');
+    const manifest = store.recoveryCleanupManifest(coordinator, value!);
+    store.discardRecoveryOriginal(coordinator, manifest); store.releaseMaintenance(coordinator);
+    console.log(JSON.stringify(manifest));
+  } finally { store.close(); }
 } else if (action === 'unknown') {
   const binding = { ...bindingOf(sandbox), sessionId: randomUUID(), branchId: randomUUID() };
   createSandboxSession(sandbox, binding);
@@ -38,7 +55,22 @@ if (action === 'migration-checkpoint') {
   syncBuiltinESMExports();
   try { await backupSandbox(sandbox); throw new Error('expected-backup-failure'); }
   catch (error) { console.log(JSON.stringify({ event: 'backup-failed', reason: (error as NodeJS.ErrnoException).code })); }
-} else if (action === 'restore-crash') {
+} else if (action === 'restore-crash' || action === 'restore-failure') {
+  const mkdir = fs.mkdirSync;
+  fs.mkdirSync = ((path: fs.PathLike, ...args: unknown[]) => {
+    const result = Reflect.apply(mkdir, fs, [path, ...args]);
+    if (value === 'directory' && /recovery-[^/\\]+$/.test(String(path))) crash(value);
+    return result;
+  }) as typeof fs.mkdirSync;
+  const write = fs.writeFileSync;
+  fs.writeFileSync = ((path: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+    if (action === 'restore-failure' && /recovery-[^/\\]+[/\\]store.sqlite$/.test(String(path))) {
+      throw Object.assign(new Error(value), { code: value });
+    }
+    const result = Reflect.apply(write, fs, [path, ...args]);
+    if (value === 'preparation' && /recovery-[^/\\]+[/\\]store.sqlite$/.test(String(path))) crash(value);
+    return result;
+  }) as typeof fs.writeFileSync;
   const open = fs.openSync, truncate = fs.ftruncateSync, files = new Map<number, string>();
   fs.openSync = ((path: fs.PathLike, ...args: unknown[]) => {
     const fd = Reflect.apply(open, fs, [path, ...args]) as number; files.set(fd, String(path)); return fd;
@@ -57,6 +89,9 @@ if (action === 'migration-checkpoint') {
   const db = new sqlite.DatabaseSync(join(sandbox.root, 'probe.sqlite'), { readOnly: true });
   const id = String(db.prepare("SELECT snapshot_id FROM store_snapshots WHERE state='ready' ORDER BY created_at DESC LIMIT 1").get()!.snapshot_id);
   db.close();
-  await restoreSandboxSnapshot(sandbox, id);
-  throw new Error('expected-crash');
+  try { await restoreSandboxSnapshot(sandbox, id); throw new Error('expected-restore-failure'); }
+  catch (error) {
+    if (action !== 'restore-failure' || (error as NodeJS.ErrnoException).code !== value) throw error;
+    console.log(JSON.stringify({ event: 'snapshot-failed', point: value }));
+  }
 }
