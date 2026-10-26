@@ -6238,7 +6238,7 @@ export class ProbeStore {
       check(JSON.stringify(manifest) === JSON.stringify(current), 'snapshot-cleanup-stale');
       if (!row.cleanup) sameFile(manifest.directory.path, manifest.directory.identity);
       const payload = JSON.stringify(manifest);
-      this.#db.prepare("UPDATE store_snapshots SET state='retired',cleanup=?,cleanup_digest=? WHERE snapshot_id=?")
+      this.#db.prepare("UPDATE store_snapshots SET state=CASE WHEN state='staging' THEN state ELSE 'retired' END,cleanup=?,cleanup_digest=? WHERE snapshot_id=?")
         .run(payload, sha256(payload), manifest.snapshotId);
       return false;
     });

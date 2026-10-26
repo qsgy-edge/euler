@@ -56,6 +56,24 @@ test('deleted backup files with a lost acknowledgement resume without reapproval
   } finally { fs.rmdirSync=remove; syncBuiltinESMExports(); store.close(); rmSync(sandbox.root,{recursive:true,force:true}); }
 });
 
+for (const point of ['before','after']) test(`staging snapshot cleanup resumes after a process dies ${point} directory removal`, () => {
+  const { sandbox, id } = prepare(true);
+  try {
+    const source = readFileSync(join(sandbox.root,'session.jsonl'));
+    const killed = spawnSync(process.execPath, ['apps/cli/test/support/backup-worker.ts',sandbox.root,'discard-snapshot-crash',id,point], { encoding: 'utf8' });
+    assert.ok(killed.signal === 'SIGKILL' || killed.status !== 0); assert.doesNotMatch(killed.stderr,/Error:|ERR_/);
+    assert.equal(JSON.parse(killed.stdout).point,'snapshot-cleanup-'+point);
+    const resumed = spawnSync(process.execPath, ['apps/cli/test/support/backup-worker.ts',sandbox.root,'discard-snapshot',id], { encoding: 'utf8' });
+    assert.equal(resumed.status,0,resumed.stdout+resumed.stderr);
+    const manifest = JSON.parse(resumed.stdout);
+    assert.equal(manifest.snapshotId,id); assert.equal(existsSync(manifest.directory.path),false);
+    assert.deepEqual(readFileSync(join(sandbox.root,'session.jsonl')),source);
+    const retried = spawnSync(process.execPath, ['apps/cli/src/main.ts','backup','--sandbox',sandbox.root], { encoding: 'utf8' });
+    assert.equal(retried.status,0,retried.stdout+retried.stderr);
+    assert.equal(retried.stdout.trim().split('\n').map(line=>JSON.parse(line)).find(event=>event.event==='backup-result').status,'created');
+  } finally { rmSync(sandbox.root,{recursive:true,force:true}); }
+});
+
 test('snapshot deletion refuses a replaced directory and preserves its replacement', () => {
   const { sandbox, id } = prepare();
   const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox));

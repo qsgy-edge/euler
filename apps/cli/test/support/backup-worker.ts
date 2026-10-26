@@ -11,7 +11,7 @@ import { seedBackupOperations, corruptBackupOperation } from './backup-operation
 import { compareCandidate, verifiedCandidate } from './memory-evolution.ts';
 import { approvedSourceUnit, saveApprovedProposal } from './source-publication.ts';
 
-const [root, action, value] = process.argv.slice(2);
+const [root, action, value, point] = process.argv.slice(2);
 const sandbox = openSandbox(root!);
 function crash(point: string): never {
   fs.writeSync(1, JSON.stringify({ event: 'snapshot-crash', point }) + '\n');
@@ -175,13 +175,24 @@ if (action === 'seed-canonical-state') {
     else throw new Error('invalid-projection-lane');
     console.log(JSON.stringify({ event: 'projection-rebuilt', health: probe.store.fence().health }));
   } finally { probe.close(); }
-} else if (action === 'discard-recovery' || action === 'discard-snapshot') {
+} else if (action === 'discard-recovery' || action === 'discard-snapshot' || action === 'discard-snapshot-crash') {
   const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox)), coordinator = randomUUID();
   try {
     store.beginMaintenance(coordinator);
     if (!store.acquireMaintenance(coordinator).acquired) throw new Error('maintenance-residuals-or-participants');
-    const manifest = action === 'discard-snapshot' ? store.snapshotCleanupManifest(coordinator, value!) : store.recoveryCleanupManifest(coordinator, value!);
-    if (action === 'discard-snapshot') store.discardSnapshot(coordinator, manifest); else store.discardRecoveryOriginal(coordinator, manifest);
+    const snapshot = action !== 'discard-recovery';
+    const manifest = snapshot ? store.snapshotCleanupManifest(coordinator, value!) : store.recoveryCleanupManifest(coordinator, value!);
+    if (action === 'discard-snapshot-crash') {
+      const remove = fs.rmdirSync;
+      fs.rmdirSync = (...args) => {
+        if (String(args[0]) === manifest.directory.path && point === 'before') crash('snapshot-cleanup-before');
+        remove(...args);
+        if (String(args[0]) === manifest.directory.path && point === 'after') crash('snapshot-cleanup-after');
+      };
+      syncBuiltinESMExports();
+    }
+    if (snapshot) store.discardSnapshot(coordinator, manifest); else store.discardRecoveryOriginal(coordinator, manifest);
+    if (action === 'discard-snapshot-crash') throw new Error('expected-snapshot-cleanup-crash');
     store.releaseMaintenance(coordinator);
     console.log(JSON.stringify(manifest));
   } finally { store.close(); }

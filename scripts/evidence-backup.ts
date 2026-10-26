@@ -85,7 +85,7 @@ for (const scenario of fixture.cases) {
       assert.equal(hash(readFileSync(join(sandbox.root, 'session.jsonl'))), original);
       assert.deepEqual(cli('failed-backups', 'backups').find(e => e.event === 'backups').snapshots, []);
     }
-    if (scenario === 'backup-directory-crash') {
+    if (scenario === 'backup-directory-crash' || scenario.startsWith('staging-cleanup-')) {
       assert.equal(run('backup-interrupted',['apps/cli/test/support/backup-worker.ts',sandbox.root,'backup-crash'],'kill')[0].point,'backup-directory');
       const db = new DatabaseSync(join(sandbox.root,'probe.sqlite'),{readOnly:true});
       let id: string;
@@ -94,7 +94,22 @@ for (const scenario of fixture.cases) {
         assert.ok(row); assert.equal(row.dev,null); assert.equal(row.ino,null); id = String(row.snapshot_id);
       } finally { db.close(); }
       cpSync(sandbox.root,join(path,'interrupted-sandbox'),{recursive:true});
+      let cleanup: unknown;
+      if (scenario.startsWith('staging-cleanup-')) {
+        const point = scenario.slice('staging-cleanup-'.length);
+        assert.equal(run('cleanup-interrupted',['apps/cli/test/support/backup-worker.ts',sandbox.root,'discard-snapshot-crash',id,point],'kill')[0].point,
+          'snapshot-cleanup-'+point);
+        const pending = new DatabaseSync(join(sandbox.root,'probe.sqlite'),{readOnly:true});
+        try {
+          const row = pending.prepare('SELECT state,cleanup,cleanup_digest FROM store_snapshots WHERE snapshot_id=?').get(id)!;
+          assert.equal(row.state,'staging'); assert.equal(hash(String(row.cleanup)),row.cleanup_digest);
+          cleanup = JSON.parse(String(row.cleanup));
+          assert.equal(pending.prepare('SELECT state FROM owner_fences').get()!.state,'exclusive');
+        } finally { pending.close(); }
+        cpSync(sandbox.root,join(path,'cleanup-interrupted-sandbox'),{recursive:true});
+      }
       const manifest = run('backup-discarded',['apps/cli/test/support/backup-worker.ts',sandbox.root,'discard-snapshot',id])[0];
+      if (cleanup) assert.deepEqual(manifest,cleanup);
       assert.equal(existsSync(manifest.directory.path),false);
     }
     if (scenario.startsWith('projection-')) {
