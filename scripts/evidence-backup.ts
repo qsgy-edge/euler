@@ -42,7 +42,7 @@ for (const scenario of fixture.cases) {
     const setup = scenario.startsWith('historian-') ? 'historian' : ['projection-memory','proposal-metadata-corruption','typed-head-corruption','batch-manifest-corruption','info-outbox-corruption','capture-metadata-corruption','feedback-metadata-corruption'].includes(scenario) ? 'memory'
       : ['projection-source','source-metadata-corruption'].includes(scenario) ? 'handoff' : scenario;
     let infoBatches: string[] | undefined, laterInfo: string | undefined, handoff: unknown, intent: unknown;
-    let feedback: { recordId: string; feedbackId: string } | undefined, captureJobId: string | undefined;
+    let feedback: { recordId: string; feedbackId: string; input: unknown } | undefined, captureJobId: string | undefined;
     if (scenario.startsWith('owner-info')) {
       infoBatches = cli('setup','remember',[],'success','记住偏好：包管理器使用 pnpm\n记住决定：本项目使用 SQLite WAL\nstop\n')
         .filter(e => e.event === 'remember-result' && e.status === 'activated').map(e => e.batchId);
@@ -328,10 +328,18 @@ for (const scenario of fixture.cases) {
     }
     if (intent) assert.deepEqual(run('intent-verified',['apps/cli/test/support/backup-worker.ts',sandbox.root,'read-intent'])[0],intent);
     if (captureJobId) assert.equal(run('capture-verified',['apps/cli/test/support/backup-worker.ts',sandbox.root,'read-capture',captureJobId])[0].jobId,captureJobId);
-    if (feedback) assert.equal(run('feedback-verified',['apps/cli/test/support/backup-worker.ts',sandbox.root,'read-feedback',feedback.recordId])[0].events[0].feedbackId,feedback.feedbackId);
+    if (feedback) {
+      const result = run('feedback-verified',['apps/cli/test/support/backup-worker.ts',sandbox.root,'read-feedback',feedback.recordId])[0];
+      const receipt = result.events.find((event: { feedbackId: string }) => event.feedbackId === feedback!.feedbackId);
+      assert.equal(receipt.kind,'user_helpful'); assert.deepEqual(receipt.evidence.source,feedback.input);
+    }
     if (scenario === 'info-outbox-corruption') {
       const listed = cli('restored-info','info').find(e => e.event === 'info-list');
-      assert.deepEqual([listed.pending,listed.unread],[0,1]);
+      assert.deepEqual([listed.pending,listed.unread],[1,1]);
+      const displayed = cli('delivered-info','info',['--batch',listed.rows[0].batchId]);
+      assert.equal(displayed.find(e => e.event === 'info-read').read,'read');
+      const settled = cli('settled-info','info').find(e => e.event === 'info-list');
+      assert.deepEqual([settled.pending,settled.unread],[0,0]);
     }
     if (expectedOutput) {
       assert.deepEqual(cli('maintenance-inventory','maintenance-status').find(e => e.event === 'maintenance-status').controlledFiles,[expectedOutput]);
