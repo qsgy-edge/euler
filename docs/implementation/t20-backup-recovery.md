@@ -16,7 +16,7 @@ npm run evidence:backup
 
 ## Snapshot boundary and inventory
 
-`ProbeStore.createSnapshot` pins a SQLite read transaction and captures the source and owner-carrier bytes at the same Core write boundary. SQLite's backup API materializes that read snapshot while other ordinary work may continue. Publication requires database `quick_check`, foreign-key and canonical-reference checks, archive framing/binding checks, referenced source byte/hash checks, and independent readback of the destination files. Published source units and proposals are checked through their canonical owner readers, including payload digests, typed versions, project scope, approvals and source relationships. Published Historian compartments are checked against their completed job, publication hash, frozen range/hash, actual attempt, recorded response and archived body. Before creating a backup directory, Core durably registers its staging intent and intended file inventory, then binds the directory identity. Interrupted staging remains available to maintenance cleanup and does not consume a verified daily snapshot slot.
+`ProbeStore.createSnapshot` pins a SQLite read transaction and captures the source and owner-carrier bytes at the same Core write boundary. SQLite's backup API materializes that read snapshot while other ordinary work may continue. Publication requires database `quick_check`, foreign-key and canonical-reference checks, archive framing/binding checks, referenced source byte/hash checks, and independent readback of the destination files. Memory heads and activation batches use the same complete replay/typed-column and manifest checks as ordinary reads; access scope remains enforced by the requesting reader. Published source units and proposals are checked through their canonical owner readers, including payload digests, typed versions, project scope, approvals and source relationships. Published Historian compartments are checked against their completed job, publication hash, frozen range/hash, actual attempt, recorded response and archived body. Before creating a backup directory, Core durably registers its staging intent and intended file inventory, then binds the directory identity. Interrupted staging remains available to maintenance cleanup and does not consume a verified daily snapshot slot.
 
 | Carrier | Snapshot treatment |
 | --- | --- |
@@ -51,7 +51,7 @@ The disposable schema version is **23**. Store opening rejects other schema vers
 
 `npm run evidence:backup` writes `artifacts/t20-*/receipt.json`, the CLI stdout/stderr, interrupted/final sandbox copies and artifact hashes. Its cases cover memory; delivered/read Info and post-snapshot Info gaps; report history, approved project excerpts and cross-project rejection; Historian; controlled project outputs and unknown jobs before/after the snapshot; backup-directory and recovery interruptions; injected `ENOSPC`/`EROFS`; projection repairs with canonical writes still available; canonical, source/proposal metadata and Historian corruption; original-copy cleanup state; and the three forward migration copy outcomes. The verifier reads the actual SQLite files and source bytes independently, checks preserved attempt outcomes and gap ownership, then proves that an old stream is rejected and a fresh session sends successfully.
 
-The `backup*.test.ts` suite additionally verifies concurrent ordinary writes, UTC-day retention, missing current owner control, source mutation, cross-session Historian verification, carrier relationships, frozen cleanup, changed file identity and lost cleanup acknowledgement. The approved boundaries are the public Core API, real CLI process I/O and final dispatch.
+The evidence runner also saves the command, exit status and TAP output for the retention/concurrency, maintenance inventory and recovery-control tests. Project visibility observations include each reader binding, request and actual result or error. The `backup*.test.ts` suite additionally verifies source mutation, cross-session Historian verification, session-scoped head validation and carrier relationships. The approved boundaries are the public Core API, real CLI process I/O and final dispatch.
 
 Controlled project-output creation uses the existing real Windows file Host. On other platforms those two evidence cases explicitly report unavailable; the remaining snapshot cases run normally.
 
@@ -59,7 +59,7 @@ The shared CI runs the full checks and this evidence command on Windows, macOS a
 
 ## Contract references
 
-- Issue [#20](https://github.com/qsgy-edge/euler/issues/20); delivery uses a feature branch and PR.
+- Issue [#20](https://github.com/qsgy-edge/euler/issues/20).
 - [Implementation specification](../architecture/issues/15-euler-v1-spec.md): I19, backup/recovery invariant and X-12.
 - [Storage contract](../architecture/issues/10-choose-storage-projections.md): verified snapshots, original preservation, forward recovery and capacity handling.
 - [Reproducibility contract](../architecture/issues/12-build-evidence-experiment-matrix.md): raw artifact and platform-specific receipts.

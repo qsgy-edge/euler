@@ -4948,7 +4948,7 @@ export class ProbeStore {
       deliveredAt: text(row.delivered_at), read: row.read_state as HostInfo['read'], readAt: text(row.read_at) };
   }
 
-  #readActivationBatch(batchId: string): ActivationBatch {
+  #readActivationBatch(batchId: string, projects: readonly string[] = [this.#binding.projectId]): ActivationBatch {
     uuid(batchId);
     const row = this.#db.prepare('SELECT * FROM activation_batches WHERE batch_id=? AND owner_id=?').get(batchId, this.#binding.ownerId);
     check(row && sha256(String(row.payload)) === row.payload_hash, 'batch-evidence-gap');
@@ -4957,7 +4957,7 @@ export class ProbeStore {
     check(manifest.schema === 'activation-batch@1' && manifest.batchId === batchId && manifest.ownerId === row.owner_id
       && manifest.scope.kind === row.scope_kind && manifest.scope.id === row.scope_id && manifest.scope.resolved === true
       && events.length === row.member_count && events.length === manifest.events.length, 'batch-evidence-gap');
-    this.#validateScope(manifest.scope);
+    this.#validateScope(manifest.scope, projects);
     const members = events.map((event, ordinal) => {
       check(event.batch_ordinal === ordinal && (['activate','auto-revise'].includes(String(event.kind))
         || event.kind === 'rollback' && JSON.parse(String(event.payload)).automatic === true)
@@ -5707,6 +5707,11 @@ export class ProbeStore {
     return record;
   }
   #readMemoryHead(recordId: string, projects: readonly string[] = [this.#binding.projectId]): MemoryRecord {
+    const record = this.#replayMemoryHead(recordId);
+    this.#validateScope(record.scope, projects);
+    return record;
+  }
+  #replayMemoryHead(recordId: string): MemoryRecord {
     const row = this.#db.prepare('SELECT * FROM memory_heads WHERE record_id=?').get(recordId);
     check(row, 'memory-evidence-gap');
     const record = this.#replayMemory(recordId);
@@ -5716,7 +5721,6 @@ export class ProbeStore {
       && record.scope.resolved === Boolean(row.scope_resolved) && record.conflictSetId === row.conflict_set_id
       && record.verificationRunId === row.verification_run_id
       && record.headEventId === row.head_event_id, 'memory-evidence-gap');
-    this.#validateScope(record.scope, projects);
     return record;
   }
   #assertMemoryExpected(recordId: string, expected: MemoryRecord): MemoryRecord {
@@ -5845,6 +5849,7 @@ export class ProbeStore {
     ]) for (const row of this.#db.prepare(`SELECT ${column} AS value FROM ${table}`).all()) sources(JSON.parse(String(row.value)));
     for (const row of this.#db.prepare('SELECT unit_id FROM source_units').all()) this.#sourceUnit(String(row.unit_id));
     const projects = this.#registeredProjects();
+    for (const row of this.#db.prepare('SELECT batch_id FROM activation_batches').all()) this.#readActivationBatch(String(row.batch_id), projects);
     for (const row of this.#db.prepare('SELECT proposal_id,payload FROM evolution_proposals').all()) {
       const binding = (JSON.parse(String(row.payload)).input as SourceAck).binding;
       this.sessionSource(binding);
@@ -5863,12 +5868,7 @@ export class ProbeStore {
     for (const row of this.#db.prepare('SELECT run_id,stream_id FROM request_runs').all()) {
       this.#readRequestLedger(this.#requestRun({ streamId: String(row.stream_id) }, String(row.run_id)));
     }
-    for (const row of this.#db.prepare('SELECT record_id FROM memory_records').all()) {
-      const record = this.#replayMemory(String(row.record_id));
-      const head = this.#db.prepare('SELECT snapshot,snapshot_hash,head_event_id FROM memory_heads WHERE record_id=?').get(record.recordId);
-      check(head?.snapshot === this.#snapshotBytes(record) && head.snapshot_hash === record.hash && head.head_event_id === record.headEventId,
-        'memory-evidence-gap');
-    }
+    for (const row of this.#db.prepare('SELECT record_id FROM memory_records').all()) this.#replayMemoryHead(String(row.record_id));
     for (const session of this.#db.prepare('SELECT session_id,branch_id FROM sessions').all()) {
       const events = this.#db.prepare('SELECT * FROM intent_events WHERE session_id=? AND branch_id=? ORDER BY version')
         .all(session.session_id!, session.branch_id!);

@@ -91,6 +91,66 @@ for (const table of ['source_units','evolution_proposals']) test(`backup rejects
   } finally {rmSync(sandbox.root,{recursive:true,force:true});}
 });
 
+test('backup rejects a valid SQLite memory head whose typed lifecycle contradicts its replay',()=>{
+  const sandbox=createSandbox();
+  try {
+    const seeded=cli(sandbox.root,'memory'); assert.equal(seeded.status,0,seeded.stdout+seeded.stderr);
+    const recordId=seeded.events.find(event=>event.event==='memory-result').activated.record.recordId;
+    const db=new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+    try {
+      db.function('euler_store_writer',()=>1);
+      assert.equal(db.prepare("UPDATE memory_heads SET lifecycle='tombstoned' WHERE record_id=?").run(recordId).changes,1);
+      assert.equal(db.prepare('PRAGMA quick_check').get()!.quick_check,'ok');
+      assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(),[]);
+    } finally {db.close();}
+    const probe=openProbe(sandbox,undefined,undefined,undefined,undefined,true);
+    try {assert.throws(()=>probe.store.readMemory(probe.activity,recordId),/memory-evidence-gap/);} finally {probe.close();}
+    const backed=cli(sandbox.root,'backup'); assert.equal(backed.status,1);
+    assert.equal(backed.events.find(event=>event.event==='error').reason,'memory-evidence-gap');
+    const state=new DatabaseSync(join(sandbox.root,'probe.sqlite'),{readOnly:true});
+    try {assert.equal(state.prepare("SELECT count(*) AS n FROM store_snapshots WHERE state='ready'").get()!.n,0);} finally {state.close();}
+  } finally {rmSync(sandbox.root,{recursive:true,force:true});}
+});
+
+test('backup rejects an activation batch whose manifest cannot be read',()=>{
+  const sandbox=createSandbox();
+  try {
+    const seeded=cli(sandbox.root,'memory'); assert.equal(seeded.status,0,seeded.stdout+seeded.stderr);
+    const db=new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+    let batchId:string;
+    try {
+      batchId=String(db.prepare('SELECT batch_id FROM activation_batches LIMIT 1').get()!.batch_id);
+      db.exec('DROP TRIGGER immutable_activation_batches_update');
+      db.prepare("UPDATE activation_batches SET payload_hash='broken' WHERE batch_id=?").run(batchId);
+    } finally {db.close();}
+    const probe=openProbe(sandbox,undefined,undefined,undefined,undefined,true);
+    try {assert.throws(()=>probe.store.readActivationBatch(probe.activity,batchId),/batch-evidence-gap/);} finally {probe.close();}
+    const backed=cli(sandbox.root,'backup'); assert.equal(backed.status,1);
+    assert.equal(backed.events.find(event=>event.event==='error').reason,'batch-evidence-gap');
+  } finally {rmSync(sandbox.root,{recursive:true,force:true});}
+});
+
+test('store-wide checks preserve foreign project batches and session-scoped memory access',()=>{
+  const sandbox=createSandbox();
+  try {
+    const binding={...bindingOf(sandbox),projectId:randomUUID(),sessionId:randomUUID(),branchId:randomUUID()}; createSandboxSession(sandbox,binding);
+    const origin=openProbe(sandbox,undefined,undefined,binding,undefined,true);
+    let recordId:string;
+    try {
+      const input=origin.archive.append(randomUUID(),'记住决定：本项目编译目标使用 ES2024');
+      assert.equal(origin.store.rememberMemory(origin.activity,{input,hostInfo:'durable'}).status,'activated');
+      const source=origin.archive.append(randomUUID(),'Synthetic session-only source.');
+      recordId=origin.store.captureMemory(origin.activity,source,'Session-only fact.',{type:'fact',
+        scope:{kind:'session',id:binding.sessionId,resolved:false},appliesTo:[]}).record.recordId;
+    } finally {origin.close();}
+    const other=openProbe(sandbox,undefined,undefined,undefined,undefined,true);
+    try {
+      assert.throws(()=>other.store.readMemory(other.activity,recordId),/invalid-memory-scope/);
+      other.store.auditStore(other.activity);
+    } finally {other.close();}
+  } finally {rmSync(sandbox.root,{recursive:true,force:true});}
+});
+
 test('store audit verifies a valid Historian publication from another registered session',()=>{
   const sandbox=createSandbox();
   try {

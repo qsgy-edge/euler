@@ -39,7 +39,7 @@ for (const scenario of fixture.cases) {
   const cli = (name: string, command: string, args: string[] = [], expected: 'success' | 'error' = 'success', input?: string) =>
     run(name, ['apps/cli/src/main.ts', command, '--sandbox', sandbox.root, ...args], expected, input);
   try {
-    const setup = scenario.startsWith('historian-') ? 'historian' : ['projection-memory','proposal-metadata-corruption'].includes(scenario) ? 'memory'
+    const setup = scenario.startsWith('historian-') ? 'historian' : ['projection-memory','proposal-metadata-corruption','typed-head-corruption','batch-manifest-corruption'].includes(scenario) ? 'memory'
       : ['projection-source','source-metadata-corruption'].includes(scenario) ? 'handoff' : scenario;
     let infoBatches: string[] | undefined, laterInfo: string | undefined, handoff: unknown;
     if (scenario === 'owner-info') {
@@ -154,6 +154,27 @@ for (const scenario of fixture.cases) {
       try { db.exec("DROP TRIGGER immutable_request_events_update; UPDATE request_events SET hash='broken' WHERE seq=1"); } finally { db.close(); }
       assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason, 'ledger-evidence-gap');
       assert.equal(cli('blocked-run','run',[],'error').find(e => e.event === 'error').reason, 'store-integrity-failed');
+    }
+    if (scenario === 'typed-head-corruption') {
+      const damaged = new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+      try {
+        damaged.function('euler_store_writer',()=>1);
+        assert.ok(Number(damaged.prepare("UPDATE memory_heads SET lifecycle='tombstoned' WHERE lifecycle='active'").run().changes)>0);
+        assert.equal(damaged.prepare('PRAGMA quick_check').get()!.quick_check,'ok');
+        assert.deepEqual(damaged.prepare('PRAGMA foreign_key_check').all(),[]);
+      } finally { damaged.close(); }
+      cpSync(sandbox.root,join(path,'damaged-sandbox'),{recursive:true});
+      assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason,'memory-evidence-gap');
+      assert.equal(cli('blocked-run','run',[],'error').find(e => e.event === 'error').reason,'store-integrity-failed');
+    }
+    if (scenario === 'batch-manifest-corruption') {
+      const damaged = new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+      try {
+        damaged.exec('DROP TRIGGER immutable_activation_batches_update');
+        assert.ok(Number(damaged.prepare("UPDATE activation_batches SET payload_hash='broken'").run().changes)>0);
+      } finally { damaged.close(); }
+      cpSync(sandbox.root,join(path,'damaged-sandbox'),{recursive:true});
+      assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason,'batch-evidence-gap');
     }
     if (scenario === 'source-metadata-corruption' || scenario === 'proposal-metadata-corruption') {
       const table = scenario === 'source-metadata-corruption' ? 'source_units' : 'evolution_proposals';
@@ -280,6 +301,15 @@ for (const scenario of fixture.cases) {
     rmSync(sandbox.root, { recursive: true, force: true });
   }
 }
+const contractTestCommand = ['--test','--test-concurrency=1','--test-reporter=tap',
+  'apps/cli/test/backup.test.ts','apps/cli/test/backup-inventory.test.ts','apps/cli/test/backup-recovery.test.ts'];
+const contractTestResult = spawnSync(process.execPath, contractTestCommand, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+writeFileSync(join(directory,'contract-tests.stdout.tap'),contractTestResult.stdout ?? '');
+writeFileSync(join(directory,'contract-tests.stderr.txt'),contractTestResult.stderr ?? '');
+const contractTests = { command: [process.execPath,...contractTestCommand], exitCode: contractTestResult.status,
+  signal: contractTestResult.signal, error: contractTestResult.error?.message ?? null,
+  stdout: 'contract-tests.stdout.tap', stderr: 'contract-tests.stderr.txt' };
+if (contractTestResult.status !== 0 || contractTestResult.error) failed = true;
 function files(path: string, prefix = ''): string[] {
   return readdirSync(path, { withFileTypes: true }).flatMap(entry => entry.isDirectory()
     ? files(join(path,entry.name), prefix + entry.name + '/') : [prefix + entry.name]);
@@ -290,7 +320,7 @@ const receipt = { schema: 't20-backup-receipt@1', synthetic: true, startedAt, co
   implementation: { commit: git(['rev-parse','HEAD']), tree: git(['rev-parse','HEAD^{tree}']), changes: git(['status','--short']) },
   environment: { platform: process.platform, arch: arch(), release: release(), node: process.version },
   authority: ['issue:20','docs/architecture/issues/15-euler-v1-spec.md#i19','docs/architecture/issues/10-choose-storage-projections.md'],
-  observations, evidenceGaps, files: files(directory).map(path => ({ path, sha256: hash(readFileSync(join(directory,path))) })) };
+  observations, contractTests, evidenceGaps, files: files(directory).map(path => ({ path, sha256: hash(readFileSync(join(directory,path))) })) };
 writeFileSync(join(directory,'receipt.json'),JSON.stringify(receipt,null,2) + '\n');
 console.log(JSON.stringify({ directory, status: receipt.status, cases: observations.length, failed: observations.filter(row => row.passed === false).length, unavailable: observations.filter(row => row.passed === null).length }));
 if (failed) process.exitCode = 1;

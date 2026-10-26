@@ -45,25 +45,37 @@ if (action === 'seed') {
 } else if (action === 'verify') {
   const history = JSON.parse(encoded!) as History;
   const origin = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
-  const target = openProbe(sandbox, undefined, undefined, session(history.target.projectId), undefined, true);
-  const unrelated = openProbe(sandbox, undefined, undefined, session(randomUUID()), undefined, true);
+  const targetBinding = session(history.target.projectId), unrelatedBinding = session(randomUUID());
+  const target = openProbe(sandbox, undefined, undefined, targetBinding, undefined, true);
+  const unrelated = openProbe(sandbox, undefined, undefined, unrelatedBinding, undefined, true);
+  const reads: { reader: Binding; request: unknown; result?: unknown; error?: string }[] = [];
+  function observe<T>(reader: Binding, request: unknown, action: () => T): T {
+    try {
+      const result = action(); reads.push({ reader, request, result }); return result;
+    } catch (error) {
+      reads.push({ reader, request, error: (error as Error).message }); throw error;
+    }
+  }
   try {
     const artifacts = new AnalysisArtifacts(origin.store, origin.activity, origin.archive);
     for (const version of history.versions) {
-      assert.deepEqual(artifacts.read(version.report.ref), version.report);
+      const report = observe(bindingOf(sandbox), { ref: version.report.ref }, () => artifacts.read(version.report.ref));
+      assert.deepEqual(report, version.report);
       assert.equal(sha256(version.report.body), version.report.bodyHash);
       const request = { unitId: version.unit.unitId, offset: 0, limit: 4096 };
-      const result = target.store.expandSource(target.activity, request);
+      const result = observe(targetBinding, request, () => target.store.expandSource(target.activity, request));
       assert.equal(result.text, version.text); assert.equal(result.version, version.unit.version);
       assert.equal(result.contentHash, version.unit.contentHash); assert.doesNotMatch(result.text, /PRIVATE-ORIGIN/);
-      assert.throws(() => target.store.expandSource(target.activity, { ref: version.report.ref, offset: 0, limit: 4096 }), /source-scope-mismatch|source-not-shared/);
-      assert.throws(() => unrelated.store.expandSource(unrelated.activity, request), /source-scope-mismatch/);
+      const rawRequest = { ref: version.report.ref, offset: 0, limit: 4096 };
+      assert.throws(() => observe(targetBinding, rawRequest, () => target.store.expandSource(target.activity, rawRequest)), /source-scope-mismatch|source-not-shared/);
+      assert.throws(() => observe(unrelatedBinding, request, () => unrelated.store.expandSource(unrelated.activity, request)), /source-scope-mismatch/);
     }
     assert.deepEqual(target.store.readEvolutionProposal(target.activity, history.proposal.proposalId), history.proposal);
     const proposalRequest = { unitId: history.proposal.proposalId, offset: 0, limit: 4096 };
-    assert.equal(target.store.expandSource(target.activity, proposalRequest).contentHash, history.proposal.hash);
-    assert.throws(() => unrelated.store.expandSource(unrelated.activity, proposalRequest), /source-scope-mismatch/);
-    console.log(JSON.stringify({ versions: history.versions.map(item => item.report.version), proposal: history.proposal.proposalId,
-      privateReadsRejected: 4, unrelatedProposalRejected: true, sends: origin.transport.count + target.transport.count + unrelated.transport.count }));
+    assert.equal(observe(targetBinding, proposalRequest, () => target.store.expandSource(target.activity, proposalRequest)).contentHash, history.proposal.hash);
+    assert.throws(() => observe(unrelatedBinding, proposalRequest, () => unrelated.store.expandSource(unrelated.activity, proposalRequest)), /source-scope-mismatch/);
+    console.log(JSON.stringify({ versions: history.versions.map(item => item.report.version), proposal: history.proposal.proposalId, reads,
+      privateReadsRejected: reads.filter(read => read.error && JSON.stringify(read.request) !== JSON.stringify(proposalRequest)).length,
+      unrelatedProposalRejected: reads.at(-1)!.error === 'source-scope-mismatch', sends: origin.transport.count + target.transport.count + unrelated.transport.count }));
   } finally { unrelated.close(); target.close(); origin.close(); }
 } else throw new Error('invalid-handoff-backup-action');
