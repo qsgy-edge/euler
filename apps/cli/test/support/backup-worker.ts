@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import sqlite from 'node:sqlite';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
-import { ProbeStore, ProbeSession, API_VERSION } from '@euler/core';
+import { ProbeStore, ProbeSession, API_VERSION, DEFAULT_BUDGET } from '@euler/core';
 import { openSandbox, bindingOf, resourcesOf, createSandboxSession } from '../../src/sandbox.ts';
 import { openProbe } from '../../src/probe.ts';
 import { backupSandbox, restoreSandboxSnapshot } from '../../src/backup.ts';
@@ -16,6 +16,30 @@ function crash(point: string): never {
 }
 if (action === 'migration-checkpoint') {
   console.log(JSON.stringify(await backupSandbox(sandbox, 'migration')));
+} else if (action === 'queue-capture') {
+  const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const source = probe.archive.append(randomUUID(), '记住：备份前尚未领取的任务');
+    console.log(JSON.stringify(probe.store.queueOwnerCapture(probe.activity, source)));
+  } finally { probe.close(); }
+} else if (action === 'unclaimed-historian') {
+  const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const job = probe.store.listCaptureJobs(probe.activity, 32, true, 'historian').find(job => job.stage === 'pending');
+    if (!job) throw new Error('pending-historian-required');
+    console.log(JSON.stringify(job));
+  } finally { probe.close(); }
+} else if (action === 'claim-restored-job') {
+  const binding = { ...bindingOf(sandbox), sessionId: randomUUID(), branchId: randomUUID() };
+  createSandboxSession(sandbox, binding);
+  const probe = openProbe(sandbox, undefined, undefined, binding, undefined, true);
+  try {
+    const job = probe.store.readCaptureJob(probe.activity, value!);
+    const oldLease = probe.store.claimCaptureJob(probe.activity, value!, DEFAULT_BUDGET, 1000);
+    const next = probe.store.queueOwnerCapture(probe.activity, probe.archive.append(randomUUID(), '记住：恢复后的新任务可以领取'));
+    const newLease = probe.store.claimCaptureJob(probe.activity, next.jobId, DEFAULT_BUDGET, 1000);
+    console.log(JSON.stringify({ binding, job, oldLease, newJobId: next.jobId, newLease, sends: probe.transport.count }));
+  } finally { probe.close(); }
 } else if (action === 'append-canonical') {
   const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
   try {

@@ -6282,10 +6282,11 @@ export class ProbeStore {
         for (const row of snapshotRows) copy('store_snapshots', row);
         const receipt = JSON.stringify(plan.receipt);
         stage.prepare('INSERT OR IGNORE INTO store_recovery_events VALUES (?,?,?)').run(plan.operationId, receipt, sha256(receipt));
-        const owners = [...this.#db.prepare('SELECT owner_kind AS kind,owner_id FROM execution_streams').all(),
-          ...stage.prepare('SELECT owner_kind AS kind,owner_id FROM execution_streams').all(),
-          ...this.#db.prepare("SELECT 'session' AS kind,session_id AS owner_id FROM sessions").all(),
-          ...this.#db.prepare("SELECT 'job' AS kind,job_id AS owner_id FROM capture_jobs").all()];
+        const owners = [this.#db, stage].flatMap(database => [
+          ...database.prepare('SELECT owner_kind AS kind,owner_id FROM execution_streams').all(),
+          ...database.prepare("SELECT 'session' AS kind,session_id AS owner_id FROM sessions").all(),
+          ...database.prepare("SELECT 'job' AS kind,job_id AS owner_id FROM capture_jobs").all(),
+        ]);
         for (const owner of owners) stage.prepare('INSERT OR IGNORE INTO store_recovered_owners VALUES (?,?,?)')
           .run(owner.kind!, owner.owner_id!, plan.operationId);
         stage.prepare("UPDATE owner_activities SET stop_state='absent',stop_observed_at=?,stop_method='snapshot-exclusive-recovery' WHERE id!=?")

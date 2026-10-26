@@ -43,6 +43,7 @@ for (const scenario of fixture.cases) {
       : ['projection-source','source-metadata-corruption'].includes(scenario) ? 'handoff' : scenario;
     let infoBatches: string[] | undefined, laterInfo: string | undefined, handoff: unknown, intent: unknown;
     let feedback: { recordId: string; feedbackId: string; input: unknown } | undefined, captureJobId: string | undefined;
+    let unclaimedJob: { jobId: string } | undefined;
     if (scenario.startsWith('owner-info')) {
       infoBatches = cli('setup','remember',[],'success','记住偏好：包管理器使用 pnpm\n记住决定：本项目使用 SQLite WAL\nstop\n')
         .filter(e => e.event === 'remember-result' && e.status === 'activated').map(e => e.batchId);
@@ -57,6 +58,10 @@ for (const scenario of fixture.cases) {
       }
     } else cli('setup', 'run');
     if (scenario === 'intent-metadata-corruption') intent = run('intent-before',['apps/cli/test/support/backup-worker.ts',sandbox.root,'read-intent'])[0];
+    if (scenario.endsWith('unclaimed-job-missing')) {
+      const action = scenario.startsWith('historian-') ? 'unclaimed-historian' : 'queue-capture';
+      unclaimedJob = run('unclaimed-job',['apps/cli/test/support/backup-worker.ts',sandbox.root,action])[0];
+    }
     let unknown: Record<string, string> | undefined;
     if (scenario === 'unknown-before') unknown = run('unknown-before', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'unknown'])[0];
     if (['ENOSPC','EROFS'].includes(scenario)) {
@@ -124,6 +129,11 @@ for (const scenario of fixture.cases) {
       assert.deepEqual(snapshotDb.prepare('PRAGMA foreign_key_check').all(), []);
       attempts = snapshotDb.prepare('SELECT * FROM request_attempts ORDER BY attempt_id').all();
       streams = snapshotDb.prepare('SELECT owner_kind,owner_id FROM execution_streams').all();
+      if (unclaimedJob) {
+        assert.ok(snapshotDb.prepare('SELECT 1 FROM capture_jobs WHERE job_id=?').get(unclaimedJob.jobId));
+        assert.equal(snapshotDb.prepare('SELECT 1 FROM capture_work WHERE job_id=?').get(unclaimedJob.jobId),undefined);
+        assert.equal(snapshotDb.prepare("SELECT 1 FROM execution_streams WHERE owner_kind='job' AND owner_id=?").get(unclaimedJob.jobId),undefined);
+      }
       snapshotEpoch = Number(snapshotDb.prepare('SELECT epoch FROM owner_fences').get()!.epoch);
       for (const event of snapshotDb.prepare('SELECT payload,hash FROM request_events').all()) assert.equal(hash(String(event.payload)), event.hash);
     } finally { snapshotDb.close(); }
@@ -155,6 +165,14 @@ for (const scenario of fixture.cases) {
         assert.deepEqual(candidateDb.prepare('PRAGMA foreign_key_check').all(), []);
       } finally { candidateDb.close(); }
       assert.equal(hash(readFileSync(snapshotPath)), saved.database.hash);
+    }
+    if (unclaimedJob) {
+      const damaged = new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+      try {
+        damaged.exec('DROP TRIGGER immutable_capture_jobs_delete');
+        assert.equal(damaged.prepare('DELETE FROM capture_jobs WHERE job_id=?').run(unclaimedJob.jobId).changes,1);
+      } finally { damaged.close(); }
+      cpSync(sandbox.root,join(path,'damaged-sandbox'),{recursive:true});
     }
     if (scenario === 'canonical-corruption') {
       const db = new DatabaseSync(join(sandbox.root, 'probe.sqlite'));
@@ -309,6 +327,7 @@ for (const scenario of fixture.cases) {
         const info = plan.originals.find((file: { role: string }) => file.role==='owner-info');
         assert.ok(readFileSync(join(plan.original.path,info.name),'utf8').includes(laterInfo!));
       }
+      if (unclaimedJob) assert.ok(db.prepare("SELECT 1 FROM store_recovered_owners WHERE kind='job' AND owner_id=?").get(unclaimedJob.jobId));
       if (unknown) {
         assert.ok(db.prepare("SELECT 1 FROM store_recovered_owners WHERE kind='job' AND owner_id=?").get(unknown.jobId!));
         const attempt = db.prepare('SELECT outcome FROM request_attempts WHERE attempt_id=?').get(unknown.attemptId!);
@@ -341,6 +360,11 @@ for (const scenario of fixture.cases) {
       const settled = cli('settled-info','info').find(e => e.event === 'info-list');
       assert.deepEqual([settled.pending,settled.unread],[0,0]);
     }
+    if (unclaimedJob) {
+      const claimed = run('restored-job-claim',['apps/cli/test/support/backup-worker.ts',sandbox.root,'claim-restored-job',unclaimedJob.jobId])[0];
+      assert.deepEqual([claimed.job.stage,claimed.job.reason,claimed.oldLease,claimed.sends],['blocked','recovered_with_gap',null,0]);
+      assert.equal(claimed.newLease.jobId,claimed.newJobId);
+    }
     if (expectedOutput) {
       assert.deepEqual(cli('maintenance-inventory','maintenance-status').find(e => e.event === 'maintenance-status').controlledFiles,[expectedOutput]);
       assert.equal(readFileSync(join(outputRoot!,'result.md'),'utf8'),'EULER-T20 controlled project output');
@@ -359,7 +383,7 @@ for (const scenario of fixture.cases) {
   }
 }
 const contractTestCommand = ['--test','--test-concurrency=1','--test-reporter=tap',
-  'apps/cli/test/backup.test.ts','apps/cli/test/backup-inventory.test.ts','apps/cli/test/backup-recovery.test.ts','apps/cli/test/backup-integrity.test.ts'];
+  'apps/cli/test/backup.test.ts','apps/cli/test/backup-inventory.test.ts','apps/cli/test/backup-recovery.test.ts','apps/cli/test/backup-integrity.test.ts','apps/cli/test/backup-content.test.ts'];
 const contractTestResult = spawnSync(process.execPath, contractTestCommand, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
 writeFileSync(join(directory,'contract-tests.stdout.tap'),contractTestResult.stdout ?? '');
 writeFileSync(join(directory,'contract-tests.stderr.txt'),contractTestResult.stderr ?? '');
