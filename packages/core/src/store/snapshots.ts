@@ -69,10 +69,23 @@ export function writeSnapshotFile(path: string, bytes: Uint8Array | string): voi
   writeFileSync(path, bytes, { flag: 'wx', mode: 0o600 });
   syncSnapshotFile(path);
 }
-export function checkSqliteSnapshot(db: DatabaseSync): void {
+export function checkSqliteSnapshot(db: DatabaseSync, scope: 'all' | 'canonical' = 'all'): 'healthy' | 'projection-failed' {
   const quick = db.prepare('PRAGMA quick_check').all();
-  check(quick.length === 1 && quick[0]!.quick_check === 'ok', 'store-integrity-failed');
-  check(db.prepare('PRAGMA foreign_key_check').all().length === 0, 'store-foreign-key-failed');
+  const foreign = db.prepare('PRAGMA foreign_key_check').all();
+  const quickOk = quick.length === 1 && quick[0]!.quick_check === 'ok';
+  if (scope === 'canonical' && (!quickOk || foreign.length > 0)) {
+    const projection = (name: string) => name === 'search_documents' || name === 'search_fts' || name.startsWith('search_fts_');
+    const tables = db.prepare("SELECT name FROM sqlite_schema WHERE type='table' UNION SELECT 'sqlite_schema'").all();
+    const checks = quickOk ? [] : tables.map(row => ({ name: String(row.name),
+      errors: db.prepare(`PRAGMA quick_check("${String(row.name).replaceAll('"','""')}")`).all()
+        .map(item => String(item.quick_check)).filter(message => message !== 'ok') }));
+    const projectionErrors = new Set(checks.filter(row => projection(row.name)).flatMap(row => row.errors));
+    if (foreign.every(row => projection(String(row.table))) && checks.every(row => projection(row.name) || row.errors.length === 0)
+      && (quickOk || quick.every(row => projectionErrors.has(String(row.quick_check))))) return 'projection-failed';
+  }
+  check(quickOk, 'store-integrity-failed');
+  check(foreign.length === 0, 'store-foreign-key-failed');
+  return 'healthy';
 }
 
 // Control bookkeeping alone does not count as a new data version for daily retention.

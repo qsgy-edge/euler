@@ -7,13 +7,14 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { ProbeStore } from '@euler/core';
 import { createSandbox, resourcesOf, bindingOf } from '../src/sandbox.ts';
+import { runBackupCli } from './support/backup-cli.ts';
 
 for (const when of ['before','after']) test(`a project output created ${when} the snapshot stays owned after recovery and original cleanup`, { skip: process.platform !== 'win32' }, () => {
   const sandbox = createSandbox(), root = realpathSync.native(mkdtempSync(join(tmpdir(),'euler-t20-output-')));
   const cli = (command: string,...args: string[]) => {
-    const result = spawnSync(process.execPath,['apps/cli/src/main.ts',command,'--sandbox',sandbox.root,...args],{encoding:'utf8'});
+    const result = runBackupCli(sandbox.root,command,args);
     assert.equal(result.status,0,result.stdout+result.stderr);
-    return result.stdout.trim().split('\n').map(line=>JSON.parse(line));
+    return result.events;
   };
   const createOutput = () => {
     const writer = spawnSync(process.execPath,['apps/cli/test/support/backup-file-worker.ts',sandbox.root,root],{encoding:'utf8'});

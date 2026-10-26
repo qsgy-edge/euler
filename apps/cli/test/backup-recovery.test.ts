@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { runBackupCli } from './support/backup-cli.ts';
 import { readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -7,9 +7,7 @@ import test from 'node:test';
 import { createSandbox } from '../src/sandbox.ts';
 
 function cli(root: string, command: string, ...args: string[]) {
-  const result = spawnSync(process.execPath, ['apps/cli/src/main.ts', command, '--sandbox', root, ...args], { encoding: 'utf8' });
-  const events = result.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
-  return { ...result, events };
+  return runBackupCli(root, command, args);
 }
 
 test('missing current owner control cannot be replaced by an older open snapshot', () => {

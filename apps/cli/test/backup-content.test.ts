@@ -6,13 +6,30 @@ import test from 'node:test';
 import { DEFAULT_BUDGET } from '@euler/core';
 import { createSandbox } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
+import { runBackupCli } from './support/backup-cli.ts';
 
 function cli(root: string, command: string, ...args: string[]) {
-  const result = spawnSync(process.execPath, ['apps/cli/src/main.ts', command, '--sandbox', root, ...args], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
-  const events = result.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const result = runBackupCli(root, command, args);
+  const events = result.events;
   assert.equal(result.status, 0, JSON.stringify(events.filter(event => event.event === 'error')) + result.stderr);
   return events;
 }
+
+test('recovery preserves report versions and project-scoped handoff without exposing the mixed report', () => {
+  const sandbox = createSandbox();
+  try {
+    const seeded = spawnSync(process.execPath, ['apps/cli/test/support/backup-handoff-worker.ts', sandbox.root, 'seed'], { encoding: 'utf8' });
+    assert.equal(seeded.status, 0, seeded.stderr);
+    const history = JSON.parse(seeded.stdout);
+    const saved = cli(sandbox.root, 'backup').find(event => event.event === 'backup-result').snapshot;
+    cli(sandbox.root, 'restore-snapshot', '--snapshot', saved.id);
+    const verified = spawnSync(process.execPath, ['apps/cli/test/support/backup-handoff-worker.ts', sandbox.root, 'verify', JSON.stringify(history)], { encoding: 'utf8' });
+    assert.equal(verified.status, 0, verified.stderr);
+    const result = JSON.parse(verified.stdout);
+    assert.deepEqual(result.versions, [1, 2]);
+    assert.equal(result.privateReadsRejected, 4); assert.equal(result.sends, 0);
+  } finally { rmSync(sandbox.root, { recursive: true, force: true }); }
+});
 
 for (const scenario of ['memory', 'handoff', 'historian']) test(`snapshot recovery preserves ${scenario} bodies, references and published identities`, () => {
   const sandbox = createSandbox();

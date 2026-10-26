@@ -249,12 +249,14 @@ CREATE TABLE owner_fences (
 ) STRICT;
 CREATE TABLE store_snapshots (
   snapshot_id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('daily','migration')),
-  day TEXT NOT NULL, created_at TEXT NOT NULL, directory TEXT NOT NULL UNIQUE, dev TEXT NOT NULL, ino TEXT NOT NULL,
+  day TEXT NOT NULL, created_at TEXT NOT NULL, directory TEXT NOT NULL UNIQUE, dev TEXT, ino TEXT,
   state TEXT NOT NULL CHECK(state IN ('staging','ready','retired','deleted')), manifest TEXT, digest TEXT,
   activity_id TEXT NOT NULL REFERENCES owner_activities(id), cleanup TEXT, cleanup_digest TEXT,
-  CHECK((cleanup IS NULL)=(cleanup_digest IS NULL))
+  CHECK((cleanup IS NULL)=(cleanup_digest IS NULL)), CHECK((dev IS NULL)=(ino IS NULL)),
+  CHECK(state='staging' OR dev IS NOT NULL)
 ) STRICT;
-CREATE UNIQUE INDEX one_daily_snapshot ON store_snapshots(day) WHERE kind='daily' AND state IN ('ready','retired','deleted');
+CREATE UNIQUE INDEX one_daily_snapshot ON store_snapshots(day) WHERE kind='daily' AND state IN ('ready','retired','deleted')
+  AND json_extract(manifest,'$.state')='ready';
 CREATE TABLE store_recovery_events (
   operation_id TEXT PRIMARY KEY, receipt TEXT NOT NULL, digest TEXT NOT NULL
 ) STRICT;
@@ -2122,24 +2124,11 @@ export class ProbeStore {
     });
   }
 
-  #repairProjection<T>(activity: Activity, action: () => T): T {
-    const repaired = this.#withAdmission(activity, () => ({ result: action(), failedHealth: this.fence().health === 'failed' }), false);
-    if (repaired.failedHealth) this.#withAdmission(activity, () => {
-      this.#checkStoreIntegrity();
-      this.#db.prepare("UPDATE owner_fences SET health='healthy' WHERE store_id=?").run(this.#storeId);
-    }, false);
-    return repaired.result;
-  }
-
   withActivity<T>(activity: Activity, action: () => T): T {
-    return this.#withAdmission(activity, action, true);
-  }
-
-  #withAdmission<T>(activity: Activity, action: () => T, requireHealthy: boolean): T {
     return this.#transaction(() => {
       const fence = this.fence();
       const row = this.#db.prepare('SELECT * FROM owner_activities WHERE id=?').get(activity.id);
-      if (requireHealthy) check(fence.health === 'healthy', 'store-integrity-failed');
+      check(fence.health === 'healthy', 'store-integrity-failed');
       check(fence.state === 'open' && fence.epoch === activity.epoch && row
         && row.incarnation === processIdentity.incarnation && row.pid === process.pid && row.store_id === this.#storeId
         && row.root_path === this.#resources.root.path && row.root_dev === this.#resources.root.identity.dev
@@ -3608,7 +3597,7 @@ export class ProbeStore {
   }
 
   rebuildSearchProjection(activity: Activity): SearchProjectionReceipt[] {
-    return this.#repairProjection(activity, () => {
+    return this.withActivity(activity, () => {
       const canonical = this.#db.prepare(`SELECT record_id FROM memory_heads
         WHERE ${this.#visibleScopeSql('memory_heads')}`).all(...this.#scopeParameters());
       this.#db.prepare(`DELETE FROM search_documents WHERE (owner_kind='memory' AND owner_id=? AND ${this.#visibleScopeSql('search_documents')})
@@ -3665,7 +3654,7 @@ export class ProbeStore {
   }
 
   rebuildSourceProjection(activity: Activity): number {
-    return this.#repairProjection(activity, () => {
+    return this.withActivity(activity, () => {
       const projectId = this.#binding.projectId;
       const sources = this.#db.prepare('SELECT unit_id FROM source_units WHERE owner_id=? AND project_id=? ORDER BY rowid')
         .all(this.#binding.ownerId, projectId);
@@ -5214,7 +5203,7 @@ export class ProbeStore {
     check(payload(decision.proposal) === payload(proposal), 'proposal-publication-approval-mismatch');
   }
 
-  #proposalForProjects(proposalId: string, projects: readonly string[]): EvolutionProposal {
+  #proposalForProjects(proposalId: string, projects: readonly string[], binding: Binding = this.#binding): EvolutionProposal {
       uuid(proposalId);
       const row = this.#db.prepare('SELECT * FROM evolution_proposals WHERE proposal_id=? AND owner=?').get(proposalId, this.#binding.ownerId);
       check(row && (String(row.scope_kind) !== 'project' || projects.includes(String(row.scope_id))), 'source-scope-mismatch');
@@ -5227,10 +5216,10 @@ export class ProbeStore {
         && value.supersedes === row.supersedes && value.inert === true && value.targetType === row.target_type && value.risk === row.risk
         && JSON.stringify(value.scope) === row.scope_json && value.scope.kind === row.scope_kind && value.scope.id === row.scope_id
         && JSON.stringify(value.evaluation) === row.evaluation_json && JSON.stringify(value.evidenceRefs) === row.evidence_json, 'proposal-evidence-gap');
-      this.#validateScope(value.scope, projects);
+      this.#validateScope(value.scope, projects, binding);
       const refs = [value.input, ...value.evidenceRefs];
       this.#checkEvidenceRows('proposal_evidence', 'proposal_id', proposalId, refs);
-      for (const ref of refs) this.#validateRawSource(ref, undefined, value.scope, projects);
+      for (const ref of refs) this.#validateRawSource(ref, undefined, value.scope, projects, binding);
       const units = this.#db.prepare('SELECT ordinal,unit_id FROM proposal_source_units WHERE proposal_id=? ORDER BY ordinal').all(proposalId);
       check(Array.isArray(value.sourceUnits ?? []) && units.length === (value.sourceUnits?.length ?? 0)
         && units.every((row, i) => row.ordinal === i && row.unit_id === value.sourceUnits![i]), 'proposal-evidence-gap');
@@ -5514,8 +5503,8 @@ export class ProbeStore {
       check(typeof content === 'string' && content.length > 0 && Buffer.byteLength(content) <= 65536, 'invalid-memory-content');
     }
   }
-  #validateRawSource(input: SourceAck, content?: string, targetScope?: MemoryScope, projects?: readonly string[]): void {
-    this.#validateSource(input, content, targetScope, projects);
+  #validateRawSource(input: SourceAck, content?: string, targetScope?: MemoryScope, projects?: readonly string[], binding: Binding = this.#binding): void {
+    this.#validateSource(input, content, targetScope, projects, binding);
     check(!this.#isCaptureOutput(input), 'source-derived');
     this.#analysisReferences(this.#archiveRef(input).text);
   }
@@ -5837,8 +5826,8 @@ export class ProbeStore {
       source: { path: String(row.source_path), identity: { dev: String(row.source_dev), ino: String(row.source_ino) } } })));
   }
 
-  #checkStoreIntegrity(): void {
-    checkSqliteSnapshot(this.#db);
+  #checkStoreIntegrity(): 'healthy' | 'projection-failed' {
+    const sqliteHealth = checkSqliteSnapshot(this.#db, 'canonical');
     const checked = new Set<string>();
     const sources = (value: unknown): void => {
       if (!value || typeof value !== 'object') return;
@@ -5854,6 +5843,13 @@ export class ProbeStore {
       ['compartments','source_json'], ['source_units','payload'], ['evolution_proposals','payload'],
       ['feedback_events','payload'], ['activation_batches','payload'], ['host_presentations','payload'],
     ]) for (const row of this.#db.prepare(`SELECT ${column} AS value FROM ${table}`).all()) sources(JSON.parse(String(row.value)));
+    for (const row of this.#db.prepare('SELECT unit_id FROM source_units').all()) this.#sourceUnit(String(row.unit_id));
+    const projects = this.#registeredProjects();
+    for (const row of this.#db.prepare('SELECT proposal_id,payload FROM evolution_proposals').all()) {
+      const binding = (JSON.parse(String(row.payload)).input as SourceAck).binding;
+      this.sessionSource(binding);
+      this.#proposalForProjects(String(row.proposal_id), projects, binding);
+    }
     for (const row of this.#db.prepare('SELECT j.job_id,j.payload FROM capture_jobs j JOIN compartments c ON c.job_id=j.job_id').all()) {
       const binding = (JSON.parse(String(row.payload)).source as SourceAck).binding;
       this.sessionSource(binding);
@@ -5881,17 +5877,19 @@ export class ProbeStore {
       const head = this.#db.prepare('SELECT event_id FROM intent_heads WHERE session_id=? AND branch_id=?').get(session.session_id!, session.branch_id!);
       check((head?.event_id ?? null) === (events.at(-1)?.event_id ?? null), 'intent-evidence-gap');
     }
+    return sqliteHealth;
   }
 
   auditStore(activity: Activity): void {
-    const failure = this.withActivity(activity, () => {
-      try { this.#checkStoreIntegrity(); return null; }
-      catch (error) { return error; }
+    const result = this.withActivity(activity, () => {
+      try { return { health: this.#checkStoreIntegrity(), failure: null }; }
+      catch (failure) { return { health: null, failure }; }
     });
-    if (failure) {
+    if (result.health === null) {
       this.#transaction(() => this.#db.prepare("UPDATE owner_fences SET health='failed' WHERE store_id=?").run(this.#storeId));
-      throw failure;
+      throw result.failure;
     }
+    check(result.health === 'healthy', 'projection-integrity-failed');
   }
 
   listSnapshots(activity: Activity): StoreSnapshot[] {
@@ -5909,11 +5907,12 @@ export class ProbeStore {
     this.auditStore(activity);
     const createdAt = new Date().toISOString(), day = createdAt.slice(0, 10);
     const prepared = this.withActivity(activity, () => {
-      if (kind === 'daily' && this.#db.prepare("SELECT 1 FROM store_snapshots WHERE kind='daily' AND day=? AND state IN ('ready','retired','deleted')").get(day)) {
+      if (kind === 'daily' && this.#db.prepare(`SELECT 1 FROM store_snapshots WHERE kind='daily' AND day=?
+        AND state IN ('ready','retired','deleted') AND json_extract(manifest,'$.state')='ready'`).get(day)) {
         return { skipped: 'daily-limit' as const };
       }
       check(['daily','migration'].includes(kind), 'invalid-snapshot-kind');
-      this.#checkStoreIntegrity();
+      check(this.#checkStoreIntegrity() === 'healthy', 'projection-integrity-failed');
       host.validate();
       check(host.files.length === 2 && new Set(host.files.map(item => item.role)).size === 2
         && host.files.every(item => item.file.path === join(this.#resources.root.path,
@@ -5938,37 +5937,37 @@ export class ProbeStore {
           reader.close(); return { skipped: 'unchanged' as const };
         }
         const id = randomUUID(), path = join(this.#resources.root.path, `backup-${id}`);
-        mkdirSync(path, { mode: 0o700 });
-        const directory = { path, identity: fileIdentity(path) };
-        const draft = JSON.stringify({ id, directory, files, state: 'staging' });
-        this.#db.prepare("INSERT INTO store_snapshots VALUES (?,?,?,?,?,?,?,'staging',?,?,?,NULL,NULL)")
-          .run(id, kind, day, createdAt, path, directory.identity.dev, directory.identity.ino, draft, sha256(draft), activity.id);
-        syncSnapshotDirectory(this.#resources.root.path);
-        return { reader, id, directory, files, contents, dataHash };
+        const draft = JSON.stringify({ id, directory: { path, identity: null }, files, state: 'staging' });
+        this.#db.prepare("INSERT INTO store_snapshots VALUES (?,?,?,?,?,NULL,NULL,'staging',?,?,?,NULL,NULL)")
+          .run(id, kind, day, createdAt, path, draft, sha256(draft), activity.id);
+        return { reader, id, files, contents, dataHash };
       } catch (error) { reader.close(); throw error; }
     });
     if (prepared.skipped) return { status: prepared.skipped, snapshot: null };
+    let directory: BoundFile;
     try {
+      directory = this.withActivity(activity, () => this.#bindSnapshotDirectory(
+        this.#db.prepare('SELECT * FROM store_snapshots WHERE snapshot_id=?').get(prepared.id)!));
       this.withActivity(activity, () => {
-        sameFile(prepared.directory.path, prepared.directory.identity);
-        for (const [index, file] of prepared.files.entries()) writeSnapshotFile(join(prepared.directory.path, file.name), prepared.contents[index]!);
-        syncSnapshotDirectory(prepared.directory.path);
+        sameFile(directory.path, directory.identity);
+        for (const [index, file] of prepared.files.entries()) writeSnapshotFile(join(directory.path, file.name), prepared.contents[index]!);
+        syncSnapshotDirectory(directory.path);
       });
-      await backup(prepared.reader, join(prepared.directory.path, 'store.sqlite'));
+      await backup(prepared.reader, join(directory.path, 'store.sqlite'));
     } finally { prepared.reader.close(); }
     const result = this.withActivity(activity, () => {
-      sameFile(prepared.directory.path, prepared.directory.identity);
-      const path = join(prepared.directory.path, 'store.sqlite');
+      sameFile(directory.path, directory.identity);
+      const path = join(directory.path, 'store.sqlite');
       const snapshotDb = new DatabaseSync(path);
       try { checkSqliteSnapshot(snapshotDb); snapshotDb.exec('PRAGMA journal_mode=DELETE'); }
       finally { snapshotDb.close(); }
       syncSnapshotFile(path);
       const bytes = readFileSync(path);
       const snapshot: StoreSnapshot = { schema: 'store-snapshot@1', id: prepared.id, kind, createdAt, day, storeId: this.#storeId,
-        root: structuredClone(this.#resources.root), directory: prepared.directory, files: prepared.files, dataHash: prepared.dataHash,
+        root: structuredClone(this.#resources.root), directory, files: prepared.files, dataHash: prepared.dataHash,
         database: { hash: sha256(bytes), bytes: bytes.length }, state: 'ready' };
-      writeSnapshotFile(join(prepared.directory.path, 'manifest.json'), JSON.stringify(snapshot) + '\n');
-      syncSnapshotDirectory(prepared.directory.path); syncSnapshotDirectory(this.#resources.root.path);
+      writeSnapshotFile(join(directory.path, 'manifest.json'), JSON.stringify(snapshot) + '\n');
+      syncSnapshotDirectory(directory.path); syncSnapshotDirectory(this.#resources.root.path);
       verifySnapshot(snapshot);
       const manifest = JSON.stringify(snapshot);
       this.#db.prepare("UPDATE store_snapshots SET state='ready',manifest=?,digest=? WHERE snapshot_id=? AND state='staging'")
@@ -5987,11 +5986,36 @@ export class ProbeStore {
     return result;
   }
 
+  #bindSnapshotDirectory(row: Record<string, unknown>): BoundFile {
+    const path = String(row.directory);
+    check(sha256(String(row.manifest)) === row.digest, 'snapshot-manifest-mismatch');
+    const saved = JSON.parse(String(row.manifest));
+    check(path === join(this.#resources.root.path, `backup-${String(row.snapshot_id)}`) && saved.directory.path === path, 'snapshot-store-mismatch');
+    if (row.dev !== null) {
+      const directory = { path, identity: { dev: String(row.dev), ino: String(row.ino) } };
+      check(JSON.stringify(saved.directory) === JSON.stringify(directory), 'snapshot-store-mismatch');
+      sameFile(path, directory.identity); return directory;
+    }
+    check(row.state === 'staging' && row.ino === null && saved.directory.identity === null, 'snapshot-store-mismatch');
+    if (!existsSync(path)) mkdirSync(path, { mode: 0o700 });
+    check(lstatSync(path).isDirectory(), 'snapshot-inventory-mismatch');
+    const directory = { path, identity: fileIdentity(path) };
+    this.#snapshotFiles(row);
+    syncSnapshotDirectory(this.#resources.root.path);
+    const manifest = JSON.stringify({ ...saved, directory });
+    this.#db.prepare('UPDATE store_snapshots SET dev=?,ino=?,manifest=?,digest=? WHERE snapshot_id=?')
+      .run(directory.identity.dev, directory.identity.ino, manifest, sha256(manifest), String(row.snapshot_id));
+    return directory;
+  }
+
   #snapshotFiles(row: Record<string, unknown>): SnapshotCleanupManifest['files'] {
     check(sha256(String(row.manifest)) === row.digest, 'snapshot-manifest-mismatch');
-    const saved = JSON.parse(String(row.manifest)) as Pick<StoreSnapshot, 'directory' | 'files'>;
-    const directory = { path: String(row.directory), identity: { dev: String(row.dev), ino: String(row.ino) } };
-    check(dirname(directory.path) === this.#resources.root.path && JSON.stringify(saved.directory) === JSON.stringify(directory), 'snapshot-store-mismatch');
+    const saved = JSON.parse(String(row.manifest)) as { directory: { path: string; identity: BoundFile['identity'] | null }; files: SnapshotFile[] };
+    const path = String(row.directory);
+    check(path === join(this.#resources.root.path, `backup-${String(row.snapshot_id)}`) && saved.directory.path === path, 'snapshot-store-mismatch');
+    const unbound = row.state === 'staging' && row.dev === null && row.ino === null && saved.directory.identity === null;
+    const directory = { path, identity: unbound ? fileIdentity(path) : { dev: String(row.dev), ino: String(row.ino) } };
+    check(unbound || JSON.stringify(saved.directory) === JSON.stringify(directory), 'snapshot-store-mismatch');
     return inspectSnapshotFiles(directory, ['manifest.json','store.sqlite','store.sqlite-wal','store.sqlite-shm','store.sqlite-journal', ...saved.files.map(file => file.name)]);
   }
 
@@ -6004,8 +6028,9 @@ export class ProbeStore {
         check(sha256(String(row.cleanup)) === row.cleanup_digest, 'snapshot-cleanup-evidence-gap');
         return JSON.parse(String(row.cleanup)) as SnapshotCleanupManifest;
       }
-      const value = { schema: 'snapshot-cleanup@1' as const, snapshotId,
-        directory: { path: String(row.directory), identity: { dev: String(row.dev), ino: String(row.ino) } }, files: this.#snapshotFiles(row) };
+      const directory = this.#bindSnapshotDirectory(row);
+      const bound = this.#db.prepare('SELECT * FROM store_snapshots WHERE snapshot_id=?').get(snapshotId)!;
+      const value = { schema: 'snapshot-cleanup@1' as const, snapshotId, directory, files: this.#snapshotFiles(bound) };
       return { ...value, digest: sha256(JSON.stringify(value)) };
     });
   }
@@ -6256,7 +6281,7 @@ export class ProbeStore {
     this.#transaction(() => {
       this.#assertCoordinator(coordinator);
       check(this.#db.prepare('SELECT 1 FROM store_recovery_events WHERE operation_id=?').get(plan.operationId), 'snapshot-restore-not-committed');
-      this.#checkStoreIntegrity();
+      check(this.#checkStoreIntegrity() === 'healthy', 'projection-integrity-failed');
       for (const file of plan.snapshot.files) check(sha256(snapshotBytes(file.source)) === file.hash, 'snapshot-content-mismatch');
       this.#db.prepare("UPDATE store_restores SET state='complete' WHERE operation_id=? AND state='prepared'").run(plan.operationId);
       this.#db.prepare("UPDATE owner_fences SET health='healthy' WHERE store_id=?").run(this.#storeId);
@@ -6396,7 +6421,8 @@ export class ProbeStore {
           if (preparation) inspectSnapshotFiles({ path: preparation.original.path, identity: preparation.original.identity
             ?? { dev: stat.dev.toString(), ino: stat.ino.toString() } }, recoveryFileNames(preparation));
           const expected = preparation && !preparation.original.identity ? stat.isDirectory() && !stat.isSymbolicLink() : snapshot ? stat.isDirectory() && !stat.isSymbolicLink()
-            && snapshot.dev === stat.dev.toString() && snapshot.ino === stat.ino.toString()
+            && (snapshot.state === 'staging' && snapshot.dev === null && snapshot.ino === null
+              || snapshot.dev === stat.dev.toString() && snapshot.ino === stat.ino.toString())
             : known.has(path) && identityMatches && stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n;
           entries.push({ path, state: expected ? 'expected' : 'unexpected', observedAt,
             dev: stat.dev.toString(), ino: stat.ino.toString(), reason: expected ? 'known-disposable-carrier' : 'unexplained-residual' });

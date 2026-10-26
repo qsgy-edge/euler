@@ -16,6 +16,12 @@ function crash(point: string): never {
 }
 if (action === 'migration-checkpoint') {
   console.log(JSON.stringify(await backupSandbox(sandbox, 'migration')));
+} else if (action === 'append-canonical') {
+  const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const source = probe.archive.append(randomUUID(), 'Canonical append remains available while the projection is damaged.');
+    console.log(JSON.stringify({ event: 'canonical-appended', source, health: probe.store.fence().health }));
+  } finally { probe.close(); }
 } else if (action === 'repair-projection') {
   const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
   try {
@@ -24,13 +30,14 @@ if (action === 'migration-checkpoint') {
     else throw new Error('invalid-projection-lane');
     console.log(JSON.stringify({ event: 'projection-rebuilt', health: probe.store.fence().health }));
   } finally { probe.close(); }
-} else if (action === 'discard-recovery') {
+} else if (action === 'discard-recovery' || action === 'discard-snapshot') {
   const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox)), coordinator = randomUUID();
   try {
     store.beginMaintenance(coordinator);
     if (!store.acquireMaintenance(coordinator).acquired) throw new Error('maintenance-residuals-or-participants');
-    const manifest = store.recoveryCleanupManifest(coordinator, value!);
-    store.discardRecoveryOriginal(coordinator, manifest); store.releaseMaintenance(coordinator);
+    const manifest = action === 'discard-snapshot' ? store.snapshotCleanupManifest(coordinator, value!) : store.recoveryCleanupManifest(coordinator, value!);
+    if (action === 'discard-snapshot') store.discardSnapshot(coordinator, manifest); else store.discardRecoveryOriginal(coordinator, manifest);
+    store.releaseMaintenance(coordinator);
     console.log(JSON.stringify(manifest));
   } finally { store.close(); }
 } else if (action === 'unknown') {
@@ -46,6 +53,16 @@ if (action === 'migration-checkpoint') {
     probe.transport.send(turn.payload, attempt);
     console.log(JSON.stringify({ jobId, sessionId: binding.sessionId, runId: run.runId, attemptId: attempt.attemptId }));
   } finally { probe.store.close(); }
+} else if (action === 'backup-crash') {
+  const mkdir = fs.mkdirSync;
+  fs.mkdirSync = ((path: fs.PathLike, ...args: unknown[]) => {
+    const result = Reflect.apply(mkdir, fs, [path, ...args]);
+    if (/backup-[^/\\]+$/.test(String(path))) crash('backup-directory');
+    return result;
+  }) as typeof fs.mkdirSync;
+  syncBuiltinESMExports();
+  await backupSandbox(sandbox);
+  throw new Error('expected-backup-crash');
 } else if (action === 'backup-failure') {
   const write = fs.writeFileSync;
   fs.writeFileSync = ((path: fs.PathOrFileDescriptor, ...args: unknown[]) => {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { runBackupCli } from './support/backup-cli.ts';
 import { randomUUID } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -10,8 +10,7 @@ import { createSandbox,createSandboxSession,bindingOf } from '../src/sandbox.ts'
 import { openProbe } from '../src/probe.ts';
 
 function cli(root: string,command: string) {
-  const result=spawnSync(process.execPath,['apps/cli/src/main.ts',command,'--sandbox',root,...(command==='handoff'?['--scenario','synthetic']:[])],{encoding:'utf8',maxBuffer:4*1024*1024});
-  return {...result,events:result.stdout.trim().split('\n').filter(Boolean).map(line=>JSON.parse(line))};
+  return runBackupCli(root,command,command==='handoff'?['--scenario','synthetic']:[]);
 }
 for (const lane of ['memory','source']) test(`a failed backup permits ${lane} projection repair without losing canonical history`,()=>{
   const sandbox=createSandbox();
@@ -27,6 +26,9 @@ for (const lane of ['memory','source']) test(`a failed backup permits ${lane} pr
     assert.equal(cli(sandbox.root,'backup').status,1);
     const probe=openProbe(sandbox,undefined,undefined,undefined,undefined,true);
     try {
+      const appended=probe.archive.append(randomUUID(),'A projection fault must not stop canonical source writes.');
+      assert.equal(appended.status,'durable');
+      assert.equal(probe.store.fence().health,'healthy');
       if(lane==='memory') probe.store.rebuildSearchProjection(probe.activity); else probe.store.rebuildSourceProjection(probe.activity);
       assert.equal(probe.store.fence().health,'healthy');
       assert.equal(probe.store.withActivity(probe.activity,()=>true),true);
@@ -72,6 +74,20 @@ for (const field of ['publication-hash','raw-range-hash','publication-stage']) t
     assert.match(backed.events.find(event=>event.event==='error').reason,/compartment-integrity|historian-source-gap/);
     const inspected=new DatabaseSync(join(sandbox.root,'probe.sqlite'),{readOnly:true});
     try {assert.equal(inspected.prepare("SELECT count(*) AS n FROM store_snapshots WHERE state='ready'").get()!.n,0);} finally {inspected.close();}
+  } finally {rmSync(sandbox.root,{recursive:true,force:true});}
+});
+
+for (const table of ['source_units','evolution_proposals']) test(`backup rejects corrupt ${table} owner metadata`,()=>{
+  const sandbox=createSandbox();
+  try {
+    const created=cli(sandbox.root,table==='source_units'?'handoff':'memory'); assert.equal(created.status,0,created.stdout+created.stderr);
+    const db=new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+    try {
+      db.exec(`DROP TRIGGER immutable_${table}_update`);
+      assert.ok(Number(db.prepare(`UPDATE ${table} SET payload_hash='broken'`).run().changes)>0);
+    } finally {db.close();}
+    const backed=cli(sandbox.root,'backup'); assert.equal(backed.status,1);
+    assert.match(backed.events.find(event=>event.event==='error').reason,/source-evidence-gap|proposal-evidence-gap/);
   } finally {rmSync(sandbox.root,{recursive:true,force:true});}
 });
 

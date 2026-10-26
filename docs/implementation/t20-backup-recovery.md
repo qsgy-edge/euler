@@ -16,7 +16,7 @@ npm run evidence:backup
 
 ## Snapshot boundary and inventory
 
-`ProbeStore.createSnapshot` pins a SQLite read transaction and captures the source and owner-carrier bytes at the same Core write boundary. SQLite's backup API materializes that read snapshot while other ordinary work may continue. Publication requires database `quick_check`, foreign-key and canonical-reference checks, archive framing/binding checks, referenced source byte/hash checks, and independent readback of the destination files. Published Historian compartments are checked against their completed job, publication hash, frozen range/hash, actual attempt, recorded response and archived body. A registered staging directory is not a recovery point.
+`ProbeStore.createSnapshot` pins a SQLite read transaction and captures the source and owner-carrier bytes at the same Core write boundary. SQLite's backup API materializes that read snapshot while other ordinary work may continue. Publication requires database `quick_check`, foreign-key and canonical-reference checks, archive framing/binding checks, referenced source byte/hash checks, and independent readback of the destination files. Published source units and proposals are checked through their canonical owner readers, including payload digests, typed versions, project scope, approvals and source relationships. Published Historian compartments are checked against their completed job, publication hash, frozen range/hash, actual attempt, recorded response and archived body. Before creating a backup directory, Core durably registers its staging intent and intended file inventory, then binds the directory identity. Interrupted staging remains available to maintenance cleanup and does not consume a verified daily snapshot slot.
 
 | Carrier | Snapshot treatment |
 | --- | --- |
@@ -29,7 +29,7 @@ npm run evidence:backup
 
 A changed UTC day creates at most one daily snapshot. Activity, maintenance and snapshot bookkeeping alone do not trigger another data version. The latest two verified daily snapshots remain; retirement first invalidates the old snapshot in SQLite and then removes only its verified files. A `migration` checkpoint uses the same verification path and remains separate from daily retention until explicitly discarded.
 
-Canonical/reference corruption marks store health failed and blocks normal writes and model dispatch. Recovery uses the current owner/fence control, never the snapshot's stale open fence. Missing or untrusted current control fails before restoration. Projection rebuilds retain the activity/root/fence checks and can repair derived rows while health is failed. Normal writes and dispatch remain blocked until the Store integrity audit succeeds.
+Canonical/reference corruption marks store health failed and blocks normal writes and model dispatch. Recovery uses the current owner/fence control, never the snapshot's stale open fence. Missing or untrusted current control fails before restoration. A failed SQLite check confined to search projection tables prevents snapshot publication while canonical writes remain available. Projection rebuilds retain the normal activity/root/fence checks. Canonical failure keeps the store closed until recovery from a verified snapshot.
 
 ## Restoring and retaining uncertainty
 
@@ -49,7 +49,7 @@ The disposable schema version is **23**. Store opening rejects other schema vers
 
 ## Evidence
 
-`npm run evidence:backup` writes `artifacts/t20-*/receipt.json`, the CLI stdout/stderr, interrupted/final sandbox copies and artifact hashes. Its cases cover memory, approved handoff, Historian, controlled project outputs before/after the snapshot, unknown jobs before/after the snapshot, preparation/carrier/database interruptions, injected `ENOSPC`/`EROFS`, projection repairs, canonical and Historian corruption, original-copy cleanup state, and the three forward migration copy outcomes. The verifier reads the actual SQLite files and source bytes independently, checks preserved attempt outcomes and gap ownership, then proves that an old stream is rejected and a fresh session sends successfully.
+`npm run evidence:backup` writes `artifacts/t20-*/receipt.json`, the CLI stdout/stderr, interrupted/final sandbox copies and artifact hashes. Its cases cover memory; delivered/read Info and post-snapshot Info gaps; report history, approved project excerpts and cross-project rejection; Historian; controlled project outputs and unknown jobs before/after the snapshot; backup-directory and recovery interruptions; injected `ENOSPC`/`EROFS`; projection repairs with canonical writes still available; canonical, source/proposal metadata and Historian corruption; original-copy cleanup state; and the three forward migration copy outcomes. The verifier reads the actual SQLite files and source bytes independently, checks preserved attempt outcomes and gap ownership, then proves that an old stream is rejected and a fresh session sends successfully.
 
 The `backup*.test.ts` suite additionally verifies concurrent ordinary writes, UTC-day retention, missing current owner control, source mutation, cross-session Historian verification, carrier relationships, frozen cleanup, changed file identity and lost cleanup acknowledgement. The approved boundaries are the public Core API, real CLI process I/O and final dispatch.
 

@@ -25,22 +25,30 @@ for (const scenario of fixture.cases) {
   const sandbox = createSandbox();
   let outputRoot: string | undefined;
   const commands: Record<string, unknown>[] = [];
-  const run = (name: string, args: string[], expected: 'success' | 'error' | 'kill' = 'success') => {
-    const result = spawnSync(process.execPath, args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  const run = (name: string, args: string[], expected: 'success' | 'error' | 'kill' = 'success', input?: string) => {
+    const result = spawnSync(process.execPath, args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, ...(input === undefined ? {} : { input }) });
+    if (input !== undefined) writeFileSync(join(path, name + '.stdin.txt'), input);
     writeFileSync(join(path, name + '.stdout.jsonl'), result.stdout ?? ''); writeFileSync(join(path, name + '.stderr.txt'), result.stderr ?? '');
-    commands.push({ command: [process.execPath, ...args], exitCode: result.status, signal: result.signal, stdout: name + '.stdout.jsonl', stderr: name + '.stderr.txt' });
+    commands.push({ command: [process.execPath, ...args], exitCode: result.status, signal: result.signal, stdout: name + '.stdout.jsonl', stderr: name + '.stderr.txt', ...(input === undefined ? {} : { stdin: name + '.stdin.txt' }) });
     assert.equal(result.error, undefined);
     if (expected === 'success') assert.equal(result.status, 0, result.stderr);
     else assert.ok(result.signal === 'SIGKILL' || result.status !== 0);
     if (expected === 'kill') assert.doesNotMatch(result.stderr, /Error:|ERR_/);
     return result.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
   };
-  const cli = (name: string, command: string, args: string[] = [], expected: 'success' | 'error' = 'success') =>
-    run(name, ['apps/cli/src/main.ts', command, '--sandbox', sandbox.root, ...args], expected);
+  const cli = (name: string, command: string, args: string[] = [], expected: 'success' | 'error' = 'success', input?: string) =>
+    run(name, ['apps/cli/src/main.ts', command, '--sandbox', sandbox.root, ...args], expected, input);
   try {
-    const setup = scenario.startsWith('historian-') ? 'historian' : scenario === 'projection-memory' ? 'memory'
-      : scenario === 'projection-source' ? 'handoff' : scenario;
-    if (['memory','handoff','historian'].includes(setup)) cli('setup', setup, ['--scenario','synthetic']);
+    const setup = scenario.startsWith('historian-') ? 'historian' : ['projection-memory','proposal-metadata-corruption'].includes(scenario) ? 'memory'
+      : ['projection-source','source-metadata-corruption'].includes(scenario) ? 'handoff' : scenario;
+    let infoBatches: string[] | undefined, laterInfo: string | undefined, handoff: unknown;
+    if (scenario === 'owner-info') {
+      infoBatches = cli('setup','remember',[],'success','记住偏好：包管理器使用 pnpm\n记住决定：本项目使用 SQLite WAL\nstop\n')
+        .filter(e => e.event === 'remember-result' && e.status === 'activated').map(e => e.batchId);
+      assert.equal(infoBatches.length,2);
+      assert.equal(cli('first-read','info',['--batch',infoBatches[0]!]).find(e => e.event === 'info-read').read,'read');
+    } else if (scenario === 'handoff-versions') handoff = run('setup',['apps/cli/test/support/backup-handoff-worker.ts',sandbox.root,'seed'])[0];
+    else if (['memory','handoff','historian'].includes(setup)) cli('setup', setup, ['--scenario','synthetic']);
     else cli('setup', 'run');
     let unknown: Record<string, string> | undefined;
     if (scenario === 'unknown-before') unknown = run('unknown-before', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'unknown'])[0];
@@ -49,6 +57,18 @@ for (const scenario of fixture.cases) {
       assert.equal(run('backup-failure', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'backup-failure',scenario])[0].reason, scenario);
       assert.equal(hash(readFileSync(join(sandbox.root, 'session.jsonl'))), original);
       assert.deepEqual(cli('failed-backups', 'backups').find(e => e.event === 'backups').snapshots, []);
+    }
+    if (scenario === 'backup-directory-crash') {
+      assert.equal(run('backup-interrupted',['apps/cli/test/support/backup-worker.ts',sandbox.root,'backup-crash'],'kill')[0].point,'backup-directory');
+      const db = new DatabaseSync(join(sandbox.root,'probe.sqlite'),{readOnly:true});
+      let id: string;
+      try {
+        const row = db.prepare("SELECT snapshot_id,dev,ino FROM store_snapshots WHERE state='staging'").get()!;
+        assert.ok(row); assert.equal(row.dev,null); assert.equal(row.ino,null); id = String(row.snapshot_id);
+      } finally { db.close(); }
+      cpSync(sandbox.root,join(path,'interrupted-sandbox'),{recursive:true});
+      const manifest = run('backup-discarded',['apps/cli/test/support/backup-worker.ts',sandbox.root,'discard-snapshot',id])[0];
+      assert.equal(existsSync(manifest.directory.path),false);
     }
     if (scenario.startsWith('projection-')) {
       const lane = scenario.slice('projection-'.length);
@@ -62,7 +82,8 @@ for (const scenario of fixture.cases) {
         assert.ok(Number(damaged.prepare('UPDATE search_documents SET projection_generation=0').run().changes) > 0);
       } finally { damaged.close(); }
       cpSync(sandbox.root, join(path, 'damaged-sandbox'), { recursive: true });
-      assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason,'store-integrity-failed');
+      assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason,'projection-integrity-failed');
+      assert.equal(run('canonical-append',['apps/cli/test/support/backup-worker.ts',sandbox.root,'append-canonical'])[0].health,'healthy');
       assert.equal(run('projection-repaired',['apps/cli/test/support/backup-worker.ts',sandbox.root,'repair-projection',lane])[0].health,'healthy');
       const repaired = new DatabaseSync(join(sandbox.root, 'probe.sqlite'), { readOnly: true });
       try {
@@ -99,6 +120,12 @@ for (const scenario of fixture.cases) {
       snapshotEpoch = Number(snapshotDb.prepare('SELECT epoch FROM owner_fences').get()!.epoch);
       for (const event of snapshotDb.prepare('SELECT payload,hash FROM request_events').all()) assert.equal(hash(String(event.payload)), event.hash);
     } finally { snapshotDb.close(); }
+    if (infoBatches) {
+      cli('second-read','info',['--batch',infoBatches[1]!]);
+      laterInfo = cli('later-info','remember',[],'success','记住偏好：测试使用独立目录\nstop\n')
+        .find(e => e.event === 'remember-result' && e.status === 'activated').batchId;
+      assert.ok(laterInfo);
+    }
     if (cleaned) {
       run('original-discarded',['apps/cli/test/support/backup-worker.ts',sandbox.root,'discard-recovery',cleaned.operationId]);
       assert.equal(existsSync(cleaned.path),false);
@@ -127,6 +154,16 @@ for (const scenario of fixture.cases) {
       try { db.exec("DROP TRIGGER immutable_request_events_update; UPDATE request_events SET hash='broken' WHERE seq=1"); } finally { db.close(); }
       assert.equal(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason, 'ledger-evidence-gap');
       assert.equal(cli('blocked-run','run',[],'error').find(e => e.event === 'error').reason, 'store-integrity-failed');
+    }
+    if (scenario === 'source-metadata-corruption' || scenario === 'proposal-metadata-corruption') {
+      const table = scenario === 'source-metadata-corruption' ? 'source_units' : 'evolution_proposals';
+      const damaged = new DatabaseSync(join(sandbox.root,'probe.sqlite'));
+      try {
+        damaged.exec('DROP TRIGGER immutable_' + table + '_update');
+        assert.ok(Number(damaged.prepare("UPDATE " + table + " SET payload_hash='broken'").run().changes)>0);
+      } finally { damaged.close(); }
+      cpSync(sandbox.root,join(path,'damaged-sandbox'),{recursive:true});
+      assert.match(cli('rejected-backup','backup',[],'error').find(e => e.event === 'error').reason,/source-evidence-gap|proposal-evidence-gap/);
     }
     if (scenario.startsWith('historian-') && scenario.endsWith('-corruption')) {
       const damaged = new DatabaseSync(join(sandbox.root, 'probe.sqlite'));
@@ -195,6 +232,20 @@ for (const scenario of fixture.cases) {
         assert.equal(job.rawHash,hash(JSON.stringify(job.range)));
         assert.ok(attempts.some(attempt => attempt.attempt_id===attemptId && attempt.run_id===published.run_id && attempt.outcome==='received'));
       }
+      if (infoBatches) {
+        const rows = db.prepare('SELECT batch_id,delivery,read_state FROM host_info_batches ORDER BY batch_id').all();
+        assert.equal(rows.length,2);
+        for (const [index,id] of infoBatches.entries()) {
+          const row = rows.find(row => row.batch_id===id)!;
+          assert.deepEqual([row.delivery,row.read_state],['delivered',index===0?'read':'unread']);
+          const batch = db.prepare('SELECT payload,payload_hash FROM activation_batches WHERE batch_id=?').get(id)!;
+          assert.equal(hash(String(batch.payload)),batch.payload_hash);
+          assert.equal(db.prepare('SELECT digest FROM host_info_batches WHERE batch_id=?').get(id)!.digest,batch.payload_hash);
+        }
+        assert.equal(db.prepare('SELECT 1 FROM activation_batches WHERE batch_id=?').get(laterInfo!),undefined);
+        const info = plan.originals.find((file: { role: string }) => file.role==='owner-info');
+        assert.ok(readFileSync(join(plan.original.path,info.name),'utf8').includes(laterInfo!));
+      }
       if (unknown) {
         assert.ok(db.prepare("SELECT 1 FROM store_recovered_owners WHERE kind='job' AND owner_id=?").get(unknown.jobId!));
         const attempt = db.prepare('SELECT outcome FROM request_attempts WHERE attempt_id=?').get(unknown.attemptId!);
@@ -203,6 +254,15 @@ for (const scenario of fixture.cases) {
         assert.ok(readFileSync(join(plan.original.path, receiver.name),'utf8').includes(unknown.attemptId!));
       }
     } finally { db.close(); }
+    if (handoff) {
+      const result = run('handoff-verified',['apps/cli/test/support/backup-handoff-worker.ts',sandbox.root,'verify',JSON.stringify(handoff)])[0];
+      assert.deepEqual(result.versions,[1,2]); assert.equal(result.privateReadsRejected,4);
+      assert.equal(result.unrelatedProposalRejected,true); assert.equal(result.sends,0);
+    }
+    if (infoBatches) {
+      const listed = cli('restored-info','info').find(e => e.event==='info-list');
+      assert.deepEqual([listed.pending,listed.unread],[0,1]);
+    }
     if (expectedOutput) {
       assert.deepEqual(cli('maintenance-inventory','maintenance-status').find(e => e.event === 'maintenance-status').controlledFiles,[expectedOutput]);
       assert.equal(readFileSync(join(outputRoot!,'result.md'),'utf8'),'EULER-T20 controlled project output');
