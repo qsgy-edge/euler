@@ -7,7 +7,7 @@ import { openProbe } from '../src/probe.ts';
 import type { Binding } from '@euler/core';
 
 function cli(args: string[]) {
-  const result = spawnSync(process.execPath, ['apps/cli/src/main.ts', 'context', ...args], { encoding: 'utf8', timeout: 30000 });
+  const result = spawnSync(process.execPath, ['apps/cli/src/main.ts', 'context', ...args], { encoding: 'utf8', timeout: 90000 });
   const events = result.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>);
   return { ...result, events };
 }

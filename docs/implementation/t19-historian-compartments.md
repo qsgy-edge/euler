@@ -43,7 +43,7 @@ Assembly, started and send gates recheck the selected compartment and its raw de
 
 ## Ownership and evidence
 
-Disposable schema 22 has no migration path. Previous probe databases are refused. Body carriers remain registered session JSONL; no additional filesystem carrier is introduced.
+The current disposable schema and migration boundary are defined in [backup and recovery](t20-backup-recovery.md#maintenance-and-schema). Earlier schema versions are refused. Body carriers remain registered session JSONL; no additional filesystem carrier is introduced.
 
 | Carrier | Owned content and cleanup references |
 | --- | --- |
