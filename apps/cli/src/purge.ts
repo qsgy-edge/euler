@@ -60,7 +60,6 @@ export async function runPurge(sandbox: Sandbox, recordId?: string, scenario = '
   let preview: PurgePresentation | undefined;
   try {
     const fence = store.beginMaintenance(coordinator);
-    await emit('maintenance-closing', { epoch: fence.epoch });
     const acquire = async () => {
       const result = store.acquireMaintenance(coordinator);
       if (!result.acquired) { await emit('maintenance-blocked', result); return; }
@@ -104,7 +103,7 @@ export async function runPurge(sandbox: Sandbox, recordId?: string, scenario = '
     let failure: unknown;
     const fail = (error: unknown) => { failure = error; lines.close(); };
     const closed = new Promise<void>(resolve => lines.once('close', resolve));
-    let queue = handle('acquire').catch(fail);
+    let queue = emit('maintenance-closing', { epoch: fence.epoch }).then(() => handle('acquire')).catch(fail);
     lines.on('line', line => {
       try {
         const input = store.receivePurgeInput(coordinator, line);

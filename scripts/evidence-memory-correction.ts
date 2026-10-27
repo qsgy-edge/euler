@@ -8,7 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { createSandbox } from '../apps/cli/src/sandbox.ts';
 import { startCli, sendCommand as send } from '../apps/cli/src/process-driver.ts';
-import { bufferedCorrectionApproval, delayedCorrectionOutput } from '../apps/cli/test/support/memory-correction.ts';
+import { bufferedCorrectionApproval, delayedCliOutput } from '../apps/cli/test/support/memory-correction.ts';
 import fixture from '../fixtures/t15-owner-correction.json' with { type: 'json' };
 
 const repo = fileURLToPath(new URL('../', import.meta.url));
@@ -160,7 +160,7 @@ for (const crash of [false, true]) {
   }
 }
 {
-  const sandbox = createSandbox(), output = delayedCorrectionOutput(sandbox);
+  const sandbox = createSandbox(), output = delayedCliOutput(sandbox, 'remember', 'memory-preview');
   try {
     save('buffered/output-delay.mjs', readFileSync(output.preload));
     const cli = launch(sandbox.root, 'buffered/session', undefined, output.env);

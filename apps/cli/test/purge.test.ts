@@ -1,10 +1,46 @@
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
+import { existsSync, rmSync } from 'node:fs';
 import test from 'node:test';
 import { createSandbox } from '../src/sandbox.ts';
 import { startCli } from '../src/process-driver.ts';
+import { delayedCliOutput } from './support/memory-correction.ts';
 
 // Seams: the public maintenance CLI and the normal runtime admission boundary.
+for (const input of ['cancel', 'eof']) test(`purge retains early ${input} while its first stdout write is held`, { timeout: 25000 }, async () => {
+  const sandbox = createSandbox(), seed = startCli(['memory', '--sandbox', sandbox.root]);
+  const children = [seed], output = delayedCliOutput(sandbox, 'purge', 'maintenance-closing');
+  const observed = async (path: string) => {
+    const deadline = Date.now() + 5000;
+    while (!existsSync(path) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(existsSync(path), `stdio observation missing: ${path}`);
+  };
+  try {
+    assert.equal((await seed.exit).code, 0);
+    const result = seed.observations.find(item => item.event === 'memory-result')!;
+    const recordId = (result.activated as { record: { recordId: string } }).record.recordId;
+    const purge = startCli(['purge', '--sandbox', sandbox.root, '--record', recordId], 15000, undefined, output.env); children.push(purge);
+    await observed(output.held);
+    if (input === 'cancel') { purge.command('cancel'); await observed(output.received); }
+    else { purge.child.stdin.end(); await observed(output.ended); }
+    output.release();
+    if (input === 'cancel') await purge.waitFor('purge-cancelled');
+    assert.equal((await purge.waitFor('process-exit')).code, 0, purge.stderr());
+    assert.equal(purge.observations.some(event => event.event === 'purge-result'), false);
+    if (input === 'eof') {
+      const resumed = startCli(['purge', '--sandbox', sandbox.root, '--record', recordId]); children.push(resumed);
+      await resumed.waitFor('purge-preview'); resumed.command('cancel'); await resumed.waitFor('purge-cancelled'); await resumed.exit;
+    }
+    const fresh = startCli(['run', '--sandbox', sandbox.root]); children.push(fresh);
+    assert.equal((await fresh.exit).code, 0, fresh.stderr());
+  } finally {
+    output.release();
+    for (const child of children) {
+      if (child.child.exitCode === null && child.child.signalCode === null) child.child.kill();
+      await child.exit;
+    }
+    output.close(); rmSync(sandbox.root, { recursive: true, force: true });
+  }
+});
 test('purge presents the actual deletion closure only after the old runtime exits', { timeout: 20000 }, async () => {
   const sandbox = createSandbox();
   const seed = startCli(['memory', '--sandbox', sandbox.root]);

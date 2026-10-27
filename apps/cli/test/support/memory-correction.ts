@@ -8,17 +8,21 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 
-/** Hold one actual stdout preview write without blocking the CLI's live stdin callback. */
-export function delayedCorrectionOutput(sandbox: Sandbox) {
-  const directory = mkdtempSync(join(tmpdir(), 'euler-correction-output-'));
+/** Hold one actual stdout write without blocking the CLI's live stdin callback. */
+export function delayedCliOutput(sandbox: Sandbox, command: string, event: string) {
+  const directory = mkdtempSync(join(tmpdir(), 'euler-cli-output-'));
   const preload = join(directory, 'delay.mjs'), released = join(directory, 'released');
-  writeFileSync(preload, `import { existsSync } from 'node:fs';
-if (process.argv.includes('remember') && process.argv.includes(${JSON.stringify(sandbox.root)})) {
+  const held = join(directory, 'held'), received = join(directory, 'received'), ended = join(directory, 'ended');
+  writeFileSync(preload, `import { existsSync, writeFileSync } from 'node:fs';
+if (process.argv.includes(${JSON.stringify(command)}) && process.argv.includes(${JSON.stringify(sandbox.root)})) {
   const write = process.stdout.write.bind(process.stdout);
   let delayed = false;
   process.stdout.write = (chunk, ...args) => {
-    if (!delayed && typeof chunk === 'string' && chunk.startsWith('{"event":"memory-preview",')) {
+    if (!delayed && typeof chunk === 'string' && chunk.startsWith(${JSON.stringify(`{"event":"${event}",`)})) {
       delayed = true;
+      process.stdin.once('data', () => writeFileSync(${JSON.stringify(received)}, 'received'));
+      process.stdin.once('end', () => writeFileSync(${JSON.stringify(ended)}, 'ended'));
+      writeFileSync(${JSON.stringify(held)}, 'held');
       const deliver = () => existsSync(${JSON.stringify(released)}) ? write(chunk, ...args) : setTimeout(deliver, 10);
       setTimeout(deliver, 10);
       return false;
@@ -26,12 +30,12 @@ if (process.argv.includes('remember') && process.argv.includes(${JSON.stringify(
     return write(chunk, ...args);
   };
 }`);
-  return { preload, env: { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${pathToFileURL(preload).href}` },
+  return { preload, held, received, ended, env: { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${pathToFileURL(preload).href}` },
     release() { writeFileSync(released, 'release'); }, close() { rmSync(directory, { recursive: true, force: true }); } };
 }
 
 export async function bufferedCorrectionApproval(cli: ReturnType<typeof startCli>, sandbox: Sandbox, recordId: string, content: string,
-  output: ReturnType<typeof delayedCorrectionOutput>) {
+  output: ReturnType<typeof delayedCliOutput>) {
   const from = cli.observations.length;
   const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
   let preview: MemoryPresentation | undefined, early: SourceAck | undefined;
