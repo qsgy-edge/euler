@@ -6096,13 +6096,17 @@ export class ProbeStore {
       }));
   }
 
+  #dailySnapshotTaken(day: string): boolean {
+    return !!this.#db.prepare(`SELECT 1 FROM store_snapshots WHERE kind='daily' AND day=?
+      AND state IN ('ready','retired','deleted') AND json_extract(manifest,'$.state')='ready'`).get(day);
+  }
+
   async createSnapshot(activity: Activity, host: { files: { file: BoundFile; role: 'owner-info' | 'receiver' }[]; validate: () => void },
     kind: StoreSnapshot['kind'] = 'daily'): Promise<{ status: 'created' | 'unchanged' | 'daily-limit'; snapshot: StoreSnapshot | null }> {
     this.auditStore(activity);
     const createdAt = new Date().toISOString(), day = createdAt.slice(0, 10);
     const prepared = this.withActivity(activity, () => {
-      if (kind === 'daily' && this.#db.prepare(`SELECT 1 FROM store_snapshots WHERE kind='daily' AND day=?
-        AND state IN ('ready','retired','deleted') AND json_extract(manifest,'$.state')='ready'`).get(day)) {
+      if (kind === 'daily' && this.#dailySnapshotTaken(day)) {
         return { skipped: 'daily-limit' as const };
       }
       check(['daily','migration'].includes(kind), 'invalid-snapshot-kind');
@@ -6150,6 +6154,11 @@ export class ProbeStore {
       await backup(prepared.reader, join(directory.path, 'store.sqlite'));
     } finally { prepared.reader.close(); }
     const result = this.withActivity(activity, () => {
+      if (kind === 'daily' && this.#dailySnapshotTaken(day)) {
+        const cleanup = this.#snapshotCleanupManifest(prepared.id);
+        this.#recordSnapshotCleanup(cleanup);
+        return { status: 'daily-limit' as const, snapshot: null, cleanup };
+      }
       sameFile(directory.path, directory.identity);
       const path = join(directory.path, 'store.sqlite');
       const snapshotDb = new DatabaseSync(path);
@@ -6168,9 +6177,10 @@ export class ProbeStore {
         .run(manifest, sha256(manifest), snapshot.id);
       if (kind === 'daily') this.#db.prepare(`UPDATE store_snapshots SET state='retired' WHERE kind='daily' AND state='ready'
         AND snapshot_id NOT IN (SELECT snapshot_id FROM store_snapshots WHERE kind='daily' AND state='ready' ORDER BY created_at DESC,snapshot_id DESC LIMIT 2)`).run();
-      return { status: 'created' as const, snapshot };
+      return { status: 'created' as const, snapshot, cleanup: null };
     });
     this.withActivity(activity, () => {
+      if (result.cleanup) this.#completeSnapshotCleanup(result.cleanup);
       for (const row of this.#db.prepare("SELECT * FROM store_snapshots WHERE state='retired'").all()) {
         const snapshot = this.#snapshotManifest(row);
         check(snapshot.state === 'ready', 'snapshot-manifest-mismatch');
@@ -6178,7 +6188,7 @@ export class ProbeStore {
         this.#db.prepare("UPDATE store_snapshots SET state='deleted' WHERE snapshot_id=? AND state='retired'").run(row.snapshot_id!);
       }
     });
-    return result;
+    return { status: result.status, snapshot: result.snapshot };
   }
 
   #bindSnapshotDirectory(row: Record<string, unknown>): BoundFile {
@@ -6210,19 +6220,34 @@ export class ProbeStore {
     return inspectSnapshotFiles(directory, ['manifest.json','store.sqlite','store.sqlite-wal','store.sqlite-shm','store.sqlite-journal', ...saved.files.map(file => file.name)]);
   }
 
+  #snapshotCleanupManifest(snapshotId: string): SnapshotCleanupManifest {
+    const row = this.#db.prepare("SELECT * FROM store_snapshots WHERE snapshot_id=? AND state!='deleted'").get(snapshotId);
+    check(row, 'snapshot-not-found');
+    if (row.cleanup) {
+      check(sha256(String(row.cleanup)) === row.cleanup_digest, 'snapshot-cleanup-evidence-gap');
+      return JSON.parse(String(row.cleanup)) as SnapshotCleanupManifest;
+    }
+    const directory = this.#bindSnapshotDirectory(row);
+    const bound = this.#db.prepare('SELECT * FROM store_snapshots WHERE snapshot_id=?').get(snapshotId)!;
+    const value = { schema: 'snapshot-cleanup@1' as const, snapshotId, directory, files: this.#snapshotFiles(bound) };
+    return { ...value, digest: sha256(JSON.stringify(value)) };
+  }
+
+  #recordSnapshotCleanup(manifest: SnapshotCleanupManifest): void {
+    const payload = JSON.stringify(manifest);
+    this.#db.prepare("UPDATE store_snapshots SET state=CASE WHEN state='staging' THEN state ELSE 'retired' END,cleanup=?,cleanup_digest=? WHERE snapshot_id=?")
+      .run(payload, sha256(payload), manifest.snapshotId);
+  }
+
+  #completeSnapshotCleanup(manifest: SnapshotCleanupManifest): void {
+    removeSnapshotFiles(manifest); syncSnapshotDirectory(this.#resources.root.path);
+    this.#db.prepare("UPDATE store_snapshots SET state='deleted',cleanup=NULL,cleanup_digest=NULL WHERE snapshot_id=?").run(manifest.snapshotId);
+  }
+
   snapshotCleanupManifest(coordinator: string, snapshotId: string): SnapshotCleanupManifest {
     return this.#transaction(() => {
       check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
-      const row = this.#db.prepare("SELECT * FROM store_snapshots WHERE snapshot_id=? AND state!='deleted'").get(snapshotId);
-      check(row, 'snapshot-not-found');
-      if (row.cleanup) {
-        check(sha256(String(row.cleanup)) === row.cleanup_digest, 'snapshot-cleanup-evidence-gap');
-        return JSON.parse(String(row.cleanup)) as SnapshotCleanupManifest;
-      }
-      const directory = this.#bindSnapshotDirectory(row);
-      const bound = this.#db.prepare('SELECT * FROM store_snapshots WHERE snapshot_id=?').get(snapshotId)!;
-      const value = { schema: 'snapshot-cleanup@1' as const, snapshotId, directory, files: this.#snapshotFiles(bound) };
-      return { ...value, digest: sha256(JSON.stringify(value)) };
+      return this.#snapshotCleanupManifest(snapshotId);
     });
   }
 
@@ -6237,16 +6262,13 @@ export class ProbeStore {
       const current = this.snapshotCleanupManifest(coordinator, manifest.snapshotId);
       check(JSON.stringify(manifest) === JSON.stringify(current), 'snapshot-cleanup-stale');
       if (!row.cleanup) sameFile(manifest.directory.path, manifest.directory.identity);
-      const payload = JSON.stringify(manifest);
-      this.#db.prepare("UPDATE store_snapshots SET state=CASE WHEN state='staging' THEN state ELSE 'retired' END,cleanup=?,cleanup_digest=? WHERE snapshot_id=?")
-        .run(payload, sha256(payload), manifest.snapshotId);
+      this.#recordSnapshotCleanup(manifest);
       return false;
     });
     if (settled) return;
     this.#transaction(() => {
       check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
-      removeSnapshotFiles(manifest); syncSnapshotDirectory(this.#resources.root.path);
-      this.#db.prepare("UPDATE store_snapshots SET state='deleted',cleanup=NULL,cleanup_digest=NULL WHERE snapshot_id=?").run(manifest.snapshotId);
+      this.#completeSnapshotCleanup(manifest);
     });
   }
 
@@ -6343,6 +6365,27 @@ export class ProbeStore {
     });
   }
 
+  #selectedRecoverySnapshot(snapshotId: string): StoreSnapshot {
+    const saved = this.#db.prepare("SELECT manifest,digest FROM store_snapshots WHERE snapshot_id=? AND state='ready'").get(snapshotId);
+    check(saved && sha256(String(saved.manifest)) === saved.digest, 'snapshot-not-recoverable');
+    const snapshot = JSON.parse(String(saved.manifest)) as StoreSnapshot;
+    check(snapshot.storeId === this.#storeId && JSON.stringify(snapshot.root) === JSON.stringify(this.#resources.root), 'snapshot-store-mismatch');
+    verifySnapshot(snapshot);
+    return snapshot;
+  }
+
+  beginSnapshotRecovery(coordinator: string, snapshotId: string): Fence {
+    uuid(snapshotId);
+    return this.#transaction(() => {
+      const pending = this.#db.prepare("SELECT * FROM store_restores WHERE state IN ('preparing','prepared')").get();
+      if (pending) {
+        check(pending.snapshot_id === snapshotId, 'snapshot-recovery-in-progress');
+        check(!pending.cleanup, 'snapshot-cleanup-in-progress');
+      } else this.#selectedRecoverySnapshot(snapshotId);
+      return this.beginMaintenance(coordinator);
+    });
+  }
+
   #prepareRecovery(coordinator: string, snapshotId: string): SnapshotRecoveryPlan {
     const row = this.#transaction(() => {
       check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
@@ -6352,11 +6395,7 @@ export class ProbeStore {
         check(!pending.cleanup, 'snapshot-cleanup-in-progress');
         return pending;
       }
-      const saved = this.#db.prepare("SELECT manifest,digest FROM store_snapshots WHERE snapshot_id=? AND state='ready'").get(snapshotId);
-      check(saved && sha256(String(saved.manifest)) === saved.digest, 'snapshot-not-recoverable');
-      const snapshot = JSON.parse(String(saved.manifest)) as StoreSnapshot;
-      check(snapshot.storeId === this.#storeId && JSON.stringify(snapshot.root) === JSON.stringify(this.#resources.root), 'snapshot-store-mismatch');
-      verifySnapshot(snapshot);
+      const snapshot = this.#selectedRecoverySnapshot(snapshotId);
       const files: SnapshotRecoveryPreparation['files'] = [
         { source: this.#resources.store, name: 'store.sqlite', role: 'source' },
         ...snapshot.files.map(({ source, name, role }) => ({ source, name, role })),

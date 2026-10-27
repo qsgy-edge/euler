@@ -44,7 +44,7 @@ export async function restoreSandboxSnapshot(input: Sandbox, snapshotId: string)
   }, sandbox.appId);
   const coordinator = randomUUID();
   try {
-    store.beginMaintenance(coordinator);
+    store.beginSnapshotRecovery(coordinator, snapshotId);
     check(store.acquireMaintenance(coordinator).acquired, 'maintenance-residuals-or-participants');
     return await store.restoreSnapshot(coordinator, snapshotId);
   } finally { store.close(); }

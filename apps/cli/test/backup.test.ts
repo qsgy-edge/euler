@@ -57,6 +57,22 @@ test('changed daily snapshots retain the latest two and unchanged days create no
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('overlapping daily backups return one snapshot and daily-limit without leaving another copy', async () => {
+  const sandbox = createSandbox();
+  try {
+    const source = readFileSync(join(sandbox.root,'session.jsonl'));
+    const results = await Promise.allSettled([backupSandbox(sandbox),backupSandbox(sandbox)]);
+    assert.deepEqual(results.map(result=>result.status),['fulfilled','fulfilled'],
+      results.filter(result=>result.status==='rejected').map(result=>String(result.reason)).join('\n'));
+    const completed = results.filter(result=>result.status==='fulfilled').map(result=>result.value);
+    assert.deepEqual(completed.map(result=>result.status).sort(),['created','daily-limit']);
+    const snapshots = listSandboxBackups(sandbox);
+    assert.equal(snapshots.length,1);
+    assert.deepEqual(readdirSync(sandbox.root).filter(name=>name.startsWith('backup-')),['backup-'+snapshots[0]!.id]);
+    assert.deepEqual(readFileSync(join(sandbox.root,'session.jsonl')),source);
+  } finally { rmSync(sandbox.root,{recursive:true,force:true}); }
+});
+
 test('an online snapshot keeps one database and archive boundary while normal writes continue', async () => {
   const sandbox = createSandbox(), probe = openProbe(sandbox);
   try {

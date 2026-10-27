@@ -74,6 +74,32 @@ for (const point of ['before','after']) test(`staging snapshot cleanup resumes a
   } finally { rmSync(sandbox.root,{recursive:true,force:true}); }
 });
 
+for (const point of ['before','after']) test(`losing concurrent backup cleanup resumes after death ${point} directory removal`, () => {
+  const sandbox = createSandbox();
+  const snapshots = () => {
+    const listed = spawnSync(process.execPath,['apps/cli/src/main.ts','backups','--sandbox',sandbox.root],{encoding:'utf8'});
+    assert.equal(listed.status,0,listed.stdout+listed.stderr);
+    return listed.stdout.trim().split('\n').map(line=>JSON.parse(line)).find(event=>event.event==='backups').snapshots;
+  };
+  try {
+    const source = readFileSync(join(sandbox.root,'session.jsonl'));
+    const killed = spawnSync(process.execPath,['apps/cli/test/support/backup-worker.ts',sandbox.root,'overlapping-backups',point],{encoding:'utf8'});
+    assert.ok(killed.signal === 'SIGKILL' || killed.status !== 0); assert.doesNotMatch(killed.stderr,/Error:|ERR_/);
+    assert.equal(JSON.parse(killed.stdout).point,'snapshot-cleanup-'+point);
+    const saved = snapshots();
+    assert.equal(saved.length,1);
+    const db = new DatabaseSync(join(sandbox.root,'probe.sqlite'),{readOnly:true});
+    let id: string;
+    try { id = String(db.prepare("SELECT snapshot_id FROM store_snapshots WHERE state='staging' AND cleanup IS NOT NULL").get()!.snapshot_id); }
+    finally { db.close(); }
+    const resumed = spawnSync(process.execPath,['apps/cli/test/support/backup-worker.ts',sandbox.root,'discard-snapshot',id],{encoding:'utf8'});
+    assert.equal(resumed.status,0,resumed.stdout+resumed.stderr);
+    assert.equal(existsSync(JSON.parse(resumed.stdout).directory.path),false);
+    assert.deepEqual(snapshots(),saved);
+    assert.deepEqual(readFileSync(join(sandbox.root,'session.jsonl')),source);
+  } finally { rmSync(sandbox.root,{recursive:true,force:true}); }
+});
+
 test('snapshot deletion refuses a replaced directory and preserves its replacement', () => {
   const { sandbox, id } = prepare();
   const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox));

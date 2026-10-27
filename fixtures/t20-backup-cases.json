@@ -3,6 +3,8 @@
   "synthetic": true,
   "cases": [
     "memory", "handoff", "historian", "owner-info", "owner-info-metadata-corruption", "handoff-versions", "backup-directory-crash", "project-output-before", "project-output-after", "unknown-before", "unknown-after", "unclaimed-job-missing", "historian-unclaimed-job-missing",
+    "invalid-snapshot-malformed", "invalid-snapshot-unknown", "invalid-snapshot-pending",
+    "overlap-daily", "overlap-cleanup-before", "overlap-cleanup-after",
     "staging-cleanup-before", "staging-cleanup-after",
     "crash-carrier", "crash-database", "crash-directory", "crash-preparation",
     "restore-ENOSPC", "restore-EROFS", "discard-preparation", "recovery-cleanup-state",

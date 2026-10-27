@@ -112,6 +112,31 @@ for (const scenario of fixture.cases) {
       if (cleanup) assert.deepEqual(manifest,cleanup);
       assert.equal(existsSync(manifest.directory.path),false);
     }
+    if (scenario.startsWith('overlap-')) {
+      const original = hash(readFileSync(join(sandbox.root,'session.jsonl')));
+      if (scenario === 'overlap-daily') {
+        const result = run('overlapping-backups',['apps/cli/test/support/backup-worker.ts',sandbox.root,'overlapping-backups'])[0];
+        assert.deepEqual(result.results.map((item: { status: string })=>item.status).sort(),['created','daily-limit']);
+      } else {
+        const point = scenario.slice('overlap-cleanup-'.length);
+        assert.equal(run('cleanup-interrupted',['apps/cli/test/support/backup-worker.ts',sandbox.root,'overlapping-backups',point],'kill')[0].point,
+          'snapshot-cleanup-'+point);
+        cpSync(sandbox.root,join(path,'cleanup-interrupted-sandbox'),{recursive:true});
+        const pending = new DatabaseSync(join(sandbox.root,'probe.sqlite'),{readOnly:true});
+        let id: string, cleanup: unknown;
+        try {
+          const row = pending.prepare("SELECT * FROM store_snapshots WHERE state='staging' AND cleanup IS NOT NULL").get()!;
+          assert.equal(hash(String(row.cleanup)),row.cleanup_digest); id = String(row.snapshot_id); cleanup = JSON.parse(String(row.cleanup));
+          assert.equal(pending.prepare('SELECT state FROM owner_fences').get()!.state,'open');
+        } finally { pending.close(); }
+        assert.deepEqual(run('backup-discarded',['apps/cli/test/support/backup-worker.ts',sandbox.root,'discard-snapshot',id])[0],cleanup);
+      }
+      const snapshots = cli('overlap-winner','backups').find(event=>event.event==='backups').snapshots;
+      assert.equal(snapshots.length,1);
+      assert.deepEqual(readdirSync(sandbox.root).filter(name=>name.startsWith('backup-')),['backup-'+snapshots[0].id]);
+      assert.equal(hash(readFileSync(join(sandbox.root,'session.jsonl'))),original);
+      cpSync(sandbox.root,join(path,'overlap-settled-sandbox'),{recursive:true});
+    }
     if (scenario.startsWith('projection-')) {
       const lane = scenario.slice('projection-'.length);
       run('indexed', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'repair-projection',lane]);
@@ -139,14 +164,35 @@ for (const scenario of fixture.cases) {
       const first = cli('initial-recovery','restore-snapshot',['--snapshot',initial.id]).find(e => e.event === 'snapshot-restored');
       cleaned = { operationId: first.receipt.operationId, path: first.original.path };
     }
+    if (scenario.startsWith('invalid-snapshot-')) {
+      const original = hash(readFileSync(join(sandbox.root,'session.jsonl')));
+      const pending = scenario === 'invalid-snapshot-pending';
+      let initial: { id: string } | undefined;
+      if (pending) {
+        initial = cli('initial-backup','backup').find(event=>event.event==='backup-result').snapshot;
+        assert.equal(run('recovery-interrupted',['apps/cli/test/support/backup-worker.ts',sandbox.root,'restore-crash','preparation'],'kill')[0].point,'preparation');
+        cpSync(sandbox.root,join(path,'interrupted-sandbox'),{recursive:true});
+      }
+      const malformed = scenario === 'invalid-snapshot-malformed';
+      const reason = pending ? 'snapshot-recovery-in-progress' : malformed ? 'invalid-identity' : 'snapshot-not-recoverable';
+      assert.equal(cli('selection-rejected','restore-snapshot',['--snapshot',malformed ? 'not-a-uuid' : '00000000-0000-4000-8000-000000000099'],'error')
+        .find(event=>event.event==='error').reason,reason);
+      assert.equal(hash(readFileSync(join(sandbox.root,'session.jsonl'))),original);
+      cpSync(sandbox.root,join(path,'selection-rejected-sandbox'),{recursive:true});
+      if (pending) {
+        assert.equal(cli('still-blocked','run',[],'error').find(event=>event.event==='error').reason,'admission-closed');
+        cli('resumed-recovery','restore-snapshot',['--snapshot',initial!.id]);
+      } else cli('continued','run');
+    }
     const createOutput = () => {
       outputRoot = realpathSync.native(mkdtempSync(join(tmpdir(),'euler-t20-output-')));
       return run('project-output',['apps/cli/test/support/backup-file-worker.ts',sandbox.root,outputRoot])[0].controlledFiles[0];
     };
     let expectedOutput: unknown;
     if (scenario === 'project-output-before') expectedOutput = createOutput();
-    const saved = scenario.startsWith('migration-') || cleaned
+    const saved = scenario.startsWith('migration-') || cleaned || scenario === 'invalid-snapshot-pending'
       ? run('backup', ['apps/cli/test/support/backup-worker.ts',sandbox.root,'migration-checkpoint'])[0].snapshot
+      : scenario.startsWith('overlap-') ? cli('backup','backups').find(event=>event.event==='backups').snapshots[0]
       : cli('backup', 'backup').find(e => e.event === 'backup-result').snapshot;
     assert.ok(saved?.id);
     const snapshotPath = join(saved.directory.path, 'store.sqlite');
