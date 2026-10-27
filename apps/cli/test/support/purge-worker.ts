@@ -85,8 +85,9 @@ try {
       other.archive.append(randomUUID(), JSON.stringify({ nested: { source_owner: unrelatedBinding.sessionId, source_event_id: target.source.eventId } }));
     } finally { other.close(); }
   }
-  if (scenario.startsWith('ambiguous-')) archive.append(randomUUID(), JSON.stringify({ nested: scenario === 'ambiguous-column'
-    ? { source_event_id: target.source.eventId } : { schema: 'cli-source-ack@1', eventId: target.source.eventId } }));
+  if (scenario.startsWith('ambiguous-')) archive.append(randomUUID(), JSON.stringify({ nested: scenario !== 'ambiguous-ack'
+    ? { source_event_id: scenario === 'ambiguous-kind' ? target.recordId : target.source.eventId }
+    : { schema: 'cli-source-ack@1', eventId: target.source.eventId } }));
   const a = randomUUID(), b = randomUUID();
   const related = [
     archive.append(a, JSON.stringify({ [target.recordId]: { next: b } })),

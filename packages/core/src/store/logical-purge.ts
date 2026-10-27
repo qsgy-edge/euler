@@ -120,6 +120,8 @@ export function purgeValues(value: unknown, qualifiedSources = new Map<string, S
           ? resolveQualifiedSource(object, sources) : key === 'source_event_id'
             ? sources.find(source => source.binding.sessionId === object.source_owner)
               ?? resolveQualifiedSource(object.source_json ?? object.payload, sources) : undefined;
+        if (sources && (key === 'source_event_id' || key === 'eventId' && object.schema === 'cli-source-ack@1'))
+          check(source, 'purge-unqualified-source-reference');
         if (source) { pending.push(key, source.locator); continue; }
         pending.push(key, child);
       }

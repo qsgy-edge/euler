@@ -59,7 +59,7 @@ for (const scenario of fixture.cases) {
       outputRoot = realpathSync.native(mkdtempSync(join(tmpdir(), 'euler-t21-output-')));
       run('project-output', ['apps/cli/test/support/backup-file-worker.ts', sandbox.root, outputRoot]);
     }
-    const mode = ['shared', 'operations', 'rollback', 'discovery', 'conflict', 'historian', 'identity', 'project-output', 'bracket-text', 'ambiguous-column', 'ambiguous-ack'].includes(scenario) ? scenario : 'separate';
+    const mode = ['shared', 'operations', 'rollback', 'discovery', 'conflict', 'historian', 'identity', 'project-output', 'bracket-text', 'ambiguous-column', 'ambiguous-ack', 'ambiguous-kind'].includes(scenario) ? scenario : 'separate';
     const seeded = run('seed', ['apps/cli/test/support/purge-worker.ts', sandbox.root, mode]).at(-1)!;
     let snapshotId: string | undefined;
     if (['backup', 'recovery'].includes(scenario)) {
@@ -81,7 +81,7 @@ for (const scenario of fixture.cases) {
       await send(child, 'cancel', 'purge-cancelled'); assert.equal((await child.exit).code, 0);
       observations.push({ scenario, passed: true, commands, result: 'unregistered-carrier-blocked' }); continue;
     }
-    if (['ambiguous-column', 'ambiguous-ack', 'unhealthy-canonical', 'broken-stream', 'broken-ledger'].includes(scenario)) {
+    if (['ambiguous-column', 'ambiguous-ack', 'ambiguous-kind', 'unhealthy-canonical', 'broken-stream', 'broken-ledger'].includes(scenario)) {
       const expected = scenario.startsWith('ambiguous-') ? 'purge-unqualified-source-reference'
         : scenario === 'unhealthy-canonical' ? 'store-integrity-failed' : scenario === 'broken-stream' ? 'stream-evidence-gap' : 'ledger-evidence-gap';
       assert.equal((await child.waitFor('purge-rejected')).reason, expected);

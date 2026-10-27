@@ -63,7 +63,7 @@ test(`purge checks unrelated ${fault} integrity before ${phase}`, () => {
   } finally { store.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
-for (const scenario of ['ambiguous-column', 'ambiguous-ack']) test(`purge rejects incomplete ambiguous source identity (${scenario})`, () => {
+for (const scenario of ['ambiguous-column', 'ambiguous-ack', 'ambiguous-kind']) test(`purge rejects incomplete ambiguous source identity (${scenario})`, () => {
   const { sandbox, fixture, store, coordinator } = setup(scenario);
   try {
     assert.throws(() => store.previewPurge(coordinator, fixture.recordId, readPurgeCarriers(sandbox, store, coordinator)),
