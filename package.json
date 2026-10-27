@@ -24,7 +24,8 @@
     "evidence:memory-rollback": "node scripts/evidence-memory-rollback.ts",
     "evidence:context": "node scripts/evidence-context.ts",
     "evidence:historian": "node scripts/evidence-historian.ts",
-    "evidence:backup": "node scripts/evidence-backup.ts"
+    "evidence:backup": "node scripts/evidence-backup.ts",
+    "evidence:purge": "node scripts/evidence-purge.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

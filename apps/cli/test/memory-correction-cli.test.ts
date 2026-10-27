@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { createSandbox, createSandboxSession, bindingOf } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 import { startCli, sendCommand as send } from '../src/process-driver.ts';
-import { bufferedCorrectionApproval, delayedCorrectionOutput } from './support/memory-correction.ts';
+import { bufferedCorrectionApproval, delayedCliOutput } from './support/memory-correction.ts';
 import correctionFixture from '../../../fixtures/t15-owner-correction.json' with { type: 'json' };
 
 type Cli = ReturnType<typeof startCli>;
@@ -66,7 +66,7 @@ test('the CLI presents the actual correction, accepts fresh text approval and re
 
 test('the actual CLI rejects buffered approval before full output, then accepts a fresh live input', async () => {
   const sandbox = createSandbox();
-  const output = delayedCorrectionOutput(sandbox);
+  const output = delayedCliOutput(sandbox, 'remember', 'memory-preview');
   const cli = startCli(['remember', '--sandbox', sandbox.root], undefined, undefined, output.env);
   const original = correctionFixture.original;
   const corrected = correctionFixture.corrected;

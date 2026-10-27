@@ -275,6 +275,7 @@ test('Host Info is an idempotent durable consumer: pending to delivered, unread 
     assert.deepEqual(probe.store.listHostInfo(probe.activity), [read]);
     const regressions = ["UPDATE host_info_batches SET read_state='unread', read_at=NULL", 'DELETE FROM host_info_batches',
       "UPDATE host_info_batches SET delivery='pending', entry_id=NULL, entry_hash=NULL, delivered_at=NULL, read_state='unread', read_at=NULL"];
+    db.function('euler_purge_writer', () => 0);
     for (const sql of regressions) assert.throws(() => db.exec(sql), /euler_store_writer|store-owned-identity/);
     db.function('euler_store_writer', () => 1); // An admitted writer still cannot move Info backwards.
     for (const sql of regressions) assert.throws(() => db.exec(sql), /host-info-state-monotonic|append-only/);

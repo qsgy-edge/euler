@@ -35,13 +35,17 @@ export async function backupSandbox(input: Sandbox, kind: StoreSnapshot['kind'] 
   } finally { probe.close(); }
 }
 
-export async function restoreSandboxSnapshot(input: Sandbox, snapshotId: string) {
-  const sandbox = openSandbox(input.root);
+export function openMaintenanceStore(sandbox: Sandbox): ProbeStore {
   const store: ProbeStore = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox), false, ref => {
     const source = store.sessionSource(ref.binding);
     return new CliArchive({ ...sandbox, sourceName: basename(source.path), archiveIdentity: source.identity,
       fixture: { ...sandbox.fixture, ...ref.binding } }, action => action()).read(ref);
   }, sandbox.appId);
+  return store;
+}
+
+export async function restoreSandboxSnapshot(input: Sandbox, snapshotId: string) {
+  const sandbox = openSandbox(input.root), store = openMaintenanceStore(sandbox);
   const coordinator = randomUUID();
   try {
     store.beginSnapshotRecovery(coordinator, snapshotId);

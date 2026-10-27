@@ -1,8 +1,11 @@
 import { CaptureRun, DEFAULT_BUDGET } from '@euler/core';
+import { mock } from 'node:test';
 import { openProbe } from '../../src/probe.ts';
 import { openSandbox } from '../../src/sandbox.ts';
 
 const [root, point] = process.argv.slice(2);
+// Keep the lease live until the intended crash; the parent uses real time for recovery.
+mock.timers.enable({ apis: ['Date'], now: Date.now() });
 const probe = openProbe(openSandbox(root!), undefined, undefined, undefined, undefined, true);
 const source = probe.archive.append('ca710000-0000-4000-8000-000000000002', '记住：崩溃测试保留原始日志');
 const job = probe.store.queueOwnerCapture(probe.activity, source);

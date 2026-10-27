@@ -17,6 +17,7 @@ import { runContextDemo } from './context-cli.ts';
 import { backupSandbox, listSandboxBackups, restoreSandboxSnapshot, runNewRecoverySession } from './backup.ts';
 import { runHistorianDemo, runHistorianDrain } from './historian.ts';
 import { runCaptureDemo, runCaptureDrain } from './capture.ts';
+import { runPurge } from './purge.ts';
 import { killPoint } from './kill-point.ts';
 import memoryFixture from '../../../fixtures/scoped-memory.json' with { type: 'json' };
 
@@ -240,13 +241,14 @@ async function main() {
   const command = args.positionals[0] ?? 'success';
   const requestCommands = ['request-status', 'request-seal', 'request-reconcile', 'request-resume', 'request-gap'];
   const snapshotCommands = ['backup', 'backups', 'restore-snapshot', 'recovery-new-session'];
-  check([...snapshotCommands, ...requestCommands, 'historian', 'historian-drain', 'context', 'capture-drain', 'capture-status', 'capture-reconcile', 'handoff', 'capture', 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
+  check([...snapshotCommands, ...requestCommands, 'purge', 'historian', 'historian-drain', 'context', 'capture-drain', 'capture-status', 'capture-reconcile', 'handoff', 'capture', 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
   const options = args.values.budget ? JSON.parse(args.values.budget) as Partial<ProbeBudget> : {};
   check(!args.values['wait-child-launch'] || command === 'hold', 'hold-only-option');
   check(Object.keys(options).every(key => key in DEFAULT_BUDGET), 'invalid-budget');
   const budget = { ...DEFAULT_BUDGET, ...options };
   if (['run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'remember', 'info', 'hold', 'task', 'maintain', 'maintenance-status'].includes(command)) check(args.values.sandbox, 'sandbox-required');
   if (snapshotCommands.includes(command)) check(args.values.sandbox, 'sandbox-required');
+  if (command === 'purge') check(args.values.sandbox, 'purge-sandbox-required');
   if (command === 'restore-snapshot') check(args.values.snapshot, 'snapshot-required');
   if (['historian-drain','capture-drain','capture-status','capture-reconcile'].includes(command)) check(args.values.sandbox, 'sandbox-required');
   check(!args.values['capture-config'] || ['agent','remember','capture-drain'].includes(command), 'capture-config-command-required');
@@ -326,6 +328,7 @@ async function main() {
   }
   if (command === 'create') return;
   if (command === 'hold' || command === 'task') return hold(sandbox, command === 'task', args.values.reservation, args.values['wait-child-launch']);
+  if (command === 'purge') return runPurge(sandbox, args.values.record, args.values.scenario);
   if (command === 'maintain') return maintain(sandbox);
   if (command === 'maintenance-status') {
     const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox), false, undefined, sandbox.appId);

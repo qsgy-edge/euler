@@ -391,6 +391,7 @@ test('forget, restore and correction use full head CAS and never revive an old e
     } finally { probe.close(); }
     const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
     try {
+      db.function('euler_purge_writer', () => 0);
       assert.throws(() => db.prepare('UPDATE memory_events SET payload=payload').run(), /append-only/);
       assert.throws(() => db.prepare('UPDATE memory_revisions SET content=content').run(), /append-only/);
     } finally { db.close(); }

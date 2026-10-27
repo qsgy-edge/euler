@@ -30,6 +30,8 @@ Owner corrections use the actual CLI input, complete previews and live approval 
 
 [Verified snapshots and recovery gaps](docs/implementation/t20-backup-recovery.md) retain the latest two changed daily backups, preserve damaged originals, and block restored old streams. Run `npm run evidence:backup` for CLI, crash, capacity and forward-migration-copy observations.
 
+[Logical purge and cleanup continuation](docs/implementation/t21-logical-purge.md) use an independent maintenance process, a complete deletion preview and an exact live approval. Database commit preserves recoverable cleanup state and keeps ordinary runtime admission closed until physical cleanup. Run `npm run evidence:purge` for retained CLI, rollback, lost-acknowledgement and restart observations.
+
 Full X-card acceptance, real provider dispatch, production schema/host acceptance, migration, and MC cutover remain unverified. CI and host results must be read from the artifact for the specific implementation and platform; this repository is not production-ready.
 
 - [Euler v1 implementation specification](docs/architecture/issues/15-euler-v1-spec.md)
