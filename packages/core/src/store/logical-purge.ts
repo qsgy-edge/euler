@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { SQLInputValue } from 'node:sqlite';
-import { check, sha256 } from '../contracts.ts';
+import { check, sameBinding, sha256 } from '../contracts.ts';
 import type { SourceAck } from '../contracts.ts';
 import type { BoundFile, MemoryRecord } from './probe-store.ts';
 import type { SnapshotCleanupManifest } from './snapshots.ts';
@@ -43,7 +43,7 @@ const identities: Record<string, readonly string[]> = {
 };
 
 type Row = Record<string, SQLInputValue>;
-export interface PurgeCarrierEntry { id: string; value: unknown; hash: string; source?: SourceAck }
+export interface PurgeCarrierEntry { id: string; value: unknown; hash: string; source?: SourceAck; content?: string }
 export interface PurgeCarrier {
   role: 'source' | 'owner-info' | 'receiver' | 'project-output'; file: BoundFile; hash: string; bytes: number;
   entries: PurgeCarrierEntry[];
@@ -69,18 +69,39 @@ export interface PurgePresentation {
   operationId: string; token: string; nonce: string; phrase: string; manifest: PurgeManifest; digest: string;
 }
 export interface PurgePlan {
-  manifest: PurgeManifest; selected: Map<string, Row[]>; detachBatches: Row[]; tokens: Set<string>; qualifiedSourceIds: Set<string>; digest: string;
+  manifest: PurgeManifest; selected: Map<string, Row[]>; detachBatches: Row[]; tokens: Set<string>; qualifiedSources: Map<string, SourceAck[]>; digest: string;
+}
+
+function resolveQualifiedSource(value: unknown, sources: SourceAck[]): SourceAck | undefined {
+  const pending: unknown[] = [value], seen = new Set<unknown>(), found = new Set<SourceAck>();
+  while (pending.length) {
+    const next = pending.pop();
+    if (seen.has(next)) continue;
+    seen.add(next);
+    if (typeof next === 'string') {
+      try { pending.push(JSON.parse(next)); } catch { /* A field may contain ordinary text. */ }
+    } else if (next && typeof next === 'object') {
+      const object = next as Partial<SourceAck>;
+      if (object.schema === 'cli-source-ack@1') {
+        const source = sources.find(source => ['schema', 'status', 'eventId', 'locator', 'hash', 'contentHash', 'byteLength']
+          .every(key => object[key as keyof SourceAck] === source[key as keyof SourceAck])
+          && object.binding && sameBinding(object.binding, source.binding));
+        if (source) found.add(source);
+      } else pending.push(...Object.values(next));
+    }
+  }
+  return found.size === 1 ? [...found][0] : undefined;
 }
 
 /** Structured equality, including object keys and nested serialized payloads. */
-export function purgeValues(value: unknown, qualifiedSourceIds = new Set<string>()): string[] {
+export function purgeValues(value: unknown, qualifiedSources = new Map<string, SourceAck[]>()): string[] {
   const values = new Set<string>(), seen = new Set<object>(), pending: unknown[] = [value];
   while (pending.length) {
     const next = pending.pop();
     if (typeof next === 'string') {
       if (values.has(next)) continue;
       values.add(next);
-      if (/^\s*[\[{]/u.test(next)) {
+      if (/^\s*[\[{"]/u.test(next)) {
         try { pending.push(JSON.parse(next)); }
         catch { /* Free text may start with a bracket; canonical JSON columns are checked by the planner. */ }
       } else {
@@ -94,8 +115,12 @@ export function purgeValues(value: unknown, qualifiedSourceIds = new Set<string>
     } else if (next && typeof next === 'object' && !seen.has(next)) {
       seen.add(next);
       for (const [key, child] of Object.entries(next)) {
-        if ((key === 'source_event_id' || key === 'eventId' && (next as { schema?: string }).schema === 'cli-source-ack@1')
-          && typeof child === 'string' && qualifiedSourceIds.has(child)) continue;
+        const object = next as Record<string, unknown>, sources = typeof child === 'string' ? qualifiedSources.get(child) : undefined;
+        const source = !sources ? undefined : key === 'eventId' && object.schema === 'cli-source-ack@1'
+          ? resolveQualifiedSource(object, sources) : key === 'source_event_id'
+            ? sources.find(source => source.binding.sessionId === object.source_owner)
+              ?? resolveQualifiedSource(object.source_json ?? object.payload, sources) : undefined;
+        if (source) { pending.push(key, source.locator); continue; }
         pending.push(key, child);
       }
     }
@@ -103,7 +128,7 @@ export function purgeValues(value: unknown, qualifiedSourceIds = new Set<string>
   return [...values];
 }
 
-function sourceValues(value: unknown, qualifiedSourceIds: Set<string>): string[] {
+function sourceValues(value: unknown, qualifiedSources: Map<string, SourceAck[]>): string[] {
   const result = new Set<string>(), seen = new Set<object>(), pending: unknown[] = [value];
   while (pending.length) {
     let next = pending.pop();
@@ -116,7 +141,7 @@ function sourceValues(value: unknown, qualifiedSourceIds: Set<string>): string[]
     if (object.schema === 'cli-source-ack@1') {
       for (const key of ['eventId', 'locator', 'hash', 'contentHash']) {
         check(typeof object[key] === 'string', 'purge-source-evidence-gap');
-        if (key !== 'eventId' || !qualifiedSourceIds.has(object[key] as string)) result.add(object[key] as string);
+        if (key !== 'eventId' || !qualifiedSources.has(object[key] as string)) result.add(object[key] as string);
       }
     }
     for (const child of Object.values(object)) pending.push(child);
@@ -150,17 +175,19 @@ export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCar
   const rows = new Map([...PURGE_DATABASE_INVENTORY.content, ...PURGE_DATABASE_INVENTORY.ledger]
     .map(table => [table, db.prepare(`SELECT rowid AS _rowid,* FROM ${table} ORDER BY rowid`).all() as Row[]]));
   const tokens = new Set([recordId]), selected = new Map<string, Row[]>();
-  const sourceCounts = new Map<string, number>();
-  for (const carrier of carriers) for (const entry of carrier.entries) if (entry.source)
-    sourceCounts.set(entry.source.eventId, (sourceCounts.get(entry.source.eventId) ?? 0) + 1);
-  const qualifiedSourceIds = new Set([...sourceCounts].filter(([, count]) => count > 1).map(([id]) => id));
+  const allSources = new Map<string, SourceAck[]>();
+  for (const carrier of carriers) for (const entry of carrier.entries) if (entry.source) {
+    const sources = allSources.get(entry.source.eventId) ?? [];
+    sources.push(entry.source); allSources.set(entry.source.eventId, sources);
+  }
+  const qualifiedSources = new Map([...allSources].filter(([, sources]) => sources.length > 1));
   for (const [table, tableRows] of rows) for (const column of identities[table] ?? []) {
     // Job and attempt IDs deliberately name their archived output. Other object
     // kinds cannot acquire a source event merely by sharing its UUID.
     if (column === 'job_id' && ['capture_jobs', 'capture_work', 'compartments'].includes(table)
       || table === 'request_attempts' && column === 'attempt_id') continue;
-    for (const row of tableRows) if (typeof row[column] === 'string' && sourceCounts.has(row[column] as string))
-      qualifiedSourceIds.add(row[column] as string);
+    for (const row of tableRows) if (typeof row[column] === 'string' && allSources.has(row[column] as string))
+      qualifiedSources.set(row[column] as string, allSources.get(row[column] as string)!);
   }
   const selectedRows = new Set<string>(), selectedEntries = new Set<string>();
   const rowValues = new Map<Row, string[]>();
@@ -171,9 +198,12 @@ export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCar
         || table === 'pending_operations' && column === 'result')) {
       try { JSON.parse(value); } catch { throw new Error('purge-unsupported-structured-copy'); }
     }
-    rowValues.set(row, purgeValues(row, qualifiedSourceIds));
+    rowValues.set(row, purgeValues(row, qualifiedSources));
   }
-  const entryValues = carriers.map(carrier => carrier.entries.map(entry => purgeValues(entry.value, qualifiedSourceIds)));
+  const entryValues = carriers.map(carrier => carrier.entries.map(entry => [
+    ...purgeValues(entry.value, qualifiedSources),
+    ...entry.content === undefined ? [] : purgeValues(entry.content).map(value => sha256(value)),
+  ]));
   let changed = true;
   while (changed) {
     changed = false;
@@ -201,23 +231,23 @@ export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCar
         else if (row.kind === 'agent/event@v1' && ['response', 'tool-result', 'file-approved', 'file-reconciled'].includes(payload.event?.kind))
           sources = payload.event;
       }
-      for (const value of sourceValues(sources, qualifiedSourceIds)) tokens.add(value);
+      for (const value of sourceValues(sources, qualifiedSources)) tokens.add(value);
     }
     for (const [ci, carrier] of carriers.entries()) for (const [ei, entry] of carrier.entries.entries()) {
       const key = `${ci}/${ei}`;
       if (selectedEntries.has(key) || !entryValues[ci]![ei]!.some(value => tokens.has(value))) continue;
       selectedEntries.add(key); changed = true;
-      if (!entry.source || !qualifiedSourceIds.has(entry.id)) tokens.add(entry.id);
+      if (!entry.source || !qualifiedSources.has(entry.id)) tokens.add(entry.id);
       tokens.add(entry.hash);
-      if (entry.source) for (const value of sourceValues(entry.source, qualifiedSourceIds)) tokens.add(value);
+      if (entry.source) for (const value of sourceValues(entry.source, qualifiedSources)) tokens.add(value);
     }
   }
   const removedSources = new Set(carriers.flatMap((carrier, ci) => carrier.entries
     .filter((entry, ei) => entry.source && selectedEntries.has(`${ci}/${ei}`)).map(entry => entry.source!.eventId)));
   for (const [table, tableRows] of rows) for (const row of tableRows) if (!selectedRows.has(`${table}/${row._rowid}`))
-    check(!rowValues.get(row)!.some(value => qualifiedSourceIds.has(value) && removedSources.has(value)), 'purge-unqualified-source-reference');
+    check(!rowValues.get(row)!.some(value => qualifiedSources.has(value) && removedSources.has(value)), 'purge-unqualified-source-reference');
   for (const [ci, carrier] of carriers.entries()) for (const [ei] of carrier.entries.entries()) if (!selectedEntries.has(`${ci}/${ei}`))
-    check(!entryValues[ci]![ei]!.some(value => qualifiedSourceIds.has(value) && removedSources.has(value)), 'purge-unqualified-source-reference');
+    check(!entryValues[ci]![ei]!.some(value => qualifiedSources.has(value) && removedSources.has(value)), 'purge-unqualified-source-reference');
   for (const table of PURGE_DATABASE_INVENTORY.backup) {
     const catalog = db.prepare(`SELECT rowid AS _rowid,* FROM ${table} ORDER BY rowid`).all() as Row[];
     if (catalog.length) selected.set(table, catalog);
@@ -246,7 +276,7 @@ export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCar
       'Source, Host carriers, backups and SQLite physical cleanup remain incomplete until their owners finish cleanup.',
       'Normal runtime admission, recovery, derivation and model dispatch remain closed while cleanup is incomplete.'],
   };
-  return { manifest, selected, detachBatches, tokens, qualifiedSourceIds, digest: sha256(JSON.stringify(manifest)) };
+  return { manifest, selected, detachBatches, tokens, qualifiedSources, digest: sha256(JSON.stringify(manifest)) };
 }
 
 function safeOwnerReceipt(row: Row): boolean {
@@ -319,7 +349,7 @@ export function applyLogicalPurge(db: DatabaseSync, plan: PurgePlan): void {
   for (const table of PURGE_DATABASE_INVENTORY.content) {
     for (const row of db.prepare(`SELECT * FROM ${table}`).all()) {
       if (table === 'memory_events' && row.record_id === null) continue;
-      check(!purgeValues(row, plan.qualifiedSourceIds).some(value => plan.tokens.has(value)), 'purge-database-postcondition-failed');
+      check(!purgeValues(row, plan.qualifiedSources).some(value => plan.tokens.has(value)), 'purge-database-postcondition-failed');
     }
   }
 }

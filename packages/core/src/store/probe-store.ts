@@ -6108,11 +6108,17 @@ export class ProbeStore {
     return sqliteHealth;
   }
 
-  auditStore(activity: Activity): void {
-    const result = this.withActivity(activity, () => {
+  auditStore(owner: Activity | string): void {
+    const inspect = () => {
       try { return { health: this.#checkStoreIntegrity(), failure: null }; }
       catch (failure) { return { health: null, failure }; }
-    });
+    };
+    const result = typeof owner === 'string' ? this.#transaction(() => {
+      const fence = this.#assertCoordinator(owner);
+      check(fence.state === 'exclusive', 'maintenance-not-exclusive');
+      check(fence.health === 'healthy', 'store-integrity-failed');
+      return inspect();
+    }) : this.withActivity(owner, inspect);
     if (result.health === null) {
       this.#transaction(() => this.#db.prepare("UPDATE owner_fences SET health='failed' WHERE store_id=?").run(this.#storeId));
       throw result.failure;
@@ -6629,6 +6635,7 @@ export class ProbeStore {
   }
 
   previewPurge(coordinator: string, recordId: string, carriers: PurgeCarrier[]): PurgePresentation {
+    this.auditStore(coordinator);
     const plan = this.#planPurge(coordinator, recordId, carriers);
     const operationId = randomUUID(), token = randomUUID(), nonce = randomUUID();
     const presentation: PurgePresentation = { operationId, token, nonce, phrase: `PURGE ${token} ${nonce}`,
@@ -6694,6 +6701,7 @@ export class ProbeStore {
       && preview.presented && live.text === preview.presentation.phrase, 'exact-live-purge-phrase-required');
     const { operationId, manifest, digest } = preview.presentation;
     this.#purgePreviews.delete(token);
+    this.auditStore(coordinator);
     const committed = this.#transaction(() => {
       const plan = this.#planPurge(coordinator, manifest.recordId, carriers);
       check(plan.digest === digest && JSON.stringify(plan.manifest) === JSON.stringify(manifest), 'purge-manifest-stale');

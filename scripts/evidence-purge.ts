@@ -54,11 +54,12 @@ for (const scenario of fixture.cases) {
   };
   try {
     if (scenario === 'historian') cli('historian', 'historian');
+    if (['broken-stream', 'broken-ledger'].includes(scenario)) cli('seed-request', 'run');
     if (scenario === 'project-output') {
       outputRoot = realpathSync.native(mkdtempSync(join(tmpdir(), 'euler-t21-output-')));
       run('project-output', ['apps/cli/test/support/backup-file-worker.ts', sandbox.root, outputRoot]);
     }
-    const mode = ['shared', 'operations', 'rollback', 'discovery', 'conflict', 'historian', 'identity', 'project-output', 'bracket-text'].includes(scenario) ? scenario : 'separate';
+    const mode = ['shared', 'operations', 'rollback', 'discovery', 'conflict', 'historian', 'identity', 'project-output', 'bracket-text', 'ambiguous-column', 'ambiguous-ack'].includes(scenario) ? scenario : 'separate';
     const seeded = run('seed', ['apps/cli/test/support/purge-worker.ts', sandbox.root, mode]).at(-1)!;
     let snapshotId: string | undefined;
     if (['backup', 'recovery'].includes(scenario)) {
@@ -67,6 +68,9 @@ for (const scenario of fixture.cases) {
     }
     if (scenario === 'postcondition-failure') fault('CREATE TRIGGER purge_test_ignore BEFORE DELETE ON memory_records BEGIN SELECT RAISE(IGNORE); END');
     if (scenario === 'unknown-carrier') writeFileSync(join(sandbox.root, 'unregistered-copy.json'), JSON.stringify(seeded.target));
+    if (scenario === 'unhealthy-canonical') fault("UPDATE owner_fences SET health='failed'");
+    if (scenario === 'broken-stream') { fault('DROP TRIGGER immutable_execution_events_update'); fault('UPDATE execution_events SET seq=seq+1'); }
+    if (scenario === 'broken-ledger') { fault('DROP TRIGGER immutable_request_events_update'); fault("UPDATE request_events SET hash='broken' WHERE seq=1"); }
     cpSync(sandbox.root, join(path, 'before'), { recursive: true });
     const scenarioFlag = scenario === 'before-commit-exit' ? 'purge-before-commit'
       : scenario === 'unknown-after-commit' ? 'purge-after-commit' : scenario === 'unknown-response' ? 'purge-unknown' : 'success';
@@ -77,12 +81,29 @@ for (const scenario of fixture.cases) {
       await send(child, 'cancel', 'purge-cancelled'); assert.equal((await child.exit).code, 0);
       observations.push({ scenario, passed: true, commands, result: 'unregistered-carrier-blocked' }); continue;
     }
+    if (['ambiguous-column', 'ambiguous-ack', 'unhealthy-canonical', 'broken-stream', 'broken-ledger'].includes(scenario)) {
+      const expected = scenario.startsWith('ambiguous-') ? 'purge-unqualified-source-reference'
+        : scenario === 'unhealthy-canonical' ? 'store-integrity-failed' : scenario === 'broken-stream' ? 'stream-evidence-gap' : 'ledger-evidence-gap';
+      assert.equal((await child.waitFor('purge-rejected')).reason, expected);
+      assert.equal(child.observations.some(event => event.event === 'purge-preview'), false);
+      assert.equal(inspect(db => db.prepare("SELECT count(*) n FROM memory_events WHERE kind='purge-logical-commit'").get()!.n), 0);
+      assert.equal(inspect(db => db.prepare('SELECT count(*) n FROM memory_records WHERE record_id=?').get(seeded.recordId)!.n), 1);
+      for (const file of readdirSync(join(path, 'before')).filter(file => file.endsWith('.jsonl')))
+        assert.deepEqual(readFileSync(join(sandbox.root, file)), readFileSync(join(path, 'before', file)));
+      await send(child, 'cancel', 'purge-cancelled'); assert.equal((await child.exit).code, 0);
+      if (!scenario.startsWith('ambiguous-'))
+        assert.equal(cli('blocked-unhealthy-runtime', 'run', [], 1).find(event => event.event === 'error').reason, 'store-integrity-failed');
+      observations.push({ scenario, passed: true, commands, result: 'preflight-rejected', reason: expected }); continue;
+    }
     let preview = await child.waitFor('purge-preview') as unknown as PurgePresentation;
     writeFileSync(join(path, 'preview.json'), JSON.stringify(preview, null, 2) + '\n');
     assert.equal(preview.manifest.schema, 'purge-manifest@1');
     assert.ok(preview.manifest.records.some(record => record.recordId === seeded.recordId));
     assert.equal(preview.manifest.records.length, scenario === 'conflict' ? 2 : 1);
     for (const role of ['source', 'owner-info']) assert.ok(preview.manifest.carriers.some(carrier => carrier.role === role));
+    const sourceIds = preview.manifest.carriers.filter(carrier => carrier.role === 'source').flatMap(carrier => carrier.entries.map(entry => entry.id));
+    for (const source of seeded.related) assert.ok(sourceIds.includes(source.eventId), source.eventId);
+    assert.equal(sourceIds.includes(seeded.unrelated.eventId), false);
     if (scenario === 'historian') assert.ok(preview.manifest.database.some(item => item.table === 'compartments' && item.count > 0));
     if (scenario === 'discovery') for (const table of ['source_units', 'evolution_proposals', 'source_query_receipts'])
       assert.ok(preview.manifest.database.some(item => item.table === table && item.count > 0));

@@ -75,20 +75,27 @@ try {
     target = store.readMemory(activity, target.recordId);
   }
   let unrelatedBinding;
-  if (scenario === 'identity') {
+  if (scenario === 'identity' || scenario.startsWith('ambiguous-')) {
     unrelatedBinding = { ...bindingOf(sandbox), sessionId: randomUUID(), branchId: randomUUID() };
     createSandboxSession(sandbox, unrelatedBinding);
     const other = openProbe(sandbox, undefined, undefined, unrelatedBinding, undefined, true);
     try {
       other.archive.append(target.source.eventId, 'An independent event with a different complete source identity.');
       other.archive.append(target.recordId, 'A source event UUID is not a memory record identity.');
+      other.archive.append(randomUUID(), JSON.stringify({ nested: { source_owner: unrelatedBinding.sessionId, source_event_id: target.source.eventId } }));
     } finally { other.close(); }
   }
+  if (scenario.startsWith('ambiguous-')) archive.append(randomUUID(), JSON.stringify({ nested: scenario === 'ambiguous-column'
+    ? { source_event_id: target.source.eventId } : { schema: 'cli-source-ack@1', eventId: target.source.eventId } }));
   const a = randomUUID(), b = randomUUID();
   const related = [
     archive.append(a, JSON.stringify({ [target.recordId]: { next: b } })),
     archive.append(b, JSON.stringify({ cycle: a, incomplete: { contentHash: target.contentHash } })),
     archive.append(randomUUID(), JSON.stringify({ nested: JSON.stringify({ oldRevision: target.revisionId }) })),
+    archive.append(randomUUID(), JSON.stringify({ nested: { content: target.content } })),
+    archive.append(randomUUID(), JSON.stringify({ nested: { content: archive.read(target.source).text } })),
+    archive.append(randomUUID(), JSON.stringify({ nested: JSON.stringify(target.recordId) })),
+    archive.append(randomUUID(), JSON.stringify({ nested: { source_owner: target.source.binding.sessionId, source_event_id: target.source.eventId } })),
   ];
   const unrelated = archive.append(randomUUID(), JSON.stringify({ id: 'mem-13', text: `prefix-${target.recordId}-suffix` }));
   store.drainSearchProjection(activity);

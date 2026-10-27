@@ -4,5 +4,5 @@
     { "key": "mem-1", "source": "T21 source mem-1: synthetic fact zero.", "content": "T21 mem-1 distinct synthetic content zero." },
     { "key": "mem-13", "source": "T21 source mem-13: independent fact thirteen.", "content": "T21 mem-13 independent synthetic content thirteen." }
   ],
-  "cases": ["separate", "shared", "operations", "rollback", "discovery", "conflict", "historian", "identity", "bracket-text", "project-output", "backup", "recovery", "postcondition-failure", "before-commit-exit", "unknown-after-commit", "unknown-response", "cancel", "stale-preview", "unknown-carrier"]
+  "cases": ["separate", "shared", "operations", "rollback", "discovery", "conflict", "historian", "identity", "bracket-text", "project-output", "backup", "recovery", "postcondition-failure", "before-commit-exit", "unknown-after-commit", "unknown-response", "cancel", "stale-preview", "unknown-carrier", "ambiguous-column", "ambiguous-ack", "unhealthy-canonical", "broken-stream", "broken-ledger"]
 }

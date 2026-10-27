@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { check, ProbeStore, sameFile, sha256 } from '@euler/core';
 import type { BoundFile, PurgeCarrier, PurgeInput, PurgePresentation } from '@euler/core';
 import { CliArchive } from './archive.ts';
-import { bindingOf, resourcesOf } from './sandbox.ts';
+import { openMaintenanceStore } from './backup.ts';
 import { killPoint } from './kill-point.ts';
 import type { Sandbox } from './sandbox.ts';
 
@@ -21,7 +21,7 @@ export function readPurgeCarriers(sandbox: Sandbox, store: ProbeStore, coordinat
     const archive = new CliArchive({ ...sandbox, sourceName: basename(source.path), archiveIdentity: source.identity,
       fixture: { ...sandbox.fixture, ...binding } }, action => action());
     return { role: 'source', ...capture(source), entries: archive.events().map(entry => ({ id: entry.ack.eventId,
-      value: entry, hash: entry.ack.hash, source: entry.ack })) };
+      value: entry, hash: entry.ack.hash, source: entry.ack, content: entry.text })) };
   });
   check(sandbox.ownerInfoIdentity, 'owner-info-unavailable');
   for (const [role, name, identity, schema] of [
@@ -35,7 +35,8 @@ export function readPurgeCarriers(sandbox: Sandbox, store: ProbeStore, coordinat
     carriers.push({ role, ...capture(file), entries: lines.map((line, index) => {
       const value = JSON.parse(line);
       check(role === 'owner-info' ? value.schema === 'owner-info-entry@1' : typeof value.record === 'object', 'purge-unsupported-carrier-entry');
-      return { id: String(role === 'owner-info' ? value.entryId : value.record.attemptId ?? index), value, hash: sha256(line) };
+      return { id: String(role === 'owner-info' ? value.entryId : value.record.attemptId ?? index), value, hash: sha256(line),
+        ...role === 'owner-info' ? { content: value.payload } : {} };
     }) });
   }
   for (const output of resources.outputs.filter(file => file.started && file.state !== 'no_effect')) {
@@ -43,15 +44,16 @@ export function readPurgeCarriers(sandbox: Sandbox, store: ProbeStore, coordinat
     const file = { path: output.path, identity: output.identity };
     if (carriers.some(carrier => carrier.file.path === file.path)) continue;
     const captured = capture(file);
+    const content = readFileSync(file.path, 'utf8');
     carriers.push({ role: 'project-output', ...captured, entries: [{ id: output.callId,
-      value: { ...output, content: readFileSync(file.path, 'utf8') }, hash: captured.hash }] });
+      value: { ...output, content }, hash: captured.hash, content }] });
   }
   return carriers;
 }
 
 export async function runPurge(sandbox: Sandbox, recordId?: string, scenario = 'success') {
   check(['success', 'purge-before-commit', 'purge-after-commit', 'purge-unknown'].includes(scenario), 'invalid-purge-scenario');
-  const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox), false, undefined, sandbox.appId);
+  const store = openMaintenanceStore(sandbox);
   const coordinator = randomUUID(), lines = createInterface({ input: process.stdin });
   const emit = (event: string, fields: object) => new Promise<void>((resolve, reject) =>
     process.stdout.write(JSON.stringify({ event, ...fields }) + '\n', error => error ? reject(error) : resolve()));

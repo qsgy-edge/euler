@@ -5,9 +5,9 @@ import { readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
-import { ProbeStore } from '@euler/core';
 import type { PurgePresentation } from '@euler/core';
-import { bindingOf, createSandbox, resourcesOf } from '../src/sandbox.ts';
+import { createSandbox } from '../src/sandbox.ts';
+import { openMaintenanceStore } from '../src/backup.ts';
 import { readPurgeCarriers } from '../src/purge.ts';
 import { startCli } from '../src/process-driver.ts';
 
@@ -17,13 +17,61 @@ function setup(scenario: string) {
     const historian = spawnSync(process.execPath, ['apps/cli/src/main.ts', 'historian', '--sandbox', sandbox.root], { encoding: 'utf8' });
     assert.equal(historian.status, 0, historian.stderr);
   }
+  if (scenario === 'integrity') {
+    const run = spawnSync(process.execPath, ['apps/cli/src/main.ts', 'run', '--sandbox', sandbox.root], { encoding: 'utf8' });
+    assert.equal(run.status, 0, run.stderr);
+  }
   const seed = spawnSync(process.execPath, ['apps/cli/test/support/purge-worker.ts', sandbox.root, scenario], { encoding: 'utf8' });
   assert.equal(seed.status, 0, seed.stderr);
   const fixture = JSON.parse(seed.stdout.trim().split('\n').at(-1)!);
-  const store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox)), coordinator = randomUUID();
+  const store = openMaintenanceStore(sandbox), coordinator = randomUUID();
   store.beginMaintenance(coordinator); assert.equal(store.acquireMaintenance(coordinator).acquired, true);
   return { sandbox, fixture, store, coordinator };
 }
+
+test('purge rejects a store whose canonical health has failed', () => {
+  const { sandbox, fixture, store, coordinator } = setup('separate');
+  try {
+    const db = new DatabaseSync(join(sandbox.root, 'probe.sqlite'));
+    try { db.function('euler_store_writer', () => 1); db.exec("UPDATE owner_fences SET health='failed'"); }
+    finally { db.close(); }
+    assert.throws(() => store.previewPurge(coordinator, fixture.recordId, readPurgeCarriers(sandbox, store, coordinator)),
+      /store-integrity-failed/);
+    assert.equal(store.purgeStatus(coordinator), null);
+  } finally { store.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+for (const fault of ['stream', 'ledger']) for (const phase of ['preview', 'commit'])
+test(`purge checks unrelated ${fault} integrity before ${phase}`, () => {
+  const { sandbox, fixture, store, coordinator } = setup('integrity');
+  try {
+    const carriers = () => readPurgeCarriers(sandbox, store, coordinator);
+    const before = carriers().map(carrier => ({ path: carrier.file.path, bytes: readFileSync(carrier.file.path) }));
+    const preview = phase === 'commit' ? store.previewPurge(coordinator, fixture.recordId, carriers()) : undefined;
+    if (preview) store.acknowledgePurgePresentation(coordinator, preview.token, preview.digest);
+    const db = new DatabaseSync(join(sandbox.root, 'probe.sqlite'));
+    try {
+      db.exec(fault === 'stream' ? 'DROP TRIGGER immutable_execution_events_update; UPDATE execution_events SET seq=seq+1'
+        : "DROP TRIGGER immutable_request_events_update; UPDATE request_events SET hash='broken' WHERE seq=1");
+    } finally { db.close(); }
+    assert.throws(() => preview
+      ? store.commitPurge(coordinator, store.receivePurgeInput(coordinator, preview.phrase), preview.token, carriers())
+      : store.previewPurge(coordinator, fixture.recordId, carriers()), new RegExp(`${fault}-evidence-gap`));
+    assert.equal(store.purgeStatus(coordinator), null);
+    assert.equal(store.fence().health, 'failed');
+    for (const file of before) assert.deepEqual(readFileSync(file.path), file.bytes);
+  } finally { store.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+for (const scenario of ['ambiguous-column', 'ambiguous-ack']) test(`purge rejects incomplete ambiguous source identity (${scenario})`, () => {
+  const { sandbox, fixture, store, coordinator } = setup(scenario);
+  try {
+    assert.throws(() => store.previewPurge(coordinator, fixture.recordId, readPurgeCarriers(sandbox, store, coordinator)),
+      /purge-unqualified-source-reference/);
+    assert.equal(store.purgeStatus(coordinator), null);
+    assert.equal(store.cancelPurge(coordinator).status, 'cancelled');
+  } finally { store.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
 
 for (const scenario of ['separate', 'shared', 'operations', 'rollback', 'discovery', 'historian', 'identity', 'bracket-text']) test(`purge closure follows keys, values and cyclic source references without deleting the independent memory (${scenario})`, () => {
   const { sandbox, fixture, store, coordinator } = setup(scenario);
