@@ -8,10 +8,15 @@ import type { AgentEvent, AgentStatus } from '../context/agent-state.ts';
 import { isUntypedRemember, parseMemoryProposal, parseOwnerAgreement, parseOwnerStatement } from '../context/owner-memory.ts';
 import type { OwnerMemoryStatement } from '../context/owner-memory.ts';
 import { randomUUID } from 'node:crypto';
-import { lstatSync, readdirSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { userInfo } from 'node:os';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, backup } from 'node:sqlite';
+import { checkSqliteSnapshot, deleteSnapshot, inspectSnapshotFiles, removeSnapshotFiles, snapshotBytes, snapshotDataHash, syncSnapshotDirectory, syncSnapshotFile, verifySnapshot, writeSnapshotFile } from './snapshots.ts';
+import type { SnapshotFile, StoreSnapshot, SnapshotCleanupManifest } from './snapshots.ts';
+import { recoveryFileNames, restoreFile } from './snapshot-recovery.ts';
+import type { SnapshotRecoveryPlan, SnapshotRecoveryPreparation, SnapshotRecoveryReceipt } from './snapshot-recovery.ts';
+import type { ControlledFile } from '../context/file-contract.ts';
 import { check, sameBinding, sha256, uuid, validateBudget } from '../contracts.ts';
 import type { Binding, ProbeBudget, SourceAck, SourceExcerpt } from '../contracts.ts';
 import { REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, assemblyIdentityHash, chargedRequestTokens, deriveAssemblyState, freezeRequestPayload } from './request-ledger.ts';
@@ -212,6 +217,7 @@ export type IntentTransition = Pick<Intent, 'step' | 'status'>;
 interface Fence {
   store_id: string;
   state: 'open' | 'closing' | 'exclusive';
+  health: 'healthy' | 'failed';
   epoch: number;
   coordinator: string | null;
   coordinator_pid: number | null;
@@ -224,7 +230,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=22), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=23), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -232,6 +238,7 @@ CREATE TABLE owner_fences (
   root_path TEXT NOT NULL, root_dev TEXT NOT NULL, root_ino TEXT NOT NULL,
   store_path TEXT NOT NULL, store_dev TEXT NOT NULL, store_ino TEXT NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('open','closing','exclusive')),
+  health TEXT NOT NULL DEFAULT 'healthy' CHECK(health IN ('healthy','failed')),
   epoch INTEGER NOT NULL CHECK(epoch > 0), coordinator TEXT, coordinator_pid INTEGER,
   coordinator_incarnation TEXT, coordinator_started_at TEXT,
   coordinator_stream TEXT REFERENCES execution_streams(stream_id), coordinator_activity TEXT REFERENCES owner_activities(id),
@@ -240,6 +247,30 @@ CREATE TABLE owner_fences (
       AND coordinator_started_at IS NOT NULL AND coordinator_stream IS NOT NULL AND coordinator_activity IS NOT NULL)),
   UNIQUE(store_id, root_path, root_dev, root_ino)
 ) STRICT;
+CREATE TABLE store_snapshots (
+  snapshot_id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('daily','migration')),
+  day TEXT NOT NULL, created_at TEXT NOT NULL, directory TEXT NOT NULL UNIQUE, dev TEXT, ino TEXT,
+  state TEXT NOT NULL CHECK(state IN ('staging','ready','retired','deleted')), manifest TEXT, digest TEXT,
+  activity_id TEXT NOT NULL REFERENCES owner_activities(id), cleanup TEXT, cleanup_digest TEXT,
+  CHECK((cleanup IS NULL)=(cleanup_digest IS NULL)), CHECK((dev IS NULL)=(ino IS NULL)),
+  CHECK(state='staging' OR dev IS NOT NULL)
+) STRICT;
+CREATE UNIQUE INDEX one_daily_snapshot ON store_snapshots(day) WHERE kind='daily' AND state IN ('ready','retired','deleted')
+  AND json_extract(manifest,'$.state')='ready';
+CREATE TABLE store_recovery_events (
+  operation_id TEXT PRIMARY KEY, receipt TEXT NOT NULL, digest TEXT NOT NULL
+) STRICT;
+CREATE TABLE store_recovered_owners (
+  kind TEXT NOT NULL, owner_id TEXT NOT NULL, operation_id TEXT NOT NULL REFERENCES store_recovery_events(operation_id),
+  PRIMARY KEY(kind,owner_id)
+) STRICT;
+CREATE TABLE store_restores (
+  operation_id TEXT PRIMARY KEY, snapshot_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('preparing','prepared','complete','cancelled')),
+  payload TEXT NOT NULL, digest TEXT NOT NULL, cleanup TEXT, cleanup_digest TEXT,
+  original_deleted INTEGER NOT NULL DEFAULT 0 CHECK(original_deleted IN (0,1)),
+  CHECK((cleanup IS NULL)=(cleanup_digest IS NULL)), CHECK(original_deleted=0 OR state IN ('complete','cancelled'))
+) STRICT;
+CREATE UNIQUE INDEX one_pending_restore ON store_restores((1)) WHERE state IN ('preparing','prepared');
 CREATE TABLE maintenance_residuals (
   store_id TEXT NOT NULL REFERENCES owner_fences(store_id), path TEXT NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('expected','unexpected','unknown')), observed_at TEXT NOT NULL,
@@ -290,7 +321,7 @@ CREATE TABLE intent_events (
   input_hash TEXT NOT NULL, input_content_hash TEXT NOT NULL, input_locator TEXT NOT NULL, input_bytes INTEGER NOT NULL CHECK(input_bytes > 0),
   goal_input_event_id TEXT NOT NULL, goal_input_hash TEXT NOT NULL, goal_input_content_hash TEXT NOT NULL,
   goal_input_locator TEXT NOT NULL, goal_input_bytes INTEGER NOT NULL CHECK(goal_input_bytes > 0),
-  transition_hash TEXT NOT NULL, snapshot TEXT NOT NULL, hash TEXT NOT NULL,
+  transition_hash TEXT NOT NULL, snapshot TEXT NOT NULL, hash TEXT NOT NULL, request_json TEXT NOT NULL,
   UNIQUE(session_id, branch_id, version), UNIQUE(session_id, branch_id, input_event_id),
   UNIQUE(session_id,branch_id,event_id), FOREIGN KEY(session_id,branch_id) REFERENCES sessions(session_id,branch_id),
   FOREIGN KEY(session_id,branch_id,expected_event_id) REFERENCES intent_events(session_id,branch_id,event_id)
@@ -382,7 +413,7 @@ CREATE TRIGGER immutable_discovery_projects_delete BEFORE DELETE ON memory_disco
 CREATE TABLE source_query_receipts (
   grant_id TEXT NOT NULL REFERENCES memory_discovery_grants(grant_id), query_id TEXT NOT NULL,
   request_hash TEXT NOT NULL, page_hash TEXT NOT NULL, result_count INTEGER NOT NULL CHECK(result_count>=0),
-  byte_length INTEGER NOT NULL CHECK(byte_length>=0), PRIMARY KEY(grant_id,query_id)
+  byte_length INTEGER NOT NULL CHECK(byte_length>=0), receipt_hash TEXT NOT NULL, PRIMARY KEY(grant_id,query_id)
 ) STRICT;
 CREATE TABLE workspaces (workspace_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL) STRICT;
 CREATE TABLE workspace_projects (
@@ -647,7 +678,7 @@ CREATE TABLE evolution_proposals (
   owner TEXT NOT NULL, scope_json TEXT NOT NULL, evidence_json TEXT NOT NULL, evaluation_json TEXT NOT NULL,
   supersedes TEXT REFERENCES evolution_proposals(proposal_id), payload TEXT NOT NULL, payload_hash TEXT NOT NULL, created_at TEXT NOT NULL,
   scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL, scope_resolved INTEGER NOT NULL,
-  request_hash TEXT NOT NULL UNIQUE, target_type TEXT NOT NULL, risk TEXT NOT NULL,
+  request_hash TEXT NOT NULL UNIQUE, target_type TEXT NOT NULL, risk TEXT NOT NULL, request_json TEXT NOT NULL,
   UNIQUE(owner,scope_kind,scope_id,target,version),
   FOREIGN KEY(scope_kind,scope_id,scope_resolved) REFERENCES memory_scopes(kind,scope_id,resolved)
 ) STRICT;
@@ -686,15 +717,15 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=22;
-` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts'].map(table => `
+PRAGMA user_version=23;
+` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts','store_recovery_events','store_recovered_owners'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
 `).join('') + ['memory_heads','intent_heads','owner_fences','host_operation_delivery','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
-  'verification_runs','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts','host_info_batches','capture_work','compartments'].map(table => `
+  'verification_runs','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts','host_info_batches','capture_work','compartments','store_snapshots','store_restores','store_recovery_events','store_recovered_owners'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
-`).join('') + ['memory_heads','intent_heads','owner_fences','host_operation_delivery','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts','source_projection_jobs','host_info_batches','capture_work'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
+`).join('') + ['memory_heads','intent_heads','owner_fences','host_operation_delivery','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts','source_projection_jobs','host_info_batches','capture_work','store_snapshots','store_restores'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
 CREATE TRIGGER owned_${table}_${operation.toLowerCase()} BEFORE ${operation} ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
 `)).join('') + `
@@ -725,7 +756,7 @@ const HOST_INFO_SELECT = `SELECT b.*, a.payload AS batch_payload, a.payload_hash
 export class ProbeStore {
   readonly #liveCapturePumps = new Map<string, { lease: CaptureLease; runId: string }>();
   readonly #liveAgentPumps = new Map<string, string>();
-  readonly #db: DatabaseSync;
+  #db: DatabaseSync;
   readonly #storeId: string;
   readonly #binding: Binding;
   readonly #resources: StoreResources;
@@ -758,15 +789,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,22,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,23,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 22, 'unsupported-probe-schema');
+        check(version === 23, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 22 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 23 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -804,15 +835,17 @@ export class ProbeStore {
   guidanceMembership(activity: Activity, projectIds: string[]): { ownerId: string; projects: { projectId: string; workspaceId: string | null }[] } {
     return this.withActivity(activity, () => {
       check(projectIds.length <= 32 && new Set(projectIds).size === projectIds.length, 'guidance-scope-unresolved');
-      return { ownerId: this.#binding.ownerId, projects: projectIds.map(projectId => {
-        const row = this.#db.prepare(`SELECT p.owner_id,w.workspace_id,w.owner_id AS workspace_owner
-          FROM projects p LEFT JOIN workspace_projects m ON m.project_id=p.project_id
-          LEFT JOIN workspaces w ON w.workspace_id=m.workspace_id WHERE p.project_id=?`).get(projectId);
-        check(row?.owner_id === this.#binding.ownerId
-          && (row.workspace_id === null || row.workspace_owner === this.#binding.ownerId), 'guidance-scope-unresolved');
-        return { projectId, workspaceId: row.workspace_id === null ? null : String(row.workspace_id) };
-      }) };
+      return { ownerId: this.#binding.ownerId, projects: projectIds.map(projectId => this.#projectMembership(projectId)) };
     });
+  }
+
+  #projectMembership(projectId: string): { projectId: string; workspaceId: string | null } {
+    const row = this.#db.prepare(`SELECT p.owner_id,w.workspace_id,w.owner_id AS workspace_owner
+      FROM projects p LEFT JOIN workspace_projects m ON m.project_id=p.project_id
+      LEFT JOIN workspaces w ON w.workspace_id=m.workspace_id WHERE p.project_id=?`).get(projectId);
+    check(row?.owner_id === this.#binding.ownerId
+      && (row.workspace_id === null || row.workspace_owner === this.#binding.ownerId), 'guidance-scope-unresolved');
+    return { projectId, workspaceId: row.workspace_id === null ? null : String(row.workspace_id) };
   }
 
   // Host-only synthetic owner decision; a search request or model text cannot create this grant.
@@ -854,10 +887,10 @@ export class ProbeStore {
     });
   }
 
-  #readDiscoveryApproval(consent: SourceAck, intent: Intent): MemoryDiscoveryApproval {
-    check(sameBinding(consent?.binding, this.#binding) && consent.eventId !== intent.goalInput.eventId, 'discovery-consent-required');
-    this.#validateRawSource(consent);
-    const source = this.#readSource!(consent);
+  #readDiscoveryApproval(consent: SourceAck, intent: Intent, binding: Binding = this.#binding): MemoryDiscoveryApproval {
+    check(sameBinding(consent?.binding, binding) && consent.eventId !== intent.goalInput.eventId, 'discovery-consent-required');
+    this.#validateRawSource(consent, undefined, { kind: 'project', id: binding.projectId, resolved: true }, [binding.projectId], binding);
+    const source = this.#archiveRef(consent);
     check(source.role === 'user', 'discovery-consent-required');
     const text = source.text;
     check(Buffer.byteLength(text) <= 8192, 'discovery-consent-required');
@@ -939,13 +972,20 @@ export class ProbeStore {
     check(row?.state === 'active', 'discovery-not-authorized');
     const intent = this.readIntent(activity);
     check(intent?.status === 'active' && intent.intentId === row.intent_id
-      && !this.#discoveryTaskCompleted(intent.intentId)
+      && !this.#discoveryTaskCompleted(intent.intentId), 'discovery-not-authorized');
+    return this.#readDiscoveryGrant(row, intent);
+  }
+
+  #readDiscoveryGrant(row: Record<string, unknown>, intent: Intent): { projects: string[]; remaining: number; remainingBytes: number;
+    remainingQueries: number; targets: Map<string, SearchTarget> } {
+    const grantId = String(row.grant_id), binding = intent.binding;
+    check(row.owner_id === binding.ownerId && row.session_id === binding.sessionId && row.intent_id === intent.intentId
       && sha256(String(row.consent)) === row.consent_hash, 'discovery-not-authorized');
     const consent = JSON.parse(String(row.consent)) as SourceAck;
-    const approval = this.#readDiscoveryApproval(consent, intent);
+    const approval = this.#readDiscoveryApproval(consent, intent, binding);
     const projects = this.#db.prepare(`SELECT m.project_id FROM memory_discovery_projects m
       JOIN projects p ON p.project_id=m.project_id AND p.owner_id=? WHERE m.grant_id=? ORDER BY m.project_id`)
-      .all(this.#binding.ownerId, grantId).map(project => String(project.project_id));
+      .all(binding.ownerId, grantId).map(project => String(project.project_id));
     check(projects.length > 0 && projects.length <= 32
       && JSON.stringify([...approval.projectIds].sort()) === JSON.stringify(projects)
       && approval.maxResults === row.max_results && approval.maxBytes === row.max_bytes
@@ -989,8 +1029,7 @@ export class ProbeStore {
       const prior = input.supersedes === undefined ? null : this.#sourceUnit(input.supersedes).unit;
       check(!prior || prior.projectId === projectId && prior.kind === kind, 'source-version-mismatch');
       check(input.approval, 'source-publication-approval-required');
-      const requestHash = sha256(JSON.stringify({ ref, projectId, kind, offset, length,
-        supersedes: prior?.unitId ?? null, approval: input.approval ?? null }));
+      const requestHash = this.#sourceUnitRequestHash(input);
       const existing = this.#db.prepare('SELECT unit_id FROM source_units WHERE request_hash=?').get(requestHash);
       if (existing) {
         const existingUnit = this.#sourceUnit(String(existing.unit_id)).unit;
@@ -1064,6 +1103,12 @@ export class ProbeStore {
       unit.ref.binding.sessionId, unit.ref.binding.branchId), 'source-publication-approval-required');
   }
 
+  #sourceUnitRequestHash(input: SourceUnitInput | SourceUnit): string {
+    const { ref, projectId, kind, offset, length } = input;
+    return sha256(JSON.stringify({ ref, projectId, kind, offset, length,
+      supersedes: input.supersedes ?? null, approval: input.approval ?? null }));
+  }
+
   #sourceUnit(unitId: string): { unit: SourceUnit; text: string } {
     uuid(unitId);
     const row = this.#db.prepare('SELECT * FROM source_units WHERE unit_id=? AND owner_id=?')
@@ -1090,6 +1135,7 @@ export class ProbeStore {
       && unit.approval.contentHash === stored.approval_content_hash
       && Number.isSafeInteger(unit.offset) && unit.offset >= 0 && Number.isSafeInteger(unit.length)
       && unit.length > 0 && unit.length <= 4096 && /^[0-9a-f]{64}$/i.test(unit.contentHash), 'source-evidence-gap');
+    check(this.#sourceUnitRequestHash(unit) === stored.request_hash, 'source-evidence-gap');
     const project = this.#db.prepare('SELECT owner_id FROM projects WHERE project_id=?').get(unit.projectId);
     check(project?.owner_id === this.#binding.ownerId, 'source-evidence-gap');
     this.#publicationApproval(unit);
@@ -1417,7 +1463,42 @@ export class ProbeStore {
     };
   }
 
+  #recoveryReceipts(): Map<string, SnapshotRecoveryReceipt> {
+    const expected = new Map<string, Set<string>>(), receipts = new Map<string, SnapshotRecoveryReceipt>();
+    for (const row of this.#db.prepare(`SELECT r.*,e.receipt AS recovery_receipt,e.digest AS recovery_digest
+      FROM store_restores r JOIN store_recovery_events e ON e.operation_id=r.operation_id`).all()) {
+      const plan = this.#readRecoveryPlanMetadata(row);
+      check(JSON.stringify(plan.receipt) === row.recovery_receipt && sha256(String(row.recovery_receipt)) === row.recovery_digest,
+        'snapshot-recovery-evidence-gap');
+      receipts.set(plan.operationId, plan.receipt);
+      for (const owner of plan.owners) {
+        const key = `${owner.kind}/${owner.ownerId}`;
+        const operations = expected.get(key) ?? new Set<string>();
+        operations.add(plan.operationId); expected.set(key, operations);
+      }
+    }
+    const result = new Map<string, SnapshotRecoveryReceipt>();
+    for (const row of this.#db.prepare('SELECT * FROM store_recovered_owners').all()) {
+      const key = `${String(row.kind)}/${String(row.owner_id)}`, operationId = String(row.operation_id);
+      check(expected.get(key)?.has(operationId), 'snapshot-recovery-evidence-gap');
+      result.set(key, receipts.get(operationId)!);
+    }
+    check(result.size === expected.size, 'snapshot-recovery-evidence-gap');
+    return result;
+  }
+
+  #requestRecoveryStatus(kind: ExecutionStream['ownerKind'], ownerId: string): Pick<RequestStatus, 'recovery'> {
+    const recovery = this.#recoveryReceipts().get(`${kind}/${ownerId}`);
+    return recovery ? { recovery } : {};
+  }
+
+  #assertStreamNotRecovered(streamId: string): void {
+    const stream = this.#readStream(streamId);
+    check(!this.#requestRecoveryStatus(stream.ownerKind, stream.ownerId).recovery, 'recovered-stream-blocked');
+  }
+
   #requestRecoveryGate(activity: Activity, relatedRunId: string | null, currentRunId?: string): void {
+    this.#assertStreamNotRecovered(activity.streamId);
     const stream = this.#readStream(activity.streamId);
     // An unrelated session or already-open run must not bypass an unresolved
     // request in the same principal/project. An explicit recovery successor
@@ -1425,6 +1506,7 @@ export class ProbeStore {
     const blockers = this.#db.prepare(`SELECT DISTINCT r.run_id FROM request_runs r
       JOIN execution_streams s ON s.stream_id=r.stream_id
       WHERE s.project_id=? AND s.principal_id=? AND r.run_id!=?
+      AND NOT EXISTS(SELECT 1 FROM store_recovered_owners recovered WHERE recovered.kind=s.owner_kind AND recovered.owner_id=s.owner_id)
       AND (EXISTS(SELECT 1 FROM request_attempts a WHERE a.run_id=r.run_id AND a.outcome='unknown-sent')
         OR EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='run-recovery-gap')
         OR (EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='agent/event@v1')
@@ -1438,6 +1520,7 @@ export class ProbeStore {
 
   authorizeRequestRun(activity: Activity, runId: string, input: { budget: ProbeBudget; intent: { eventId: string; hash: string } | null; relatedRunId: string | null; acceptDuplicateRisk?: boolean }): RequestRun {
     return this.withActivity(activity, () => {
+      this.#assertStreamNotRecovered(activity.streamId);
       uuid(runId);
       validateBudget(input.budget);
       if (input.relatedRunId) {
@@ -1820,34 +1903,40 @@ export class ProbeStore {
   }
 
   #verifyRequestSources(assemblies: (RequestAssembly & { state?: RequestAssemblyState })[], activity?: Activity, currentAssemblyId?: string | null): void {
-    for (const assembly of assemblies) for (const source of assembly.sources) {
-      let refs = [source], scope: MemoryScope | undefined;
-      // Only settled history can use a published compartment's original raw range.
-      // Undefined keeps strict artifact checks; null denotes a sealed predecessor.
-      if (currentAssemblyId !== undefined && assembly.assemblyId !== currentAssemblyId && assembly.state === 'finished') {
-        const row = this.#db.prepare(`SELECT c.* FROM compartments c JOIN capture_jobs j ON j.job_id=c.job_id
-          WHERE c.job_id=? AND j.source_owner=? AND j.consumer='historian'`).get(source.eventId, source.binding.sessionId);
-        if (row) {
-          const published = JSON.parse(String(row.source_json)) as SourceAck, attemptId = String(row.attempt_id);
-          if (sameSourceAck(source, published)) {
-            check(row.hash === sha256(JSON.stringify({ source: published, attemptId })), 'compartment-integrity');
-            const job = this.#captureJob(source.eventId);
-            check(job.consumer === 'historian' && sameBinding(source.binding, job.source.binding), 'historian-owner-mismatch');
-            refs = job.range; scope = job.scope;
+    for (const assembly of assemblies) {
+      let projects: string[] | undefined;
+      for (const source of assembly.sources) {
+        let refs = [source], scope: MemoryScope | undefined;
+        // Only settled history can use a published compartment's original raw range.
+        // Undefined keeps strict artifact checks; null denotes a sealed predecessor.
+        if (currentAssemblyId !== undefined && assembly.assemblyId !== currentAssemblyId && assembly.state === 'finished') {
+          const row = this.#db.prepare(`SELECT c.* FROM compartments c JOIN capture_jobs j ON j.job_id=c.job_id
+            WHERE c.job_id=? AND j.source_owner=? AND j.consumer='historian'`).get(source.eventId, source.binding.sessionId);
+          if (row) {
+            const published = JSON.parse(String(row.source_json)) as SourceAck, attemptId = String(row.attempt_id);
+            if (sameSourceAck(source, published)) {
+              check(row.hash === sha256(JSON.stringify({ source: published, attemptId })), 'compartment-integrity');
+              const job = this.#captureJob(source.eventId);
+              check(job.consumer === 'historian' && sameBinding(source.binding, job.source.binding), 'historian-owner-mismatch');
+              refs = job.range; scope = job.scope;
+            }
           }
         }
-      }
-      for (const ref of refs) {
-        this.#validateSource(ref, undefined, scope);
-        if (activity) this.#assertRawSourceAccess(activity, ref, assembly.context
-          ? assembly.context.discoveryGrantId ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : [this.#binding.projectId]
-          : undefined);
+        for (const ref of refs) {
+          this.#validateSource(ref, undefined, scope);
+          if (activity) {
+            if (assembly.context && !projects) projects = assembly.context.discoveryGrantId
+              ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : [this.#binding.projectId];
+            this.#assertRawSourceAccess(activity, ref, projects);
+          }
+        }
       }
     }
   }
 
   reconcileRequestAttempt(activity: Activity, attemptId: string): RequestStatus {
     return this.withActivity(activity, () => {
+      this.#assertStreamNotRecovered(activity.streamId);
       uuid(attemptId);
       const row = this.#db.prepare('SELECT run_id FROM request_attempts WHERE attempt_id=?').get(attemptId);
       check(row, 'unknown-attempt');
@@ -1891,11 +1980,11 @@ export class ProbeStore {
     return this.withActivity(activity, () => this.#readRequestLedger(this.#requestRun(activity, runId)));
   }
 
-  #readProjectRequestLedger(runId: string): RequestStatus {
+  #readProjectRequestLedger(runId: string, binding: Binding = this.#binding): RequestStatus {
     const row = this.#db.prepare(`SELECT r.stream_id FROM request_runs r
       JOIN execution_streams s ON s.stream_id=r.stream_id
       WHERE r.run_id=? AND s.principal_id=? AND s.project_id=?`)
-      .get(runId, this.#binding.ownerId, this.#binding.projectId);
+      .get(runId, binding.ownerId, binding.projectId);
     check(row, 'request-scope-mismatch');
     return this.#readRequestLedger(this.#requestRun({ streamId: String(row.stream_id) }, runId));
   }
@@ -1907,9 +1996,14 @@ export class ProbeStore {
     const attempts = this.#db.prepare('SELECT * FROM request_attempts WHERE run_id=? ORDER BY rowid').all(runId);
     check(events.length > 0 && events[0]!.kind === 'run-authorized', 'ledger-evidence-gap');
     const authorization = JSON.parse(String(events[0]!.payload));
-    check(authorization.runId === run.runId && authorization.streamId === run.streamId
-      && authorization.epoch === run.epoch && JSON.stringify(authorization.budget) === JSON.stringify(run.budget)
-      && authorization.relatedRunId === run.relatedRunId, 'ledger-evidence-gap');
+    for (const key of ['runId', 'streamId', 'ownerKind', 'ownerId', 'authorizationId', 'activityId', 'epoch',
+      'budget', 'intent', 'relatedRunId', 'authorizedAt'] as const) {
+      check(JSON.stringify(authorization[key]) === JSON.stringify(run[key]), 'ledger-evidence-gap');
+    }
+    const stream = this.#readStream(run.streamId);
+    const owner = this.#db.prepare('SELECT stream_id,epoch FROM owner_activities WHERE id=?').get(run.activityId);
+    check(stream.ownerKind === run.ownerKind && stream.ownerId === run.ownerId && stream.authorization.id === run.authorizationId
+      && owner?.stream_id === run.streamId && owner.epoch === run.epoch && events[0]!.activity_id === run.activityId, 'ledger-evidence-gap');
     for (const [index, row] of events.entries()) {
       check(row.seq === index + 1 && sha256(String(row.payload)) === row.hash, 'ledger-evidence-gap');
       const payload = JSON.parse(String(row.payload)) as Record<string, unknown>;
@@ -1947,13 +2041,23 @@ export class ProbeStore {
         check(attempt.ordinal === index + 1 && attempt.payload_hash === assembly.payload_hash
           && attempt.byte_length === assembly.byte_length, 'ledger-evidence-gap');
         check(startedEvents.has(String(attempt.attempt_id)), 'ledger-evidence-gap');
-        const startedPayload = JSON.parse(String(events.find(event => event.kind === 'model/request-attempt-started@v1'
-          && event.attempt_id === attempt.attempt_id)!.payload));
-        check(startedPayload.payloadHash === attempt.payload_hash && startedPayload.byteLength === attempt.byte_length
-          && startedPayload.assemblyId === assembly.assembly_id && startedPayload.ordinal === attempt.ordinal
-          && startedPayload.route === assembly.route && startedPayload.model === assembly.model, 'ledger-evidence-gap');
+        const started = events.find(event => event.kind === 'model/request-attempt-started@v1' && event.attempt_id === attempt.attempt_id)!;
+        const startedPayload = JSON.parse(String(started.payload));
+        const decodedAttempt = this.#requestAttempt(attempt, run);
+        for (const key of ['attemptId', 'runId', 'assemblyId', 'ordinal', 'payloadHash', 'byteLength',
+          'encoding', 'hashAlgorithm', 'adapterVersion', 'startedAt'] as const) {
+          check(JSON.stringify(startedPayload[key]) === JSON.stringify(decodedAttempt[key]), 'ledger-evidence-gap');
+        }
+        check(startedPayload.route === assembly.route && startedPayload.model === assembly.model, 'ledger-evidence-gap');
+        const ownership = this.#db.prepare("SELECT * FROM execution_events WHERE attempt_id=? AND kind='attempt-bound'").get(attempt.attempt_id!);
+        check(ownership?.stream_id === run.streamId && ownership.run_id === runId && ownership.activity_id === started.activity_id,
+          'ledger-evidence-gap');
         const finished = events.find(event => event.kind === 'model/request-attempt-finished@v1' && event.attempt_id === attempt.attempt_id);
-        if (finished) check(JSON.parse(String(finished.payload)).outcome === attempt.outcome, 'ledger-evidence-gap');
+        if (finished) {
+          const payload = JSON.parse(String(finished.payload));
+          check(payload.outcome === attempt.outcome && payload.finishedAt === attempt.finished_at
+            && finished.activity_id === ownership.activity_id, 'ledger-evidence-gap');
+        }
         check((attempt.outcome === 'unknown-sent') === !finishedEvents.has(String(attempt.attempt_id)), 'ledger-evidence-gap');
       }
       check(assembly.state === deriveAssemblyState(assemblyAttempts
@@ -1969,6 +2073,7 @@ export class ProbeStore {
       assemblies: assemblies.map(row => ({ ...this.#requestAssembly(row), state: String(row.state) as RequestStatus['assemblies'][number]['state'] })),
       attempts: attempts.map(row => this.#requestAttempt(row, run)),
       revoked: run.state === 'revoked', sealed: run.state === 'sealed',
+      ...this.#requestRecoveryStatus(run.ownerKind, run.ownerId),
     };
   }
   inspectAssembly(activity: Activity, assemblyId: string, recordId?: string): {
@@ -2078,6 +2183,7 @@ export class ProbeStore {
     return this.#transaction(() => {
       const fence = this.fence();
       const row = this.#db.prepare('SELECT * FROM owner_activities WHERE id=?').get(activity.id);
+      check(fence.health === 'healthy', 'store-integrity-failed');
       check(fence.state === 'open' && fence.epoch === activity.epoch && row
         && row.incarnation === processIdentity.incarnation && row.pid === process.pid && row.store_id === this.#storeId
         && row.root_path === this.#resources.root.path && row.root_dev === this.#resources.root.identity.dev
@@ -2110,10 +2216,16 @@ export class ProbeStore {
     });
   }
 
-  #readIntentSnapshot(row: Record<string, unknown>): Intent {
+  #readIntentSnapshot(row: Record<string, unknown>, binding: Binding = this.#binding): Intent {
     const snapshot = String(row.snapshot);
     check(sha256(snapshot) === row.hash, 'intent-evidence-gap');
     const intent = JSON.parse(snapshot) as Omit<Intent, 'hash'>;
+    check(sha256(String(row.request_json)) === row.transition_hash, 'intent-evidence-gap');
+    const request = JSON.parse(String(row.request_json)) as { expected: string | null; input: SourceAck;
+      transition: IntentTransition; initialGoal: string | null };
+    check(request.expected === row.expected_event_id && JSON.stringify(request.input) === JSON.stringify(intent.input)
+      && request.transition.step === intent.step && request.transition.status === intent.status
+      && request.initialGoal === (intent.input.eventId === intent.goalInput.eventId ? intent.goal : null), 'intent-evidence-gap');
     check(intent.schema === 'intent@1' && intent.eventId === row.event_id && intent.version === row.version
       && intent.intentId === row.intent_id && intent.status === row.status
       && intent.input.eventId === row.input_event_id && intent.input.hash === row.input_hash
@@ -2122,30 +2234,36 @@ export class ProbeStore {
       && intent.goalInput.eventId === row.goal_input_event_id && intent.goalInput.hash === row.goal_input_hash
       && intent.goalInput.contentHash === row.goal_input_content_hash
       && intent.goalInput.locator === row.goal_input_locator && intent.goalInput.byteLength === row.goal_input_bytes
-      && sameBinding(intent.input.binding, this.#binding) && sameBinding(intent.goalInput.binding, this.#binding)
-      && sameBinding(intent.binding, this.#binding), 'intent-evidence-gap');
-    this.#validateSource(intent.input);
-    this.#validateSource(intent.goalInput);
+      && sameBinding(intent.input.binding, binding) && sameBinding(intent.goalInput.binding, binding)
+      && sameBinding(intent.binding, binding), 'intent-evidence-gap');
+    const scope: MemoryScope = { kind: 'project', id: binding.projectId, resolved: true };
+    this.#validateSource(intent.input, undefined, scope, [binding.projectId], binding);
+    this.#validateSource(intent.goalInput, undefined, scope, [binding.projectId], binding);
     check(!this.#isCaptureOutput(intent.input) && !this.#isCaptureOutput(intent.goalInput), 'source-derived');
     return { ...intent, hash: String(row.hash) };
   }
 
+  #replayIntent(binding: Binding): Intent | null {
+    const rows = this.#db.prepare('SELECT * FROM intent_events WHERE session_id=? AND branch_id=? ORDER BY version')
+      .all(binding.sessionId, binding.branchId);
+    let latest: Intent | null = null;
+    for (const [index, row] of rows.entries()) {
+      check(row.version === index + 1 && row.expected_event_id === (latest?.eventId ?? null), 'intent-evidence-gap');
+      const next = this.#readIntentSnapshot(row, binding);
+      const newTask = latest && next.intentId !== latest.intentId;
+      check(!latest || (JSON.stringify(next.constraints) === JSON.stringify(latest.constraints)
+        && (newTask ? latest.status === 'completed' && next.status === 'active'
+          && JSON.stringify(next.goalInput) === JSON.stringify(next.input)
+          && sha256(next.goal) === next.input.contentHash && this.#archiveRef(next.input).role === 'user'
+          : next.goal === latest.goal && JSON.stringify(next.goalInput) === JSON.stringify(latest.goalInput))), 'intent-evidence-gap');
+      latest = next;
+    }
+    return latest;
+  }
+
   recoverIntent(activity: Activity): Intent | null {
     return this.withActivity(activity, () => {
-      const rows = this.#db.prepare('SELECT * FROM intent_events WHERE session_id=? AND branch_id=? ORDER BY version')
-        .all(this.#binding.sessionId, this.#binding.branchId);
-      let latest: Intent | null = null;
-      for (const [index, row] of rows.entries()) {
-        check(row.version === index + 1 && row.expected_event_id === (latest?.eventId ?? null), 'intent-evidence-gap');
-        const next = this.#readIntentSnapshot(row);
-        const newTask = latest && next.intentId !== latest.intentId;
-        check(!latest || (JSON.stringify(next.constraints) === JSON.stringify(latest.constraints)
-          && (newTask ? latest.status === 'completed' && next.status === 'active'
-            && JSON.stringify(next.goalInput) === JSON.stringify(next.input)
-            && sha256(next.goal) === next.input.contentHash && this.#archiveRef(next.input).role === 'user'
-            : next.goal === latest.goal && JSON.stringify(next.goalInput) === JSON.stringify(latest.goalInput))), 'intent-evidence-gap');
-        latest = next;
-      }
+      const latest = this.#replayIntent(this.#binding);
       const head = this.#db.prepare('SELECT event_id FROM intent_heads WHERE session_id=? AND branch_id=?')
         .get(this.#binding.sessionId, this.#binding.branchId);
       if (!head && latest) {
@@ -2165,7 +2283,8 @@ export class ProbeStore {
         && Object.keys(transition).every(key => key === 'step' || key === 'status'), 'invalid-transition');
       check(['active', 'paused', 'completed', 'needs-input'].includes(transition.status)
         && typeof transition.step === 'string' && transition.step.length > 0 && Buffer.byteLength(transition.step) <= 1024, 'invalid-transition');
-      const transitionHash = sha256(JSON.stringify({ expected, input, transition, initialGoal: initialGoal ?? null }));
+      const requestJson = JSON.stringify({ expected, input, transition, initialGoal: initialGoal ?? null });
+      const transitionHash = sha256(requestJson);
       const previous = this.#db.prepare('SELECT * FROM intent_events WHERE session_id=? AND branch_id=? AND input_event_id=?')
         .get(this.#binding.sessionId, this.#binding.branchId, input.eventId);
       if (previous) {
@@ -2186,11 +2305,11 @@ export class ProbeStore {
       };
       const bytes = JSON.stringify(snapshot);
       const hash = sha256(bytes);
-      this.#db.prepare('INSERT INTO intent_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      this.#db.prepare('INSERT INTO intent_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(snapshot.eventId, snapshot.intentId, snapshot.version, this.#binding.sessionId, this.#binding.branchId,
           input.eventId, expected, snapshot.status, input.hash, input.contentHash, input.locator, input.byteLength,
           snapshot.goalInput.eventId, snapshot.goalInput.hash, snapshot.goalInput.contentHash, snapshot.goalInput.locator, snapshot.goalInput.byteLength,
-          transitionHash, bytes, hash);
+          transitionHash, bytes, hash, requestJson);
       this.#db.prepare(`INSERT INTO intent_heads VALUES (?, ?, ?) ON CONFLICT(session_id,branch_id) DO UPDATE SET event_id=excluded.event_id`)
         .run(this.#binding.sessionId, this.#binding.branchId, snapshot.eventId);
       if (snapshot.status === 'completed') for (const grant of this.#db.prepare(`SELECT grant_id FROM memory_discovery_grants
@@ -2342,11 +2461,12 @@ export class ProbeStore {
     });
   }
 
-  #historianBody(job: CaptureJob, attemptId: string): CompartmentBody {
-    check(job.consumer === 'historian' && job.source.binding.sessionId === this.#binding.sessionId, 'historian-owner-mismatch');
+  #historianBody(job: CaptureJob, attemptId: string, binding: Binding = this.#binding): CompartmentBody {
+    check(job.consumer === 'historian' && job.source.binding.sessionId === binding.sessionId, 'historian-owner-mismatch');
     const row = this.#db.prepare('SELECT run_id FROM capture_work WHERE job_id=?').get(job.jobId);
     check(row?.run_id, 'capture-run-unavailable');
-    const ledger = this.#readProjectRequestLedger(String(row.run_id));
+    const ledger = this.#readProjectRequestLedger(String(row.run_id), binding);
+    check(ledger.run.ownerKind === 'job' && ledger.run.ownerId === job.jobId, 'historian-owner-mismatch');
     const attempt = ledger.attempts.find(item => item.attemptId === attemptId);
     check(attempt?.outcome === 'received', 'response-not-received');
     const step = ledger.events.filter(event => event.kind === 'capture/step@v1').map(event => JSON.parse(event.payload))
@@ -2362,7 +2482,7 @@ export class ProbeStore {
     const payload = JSON.parse(String(this.#db.prepare('SELECT payload FROM capture_jobs WHERE job_id=?').get(job.jobId)!.payload));
     check(payload.lane === 'historian' && payload.rawHash === sha256(JSON.stringify(job.range)), 'historian-source-gap');
     const raw = job.range.map(ref => {
-      this.#validateSource(ref, undefined, job.scope);
+      this.#validateSource(ref, undefined, job.scope, [binding.projectId], binding);
       return { ref, ...this.#archiveRef(ref) };
     });
     return compartmentBody(raw, payload.runId, reply.summary);
@@ -2391,18 +2511,20 @@ export class ProbeStore {
   }
 
   readCompartment(activity: Activity, jobId: string): Compartment {
-    return this.withActivity(activity, () => {
-      const job = this.#captureJob(jobId), row = this.#db.prepare('SELECT * FROM compartments WHERE job_id=?').get(jobId);
-      check(row, 'compartment-unavailable');
-      const source = JSON.parse(String(row.source_json)) as SourceAck, attemptId = String(row.attempt_id);
-      check(row.hash === sha256(JSON.stringify({ source, attemptId })), 'compartment-integrity');
-      const body = this.#historianBody(job, attemptId);
-      check(source.eventId === jobId && sameBinding(source.binding, job.source.binding)
-        && this.#archiveRef(source).text === JSON.stringify(body), 'compartment-integrity');
-      const payload = JSON.parse(String(this.#db.prepare('SELECT payload FROM capture_jobs WHERE job_id=?').get(jobId)!.payload));
-      return { jobId, runId: payload.runId, firstResponse: payload.firstResponse, endResponse: payload.endResponse,
-        rawHash: payload.rawHash, attemptId, source, body };
-    });
+    return this.withActivity(activity, () => this.#readCompartment(jobId, this.#binding));
+  }
+
+  #readCompartment(jobId: string, binding: Binding): Compartment {
+    const job = this.#captureJob(jobId, binding), row = this.#db.prepare('SELECT * FROM compartments WHERE job_id=?').get(jobId);
+    check(row, 'compartment-unavailable');
+    const source = JSON.parse(String(row.source_json)) as SourceAck, attemptId = String(row.attempt_id);
+    check(job.stage === 'complete' && row.hash === sha256(JSON.stringify({ source, attemptId })), 'compartment-integrity');
+    const body = this.#historianBody(job, attemptId, binding);
+    check(source.eventId === jobId && sameBinding(source.binding, job.source.binding)
+      && this.#archiveRef(source).text === JSON.stringify(body), 'compartment-integrity');
+    const payload = JSON.parse(String(this.#db.prepare('SELECT payload FROM capture_jobs WHERE job_id=?').get(jobId)!.payload));
+    return { jobId, runId: payload.runId, firstResponse: payload.firstResponse, endResponse: payload.endResponse,
+      rawHash: payload.rawHash, attemptId, source, body };
   }
 
   compartmentsForWindow(activity: Activity, runId: string, throughResponse: number, maxBytes: number) {
@@ -2488,7 +2610,8 @@ export class ProbeStore {
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= 32, 'invalid-capture-limit');
       return this.#db.prepare(`SELECT j.job_id FROM capture_jobs j JOIN sessions s ON s.session_id=j.source_owner
         LEFT JOIN capture_work w ON w.job_id=j.job_id
-        WHERE s.owner_id=? AND s.project_id=? AND j.consumer=? AND (?=0 OR (j.status='pending' AND (w.stage IS NULL OR w.stage IN ('pending','proposing','verifying','comparing'))))
+        WHERE s.owner_id=? AND s.project_id=? AND j.consumer=? AND (?=0 OR (j.status='pending' AND (w.stage IS NULL OR w.stage IN ('pending','proposing','verifying','comparing'))
+          AND NOT EXISTS(SELECT 1 FROM store_recovered_owners recovered WHERE recovered.kind='job' AND recovered.owner_id=j.job_id)))
           AND (json_extract(j.payload,'$.scope.kind') IS NOT 'session' OR j.source_owner=?)
           AND (j.consumer='memory' OR j.source_owner=?)
         ORDER BY j.rowid LIMIT ?`)
@@ -2496,14 +2619,19 @@ export class ProbeStore {
     });
   }
 
-  #captureJob(jobId: string): CaptureJob {
+  #readCaptureJobMetadata(jobId: string, binding: Binding) {
     uuid(jobId);
     const row = this.#db.prepare('SELECT * FROM capture_jobs WHERE job_id=?').get(jobId);
     check(row && sha256(String(row.payload)) === row.payload_hash, 'capture-evidence-gap');
     const payload = JSON.parse(String(row.payload));
-    check(payload.schema === 'capture-job@1' && payload.source?.binding?.ownerId === this.#binding.ownerId
-      && payload.source.binding.projectId === this.#binding.projectId && payload.source.eventId === row.source_event_id
+    check(payload.schema === 'capture-job@1' && payload.source?.binding?.ownerId === binding.ownerId
+      && payload.source.binding.projectId === binding.projectId && payload.source.eventId === row.source_event_id
       && payload.source.binding.sessionId === row.source_owner, 'capture-evidence-gap');
+    return { row, payload };
+  }
+
+  #captureJob(jobId: string, binding: Binding = this.#binding): CaptureJob {
+    const { row, payload } = this.#readCaptureJobMetadata(jobId, binding);
     const work = this.#db.prepare('SELECT * FROM capture_work WHERE job_id=?').get(jobId);
     const recordId = work?.record_id ?? row.record_id ?? payload.recordId;
     let record: MemoryRecord | null = null, unavailable: string | null = null;
@@ -2520,8 +2648,10 @@ export class ProbeStore {
       ? this.#db.prepare('SELECT scope_kind,scope_id,scope_resolved FROM memory_heads WHERE record_id=?').get(String(recordId)) : null;
     const scope: MemoryScope = payload.scope ?? record?.scope ?? (head ? {
       kind: head.scope_kind as MemoryScopeKind, id: String(head.scope_id), resolved: Boolean(head.scope_resolved) } : null);
-    this.#validateScope(scope);
-    return { jobId, consumer: row.consumer as CaptureJob['consumer'], ownerId: this.#binding.ownerId, scope: structuredClone(scope), source: payload.source,
+    this.#validateScope(scope, [binding.projectId], binding);
+    if ((work?.stage ?? row.status) !== 'complete'
+      && this.#requestRecoveryStatus('job', jobId).recovery) unavailable = 'recovered_with_gap';
+    return { jobId, consumer: row.consumer as CaptureJob['consumer'], ownerId: binding.ownerId, scope: structuredClone(scope), source: payload.source,
       range: payload.range ?? [payload.source], stage: unavailable ? 'blocked' : (work?.stage ?? row.status) as CaptureJob['stage'],
       reason: unavailable ?? (work ? work.reason as string | null : payload.reason ?? null), record };
   }
@@ -2600,6 +2730,7 @@ export class ProbeStore {
       validateBudget(budget);
       check(Number.isSafeInteger(leaseMs) && leaseMs > 0 && leaseMs <= 30000, 'invalid-capture-lease');
       const job = this.#captureJob(jobId);
+      if (job.reason === 'recovered_with_gap') return null;
       const previous = this.#db.prepare('SELECT * FROM capture_work WHERE job_id=?').get(jobId);
       if (['complete','blocked','unknown'].includes(job.stage) || previous && Number(previous.lease_until) > Date.now()) return null;
       if (previous?.budget != null) check(previous.budget === JSON.stringify(budget), 'capture-budget-mismatch');
@@ -3161,55 +3292,57 @@ export class ProbeStore {
   }
 
   readMemoryPresentation(activity: Activity, token: string): MemoryPresentation {
-    return this.withActivity(activity, () => {
-      const row = this.#db.prepare('SELECT * FROM host_presentations WHERE token=? AND session_id=? AND branch_id=?')
-        .get(token, this.#binding.sessionId, this.#binding.branchId);
-      check(row && sha256(String(row.payload)) === row.payload_hash, 'invalid-presentation-identity');
-      const value = JSON.parse(String(row.payload)) as Omit<MemoryPresentation, 'hash'>;
-      check(value.schema === 'memory-presentation@1' && value.presentationId === row.presentation_id && value.token === row.token
-        && value.sessionId === row.session_id && value.branchId === row.branch_id && value.epoch === row.epoch && value.ordinal === row.ordinal
-        && value.kind === row.kind && value.operationId === row.operation_id && value.originatingPresentationId === row.originating_id
-        && value.supersedesOperationId === row.supersedes_operation_id && value.batchId === row.batch_id && value.batchDigest === row.batch_digest
-        && Array.isArray(value.eventIds) && Array.isArray(value.updateEventIds)
-        && value.updateEventIds.length === (value.kind === 'inspect' ? 0 : value.targets.length)
-        && value.eventIds.length === (value.kind === 'rollback' ? value.targets.length : 0)
-        && (value.kind === 'correct' ? typeof value.content === 'string' && value.input !== null && value.targets.length === 1
-          : value.content === null && value.input === null),
-      'presentation-evidence-gap');
-      if (value.operationId) {
-        const operation = this.#db.prepare('SELECT presentation_hash FROM pending_operations WHERE operation_id=? AND presentation_id=?')
-          .get(value.operationId, value.presentationId);
-        check(operation?.presentation_hash === row.payload_hash, 'presentation-evidence-gap');
+    return this.withActivity(activity, () => this.#readMemoryPresentation(token));
+  }
+
+  #readMemoryPresentation(token: string, binding: Binding = this.#binding): MemoryPresentation {
+    const row = this.#db.prepare('SELECT * FROM host_presentations WHERE token=? AND session_id=? AND branch_id=?')
+      .get(token, binding.sessionId, binding.branchId);
+    check(row && sha256(String(row.payload)) === row.payload_hash, 'invalid-presentation-identity');
+    const value = JSON.parse(String(row.payload)) as Omit<MemoryPresentation, 'hash'>;
+    check(value.schema === 'memory-presentation@1' && value.presentationId === row.presentation_id && value.token === row.token
+      && value.sessionId === row.session_id && value.branchId === row.branch_id && value.epoch === row.epoch && value.ordinal === row.ordinal
+      && value.kind === row.kind && value.operationId === row.operation_id && value.originatingPresentationId === row.originating_id
+      && value.supersedesOperationId === row.supersedes_operation_id && value.batchId === row.batch_id && value.batchDigest === row.batch_digest
+      && Array.isArray(value.eventIds) && Array.isArray(value.updateEventIds)
+      && value.updateEventIds.length === (value.kind === 'inspect' ? 0 : value.targets.length)
+      && value.eventIds.length === (value.kind === 'rollback' ? value.targets.length : 0)
+      && (value.kind === 'correct' ? typeof value.content === 'string' && value.input !== null && value.targets.length === 1
+        : value.content === null && value.input === null),
+    'presentation-evidence-gap');
+    if (value.operationId) {
+      const operation = this.#db.prepare('SELECT presentation_hash FROM pending_operations WHERE operation_id=? AND presentation_id=?')
+        .get(value.operationId, value.presentationId);
+      check(operation?.presentation_hash === row.payload_hash, 'presentation-evidence-gap');
+    }
+    const targets = this.#db.prepare('SELECT * FROM presentation_targets WHERE presentation_id=? ORDER BY ordinal').all(value.presentationId);
+    check(targets.length === value.targets.length && targets.length > 0, 'presentation-evidence-gap');
+    for (const [index, target] of value.targets.entries()) {
+      const stored = targets[index]!;
+      if (value.kind !== 'inspect') uuid(value.updateEventIds[index]!);
+      check(stored.ordinal === index && stored.record_id === target.recordId && stored.revision_id === target.revisionId
+        && stored.head_event_id === target.headEventId && stored.lifecycle === target.lifecycle && stored.verification === target.verification
+        && stored.scope_kind === target.scope.kind && stored.scope_id === target.scope.id
+        && stored.selected_event_id === (value.eventIds[index] ?? null) && stored.update_event_id === (value.updateEventIds[index] ?? null)
+        && stored.snapshot === this.#snapshotBytes(target)
+        && stored.snapshot_hash === target.hash && target.hash === sha256(String(stored.snapshot)), 'presentation-evidence-gap');
+      if (value.kind !== 'rollback') {
+        const event = this.#db.prepare('SELECT after_snapshot FROM memory_events WHERE event_id=? AND record_id=?').get(target.headEventId, target.recordId);
+        check(event?.after_snapshot === stored.snapshot, 'presentation-evidence-gap');
       }
-      const targets = this.#db.prepare('SELECT * FROM presentation_targets WHERE presentation_id=? ORDER BY ordinal').all(value.presentationId);
-      check(targets.length === value.targets.length && targets.length > 0, 'presentation-evidence-gap');
-      for (const [index, target] of value.targets.entries()) {
-        const stored = targets[index]!;
-        if (value.kind !== 'inspect') uuid(value.updateEventIds[index]!);
-        check(stored.ordinal === index && stored.record_id === target.recordId && stored.revision_id === target.revisionId
-          && stored.head_event_id === target.headEventId && stored.lifecycle === target.lifecycle && stored.verification === target.verification
-          && stored.scope_kind === target.scope.kind && stored.scope_id === target.scope.id
-          && stored.selected_event_id === (value.eventIds[index] ?? null) && stored.update_event_id === (value.updateEventIds[index] ?? null)
-          && stored.snapshot === this.#snapshotBytes(target)
-          && stored.snapshot_hash === target.hash && target.hash === sha256(String(stored.snapshot)), 'presentation-evidence-gap');
-        if (value.kind !== 'rollback') {
-          const event = this.#db.prepare('SELECT after_snapshot FROM memory_events WHERE event_id=? AND record_id=?').get(target.headEventId, target.recordId);
-          check(event?.after_snapshot === stored.snapshot, 'presentation-evidence-gap');
-        }
-      }
-      if (value.batchId) {
-        // Read the immutable presentation independently of later canonical damage. Commit
-        // revalidates the live batch inside its transaction and durably settles stale selections.
-        check(typeof value.batchPayload === 'string' && sha256(value.batchPayload) === value.batchDigest, 'batch-evidence-gap');
-        const batch = JSON.parse(value.batchPayload);
-        check(batch.schema === 'activation-batch@1' && batch.batchId === value.batchId
-          && batch.ownerId === this.#binding.ownerId && Array.isArray(batch.events) && batch.events.length > 0
-          && new Set(value.eventIds).size === value.eventIds.length && new Set(value.targets.map(target => target.recordId)).size === value.targets.length
-          && value.eventIds.every((eventId, index) => batch.events.some((event: { eventId: string; recordId: string }) =>
-            event.eventId === eventId && event.recordId === value.targets[index]!.recordId)), 'batch-evidence-gap');
-      }
-      return { ...value, hash: String(row.payload_hash) };
-    });
+    }
+    if (value.batchId) {
+      // Read the immutable presentation independently of later canonical damage. Commit
+      // revalidates the live batch inside its transaction and durably settles stale selections.
+      check(typeof value.batchPayload === 'string' && sha256(value.batchPayload) === value.batchDigest, 'batch-evidence-gap');
+      const batch = JSON.parse(value.batchPayload);
+      check(batch.schema === 'activation-batch@1' && batch.batchId === value.batchId
+        && batch.ownerId === binding.ownerId && Array.isArray(batch.events) && batch.events.length > 0
+        && new Set(value.eventIds).size === value.eventIds.length && new Set(value.targets.map(target => target.recordId)).size === value.targets.length
+        && value.eventIds.every((eventId, index) => batch.events.some((event: { eventId: string; recordId: string }) =>
+          event.eventId === eventId && event.recordId === value.targets[index]!.recordId)), 'batch-evidence-gap');
+    }
+    return { ...value, hash: String(row.payload_hash) };
   }
 
   // Durable output acknowledgement only. The synthetic driver supplies it after
@@ -3227,18 +3360,24 @@ export class ProbeStore {
       const row = this.#db.prepare(`SELECT o.* FROM pending_operations o JOIN host_presentations p ON p.presentation_id=o.presentation_id
         WHERE p.token=? AND p.session_id=? AND p.branch_id=?`).get(token, this.#binding.sessionId, this.#binding.branchId);
       if (!row) return { status: 'invalid_identity', operationId: null, receiptIds: [], expected: [], current: [], reason: 'unknown-token' };
-      const presentation = this.readMemoryPresentation(activity, token);
-      if (row.state === 'pending') return { status: 'pending', operationId: presentation.operationId,
-        receiptIds: [], expected: presentation.targets, current: [], reason: null };
-      check(sha256(String(row.result)) === row.result_hash, 'operation-evidence-gap');
-      const result = JSON.parse(String(row.result)) as MemoryOperationResult;
-      check(result.status === row.state && result.operationId === row.operation_id
-        && JSON.stringify(result.expected) === JSON.stringify(presentation.targets), 'operation-evidence-gap');
-      const receipts = this.#db.prepare('SELECT receipt_id FROM memory_events WHERE operation_id=? ORDER BY origin_seq').all(result.operationId!);
-      check(JSON.stringify(result.receiptIds) === JSON.stringify(receipts.map(event => event.receipt_id)), 'operation-evidence-gap');
+      const result = this.#readMemoryOperation(row, this.readMemoryPresentation(activity, token));
       for (const id of result.receiptIds) this.readOwnerReceipt(activity, id);
       return result;
     });
+  }
+
+  #readMemoryOperation(row: Record<string, unknown>, presentation: MemoryPresentation): MemoryOperationResult {
+    check(row.operation_id === presentation.operationId && row.presentation_id === presentation.presentationId
+      && row.session_id === presentation.sessionId && row.presentation_hash === presentation.hash, 'operation-evidence-gap');
+    if (row.state === 'pending') return { status: 'pending', operationId: presentation.operationId,
+      receiptIds: [], expected: presentation.targets, current: [], reason: null };
+    check(sha256(String(row.result)) === row.result_hash, 'operation-evidence-gap');
+    const result = JSON.parse(String(row.result)) as MemoryOperationResult;
+    check(result.status === row.state && result.operationId === row.operation_id
+      && JSON.stringify(result.expected) === JSON.stringify(presentation.targets), 'operation-evidence-gap');
+    const receipts = this.#db.prepare('SELECT receipt_id FROM memory_events WHERE operation_id=? ORDER BY origin_seq').all(result.operationId!);
+    check(JSON.stringify(result.receiptIds) === JSON.stringify(receipts.map(event => event.receipt_id)), 'operation-evidence-gap');
+    return result;
   }
 
   registerCorrectionDelivery(activity: Activity, token: string) {
@@ -3252,23 +3391,24 @@ export class ProbeStore {
   }
 
   correctionDelivery(activity: Activity, token: string) {
-    return this.withActivity(activity, () => {
-      const presentation = this.readMemoryPresentation(activity, token);
-      const row = this.#db.prepare('SELECT * FROM host_operation_delivery WHERE operation_id=?').get(presentation.operationId!);
-      check(row, 'operation-delivery-missing');
-      const source = (field: 'approval' | 'model'): SourceAck | null => {
-        if (row[`${field}_source`] === null) return null;
-        const payload = String(row[`${field}_source`]);
-        check(sha256(payload) === row[`${field}_hash`], 'operation-delivery-evidence-gap');
-        const ref = JSON.parse(payload) as SourceAck;
-        check(sameBinding(ref.binding, this.#binding), 'operation-delivery-evidence-gap');
-        if (field === 'approval') this.#validateRawSource(ref);
-        else this.#archiveRef(ref);
-        return ref;
-      };
-      return { operationId: presentation.operationId!, summaryEventId: String(row.summary_event_id),
-        ownerDelivered: row.owner_ack === 1, approval: source('approval'), model: source('model') };
-    });
+    return this.withActivity(activity, () => this.#readCorrectionDelivery(this.readMemoryPresentation(activity, token)));
+  }
+
+  #readCorrectionDelivery(presentation: MemoryPresentation, binding: Binding = this.#binding) {
+    const row = this.#db.prepare('SELECT * FROM host_operation_delivery WHERE operation_id=?').get(presentation.operationId!);
+    check(row, 'operation-delivery-missing');
+    const source = (field: 'approval' | 'model'): SourceAck | null => {
+      if (row[`${field}_source`] === null) return null;
+      const payload = String(row[`${field}_source`]);
+      check(sha256(payload) === row[`${field}_hash`], 'operation-delivery-evidence-gap');
+      const ref = JSON.parse(payload) as SourceAck;
+      check(sameBinding(ref.binding, binding), 'operation-delivery-evidence-gap');
+      if (field === 'approval') this.#validateRawSource(ref, undefined, { kind: 'project', id: binding.projectId, resolved: true }, [binding.projectId], binding);
+      else this.#archiveRef(ref);
+      return ref;
+    };
+    return { operationId: presentation.operationId!, summaryEventId: String(row.summary_event_id),
+      ownerDelivered: row.owner_ack === 1, approval: source('approval'), model: source('model') };
   }
 
   recordCorrectionApproval(activity: Activity, token: string, input: SourceAck): void {
@@ -3338,12 +3478,16 @@ export class ProbeStore {
   }
 
   correctionModelSummaries(activity: Activity) {
-    return this.withActivity(activity, () => this.correctionDeliveries(activity).map(({ token, delivery }) => {
-      check(delivery.ownerDelivered && delivery.model, 'operation-presentation-recovery-required');
-      const summary = this.correctionSummary(activity, token);
-      check(this.#archiveRef(delivery.model).text === JSON.stringify(summary), 'operation-summary-mismatch');
-      return summary;
-    }));
+    return this.withActivity(activity, () => this.correctionDeliveries(activity).map(({ token, result, delivery }) =>
+      this.#readCorrectionModelSummary(this.readMemoryPresentation(activity, token), result, delivery)));
+  }
+
+  #readCorrectionModelSummary(presentation: MemoryPresentation, result: MemoryOperationResult,
+    delivery: { ownerDelivered: boolean; model: SourceAck | null }) {
+    check(delivery.ownerDelivered && delivery.model, 'operation-presentation-recovery-required');
+    const summary = memoryOperationSummary(presentation, result);
+    check(this.#archiveRef(delivery.model).text === JSON.stringify(summary), 'operation-summary-mismatch');
+    return summary;
   }
 
   correctionModelContext(activity: Activity, budget: Pick<ProbeBudget, 'contextLimit' | 'outputReserve' | 'safetyMargin'>, selection: 'bounded' | 'latest' = 'bounded') {
@@ -3449,16 +3593,22 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       uuid(receiptId);
       const row = this.#db.prepare('SELECT * FROM memory_events WHERE receipt_id=?').get(receiptId);
-      check(row && sha256(String(row.receipt_payload)) === row.receipt_hash, 'receipt-evidence-gap');
+      check(row, 'receipt-evidence-gap');
+      const receipt = this.#readOwnerReceipt(row);
       const record = this.#readMemoryUnsafe(String(row.record_id));
       this.#validateScope(record.scope);
-      const receipt = JSON.parse(String(row.receipt_payload)) as OwnerReceipt;
-      check(receipt.schema === 'owner-receipt@1' && receipt.receiptId === receiptId
-        && receipt.operationId === (row.operation_id ?? row.event_id) && receipt.kind === row.kind
-        && receipt.outcome === 'committed' && JSON.stringify(JSON.parse(String(row.payload)).ownerReceipt) === row.receipt_payload,
-      'receipt-evidence-gap');
       return receipt;
     });
+  }
+
+  #readOwnerReceipt(row: Record<string, unknown>): OwnerReceipt {
+    check(sha256(String(row.receipt_payload)) === row.receipt_hash, 'receipt-evidence-gap');
+    const receipt = JSON.parse(String(row.receipt_payload)) as OwnerReceipt;
+    check(receipt.schema === 'owner-receipt@1' && receipt.receiptId === row.receipt_id
+      && receipt.operationId === (row.operation_id ?? row.event_id) && receipt.kind === row.kind
+      && receipt.outcome === 'committed' && JSON.stringify(JSON.parse(String(row.payload)).ownerReceipt) === row.receipt_payload,
+    'receipt-evidence-gap');
+    return receipt;
   }
 
   /** One owner-facing receipt derived from the immutable, atomically committed member receipts. */
@@ -3508,12 +3658,8 @@ export class ProbeStore {
         ORDER BY j.rowid LIMIT ?`).all(this.#binding.ownerId, ...this.#scopeParameters(), limit);
       const receipts: SearchProjectionReceipt[] = [];
       for (const job of jobs) {
-        const payload = String(job.payload);
-        check(sha256(payload) === job.payload_hash, 'outbox-evidence-gap');
-        const manifest = JSON.parse(payload) as { schema: string; kind: string; events: unknown[] };
-        check(manifest.schema === 'memory-outbox@1' && manifest.kind === 'search' && manifest.events.length === 1, 'outbox-evidence-gap');
-        const event = manifest.events[0] as { eventId?: string; recordId?: string };
-        check(event.eventId === job.event_id && typeof event.recordId === 'string', 'outbox-evidence-gap');
+        this.#validateMemoryOutbox(job);
+        const event = JSON.parse(String(job.payload)).events[0] as { recordId: string };
         const record = this.#readMemoryHead(event.recordId);
         const generation = Number(job.projection_rowid);
         const exposure = memoryProjectionExposure(record);
@@ -3731,12 +3877,31 @@ export class ProbeStore {
       query: request.query, limit: request.limit ?? 10, byteBudget: request.byteBudget ?? 8192, cursor: request.cursor ?? null }));
   }
 
+  #sourceQueryDigest(row: Record<string, unknown>): string {
+    return sha256(JSON.stringify([row.grant_id, row.query_id, row.request_hash, row.page_hash, row.result_count, row.byte_length]));
+  }
+
+  #readSourceQueryReceipt(row: Record<string, unknown>): void {
+    check(this.#sourceQueryDigest(row) === row.receipt_hash, 'source-query-evidence-gap');
+  }
+
+  #sourceQueryReceipt(grantId: string, queryId: string) {
+    const row = this.#db.prepare('SELECT * FROM source_query_receipts WHERE grant_id=? AND query_id=?').get(grantId, queryId);
+    if (row) this.#readSourceQueryReceipt(row);
+    return row;
+  }
+
+  #recordSourceQueryReceipt(grantId: string, queryId: string, requestHash: string, pageHash: string, count: number, bytes: number): void {
+    const digest = this.#sourceQueryDigest({ grant_id: grantId, query_id: queryId, request_hash: requestHash,
+      page_hash: pageHash, result_count: count, byte_length: bytes });
+    this.#db.prepare('INSERT INTO source_query_receipts VALUES (?,?,?,?,?,?,?)').run(grantId, queryId, requestHash, pageHash, count, bytes, digest);
+  }
+
   assertSourceSearchResult(activity: Activity, request: SourceSearchRequest, page: SourceSearchPage): void {
     this.withActivity(activity, () => {
       check(request.grantId && request.queryId, 'source-query-id-required');
       const projects = this.#discoveryProjects(activity, request.grantId).projects;
-      const receipt = this.#db.prepare('SELECT request_hash,page_hash FROM source_query_receipts WHERE grant_id=? AND query_id=?')
-        .get(request.grantId, request.queryId);
+      const receipt = this.#sourceQueryReceipt(request.grantId, request.queryId);
       check(receipt && receipt.request_hash === this.#sourceSearchHash(request)
         && receipt.page_hash === sha256(JSON.stringify(page)), 'source-query-result-stale');
       // The frozen page describes its original query. Later budget consumption
@@ -3766,8 +3931,7 @@ export class ProbeStore {
         || (typeof request.grantId === 'string' && typeof request.queryId === 'string'), 'source-query-id-required');
       if (request.grantId) { uuid(request.grantId); uuid(request.queryId!); }
       const requestHash = this.#sourceSearchHash(request);
-      const receipt = request.grantId ? this.#db.prepare(`SELECT * FROM source_query_receipts WHERE grant_id=? AND query_id=?`)
-        .get(request.grantId, request.queryId!) : null;
+      const receipt = request.grantId ? this.#sourceQueryReceipt(request.grantId, request.queryId!) : null;
       check(!receipt || receipt.request_hash === requestHash, 'source-query-identity-conflict');
       let baseGrant: { projects: string[]; remaining: number; remainingBytes: number;
         remainingQueries: number; targets: Map<string, SearchTarget> } | null = null;
@@ -3802,8 +3966,7 @@ export class ProbeStore {
           WHERE grant_id=? AND state='active' AND used_queries<max_queries
             AND used_results+?<=max_results AND used_bytes+?<=max_bytes`)
           .run(count, bytes, request.grantId!, count, bytes).changes === 1, 'discovery-budget-stale');
-        this.#db.prepare('INSERT INTO source_query_receipts VALUES (?,?,?,?,?,?)')
-          .run(request.grantId!, request.queryId!, requestHash, hash, count, bytes);
+        this.#recordSourceQueryReceipt(request.grantId!, request.queryId!, requestHash, hash, count, bytes);
         return page;
       };
       const ids = projects.map(() => '?').join(',');
@@ -4131,19 +4294,39 @@ export class ProbeStore {
       WHERE owner_id=? AND ${this.#visibleScopeSql('projection_jobs')} ORDER BY rowid`)
       .all(this.#binding.ownerId, ...this.#scopeParameters())
       .map(row => {
-        check(sha256(String(row.payload)) === row.payload_hash, 'outbox-evidence-gap');
-        const manifest = JSON.parse(String(row.payload));
-        const event = this.#db.prepare('SELECT payload FROM memory_events WHERE event_id=?').get(String(row.event_id));
-        check(event && manifest.schema === 'memory-outbox@1' && manifest.kind === row.kind && manifest.batchId === row.batch_id,
-          'outbox-evidence-gap');
-        if (row.kind === 'host-info') {
-          const batch = this.#readActivationBatch(String(row.batch_id));
-          check(JSON.stringify(manifest.events) === JSON.stringify(JSON.parse(batch.payload).events)
-            && manifest.events[0].eventId === row.event_id, 'outbox-evidence-gap');
-        } else check(manifest.events.length === 1 && JSON.stringify(manifest.events[0]) === event.payload, 'outbox-evidence-gap');
+        this.#validateMemoryOutbox(row);
         return { jobId: String(row.job_id), kind: String(row.kind), eventId: String(row.event_id), batchId: row.batch_id,
           payload: String(row.payload), digest: String(row.payload_hash) };
       }));
+  }
+
+  #validateMemoryOutbox(row: Record<string, unknown>, projects: readonly string[] = [this.#binding.projectId]): ActivationBatch | null {
+    check(sha256(String(row.payload)) === row.payload_hash, 'outbox-evidence-gap');
+    const manifest = JSON.parse(String(row.payload));
+    const event = this.#db.prepare(`SELECT e.payload,e.payload_hash,e.batch_id,e.record_id,r.owner_id FROM memory_events e
+      JOIN memory_records r ON r.record_id=e.record_id WHERE e.event_id=?`).get(String(row.event_id));
+    check(event && sha256(String(event.payload)) === event.payload_hash && manifest.schema === 'memory-outbox@1'
+      && manifest.kind === row.kind && manifest.batchId === row.batch_id && row.batch_id === event.batch_id
+      && row.owner_id === event.owner_id, 'outbox-evidence-gap');
+    const memoryEvent = JSON.parse(String(event.payload));
+    check(memoryEvent.schema === 'memory-event@1' && memoryEvent.eventId === row.event_id
+      && memoryEvent.recordId === event.record_id, 'outbox-evidence-gap');
+    const scope = memoryEvent.after.scope as MemoryScope;
+    check(row.scope_kind === scope.kind && row.scope_id === scope.id, 'outbox-evidence-gap');
+    if (row.kind === 'host-info') {
+      const batch = this.#readActivationBatch(String(row.batch_id), projects);
+      check(JSON.stringify(manifest.events) === JSON.stringify(JSON.parse(batch.payload).events)
+        && batch.events[0]?.eventId === row.event_id, 'outbox-evidence-gap');
+      const info = this.#db.prepare('SELECT * FROM host_info_batches WHERE batch_id=?').get(batch.batchId);
+      if (info) {
+        check(info.job_id === row.job_id && info.owner_id === batch.ownerId, 'host-info-evidence-gap');
+        this.#assertHostInfoBatch(batch, { digest: String(info.digest), memberCount: Number(info.member_count),
+          scope: { kind: info.scope_kind as MemoryScopeKind, id: String(info.scope_id), resolved: true } });
+      }
+      return batch;
+    }
+    check(row.kind === 'search' && manifest.events.length === 1 && JSON.stringify(manifest.events[0]) === event.payload, 'outbox-evidence-gap');
+    return null;
   }
 
   readMemory(activity: Activity, recordId: string): MemoryRecord {
@@ -4283,15 +4466,12 @@ export class ProbeStore {
   }
 
   #recordMemoryFeedback(record: MemoryRecord, kind: string, evidence: unknown, identity: string): string {
-    const existing = this.#db.prepare('SELECT feedback_id,payload,payload_hash FROM feedback_events WHERE identity_hash=?').get(sha256(identity));
-    if (existing) {
-      check(sha256(String(existing.payload)) === existing.payload_hash, 'feedback-evidence-gap');
-      return String(existing.feedback_id);
-    }
+    const existing = this.#db.prepare('SELECT * FROM feedback_events WHERE identity_hash=?').get(sha256(identity));
+    if (existing) return this.#readFeedbackReceipt(existing).feedbackId;
     const id = randomUUID();
     const payload = JSON.stringify({ schema: 'memory-feedback-receipt@1', feedbackId: id, kind, recordId: record.recordId,
       revisionId: record.revisionId, headEventId: record.headEventId, evidence, observingProjectId: this.#binding.projectId,
-      sessionId: this.#binding.sessionId, observedAt: new Date().toISOString() });
+      sessionId: this.#binding.sessionId, observedAt: new Date().toISOString(), identity });
     this.#db.prepare('INSERT INTO feedback_events VALUES (?,?,?,?,?,?,?,?)')
       .run(id, record.recordId, record.headEventId, record.revisionId, kind, payload, sha256(payload), sha256(identity));
     return id;
@@ -4437,8 +4617,9 @@ export class ProbeStore {
         && value.recordId === recordId && value.revisionId === expected.revisionId
         && value.headEventId === expected.headEventId, 'invalid-memory-feedback');
       const identity = JSON.stringify(input);
-      const prior = this.#db.prepare('SELECT feedback_id,record_id FROM feedback_events WHERE identity_hash=?').get(sha256(identity));
+      const prior = this.#db.prepare('SELECT * FROM feedback_events WHERE identity_hash=?').get(sha256(identity));
       if (prior) {
+        this.#readFeedbackReceipt(prior);
         check(prior.record_id === recordId, 'feedback-identity-conflict');
         return { status: 'no_op', feedbackId: String(prior.feedback_id), record: this.#readMemoryUnsafe(recordId) };
       }
@@ -4458,18 +4639,22 @@ export class ProbeStore {
     });
   }
 
+  #readFeedbackReceipt(row: Record<string, unknown>) {
+    check(sha256(String(row.payload)) === row.payload_hash, 'feedback-evidence-gap');
+    const payload = JSON.parse(String(row.payload));
+    check(payload.schema === 'memory-feedback-receipt@1' && payload.feedbackId === row.feedback_id && payload.kind === row.kind
+      && typeof payload.identity === 'string' && sha256(payload.identity) === row.identity_hash
+      && payload.recordId === row.record_id && payload.revisionId === row.revision_id && payload.headEventId === row.head_event_id, 'feedback-evidence-gap');
+    return { feedbackId: String(row.feedback_id), kind: String(row.kind), revisionId: String(row.revision_id),
+      headEventId: String(row.head_event_id), evidence: payload.evidence as unknown, hash: String(row.payload_hash) };
+  }
+
   readMemoryFeedback(activity: Activity, recordId: string) {
     return this.withActivity(activity, () => {
       this.#readMemoryHead(recordId);
       const events = this.#db.prepare(`SELECT * FROM feedback_events WHERE record_id=?
-        AND json_extract(payload,'$.observingProjectId')=? ORDER BY rowid`).all(recordId, this.#binding.projectId).map(row => {
-        check(sha256(String(row.payload)) === row.payload_hash, 'feedback-evidence-gap');
-        const payload = JSON.parse(String(row.payload));
-        check(payload.schema === 'memory-feedback-receipt@1' && payload.feedbackId === row.feedback_id && payload.kind === row.kind
-          && payload.recordId === recordId && payload.revisionId === row.revision_id && payload.headEventId === row.head_event_id, 'feedback-evidence-gap');
-        return { feedbackId: String(row.feedback_id), kind: String(row.kind), revisionId: String(row.revision_id),
-          headEventId: String(row.head_event_id), evidence: payload.evidence as unknown, hash: String(row.payload_hash) };
-      });
+        AND json_extract(payload,'$.observingProjectId')=? ORDER BY rowid`).all(recordId, this.#binding.projectId)
+        .map(row => this.#readFeedbackReceipt(row));
       const runs = this.#db.prepare(`SELECT DISTINCT a.run_id FROM request_assemblies a JOIN request_runs r ON r.run_id=a.run_id
         JOIN execution_streams s ON s.stream_id=r.stream_id JOIN json_each(a.used_memories) u
         WHERE s.principal_id=? AND s.project_id=? AND json_extract(u.value,'$.recordId')=?`)
@@ -4789,12 +4974,7 @@ export class ProbeStore {
         WHERE j.kind='host-info' AND b.batch_id IS NULL AND j.owner_id=? AND ${this.#visibleScopeSql('j')}
         ORDER BY j.rowid LIMIT ?`).all(this.#binding.ownerId, ...this.#scopeParameters(), HOST_INFO_REGISTER_LIMIT + 1);
       for (const job of jobs.slice(0, HOST_INFO_REGISTER_LIMIT)) {
-        check(sha256(String(job.payload)) === job.payload_hash, 'outbox-evidence-gap');
-        const manifest = JSON.parse(String(job.payload)) as { schema: string; kind: string; batchId: string; events: unknown[] };
-        const batch = this.#readActivationBatch(String(job.batch_id));
-        check(manifest.schema === 'memory-outbox@1' && manifest.kind === 'host-info' && manifest.batchId === job.batch_id
-          && JSON.stringify(manifest.events) === JSON.stringify(JSON.parse(batch.payload).events)
-          && batch.events[0]?.eventId === job.event_id, 'outbox-evidence-gap');
+        const batch = this.#validateMemoryOutbox(job)!;
         this.#db.prepare(`INSERT INTO host_info_batches(batch_id,job_id,owner_id,scope_kind,scope_id,digest,member_count,delivery,read_state,registered_at)
           VALUES (?,?,?,?,?,?,?,'pending','unread',?)`).run(batch.batchId, String(job.job_id), this.#binding.ownerId,
           batch.scope.kind, batch.scope.id, batch.digest, batch.events.length, new Date().toISOString());
@@ -4812,7 +4992,7 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       const info = this.#hostInfoRow(batchId);
       const batch = this.#readActivationBatch(batchId);
-      check(batch.digest === info.digest && batch.events.length === info.memberCount, 'host-info-evidence-gap');
+      this.#assertHostInfoBatch(batch, info);
       const members = batch.events.map(event => {
         try {
           const current = this.#readMemoryUnsafe(event.recordId);
@@ -4890,7 +5070,12 @@ export class ProbeStore {
       deliveredAt: text(row.delivered_at), read: row.read_state as HostInfo['read'], readAt: text(row.read_at) };
   }
 
-  #readActivationBatch(batchId: string): ActivationBatch {
+  #assertHostInfoBatch(batch: ActivationBatch, info: Pick<HostInfo, 'digest' | 'memberCount' | 'scope'>): void {
+    check(batch.digest === info.digest && batch.events.length === info.memberCount
+      && batch.scope.kind === info.scope.kind && batch.scope.id === info.scope.id, 'host-info-evidence-gap');
+  }
+
+  #readActivationBatch(batchId: string, projects: readonly string[] = [this.#binding.projectId]): ActivationBatch {
     uuid(batchId);
     const row = this.#db.prepare('SELECT * FROM activation_batches WHERE batch_id=? AND owner_id=?').get(batchId, this.#binding.ownerId);
     check(row && sha256(String(row.payload)) === row.payload_hash, 'batch-evidence-gap');
@@ -4899,7 +5084,7 @@ export class ProbeStore {
     check(manifest.schema === 'activation-batch@1' && manifest.batchId === batchId && manifest.ownerId === row.owner_id
       && manifest.scope.kind === row.scope_kind && manifest.scope.id === row.scope_id && manifest.scope.resolved === true
       && events.length === row.member_count && events.length === manifest.events.length, 'batch-evidence-gap');
-    this.#validateScope(manifest.scope);
+    this.#validateScope(manifest.scope, projects);
     const members = events.map((event, ordinal) => {
       check(event.batch_ordinal === ordinal && (['activate','auto-revise'].includes(String(event.kind))
         || event.kind === 'rollback' && JSON.parse(String(event.payload)).automatic === true)
@@ -5087,7 +5272,7 @@ export class ProbeStore {
       const targetType = proposal.targetType ?? 'guidance';
       const risk = proposal.risk ?? 'low';
       check(['guidance','skill','code','policy'].includes(targetType) && ['low','high'].includes(risk), 'invalid-proposal');
-      const request = sha256(JSON.stringify({ input, proposal }));
+      const requestJson = JSON.stringify({ input, proposal }), request = sha256(requestJson);
       const existing = this.#db.prepare('SELECT proposal_id FROM evolution_proposals WHERE request_hash=?').get(request);
       if (existing) return this.readEvolutionProposal(activity, String(existing.proposal_id));
       const prior = proposal.supersedes ? this.readEvolutionProposal(activity, proposal.supersedes) : null;
@@ -5106,10 +5291,10 @@ export class ProbeStore {
         supersedes: proposal.supersedes ?? null, inert: true };
       const payload = JSON.stringify(value);
       const result = { ...value, hash: sha256(payload) };
-      this.#db.prepare('INSERT INTO evolution_proposals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      this.#db.prepare('INSERT INTO evolution_proposals VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
         .run(proposalId, version, proposal.target, proposal.expectedChange, proposal.owner, JSON.stringify(scope),
           JSON.stringify(proposal.evidenceRefs), JSON.stringify(evaluation), proposal.supersedes ?? null, payload, result.hash,
-          new Date().toISOString(), scope.kind, scope.id, 1, request, targetType, risk);
+          new Date().toISOString(), scope.kind, scope.id, 1, request, targetType, risk, requestJson);
       for (const [ordinal, ref] of [input, ...proposal.evidenceRefs].entries()) {
         this.#db.prepare('INSERT INTO proposal_evidence VALUES (?,?,?,?,?,?,?)')
           .run(proposalId, ordinal, ref.binding.sessionId, ref.eventId, ref.locator, ref.hash, ref.contentHash);
@@ -5129,6 +5314,12 @@ export class ProbeStore {
       .map(row => String(row.project_id));
   }
 
+  #proposalPublicationPayload(value: EvolutionProposalInput | Omit<EvolutionProposal, 'hash'>): string {
+    return JSON.stringify({ target: value.target, expectedChange: value.expectedChange,
+      owner: value.owner, scope: value.scope, evidenceRefs: value.evidenceRefs, sourceUnits: value.sourceUnits ?? [],
+      evaluation: value.evaluation, supersedes: value.supersedes ?? null, targetType: value.targetType ?? 'guidance', risk: value.risk ?? 'low' });
+  }
+
   #assertProposalPublication(input: SourceAck, proposal: EvolutionProposalInput | Omit<EvolutionProposal, 'hash'>): void {
     for (const ref of [input, ...proposal.evidenceRefs]) check(!parseAnalysisArtifact(this.#archiveRef(ref).text), 'report-evidence-requires-approved-unit');
     const approval = this.#archiveRef(input);
@@ -5139,13 +5330,10 @@ export class ProbeStore {
     check(decision && Object.keys(decision).sort().join(',') === 'proposal,schema'
       && decision.schema === 'analysis-proposal-approval@1' && decision.proposal && typeof decision.proposal === 'object'
       && !Array.isArray(decision.proposal), 'proposal-publication-approval-required');
-    const payload = (value: typeof proposal) => JSON.stringify({ target: value.target, expectedChange: value.expectedChange,
-      owner: value.owner, scope: value.scope, evidenceRefs: value.evidenceRefs, sourceUnits: value.sourceUnits ?? [],
-      evaluation: value.evaluation, supersedes: value.supersedes ?? null, targetType: value.targetType ?? 'guidance', risk: value.risk ?? 'low' });
-    check(payload(decision.proposal) === payload(proposal), 'proposal-publication-approval-mismatch');
+    check(this.#proposalPublicationPayload(decision.proposal) === this.#proposalPublicationPayload(proposal), 'proposal-publication-approval-mismatch');
   }
 
-  #proposalForProjects(proposalId: string, projects: readonly string[]): EvolutionProposal {
+  #proposalForProjects(proposalId: string, projects: readonly string[], binding: Binding = this.#binding): EvolutionProposal {
       uuid(proposalId);
       const row = this.#db.prepare('SELECT * FROM evolution_proposals WHERE proposal_id=? AND owner=?').get(proposalId, this.#binding.ownerId);
       check(row && (String(row.scope_kind) !== 'project' || projects.includes(String(row.scope_id))), 'source-scope-mismatch');
@@ -5158,10 +5346,14 @@ export class ProbeStore {
         && value.supersedes === row.supersedes && value.inert === true && value.targetType === row.target_type && value.risk === row.risk
         && JSON.stringify(value.scope) === row.scope_json && value.scope.kind === row.scope_kind && value.scope.id === row.scope_id
         && JSON.stringify(value.evaluation) === row.evaluation_json && JSON.stringify(value.evidenceRefs) === row.evidence_json, 'proposal-evidence-gap');
-      this.#validateScope(value.scope, projects);
+      check(sha256(String(row.request_json)) === row.request_hash, 'proposal-evidence-gap');
+      const request = JSON.parse(String(row.request_json)) as { input: SourceAck; proposal: EvolutionProposalInput };
+      check(JSON.stringify(request.input) === JSON.stringify(value.input)
+        && this.#proposalPublicationPayload(request.proposal) === this.#proposalPublicationPayload(value), 'proposal-evidence-gap');
+      this.#validateScope(value.scope, projects, binding);
       const refs = [value.input, ...value.evidenceRefs];
       this.#checkEvidenceRows('proposal_evidence', 'proposal_id', proposalId, refs);
-      for (const ref of refs) this.#validateRawSource(ref, undefined, value.scope, projects);
+      for (const ref of refs) this.#validateRawSource(ref, undefined, value.scope, projects, binding);
       const units = this.#db.prepare('SELECT ordinal,unit_id FROM proposal_source_units WHERE proposal_id=? ORDER BY ordinal').all(proposalId);
       check(Array.isArray(value.sourceUnits ?? []) && units.length === (value.sourceUnits?.length ?? 0)
         && units.every((row, i) => row.ordinal === i && row.unit_id === value.sourceUnits![i]), 'proposal-evidence-gap');
@@ -5233,12 +5425,11 @@ export class ProbeStore {
   }
   /** A later owner input already attached to an existing claim resolves to that claim on replay. */
   #corroboratedRecord(input: SourceAck): MemoryRecord | null {
-    const row = this.#db.prepare(`SELECT record_id,payload,payload_hash FROM provenance_refs WHERE owner_id=? AND source_event_id=?
+    const row = this.#db.prepare(`SELECT * FROM provenance_refs WHERE owner_id=? AND source_event_id=?
       AND json_extract(payload,'$.role')='corroboration' ORDER BY rowid LIMIT 1`).get(input.binding.sessionId, input.eventId);
     if (!row) return null;
-    const ref = JSON.parse(String(row.payload)) as { source: SourceAck };
-    check(sha256(String(row.payload)) === row.payload_hash && ref.source.hash === input.hash
-      && ref.source.contentHash === input.contentHash, 'capture-evidence-gap');
+    const source = this.#readProvenance(row, 'capture-evidence-gap');
+    check(source.hash === input.hash && source.contentHash === input.contentHash, 'capture-evidence-gap');
     return this.#readMemoryUnsafe(String(row.record_id));
   }
   #corroborate(record: MemoryRecord, range: SourceAck[]): void {
@@ -5272,14 +5463,22 @@ export class ProbeStore {
     }
     return runId;
   }
+  #readProvenance(row: Record<string, unknown>, reason = 'memory-evidence-gap'): SourceAck {
+    check(sha256(String(row.payload)) === row.payload_hash, reason);
+    const value = JSON.parse(String(row.payload)) as { schema: string; recordId: string; revisionId: string;
+      ownerKind: string; ownerId: string; source: SourceAck; role?: string };
+    check(value.schema === 'provenance-ref@1' && value.recordId === row.record_id && value.revisionId === row.revision_id
+      && value.ownerKind === 'session' && value.ownerKind === row.owner_kind && value.ownerId === row.owner_id
+      && value.ownerId === value.source.binding.sessionId && JSON.stringify(value.source) === row.source_json
+      && value.source.eventId === row.source_event_id && value.source.locator === row.locator && value.source.contentHash === row.content_hash
+      && (value.role === undefined || value.role === 'context' || value.role === 'corroboration'), reason);
+    return value.source;
+  }
   #memorySources(record: MemoryRecord): SourceAck[] {
     const sources: SourceAck[] = [record.source];
-    for (const row of this.#db.prepare('SELECT payload,payload_hash FROM provenance_refs WHERE record_id=? ORDER BY rowid')
-      .all(record.recordId)) {
-      check(sha256(String(row.payload)) === row.payload_hash, 'memory-evidence-gap');
-      const value = JSON.parse(String(row.payload)) as { recordId: string; source: SourceAck };
-      check(value.recordId === record.recordId, 'memory-evidence-gap');
-      if (!sources.some(source => sameSourceAck(source, value.source))) sources.push(value.source);
+    for (const row of this.#db.prepare('SELECT * FROM provenance_refs WHERE record_id=? ORDER BY rowid').all(record.recordId)) {
+      const source = this.#readProvenance(row);
+      if (!sources.some(existing => sameSourceAck(existing, source))) sources.push(source);
     }
     return sources;
   }
@@ -5352,8 +5551,7 @@ export class ProbeStore {
     if (request.grantId) uuid(request.queryId!);
     const requestHash = sha256(JSON.stringify({ operation: 'expand', sessionId: this.#binding.sessionId,
       grantId: request.grantId, unitId: request.unitId, offset: request.offset, limit: request.limit }));
-    const receipt = request.grantId ? this.#db.prepare('SELECT * FROM source_query_receipts WHERE grant_id=? AND query_id=?')
-      .get(request.grantId, request.queryId!) : null;
+    const receipt = request.grantId ? this.#sourceQueryReceipt(request.grantId, request.queryId!) : null;
     check(!receipt || receipt.request_hash === requestHash, 'source-query-identity-conflict');
     let grant: { projects: string[]; targets: Map<string, SearchTarget>; remaining: number; remainingBytes: number; remainingQueries: number } | null = null;
     try { grant = request.grantId ? this.#discoveryProjects(activity, request.grantId) : null; }
@@ -5406,8 +5604,7 @@ export class ProbeStore {
         check(this.#db.prepare(`UPDATE memory_discovery_grants SET used_queries=used_queries+1, used_results=used_results+1, used_bytes=used_bytes+?
           WHERE grant_id=? AND state='active' AND used_queries<max_queries AND used_results+1<=max_results AND used_bytes+?<=max_bytes`)
           .run(size, request.grantId!, size).changes === 1, 'discovery-budget-stale');
-        this.#db.prepare('INSERT INTO source_query_receipts VALUES (?,?,?,?,?,?)')
-          .run(request.grantId!, request.queryId!, requestHash, sha256(JSON.stringify(result)), 1, size);
+        this.#recordSourceQueryReceipt(request.grantId!, request.queryId!, requestHash, sha256(JSON.stringify(result)), 1, size);
       }
     }
     return result;
@@ -5434,18 +5631,19 @@ export class ProbeStore {
   }
 
   #validateSource(input: SourceAck, content?: string,
-    targetScope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true }, projects: readonly string[] = [this.#binding.projectId]): void {
+    targetScope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true }, projects: readonly string[] = [this.#binding.projectId],
+    binding: Binding = this.#binding): void {
     check(input?.schema === 'cli-source-ack@1' && input.status === 'durable'
-      && input.binding.ownerId === this.#binding.ownerId && input.binding.hostId === this.#binding.hostId, 'source-scope-mismatch');
-    this.#validateScope(targetScope, projects);
+      && input.binding.ownerId === binding.ownerId && input.binding.hostId === binding.hostId, 'source-scope-mismatch');
+    this.#validateScope(targetScope, projects, binding);
     check(this.#sourceAllowedForScope(input.binding, targetScope), 'source-scope-mismatch');
     this.#archiveRef(input);
     if (content !== undefined) {
       check(typeof content === 'string' && content.length > 0 && Buffer.byteLength(content) <= 65536, 'invalid-memory-content');
     }
   }
-  #validateRawSource(input: SourceAck, content?: string, targetScope?: MemoryScope, projects?: readonly string[]): void {
-    this.#validateSource(input, content, targetScope, projects);
+  #validateRawSource(input: SourceAck, content?: string, targetScope?: MemoryScope, projects?: readonly string[], binding: Binding = this.#binding): void {
+    this.#validateSource(input, content, targetScope, projects, binding);
     check(!this.#isCaptureOutput(input), 'source-derived');
     this.#analysisReferences(this.#archiveRef(input).text);
   }
@@ -5458,17 +5656,17 @@ export class ProbeStore {
       WHERE m.workspace_id=? AND m.project_id=? AND w.owner_id=?`).get(scope.id, binding.projectId, this.#binding.ownerId));
   }
 
-  #validateScope(scope: MemoryScope, projects: readonly string[] = [this.#binding.projectId]): MemoryScope {
+  #validateScope(scope: MemoryScope, projects: readonly string[] = [this.#binding.projectId], binding: Binding = this.#binding): MemoryScope {
     check(scope && ['project', 'workspace', 'personal', 'session'].includes(scope.kind) && typeof scope.id === 'string', 'invalid-memory-scope');
     uuid(scope.id);
     check(Object.keys(scope).every(key => ['kind','id','resolved'].includes(key)) && typeof scope.resolved === 'boolean', 'invalid-memory-scope');
     if (scope.kind === 'project') check(projects.includes(scope.id) && scope.resolved, 'invalid-memory-scope');
-    if (scope.kind === 'personal') check(scope.id === this.#binding.ownerId && scope.resolved, 'invalid-memory-scope');
-    if (scope.kind === 'session') check(scope.id === this.#binding.sessionId && !scope.resolved, 'invalid-memory-scope');
+    if (scope.kind === 'personal') check(scope.id === binding.ownerId && scope.resolved, 'invalid-memory-scope');
+    if (scope.kind === 'session') check(scope.id === binding.sessionId && !scope.resolved, 'invalid-memory-scope');
     if (scope.kind === 'workspace') {
       check(scope.resolved && this.#db.prepare(`SELECT 1 FROM workspace_projects m JOIN workspaces w ON w.workspace_id=m.workspace_id
         WHERE m.workspace_id=? AND m.project_id IN (${projects.map(() => '?').join(',')}) AND w.owner_id=?`)
-        .get(scope.id, ...projects, this.#binding.ownerId), 'workspace-unavailable');
+        .get(scope.id, ...projects, binding.ownerId), 'workspace-unavailable');
     }
     return structuredClone(scope);
   }
@@ -5497,25 +5695,28 @@ export class ProbeStore {
     try {
       this.#validateRawSource(record.source, undefined, record.scope, projects);
       this.#checkVerification(record, true, projects, sourceChecks);
-      for (const row of this.#db.prepare('SELECT payload,payload_hash FROM provenance_refs WHERE record_id=? AND revision_id=?')
+      for (const row of this.#db.prepare('SELECT * FROM provenance_refs WHERE record_id=? AND revision_id=?')
         .all(record.recordId, record.revisionId)) {
-        check(sha256(String(row.payload)) === row.payload_hash, 'memory-evidence-gap');
-        this.#validateRawSource(JSON.parse(String(row.payload)).source as SourceAck, undefined, record.scope, projects);
+        this.#validateRawSource(this.#readProvenance(row), undefined, record.scope, projects);
       }
       sourceChecks.set(key, 'checked');
     } finally {
       if (sourceChecks.get(key) === 'checking') sourceChecks.delete(key);
     }
   }
+  #verificationEvidence(row: Record<string, unknown>, reason = 'verification-evidence-gap'): SourceAck[] {
+    check(sha256(String(row.evidence_json)) === row.evidence_hash, reason);
+    const evidence = JSON.parse(String(row.evidence_json)) as SourceAck[];
+    this.#checkEvidenceRows('verification_evidence', 'run_id', String(row.run_id), evidence);
+    return evidence;
+  }
   #checkVerification(record: MemoryRecord, readSources = false, projects: readonly string[] = [this.#binding.projectId],
     sourceChecks?: MemorySourceCheck): void {
     if (!record.verificationRunId) { check(!['verified','conflicted'].includes(record.verification), 'verification-evidence-gap'); return; }
     const row = this.#db.prepare('SELECT * FROM verification_runs WHERE run_id=?').get(record.verificationRunId);
     check(row && row.record_id === record.recordId && row.revision_id === record.revisionId
-      && sha256(String(row.evidence_json)) === row.evidence_hash
       && (!['verified','conflicted'].includes(record.verification) || row.result === 'pass'), 'verification-evidence-gap');
-    const evidence = JSON.parse(String(row.evidence_json)) as SourceAck[];
-    this.#checkEvidenceRows('verification_evidence', 'run_id', record.verificationRunId, evidence);
+    const evidence = this.#verificationEvidence(row);
     if (readSources) {
       const event = this.#db.prepare(`SELECT payload,payload_hash FROM memory_events WHERE record_id=? AND kind='verify'
         AND json_extract(payload,'$.runId')=?`).get(record.recordId, record.verificationRunId);
@@ -5550,9 +5751,8 @@ export class ProbeStore {
         checked.add(verdict.runId);
         const proof = this.#db.prepare('SELECT * FROM verification_runs WHERE run_id=?').get(verdict.runId);
         check(proof && proof.record_id === final.record_id && proof.revision_id === state.candidate.revisionId
-          && proof.result === 'pass' && sha256(String(proof.evidence_json)) === proof.evidence_hash
-          && proof.evidence_json === JSON.stringify(verdict.evidence), 'comparison-evidence-gap');
-        this.#checkEvidenceRows('verification_evidence', 'run_id', verdict.runId, verdict.evidence);
+          && proof.result === 'pass' && proof.evidence_json === JSON.stringify(verdict.evidence), 'comparison-evidence-gap');
+        this.#verificationEvidence(proof, 'comparison-evidence-gap');
         if (readSources) {
           for (const ref of verdict.evidence as SourceAck[])
             this.#validateVerificationSource(ref, record.scope, verdict.sourceUnits ?? [], projects);
@@ -5648,6 +5848,11 @@ export class ProbeStore {
     return record;
   }
   #readMemoryHead(recordId: string, projects: readonly string[] = [this.#binding.projectId]): MemoryRecord {
+    const record = this.#replayMemoryHead(recordId);
+    this.#validateScope(record.scope, projects);
+    return record;
+  }
+  #replayMemoryHead(recordId: string): MemoryRecord {
     const row = this.#db.prepare('SELECT * FROM memory_heads WHERE record_id=?').get(recordId);
     check(row, 'memory-evidence-gap');
     const record = this.#replayMemory(recordId);
@@ -5657,7 +5862,6 @@ export class ProbeStore {
       && record.scope.resolved === Boolean(row.scope_resolved) && record.conflictSetId === row.conflict_set_id
       && record.verificationRunId === row.verification_run_id
       && record.headEventId === row.head_event_id, 'memory-evidence-gap');
-    this.#validateScope(record.scope, projects);
     return record;
   }
   #assertMemoryExpected(recordId: string, expected: MemoryRecord): MemoryRecord {
@@ -5760,6 +5964,580 @@ export class ProbeStore {
         after.headEventId, afterSnapshot, sha256(afterSnapshot), after.conflictSetId, after.verificationRunId);
   }
 
+  snapshotSources(activity: Activity): { binding: Binding; source: BoundFile }[] {
+    return this.withActivity(activity, () => this.#db.prepare('SELECT * FROM sessions WHERE store_id=? ORDER BY session_id').all(this.#storeId)
+      .map(row => ({ binding: { ownerId: String(row.owner_id), hostId: String(row.host_id), projectId: String(row.project_id),
+        sessionId: String(row.session_id), branchId: String(row.branch_id) },
+      source: { path: String(row.source_path), identity: { dev: String(row.source_dev), ino: String(row.source_ino) } } })));
+  }
+
+  #checkStoreIntegrity(): 'healthy' | 'projection-failed' {
+    const sqliteHealth = checkSqliteSnapshot(this.#db, 'canonical');
+    this.#recoveryReceipts();
+    for (const row of this.#db.prepare('SELECT * FROM store_snapshots').all()) this.#snapshotManifest(row);
+    for (const row of this.#db.prepare('SELECT * FROM source_query_receipts').all()) this.#readSourceQueryReceipt(row);
+    const checked = new Set<string>();
+    const sources = (value: unknown): void => {
+      if (!value || typeof value !== 'object') return;
+      if ((value as { schema?: string }).schema === 'cli-source-ack@1') {
+        const key = JSON.stringify(value);
+        if (!checked.has(key)) { this.#archiveRef(value as SourceAck); checked.add(key); }
+      } else for (const child of Object.values(value)) sources(child);
+    };
+    for (const [table, column] of [
+      ['intent_events','snapshot'], ['request_events','payload'], ['request_assemblies','sources'],
+      ['memory_events','payload'], ['memory_revisions','source_json'], ['verification_runs','evidence_json'],
+      ['capture_jobs','payload'], ['capture_work','searched_refs'], ['capture_work','expanded_refs'],
+      ['compartments','source_json'], ['source_units','payload'], ['evolution_proposals','payload'],
+      ['feedback_events','payload'], ['activation_batches','payload'], ['host_presentations','payload'],
+    ]) for (const row of this.#db.prepare(`SELECT ${column} AS value FROM ${table}`).all()) sources(JSON.parse(String(row.value)));
+    for (const row of this.#db.prepare('SELECT unit_id FROM source_units').all()) this.#sourceUnit(String(row.unit_id));
+    const projects = this.#registeredProjects();
+    for (const row of this.#db.prepare('SELECT project_id FROM projects').all()) this.#projectMembership(String(row.project_id));
+    for (const row of this.#db.prepare('SELECT * FROM projection_jobs').all()) this.#validateMemoryOutbox(row, projects);
+    check(!this.#db.prepare(`SELECT 1 FROM activation_batches b WHERE NOT EXISTS
+      (SELECT 1 FROM projection_jobs j WHERE j.kind='host-info' AND j.batch_id=b.batch_id) LIMIT 1`).get(), 'outbox-evidence-gap');
+    for (const row of this.#db.prepare('SELECT proposal_id,payload FROM evolution_proposals').all()) {
+      const binding = (JSON.parse(String(row.payload)).input as SourceAck).binding;
+      this.sessionSource(binding);
+      this.#proposalForProjects(String(row.proposal_id), projects, binding);
+    }
+    for (const row of this.#db.prepare('SELECT job_id,payload FROM capture_jobs').all()) {
+      const binding = (JSON.parse(String(row.payload)).source as SourceAck).binding;
+      this.sessionSource(binding);
+      this.#readCaptureJobMetadata(String(row.job_id), binding);
+      if (this.#db.prepare('SELECT 1 FROM compartments WHERE job_id=?').get(row.job_id!)) this.#readCompartment(String(row.job_id), binding);
+    }
+    for (const row of this.#db.prepare('SELECT job_id,run_id,comparison_event_id FROM capture_work').all()) {
+      if (row.run_id) {
+        const stream = this.#db.prepare("SELECT stream_id FROM execution_streams WHERE owner_kind='job' AND owner_id=?").get(row.job_id!);
+        check(stream, 'request-scope-mismatch');
+        this.#requestRun({ streamId: String(stream.stream_id) }, String(row.run_id));
+      }
+      if (row.comparison_event_id) this.#memoryComparisonState(String(row.job_id));
+    }
+    for (const row of this.#db.prepare('SELECT stream_id FROM execution_streams').all()) {
+      this.#readStream(String(row.stream_id));
+      const events = this.#db.prepare('SELECT seq FROM execution_events WHERE stream_id=? ORDER BY seq').all(row.stream_id!);
+      check(events.every((event, index) => event.seq === index + 1), 'stream-evidence-gap');
+    }
+    for (const row of this.#db.prepare('SELECT run_id,stream_id FROM request_runs').all()) {
+      this.#readRequestLedger(this.#requestRun({ streamId: String(row.stream_id) }, String(row.run_id)));
+    }
+    for (const row of this.#db.prepare('SELECT record_id FROM memory_records').all()) this.#replayMemoryHead(String(row.record_id));
+    for (const row of this.#db.prepare('SELECT * FROM provenance_refs').all()) sources(this.#readProvenance(row));
+    for (const row of this.#db.prepare('SELECT * FROM verification_runs').all()) this.#verificationEvidence(row);
+    for (const row of this.#db.prepare("SELECT after_snapshot FROM memory_events WHERE kind='comparison'").all())
+      this.#checkComparisonEvidence(this.#parseMemorySnapshot(String(row.after_snapshot)), projects, false);
+    for (const row of this.#db.prepare('SELECT * FROM feedback_events').all()) this.#readFeedbackReceipt(row);
+    for (const row of this.#db.prepare('SELECT * FROM memory_events WHERE receipt_id IS NOT NULL').all()) this.#readOwnerReceipt(row);
+    for (const session of this.#db.prepare('SELECT * FROM sessions').all()) {
+      const binding: Binding = { ownerId: String(session.owner_id), hostId: String(session.host_id), projectId: String(session.project_id),
+        sessionId: String(session.session_id), branchId: String(session.branch_id) };
+      for (const row of this.#db.prepare('SELECT token FROM host_presentations WHERE session_id=?').all(binding.sessionId))
+        this.#readMemoryPresentation(String(row.token), binding);
+      for (const row of this.#db.prepare(`SELECT o.*,p.token FROM pending_operations o
+        JOIN host_presentations p ON p.presentation_id=o.presentation_id WHERE o.session_id=?`).all(binding.sessionId)) {
+        const presentation = this.#readMemoryPresentation(String(row.token), binding);
+        const result = this.#readMemoryOperation(row, presentation);
+        if (this.#db.prepare('SELECT 1 FROM host_operation_delivery WHERE operation_id=?').get(presentation.operationId!)) {
+          const delivery = this.#readCorrectionDelivery(presentation, binding);
+          if (delivery.model) this.#readCorrectionModelSummary(presentation, result, delivery);
+        }
+      }
+      for (const grant of this.#db.prepare('SELECT * FROM memory_discovery_grants WHERE session_id=?').all(binding.sessionId)) {
+        const intent = this.#db.prepare('SELECT * FROM intent_events WHERE session_id=? AND intent_id=? ORDER BY version LIMIT 1')
+          .get(binding.sessionId, grant.intent_id!);
+        check(intent, 'discovery-not-authorized');
+        this.#readDiscoveryGrant(grant, this.#readIntentSnapshot(intent, binding));
+      }
+      const latest = this.#replayIntent(binding);
+      const head = this.#db.prepare('SELECT event_id FROM intent_heads WHERE session_id=? AND branch_id=?').get(binding.sessionId, binding.branchId);
+      check((head?.event_id ?? null) === (latest?.eventId ?? null), 'intent-evidence-gap');
+    }
+    return sqliteHealth;
+  }
+
+  auditStore(activity: Activity): void {
+    const result = this.withActivity(activity, () => {
+      try { return { health: this.#checkStoreIntegrity(), failure: null }; }
+      catch (failure) { return { health: null, failure }; }
+    });
+    if (result.health === null) {
+      this.#transaction(() => this.#db.prepare("UPDATE owner_fences SET health='failed' WHERE store_id=?").run(this.#storeId));
+      throw result.failure;
+    }
+    check(result.health === 'healthy', 'projection-integrity-failed');
+  }
+
+  #snapshotManifest(row: Record<string, unknown>) {
+    check(sha256(String(row.manifest)) === row.digest, 'snapshot-manifest-mismatch');
+    const saved = JSON.parse(String(row.manifest)) as StoreSnapshot | { id: string; state: 'staging'; files: SnapshotFile[];
+      directory: { path: string; identity: BoundFile['identity'] | null } };
+    check(saved.id === row.snapshot_id && saved.directory.path === row.directory
+      && saved.directory.path === join(this.#resources.root.path, `backup-${String(row.snapshot_id)}`), 'snapshot-store-mismatch');
+    const identity = row.dev === null ? null : { dev: String(row.dev), ino: String(row.ino) };
+    check(JSON.stringify(saved.directory.identity) === JSON.stringify(identity), 'snapshot-store-mismatch');
+    if (saved.state === 'ready') {
+      check(saved.schema === 'store-snapshot@1' && saved.storeId === this.#storeId && saved.kind === row.kind
+        && saved.createdAt === row.created_at && saved.day === row.day
+        && JSON.stringify(saved.root) === JSON.stringify(this.#resources.root), 'snapshot-store-mismatch');
+    } else check(saved.state === 'staging' && (row.state === 'staging' || row.state === 'deleted'), 'snapshot-store-mismatch');
+    return saved;
+  }
+
+  listSnapshots(activity: Activity): StoreSnapshot[] {
+    return this.withActivity(activity, () => this.#db.prepare("SELECT * FROM store_snapshots WHERE state='ready' ORDER BY created_at,snapshot_id").all()
+      .map(row => {
+        const snapshot = this.#snapshotManifest(row);
+        check(snapshot.state === 'ready', 'snapshot-manifest-mismatch');
+        verifySnapshot(snapshot);
+        return snapshot;
+      }));
+  }
+
+  #dailySnapshotTaken(day: string): boolean {
+    return !!this.#db.prepare(`SELECT 1 FROM store_snapshots WHERE kind='daily' AND day=?
+      AND state IN ('ready','retired','deleted') AND json_extract(manifest,'$.state')='ready'`).get(day);
+  }
+
+  async createSnapshot(activity: Activity, host: { files: { file: BoundFile; role: 'owner-info' | 'receiver' }[]; validate: () => void },
+    kind: StoreSnapshot['kind'] = 'daily'): Promise<{ status: 'created' | 'unchanged' | 'daily-limit'; snapshot: StoreSnapshot | null }> {
+    this.auditStore(activity);
+    const createdAt = new Date().toISOString(), day = createdAt.slice(0, 10);
+    const prepared = this.withActivity(activity, () => {
+      if (kind === 'daily' && this.#dailySnapshotTaken(day)) {
+        return { skipped: 'daily-limit' as const };
+      }
+      check(['daily','migration'].includes(kind), 'invalid-snapshot-kind');
+      check(this.#checkStoreIntegrity() === 'healthy', 'projection-integrity-failed');
+      host.validate();
+      check(host.files.length === 2 && new Set(host.files.map(item => item.role)).size === 2
+        && host.files.every(item => item.file.path === join(this.#resources.root.path,
+          item.role === 'receiver' ? 'counting-receiver.jsonl' : 'owner-info.jsonl')), 'snapshot-host-carriers-required');
+      const inventory: { file: BoundFile; role: SnapshotFile['role'] }[] = [
+        ...this.snapshotSources(activity).map(item => ({ file: item.source, role: 'source' as const })), ...host.files,
+      ];
+      for (const file of this.#controlledFiles().filter(file => file.started && file.state !== 'no_effect')) {
+        check(file.state === 'recorded' && file.identity, 'file-cleanup-evidence-gap');
+        sameFile(file.root.path, file.root.identity); sameFile(file.parent.path, file.parent.identity);
+        if (!inventory.some(item => item.file.path === file.path)) inventory.push({ file: { path: file.path, identity: file.identity }, role: 'project-output' });
+      }
+      const contents = inventory.map(item => snapshotBytes(item.file));
+      const files = inventory.map((item, index): SnapshotFile => ({ source: item.file, role: item.role, name: `carrier-${index}`,
+        hash: sha256(contents[index]!), bytes: contents[index]!.length }));
+      const reader = new DatabaseSync(this.#resources.store.path, { readOnly: true });
+      try {
+        reader.exec('BEGIN');
+        const dataHash = snapshotDataHash(reader, files);
+        const last = this.#db.prepare("SELECT manifest FROM store_snapshots WHERE kind='daily' AND state='ready' ORDER BY created_at DESC LIMIT 1").get();
+        if (kind === 'daily' && last && (JSON.parse(String(last.manifest)) as StoreSnapshot).dataHash === dataHash) {
+          reader.close(); return { skipped: 'unchanged' as const };
+        }
+        const id = randomUUID(), path = join(this.#resources.root.path, `backup-${id}`);
+        const draft = JSON.stringify({ id, directory: { path, identity: null }, files, state: 'staging' });
+        this.#db.prepare("INSERT INTO store_snapshots VALUES (?,?,?,?,?,NULL,NULL,'staging',?,?,?,NULL,NULL)")
+          .run(id, kind, day, createdAt, path, draft, sha256(draft), activity.id);
+        return { reader, id, files, contents, dataHash };
+      } catch (error) { reader.close(); throw error; }
+    });
+    if (prepared.skipped) return { status: prepared.skipped, snapshot: null };
+    let directory: BoundFile;
+    try {
+      directory = this.withActivity(activity, () => this.#bindSnapshotDirectory(
+        this.#db.prepare('SELECT * FROM store_snapshots WHERE snapshot_id=?').get(prepared.id)!));
+      this.withActivity(activity, () => {
+        sameFile(directory.path, directory.identity);
+        for (const [index, file] of prepared.files.entries()) writeSnapshotFile(join(directory.path, file.name), prepared.contents[index]!);
+        syncSnapshotDirectory(directory.path);
+      });
+      await backup(prepared.reader, join(directory.path, 'store.sqlite'));
+    } finally { prepared.reader.close(); }
+    const result = this.withActivity(activity, () => {
+      if (kind === 'daily' && this.#dailySnapshotTaken(day)) {
+        const cleanup = this.#snapshotCleanupManifest(prepared.id);
+        this.#recordSnapshotCleanup(cleanup);
+        return { status: 'daily-limit' as const, snapshot: null, cleanup };
+      }
+      sameFile(directory.path, directory.identity);
+      const path = join(directory.path, 'store.sqlite');
+      const snapshotDb = new DatabaseSync(path);
+      try { checkSqliteSnapshot(snapshotDb); snapshotDb.exec('PRAGMA journal_mode=DELETE'); }
+      finally { snapshotDb.close(); }
+      syncSnapshotFile(path);
+      const bytes = readFileSync(path);
+      const snapshot: StoreSnapshot = { schema: 'store-snapshot@1', id: prepared.id, kind, createdAt, day, storeId: this.#storeId,
+        root: structuredClone(this.#resources.root), directory, files: prepared.files, dataHash: prepared.dataHash,
+        database: { hash: sha256(bytes), bytes: bytes.length }, state: 'ready' };
+      writeSnapshotFile(join(directory.path, 'manifest.json'), JSON.stringify(snapshot) + '\n');
+      syncSnapshotDirectory(directory.path); syncSnapshotDirectory(this.#resources.root.path);
+      verifySnapshot(snapshot);
+      const manifest = JSON.stringify(snapshot);
+      this.#db.prepare("UPDATE store_snapshots SET state='ready',manifest=?,digest=? WHERE snapshot_id=? AND state='staging'")
+        .run(manifest, sha256(manifest), snapshot.id);
+      if (kind === 'daily') this.#db.prepare(`UPDATE store_snapshots SET state='retired' WHERE kind='daily' AND state='ready'
+        AND snapshot_id NOT IN (SELECT snapshot_id FROM store_snapshots WHERE kind='daily' AND state='ready' ORDER BY created_at DESC,snapshot_id DESC LIMIT 2)`).run();
+      return { status: 'created' as const, snapshot, cleanup: null };
+    });
+    this.withActivity(activity, () => {
+      if (result.cleanup) this.#completeSnapshotCleanup(result.cleanup);
+      for (const row of this.#db.prepare("SELECT * FROM store_snapshots WHERE state='retired'").all()) {
+        const snapshot = this.#snapshotManifest(row);
+        check(snapshot.state === 'ready', 'snapshot-manifest-mismatch');
+        deleteSnapshot(snapshot);
+        this.#db.prepare("UPDATE store_snapshots SET state='deleted' WHERE snapshot_id=? AND state='retired'").run(row.snapshot_id!);
+      }
+    });
+    return { status: result.status, snapshot: result.snapshot };
+  }
+
+  #bindSnapshotDirectory(row: Record<string, unknown>): BoundFile {
+    const path = String(row.directory);
+    const saved = this.#snapshotManifest(row);
+    if (row.dev !== null) {
+      const directory = { path, identity: { dev: String(row.dev), ino: String(row.ino) } };
+      check(JSON.stringify(saved.directory) === JSON.stringify(directory), 'snapshot-store-mismatch');
+      sameFile(path, directory.identity); return directory;
+    }
+    check(row.state === 'staging' && row.ino === null && saved.directory.identity === null, 'snapshot-store-mismatch');
+    if (!existsSync(path)) mkdirSync(path, { mode: 0o700 });
+    check(lstatSync(path).isDirectory(), 'snapshot-inventory-mismatch');
+    const directory = { path, identity: fileIdentity(path) };
+    this.#snapshotFiles(row);
+    syncSnapshotDirectory(this.#resources.root.path);
+    const manifest = JSON.stringify({ ...saved, directory });
+    this.#db.prepare('UPDATE store_snapshots SET dev=?,ino=?,manifest=?,digest=? WHERE snapshot_id=?')
+      .run(directory.identity.dev, directory.identity.ino, manifest, sha256(manifest), String(row.snapshot_id));
+    return directory;
+  }
+
+  #snapshotFiles(row: Record<string, unknown>): SnapshotCleanupManifest['files'] {
+    const saved = this.#snapshotManifest(row);
+    const path = String(row.directory);
+    const unbound = row.state === 'staging' && row.dev === null && row.ino === null && saved.directory.identity === null;
+    const directory = { path, identity: unbound ? fileIdentity(path) : { dev: String(row.dev), ino: String(row.ino) } };
+    check(unbound || JSON.stringify(saved.directory) === JSON.stringify(directory), 'snapshot-store-mismatch');
+    return inspectSnapshotFiles(directory, ['manifest.json','store.sqlite','store.sqlite-wal','store.sqlite-shm','store.sqlite-journal', ...saved.files.map(file => file.name)]);
+  }
+
+  #snapshotCleanupManifest(snapshotId: string): SnapshotCleanupManifest {
+    const row = this.#db.prepare("SELECT * FROM store_snapshots WHERE snapshot_id=? AND state!='deleted'").get(snapshotId);
+    check(row, 'snapshot-not-found');
+    if (row.cleanup) {
+      check(sha256(String(row.cleanup)) === row.cleanup_digest, 'snapshot-cleanup-evidence-gap');
+      return JSON.parse(String(row.cleanup)) as SnapshotCleanupManifest;
+    }
+    const directory = this.#bindSnapshotDirectory(row);
+    const bound = this.#db.prepare('SELECT * FROM store_snapshots WHERE snapshot_id=?').get(snapshotId)!;
+    const value = { schema: 'snapshot-cleanup@1' as const, snapshotId, directory, files: this.#snapshotFiles(bound) };
+    return { ...value, digest: sha256(JSON.stringify(value)) };
+  }
+
+  #recordSnapshotCleanup(manifest: SnapshotCleanupManifest): void {
+    const payload = JSON.stringify(manifest);
+    this.#db.prepare("UPDATE store_snapshots SET state=CASE WHEN state='staging' THEN state ELSE 'retired' END,cleanup=?,cleanup_digest=? WHERE snapshot_id=?")
+      .run(payload, sha256(payload), manifest.snapshotId);
+  }
+
+  #completeSnapshotCleanup(manifest: SnapshotCleanupManifest): void {
+    removeSnapshotFiles(manifest); syncSnapshotDirectory(this.#resources.root.path);
+    this.#db.prepare("UPDATE store_snapshots SET state='deleted',cleanup=NULL,cleanup_digest=NULL WHERE snapshot_id=?").run(manifest.snapshotId);
+  }
+
+  snapshotCleanupManifest(coordinator: string, snapshotId: string): SnapshotCleanupManifest {
+    return this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      return this.#snapshotCleanupManifest(snapshotId);
+    });
+  }
+
+  discardSnapshot(coordinator: string, manifest: SnapshotCleanupManifest): void {
+    check(!manifest.recoveryId, 'snapshot-cleanup-kind-mismatch');
+    const settled = this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state IN ('preparing','prepared')").get(), 'snapshot-recovery-in-progress');
+      const row = this.#db.prepare('SELECT * FROM store_snapshots WHERE snapshot_id=?').get(manifest.snapshotId);
+      check(row, 'snapshot-not-found');
+      if (row.state === 'deleted') return true;
+      const current = this.snapshotCleanupManifest(coordinator, manifest.snapshotId);
+      check(JSON.stringify(manifest) === JSON.stringify(current), 'snapshot-cleanup-stale');
+      if (!row.cleanup) sameFile(manifest.directory.path, manifest.directory.identity);
+      this.#recordSnapshotCleanup(manifest);
+      return false;
+    });
+    if (settled) return;
+    this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      this.#completeSnapshotCleanup(manifest);
+    });
+  }
+
+  recoveryCleanupManifest(coordinator: string, operationId: string): SnapshotCleanupManifest {
+    return this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      const row = this.#db.prepare("SELECT * FROM store_restores WHERE operation_id=? AND state IN ('preparing','complete') AND original_deleted=0").get(operationId);
+      check(row, 'recovery-original-unavailable');
+      if (row.cleanup) {
+        check(sha256(String(row.cleanup)) === row.cleanup_digest, 'snapshot-cleanup-evidence-gap');
+        return JSON.parse(String(row.cleanup)) as SnapshotCleanupManifest;
+      }
+      const plan = row.state === 'preparing' ? this.#bindRecoveryPreparation(coordinator, row) : this.#readRecoveryPlan(row);
+      check(plan.original.identity, 'snapshot-recovery-evidence-gap');
+      const directory = { path: plan.original.path, identity: plan.original.identity };
+      const files = inspectSnapshotFiles(directory, recoveryFileNames(plan));
+      const value = { schema: 'snapshot-cleanup@1' as const, snapshotId: plan.snapshot.id, recoveryId: operationId, directory, files };
+      return { ...value, digest: sha256(JSON.stringify(value)) };
+    });
+  }
+
+  discardRecoveryOriginal(coordinator: string, manifest: SnapshotCleanupManifest): void {
+    check(manifest.recoveryId, 'snapshot-cleanup-kind-mismatch');
+    const settled = this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state='prepared' OR (state='preparing' AND operation_id!=?)")
+        .get(manifest.recoveryId!), 'snapshot-recovery-in-progress');
+      const row = this.#db.prepare("SELECT * FROM store_restores WHERE operation_id=? AND state IN ('preparing','complete','cancelled')").get(manifest.recoveryId!);
+      check(row, 'recovery-original-unavailable');
+      if (row.original_deleted === 1) return true;
+      check(JSON.stringify(this.recoveryCleanupManifest(coordinator, manifest.recoveryId!)) === JSON.stringify(manifest), 'snapshot-cleanup-stale');
+      if (!row.cleanup) sameFile(manifest.directory.path, manifest.directory.identity);
+      const payload = JSON.stringify(manifest);
+      this.#db.prepare('UPDATE store_restores SET cleanup=?,cleanup_digest=? WHERE operation_id=?')
+        .run(payload, sha256(payload), manifest.recoveryId!);
+      return false;
+    });
+    if (settled) return;
+    this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      removeSnapshotFiles(manifest); syncSnapshotDirectory(this.#resources.root.path);
+      this.#db.prepare(`UPDATE store_restores SET original_deleted=1,cleanup=NULL,cleanup_digest=NULL,
+        state=CASE WHEN state='preparing' THEN 'cancelled' ELSE state END WHERE operation_id=?`).run(manifest.recoveryId!);
+    });
+  }
+
+  #readRecoveryPlanMetadata(row: Record<string, unknown>): SnapshotRecoveryPlan {
+    check(sha256(String(row.payload)) === row.digest, 'snapshot-recovery-evidence-gap');
+    const plan = JSON.parse(String(row.payload)) as SnapshotRecoveryPlan;
+    check(plan.operationId === row.operation_id && plan.snapshot.id === row.snapshot_id
+      && plan.receipt.operationId === plan.operationId && plan.receipt.schema === 'store/recovered-from-snapshot@v1'
+      && plan.receipt.outcome === 'recovered_with_gap' && Array.isArray(plan.owners), 'snapshot-recovery-evidence-gap');
+    for (const owner of plan.owners) {
+      check(['session', 'job', 'maintenance', 'migration'].includes(owner.kind), 'snapshot-recovery-evidence-gap');
+      uuid(owner.ownerId);
+    }
+    return plan;
+  }
+
+  #readRecoveryPlan(row: Record<string, unknown>): SnapshotRecoveryPlan {
+    const plan = this.#readRecoveryPlanMetadata(row);
+    if (row.original_deleted !== 1 && !row.cleanup) {
+      sameFile(plan.original.path, plan.original.identity);
+      sameFile(plan.stage.path, plan.stage.identity);
+    }
+    return plan;
+  }
+
+  #readRecoveryPreparation(row: Record<string, unknown>): SnapshotRecoveryPreparation {
+    check(sha256(String(row.payload)) === row.digest, 'snapshot-recovery-evidence-gap');
+    const preparation = JSON.parse(String(row.payload)) as SnapshotRecoveryPreparation;
+    check(preparation.operationId === row.operation_id && preparation.snapshot.id === row.snapshot_id
+      && preparation.original.path === join(this.#resources.root.path, `recovery-${preparation.operationId}`), 'snapshot-recovery-evidence-gap');
+    if (preparation.original.identity && !row.cleanup) sameFile(preparation.original.path, preparation.original.identity);
+    return preparation;
+  }
+
+  #bindRecoveryPreparation(coordinator: string, row: Record<string, unknown>): SnapshotRecoveryPreparation {
+    return this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      const preparation = this.#readRecoveryPreparation(row);
+      if (!preparation.original.identity) {
+        if (!existsSync(preparation.original.path)) mkdirSync(preparation.original.path, { mode: 0o700 });
+        const stat = lstatSync(preparation.original.path);
+        check(stat.isDirectory() && !stat.isSymbolicLink(), 'snapshot-inventory-mismatch');
+        preparation.original.identity = fileIdentity(preparation.original.path);
+        inspectSnapshotFiles({ path: preparation.original.path, identity: preparation.original.identity }, recoveryFileNames(preparation));
+        syncSnapshotDirectory(this.#resources.root.path);
+        const payload = JSON.stringify(preparation);
+        this.#db.prepare('UPDATE store_restores SET payload=?,digest=? WHERE operation_id=?')
+          .run(payload, sha256(payload), preparation.operationId);
+      }
+      return preparation;
+    });
+  }
+
+  #selectedRecoverySnapshot(snapshotId: string): StoreSnapshot {
+    const saved = this.#db.prepare("SELECT manifest,digest FROM store_snapshots WHERE snapshot_id=? AND state='ready'").get(snapshotId);
+    check(saved && sha256(String(saved.manifest)) === saved.digest, 'snapshot-not-recoverable');
+    const snapshot = JSON.parse(String(saved.manifest)) as StoreSnapshot;
+    check(snapshot.storeId === this.#storeId && JSON.stringify(snapshot.root) === JSON.stringify(this.#resources.root), 'snapshot-store-mismatch');
+    verifySnapshot(snapshot);
+    return snapshot;
+  }
+
+  beginSnapshotRecovery(coordinator: string, snapshotId: string): Fence {
+    uuid(snapshotId);
+    return this.#transaction(() => {
+      const pending = this.#db.prepare("SELECT * FROM store_restores WHERE state IN ('preparing','prepared')").get();
+      if (pending) {
+        check(pending.snapshot_id === snapshotId, 'snapshot-recovery-in-progress');
+        check(!pending.cleanup, 'snapshot-cleanup-in-progress');
+      } else this.#selectedRecoverySnapshot(snapshotId);
+      return this.beginMaintenance(coordinator);
+    });
+  }
+
+  #prepareRecovery(coordinator: string, snapshotId: string): SnapshotRecoveryPlan {
+    const row = this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      const pending = this.#db.prepare("SELECT * FROM store_restores WHERE state IN ('preparing','prepared')").get();
+      if (pending) {
+        check(pending.snapshot_id === snapshotId, 'snapshot-recovery-in-progress');
+        check(!pending.cleanup, 'snapshot-cleanup-in-progress');
+        return pending;
+      }
+      const snapshot = this.#selectedRecoverySnapshot(snapshotId);
+      const files: SnapshotRecoveryPreparation['files'] = [
+        { source: this.#resources.store, name: 'store.sqlite', role: 'source' },
+        ...snapshot.files.map(({ source, name, role }) => ({ source, name, role })),
+      ];
+      for (const session of this.#db.prepare('SELECT source_path,source_dev,source_ino FROM sessions WHERE store_id=?').all(this.#storeId)) {
+        if (!files.some(file => file.source.path === session.source_path)) files.push({ source: { path: String(session.source_path),
+          identity: { dev: String(session.source_dev), ino: String(session.source_ino) } }, name: `later-source-${files.length}`, role: 'source' });
+      }
+      const controlledFiles = this.#controlledFiles().filter(file => file.started && file.state !== 'no_effect');
+      for (const file of controlledFiles) {
+        check(file.state === 'recorded' && file.identity, 'file-cleanup-evidence-gap');
+        sameFile(file.root.path, file.root.identity); sameFile(file.parent.path, file.parent.identity);
+        if (!files.some(item => item.source.path === file.path)) files.push({ source: { path: file.path, identity: file.identity },
+          name: `later-output-${files.length}`, role: 'project-output' });
+      }
+      for (const file of files) sameFile(file.source.path, file.source.identity);
+      const operationId = randomUUID();
+      const preparation: SnapshotRecoveryPreparation = { operationId, snapshot, files, controlledFiles,
+        original: { path: join(this.#resources.root.path, `recovery-${operationId}`), identity: null },
+        receipt: { schema: 'store/recovered-from-snapshot@v1', operationId, outcome: 'recovered_with_gap', createdAt: new Date().toISOString() } };
+      const payload = JSON.stringify(preparation);
+      this.#db.prepare("INSERT INTO store_restores(operation_id,snapshot_id,state,payload,digest) VALUES (?,?,'preparing',?,?)")
+        .run(operationId, snapshotId, payload, sha256(payload));
+      return this.#db.prepare('SELECT * FROM store_restores WHERE operation_id=?').get(operationId)!;
+    });
+    if (row.state === 'prepared') return this.#readRecoveryPlan(row);
+    const preparation = this.#bindRecoveryPreparation(coordinator, row);
+    return this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      check(preparation.original.identity, 'snapshot-recovery-evidence-gap');
+      const original = { path: preparation.original.path, identity: preparation.original.identity };
+      verifySnapshot(preparation.snapshot);
+      inspectSnapshotFiles(original, recoveryFileNames(preparation));
+      const write = (name: string, bytes: Uint8Array | string) => {
+        const path = join(original.path, name);
+        if (existsSync(path)) restoreFile({ path, identity: fileIdentity(path) }, typeof bytes === 'string' ? Buffer.from(bytes) : bytes);
+        else writeSnapshotFile(path, bytes);
+      };
+      const originals: SnapshotFile[] = [];
+      const save = (file: SnapshotRecoveryPreparation['files'][number]) => {
+        const bytes = snapshotBytes(file.source); write(file.name, bytes);
+        originals.push({ ...file, hash: sha256(bytes), bytes: bytes.length });
+      };
+      for (const file of preparation.files) save(file);
+      const wal = this.#resources.store.path + '-wal';
+      if (existsSync(wal)) save({ source: { path: wal, identity: fileIdentity(wal) }, name: 'store.sqlite-wal', role: 'source' });
+      else if (existsSync(join(original.path, 'store.sqlite-wal'))) unlinkSync(join(original.path, 'store.sqlite-wal'));
+      write('restore.sqlite', '');
+      const stagePath = join(original.path, 'restore.sqlite');
+      const snapshot = new DatabaseSync(join(preparation.snapshot.directory.path, 'store.sqlite'), { readOnly: true });
+      let owners: SnapshotRecoveryPlan['owners'];
+      try {
+        const all = [this.#db, snapshot].flatMap(database => [
+          ...database.prepare('SELECT owner_kind AS kind,owner_id FROM execution_streams').all(),
+          ...database.prepare("SELECT 'session' AS kind,session_id AS owner_id FROM sessions").all(),
+          ...database.prepare("SELECT 'job' AS kind,job_id AS owner_id FROM capture_jobs").all(),
+        ]);
+        owners = [...new Map(all.map(owner => [`${String(owner.kind)}/${String(owner.owner_id)}`,
+          { kind: String(owner.kind) as SnapshotRecoveryPlan['owners'][number]['kind'], ownerId: String(owner.owner_id) }])).values()];
+      } finally { snapshot.close(); }
+      const plan: SnapshotRecoveryPlan = { operationId: preparation.operationId, snapshot: preparation.snapshot, original, originals, owners,
+        controlledFiles: preparation.controlledFiles, receipt: preparation.receipt, stage: { path: stagePath, identity: fileIdentity(stagePath) } };
+      syncSnapshotDirectory(original.path);
+      const payload = JSON.stringify(plan);
+      this.#db.prepare("UPDATE store_restores SET state='prepared',payload=?,digest=? WHERE operation_id=? AND state='preparing'")
+        .run(payload, sha256(payload), plan.operationId);
+      return plan;
+    });
+  }
+
+  async restoreSnapshot(coordinator: string, snapshotId: string): Promise<{ receipt: SnapshotRecoveryReceipt; original: BoundFile }> {
+    uuid(snapshotId);
+    const plan = this.#prepareRecovery(coordinator, snapshotId);
+    this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      verifySnapshot(plan.snapshot);
+      restoreFile(plan.stage, readFileSync(join(plan.snapshot.directory.path, 'store.sqlite')));
+      const stage = new DatabaseSync(plan.stage.path);
+      try {
+        stage.function('euler_store_writer', () => 1);
+        stage.exec('PRAGMA foreign_keys=ON; BEGIN IMMEDIATE; PRAGMA defer_foreign_keys=ON;');
+        const copy = (table: string, row: Record<string, unknown>) => {
+          const columns = Object.keys(row);
+          stage.prepare(`INSERT OR IGNORE INTO ${table} (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`)
+            .run(...Object.values(row) as (string | number | null)[]);
+        };
+        stage.exec('DELETE FROM store_restores');
+        for (const table of ['store_recovery_events', 'store_recovered_owners', 'store_restores']) {
+          for (const row of this.#db.prepare(`SELECT * FROM ${table}`).all()) copy(table, row);
+        }
+        const currentFence = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(this.#storeId)!;
+        const snapshotRows = this.#db.prepare('SELECT * FROM store_snapshots').all();
+        const activityIds = new Set([...snapshotRows.map(row => String(row.activity_id)), String(currentFence.coordinator_activity)]);
+        for (const id of activityIds) {
+          const activity = this.#db.prepare('SELECT * FROM owner_activities WHERE id=?').get(id);
+          check(activity && activity.parent_id === null, 'snapshot-control-evidence-gap');
+          const stream = this.#db.prepare('SELECT * FROM execution_streams WHERE stream_id=?').get(activity.stream_id!);
+          check(stream, 'snapshot-control-evidence-gap');
+          copy('projects', this.#db.prepare('SELECT * FROM projects WHERE project_id=?').get(stream.project_id!)!);
+          copy('execution_streams', stream); copy('owner_activities', activity);
+        }
+        stage.exec('DELETE FROM store_snapshots');
+        for (const row of snapshotRows) copy('store_snapshots', row);
+        const receipt = JSON.stringify(plan.receipt);
+        stage.prepare('INSERT OR IGNORE INTO store_recovery_events VALUES (?,?,?)').run(plan.operationId, receipt, sha256(receipt));
+        for (const owner of plan.owners) stage.prepare('INSERT OR IGNORE INTO store_recovered_owners VALUES (?,?,?)')
+          .run(owner.kind, owner.ownerId, plan.operationId);
+        stage.prepare("UPDATE owner_activities SET stop_state='absent',stop_observed_at=?,stop_method='snapshot-exclusive-recovery' WHERE id!=?")
+          .run(plan.receipt.createdAt, currentFence.coordinator_activity!);
+        const columns = Object.keys(currentFence).filter(key => key !== 'store_id');
+        stage.prepare(`UPDATE owner_fences SET ${columns.map(column => `${column}=?`).join(',')} WHERE store_id=?`)
+          .run(...columns.map(column => currentFence[column]!) as (string | number | null)[], this.#storeId);
+        stage.exec("UPDATE memory_discovery_grants SET state='revoked' WHERE state='active'");
+        checkSqliteSnapshot(stage);
+        stage.exec('COMMIT');
+      } finally { stage.close(); }
+      syncSnapshotFile(plan.stage.path);
+      for (const file of plan.snapshot.files) {
+        restoreFile(file.source, readFileSync(join(plan.snapshot.directory.path, file.name)));
+      }
+    });
+    const source = new DatabaseSync(plan.stage.path, { readOnly: true });
+    this.#db.close();
+    try { await backup(source, this.#resources.store.path); }
+    finally {
+      source.close();
+      this.#db = new DatabaseSync(this.#resources.store.path);
+      this.#db.function('euler_store_writer', () => this.#depth > 0 ? 1 : 0);
+      this.#db.exec('PRAGMA busy_timeout=2000; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA journal_mode=WAL;');
+    }
+    this.#transaction(() => {
+      this.#assertCoordinator(coordinator);
+      check(this.#db.prepare('SELECT 1 FROM store_recovery_events WHERE operation_id=?').get(plan.operationId), 'snapshot-restore-not-committed');
+      check(this.#checkStoreIntegrity() === 'healthy', 'projection-integrity-failed');
+      for (const file of plan.snapshot.files) check(sha256(snapshotBytes(file.source)) === file.hash, 'snapshot-content-mismatch');
+      this.#db.prepare("UPDATE store_restores SET state='complete' WHERE operation_id=? AND state='prepared'").run(plan.operationId);
+      this.#db.prepare("UPDATE owner_fences SET health='healthy' WHERE store_id=?").run(this.#storeId);
+      this.releaseMaintenance(coordinator);
+    });
+    return { receipt: plan.receipt, original: plan.original };
+  }
+
   beginMaintenance(coordinator: string): Fence {
     uuid(coordinator);
     return this.#transaction(() => {
@@ -5823,7 +6601,7 @@ export class ProbeStore {
     });
   }
 
-  #controlledFiles() {
+  #controlledFiles(): ControlledFile[] {
     const rows = this.#db.prepare(`SELECT e.run_id,e.payload,e.hash,s.principal_id,s.project_id FROM request_events e
       JOIN request_runs r ON r.run_id=e.run_id JOIN execution_streams s ON s.stream_id=r.stream_id
       WHERE s.store_id=? AND e.kind='agent/event@v1' ORDER BY e.run_id,e.seq`).all(this.#storeId);
@@ -5834,7 +6612,7 @@ export class ProbeStore {
       const run = runs.get(runId) ?? { events: [], ownerId: String(row.principal_id), projectId: String(row.project_id) };
       run.events.push(JSON.parse(String(row.payload)).event as AgentEvent); runs.set(runId, run);
     }
-    return [...runs].flatMap(([runId, run]) => {
+    const files: ControlledFile[] = [...runs].flatMap(([runId, run]) => {
       const state = replayAgent(run.events, 0);
       return state.files.filter(file => file.admission.operation === 'file.write').map(file => {
         const tool = state.tools.find(tool => tool.callId === file.admission.callId)!;
@@ -5847,6 +6625,12 @@ export class ProbeStore {
             : tool.started ? 'unknown' : 'not_started' };
       });
     });
+    for (const row of this.#db.prepare("SELECT * FROM store_restores WHERE state IN ('prepared','complete')").all()) {
+      for (const file of this.#readRecoveryPlan(row).controlledFiles) {
+        if (!files.some(current => current.runId === file.runId && current.callId === file.callId)) files.push(file);
+      }
+    }
+    return files;
   }
   #scanResiduals() {
     const observedAt = new Date().toISOString();
@@ -5856,6 +6640,19 @@ export class ProbeStore {
     const sourceNames = sources.map(row => basename(String(row.source_path)));
     const known = new Set(['sandbox.json', 'counting-receiver.jsonl', 'owner-info.jsonl', ...sourceNames, basename(this.#resources.store.path),
       `${basename(this.#resources.store.path)}-wal`, `${basename(this.#resources.store.path)}-shm`]);
+    const snapshots = this.#db.prepare("SELECT * FROM store_snapshots WHERE state!='deleted'").all();
+    const recoveries = this.#db.prepare("SELECT * FROM store_restores WHERE state IN ('prepared','complete')").all().map(row => this.#readRecoveryPlan(row));
+    const preparations = this.#db.prepare("SELECT * FROM store_restores WHERE state='preparing'").all().map(row => this.#readRecoveryPreparation(row));
+    for (const preparation of preparations) if (preparation.original.identity) snapshots.push({
+      directory: preparation.original.path, dev: preparation.original.identity.dev, ino: preparation.original.identity.ino });
+    for (const recovery of recoveries) {
+      if (this.#db.prepare('SELECT original_deleted FROM store_restores WHERE operation_id=?').get(recovery.operationId)!.original_deleted === 0) {
+        snapshots.push({ directory: recovery.original.path, dev: recovery.original.identity.dev, ino: recovery.original.identity.ino });
+      }
+      for (const file of recovery.originals) if (file.name.startsWith('later-source-')) sources.push({
+        source_path: file.source.path, source_dev: file.source.identity.dev, source_ino: file.source.identity.ino });
+    }
+    for (const source of sources) known.add(basename(String(source.source_path)));
     try {
       const names = readdirSync(this.#resources.root.path).sort();
       check(names.length <= 1024, 'residual-enumeration-limit');
@@ -5864,7 +6661,17 @@ export class ProbeStore {
           const stat = lstatSync(join(this.#resources.root.path, path), { bigint: true });
           const source = sources.find(row => basename(String(row.source_path)) === path);
           const identityMatches = !source || (source.source_dev === stat.dev.toString() && source.source_ino === stat.ino.toString());
-          const expected = known.has(path) && identityMatches && stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n;
+          const snapshot = snapshots.find(row => basename(String(row.directory)) === path);
+          if (snapshot?.snapshot_id) this.#snapshotFiles(snapshot);
+          const recovery = recoveries.find(plan => basename(plan.original.path) === path);
+          if (snapshot && recovery) inspectSnapshotFiles(recovery.original, recoveryFileNames(recovery));
+          const preparation = preparations.find(item => basename(item.original.path) === path);
+          if (preparation) inspectSnapshotFiles({ path: preparation.original.path, identity: preparation.original.identity
+            ?? { dev: stat.dev.toString(), ino: stat.ino.toString() } }, recoveryFileNames(preparation));
+          const expected = preparation && !preparation.original.identity ? stat.isDirectory() && !stat.isSymbolicLink() : snapshot ? stat.isDirectory() && !stat.isSymbolicLink()
+            && (snapshot.state === 'staging' && snapshot.dev === null && snapshot.ino === null
+              || snapshot.dev === stat.dev.toString() && snapshot.ino === stat.ino.toString())
+            : known.has(path) && identityMatches && stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n;
           entries.push({ path, state: expected ? 'expected' : 'unexpected', observedAt,
             dev: stat.dev.toString(), ino: stat.ino.toString(), reason: expected ? 'known-disposable-carrier' : 'unexplained-residual' });
         } catch {
@@ -5901,6 +6708,7 @@ export class ProbeStore {
     const released = this.#transaction(() => {
       const fence = this.#assertCoordinator(coordinator);
       check(fence.state === 'exclusive', 'maintenance-not-exclusive');
+      check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state IN ('preparing','prepared')").get(), 'snapshot-recovery-in-progress');
       if (!this.acquireMaintenance(coordinator).acquired) return null;
       return this.#reopenMaintenance();
     });
@@ -5912,12 +6720,13 @@ export class ProbeStore {
   cancelMaintenance(coordinator: string): Fence {
     return this.#transaction(() => {
       this.#assertCoordinator(coordinator);
-      // No irreversible maintenance operation is enabled in this synthetic slice.
+      check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state IN ('preparing','prepared')").get(), 'snapshot-recovery-in-progress');
       return this.#reopenMaintenance();
     });
   }
 
   #reopenMaintenance(): Fence {
+    check(!this.#db.prepare("SELECT 1 FROM store_snapshots WHERE cleanup IS NOT NULL UNION ALL SELECT 1 FROM store_restores WHERE cleanup IS NOT NULL LIMIT 1").get(), 'snapshot-cleanup-in-progress');
     this.#db.prepare(`UPDATE owner_fences SET state='open',epoch=epoch+1,coordinator=NULL,coordinator_pid=NULL,
       coordinator_incarnation=NULL,coordinator_started_at=NULL,coordinator_activity=NULL WHERE store_id=?`).run(this.#storeId);
     return this.fence();

@@ -1,0 +1,17 @@
+{
+  "schema": "t20-backup-cases@1",
+  "synthetic": true,
+  "cases": [
+    "memory", "handoff", "historian", "owner-info", "owner-info-metadata-corruption", "handoff-versions", "backup-directory-crash", "project-output-before", "project-output-after", "unknown-before", "unknown-after", "unclaimed-job-missing", "historian-unclaimed-job-missing",
+    "invalid-snapshot-malformed", "invalid-snapshot-unknown", "invalid-snapshot-pending",
+    "overlap-daily", "overlap-cleanup-before", "overlap-cleanup-after",
+    "staging-cleanup-before", "staging-cleanup-after",
+    "crash-carrier", "crash-database", "crash-directory", "crash-preparation",
+    "restore-ENOSPC", "restore-EROFS", "discard-preparation", "recovery-cleanup-state",
+    "ENOSPC", "EROFS", "canonical-corruption", "typed-head-corruption", "intent-metadata-corruption", "info-outbox-corruption", "capture-metadata-corruption", "feedback-metadata-corruption", "batch-manifest-corruption", "source-metadata-corruption", "proposal-metadata-corruption", "projection-memory", "projection-source",
+    "historian-publication-corruption", "historian-range-corruption", "historian-stage-corruption",
+    "canonical-state", "provenance", "provenance-digest", "provenance-identity", "provenance-source",
+    "operations", "operations-presentation-hash", "operations-presentation-target", "operations-operation-hash", "operations-operation-receipts", "operations-approval-hash", "operations-model-hash", "operations-model-summary",
+    "migration-success", "migration-before-commit", "migration-after-commit"
+  ]
+}

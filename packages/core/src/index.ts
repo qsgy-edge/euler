@@ -22,6 +22,7 @@ export { OWNER_MEMORY_FORMS, parseOwnerStatement, parseMemoryProposal, parseOwne
 export type { OwnerMemoryType, OwnerMemoryStatement, OwnerAgreement } from './context/owner-memory.ts';
 export type { PreparedTurn, ProbeReceipt } from './context/probe-session.ts';
 export type { FileIdentity, BoundFile, StoreResources } from './store/probe-store.ts';
+export type { StoreSnapshot, SnapshotFile, SnapshotCleanupManifest } from './store/snapshots.ts';
 export { ProbeStore, fileIdentity, sameFile, probeSchemaDigest } from './store/probe-store.ts';
 export { REQUEST_POLICY_HASH, REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, assemblyIdentityHash, deriveAssemblyState, freezeRequestPayload } from './store/request-ledger.ts';
 export type { RequestAssembly, RequestAssemblyInput, RequestAttempt, RequestAttemptOutcome, RequestAssemblyState, RequestEvent, RequestEventKind, RequestOwnerKind, RequestRun, RequestRunState, RequestStatus, RequestRecovery, RequestReconciliation } from './store/request-ledger.ts';

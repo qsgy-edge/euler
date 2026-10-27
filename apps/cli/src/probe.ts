@@ -28,6 +28,7 @@ export class CountingTransport {
     });
     return { bytes, records };
   }
+  inspect(): { count: number } { return { count: this.#readReceiver().records.length }; }
   query(attempt: RequestAttempt): RequestReconciliation {
     check([API_VERSION, 'capture-counting@1'].includes(attempt.adapterVersion), 'reconciliation-reader-unavailable');
     const { bytes, records } = this.#readReceiver();
