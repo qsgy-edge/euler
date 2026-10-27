@@ -70,6 +70,9 @@ jobs:
       - name: Record verified snapshot and recovery gap observations
         if: always()
         run: npm run evidence:backup
+      - name: Record logical purge and continuation observations
+        if: always()
+        run: npm run evidence:purge
       - uses: actions/upload-artifact@v4
         if: always()
         with:

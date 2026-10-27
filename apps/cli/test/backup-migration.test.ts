@@ -27,12 +27,12 @@ for (const point of ['success', 'before-commit', 'after-commit']) test(`a dispos
     try {
       assert.equal(db.prepare('PRAGMA quick_check').get()!.quick_check, 'ok');
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
-      const version = point === 'before-commit' ? 23 : 24;
+      const version = point === 'before-commit' ? 24 : 25;
       assert.equal(db.prepare('PRAGMA user_version').get()!.user_version,version);
       const metadata = db.prepare('SELECT schema_version,ddl_hash FROM schema_meta').get()!;
       assert.equal(metadata.schema_version,version);
       assert.ok(String(db.prepare("SELECT sql FROM sqlite_schema WHERE name='schema_meta'").get()!.sql).includes(`CHECK(schema_version=${version})`));
-      if (version === 24) {
+      if (version === 25) {
         const schema = db.prepare('SELECT type,name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type,name').all();
         assert.equal(metadata.ddl_hash,createHash('sha256').update(JSON.stringify(schema)).digest('hex'));
       }

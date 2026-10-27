@@ -132,6 +132,7 @@ export class MemoryCorrections {
         && /(彻底|永久|不可恢复|不可撤销|purge)/i.test(live.text) && /(恢复|撤销|回滚|restore|rollback)/i.test(outside)) {
         return this.#reject('conflict', 'opposing-directions');
       }
+      if (/(purge|隐私清除|彻底清除|永久删除)/i.test(request)) return this.#reject('unavailable', 'purge-maintenance-required');
       if (!inquiry && /^rollback(?: |$)/.test(request)) return this.#reject('invalid_identity', 'batch-and-update-identity-required');
       return this.#reject('not_actionable', 'explicit-correction-command-required');
     }

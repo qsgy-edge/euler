@@ -34,7 +34,7 @@ try {
   assert.ok(result && result.syntheticPassed === true);
   const db = new DatabaseSync(join(directory, 'sandbox', 'probe.sqlite'), { readOnly: true });
   try {
-    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 23);
+    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 24);
     sqlite = String(db.prepare('SELECT sqlite_version() AS version').get()!.version);
     checks.schema = true;
     const archive = new Map<string, { line: string; text: string }>();

@@ -33,7 +33,7 @@ export class CorrectionHost {
 
   receive(text: string): CorrectionInput | null {
     if (text.trim() === 'stop') { this.#setupAbort.abort(); this.#run?.cancel(); return null; }
-    return /^(inspect|correct|forget|restore|rollback|commit|cancel|replay|model)(?: |$)/.test(text.trim()) || /^(把 |不要|别|是否|帮我判断|恢复被|撤销彻底|do not |don't )/i.test(text)
+    return /^(inspect|correct|forget|restore|rollback|purge|commit|cancel|replay|model)(?: |$)/.test(text.trim()) || /^(把 |不要|别|是否|帮我判断|恢复被|撤销彻底|隐私清除|彻底清除|永久删除|do not |don't )/i.test(text)
       ? this.core.receive(text) : null;
   }
 
@@ -163,6 +163,13 @@ export class CorrectionHost {
       if (reply.kind === 'result' && reply.canonical === 'committed' && command?.kind === 'commit') {
         this.#checkpoint('correction-after-commit');
         if (this.#scenario === 'correction-unknown') throw new Error('injected-unknown-commit');
+      }
+      if (reply.kind === 'result' && reply.result.reason === 'purge-maintenance-required') {
+        await emit('purge-maintenance-required', {
+          message: '先退出当前 runtime 及其受控子任务，再从新进程进入维护。维护会暂停该数据根的运行，取得独占后展示删除范围并要求输入新口令。逻辑提交后不可取消，物理清理未完成时保持暂停。',
+          command: ['npm', 'run', 'demo', '--', 'purge', '--sandbox', this.#probe.activity.root.path, '--record',
+            /^purge ([a-f0-9-]{36})$/u.exec(text)?.[1] ?? '<record-id>'],
+        });
       }
       if (command?.kind === 'replay' && reply.kind === 'result' && reply.result.operationId) {
         await this.#ownerEntry(command.token);

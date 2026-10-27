@@ -1,3 +1,5 @@
+import { applyLogicalPurge, planPurge } from './logical-purge.ts';
+import type { PurgeCarrier, PurgeContinuation, PurgeInput, PurgePresentation, PurgeReceipt } from './logical-purge.ts';
 import { isLiveMemoryOperation, matchesMemoryApproval, memoryOperationSummary, parseCorrectionCommand } from '../context/memory-correction.ts';
 import { parseAnalysisArtifact } from '../context/analysis-artifacts.ts';
 import { assertHistorianReply, compartmentBody, isCompartmentEvidenceGap } from '../context/historian.ts';
@@ -53,7 +55,7 @@ export interface ExecutionOwner {
 export interface ExecutionStream {
   streamId: string; ownerKind: 'session' | 'job' | 'maintenance' | 'migration'; ownerId: string;
   principalId: string; originHostId: string; projectId: string;
-  authorization: { kind: 'synthetic-host-command'; id: string };
+  authorization: { kind: 'synthetic-host-command'; id: string }; replayable: boolean;
 }
 export interface AttemptOwnership {
   attemptId: string; runId: string; streamId: string; ownerKind: ExecutionStream['ownerKind']; ownerId: string;
@@ -216,7 +218,7 @@ export interface Intent {
 export type IntentTransition = Pick<Intent, 'step' | 'status'>;
 interface Fence {
   store_id: string;
-  state: 'open' | 'closing' | 'exclusive';
+  state: 'open' | 'closing' | 'exclusive' | 'cleaning';
   health: 'healthy' | 'failed';
   epoch: number;
   coordinator: string | null;
@@ -230,14 +232,14 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=23), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=24), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
   store_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, host_id TEXT NOT NULL,
   root_path TEXT NOT NULL, root_dev TEXT NOT NULL, root_ino TEXT NOT NULL,
   store_path TEXT NOT NULL, store_dev TEXT NOT NULL, store_ino TEXT NOT NULL,
-  state TEXT NOT NULL CHECK(state IN ('open','closing','exclusive')),
+  state TEXT NOT NULL CHECK(state IN ('open','closing','exclusive','cleaning')),
   health TEXT NOT NULL DEFAULT 'healthy' CHECK(health IN ('healthy','failed')),
   epoch INTEGER NOT NULL CHECK(epoch > 0), coordinator TEXT, coordinator_pid INTEGER,
   coordinator_incarnation TEXT, coordinator_started_at TEXT,
@@ -258,7 +260,7 @@ CREATE TABLE store_snapshots (
 CREATE UNIQUE INDEX one_daily_snapshot ON store_snapshots(day) WHERE kind='daily' AND state IN ('ready','retired','deleted')
   AND json_extract(manifest,'$.state')='ready';
 CREATE TABLE store_recovery_events (
-  operation_id TEXT PRIMARY KEY, receipt TEXT NOT NULL, digest TEXT NOT NULL
+  operation_id TEXT PRIMARY KEY, receipt TEXT NOT NULL, digest TEXT NOT NULL, purged_owners_hash TEXT
 ) STRICT;
 CREATE TABLE store_recovered_owners (
   kind TEXT NOT NULL, owner_id TEXT NOT NULL, operation_id TEXT NOT NULL REFERENCES store_recovery_events(operation_id),
@@ -281,6 +283,7 @@ CREATE TABLE execution_streams (
   owner_kind TEXT NOT NULL CHECK(owner_kind IN ('session','job','maintenance','migration')), owner_id TEXT NOT NULL,
   principal_id TEXT NOT NULL, origin_host_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(project_id),
   authorization_kind TEXT NOT NULL CHECK(authorization_kind='synthetic-host-command'), authorization_id TEXT NOT NULL,
+  redacted INTEGER NOT NULL DEFAULT 0 CHECK(redacted IN (0,1)),
   UNIQUE(store_id,owner_kind,owner_id), UNIQUE(store_id,stream_id)
 ) STRICT;
 CREATE TABLE execution_events (
@@ -336,30 +339,31 @@ WHEN NEW.version!=(SELECT COALESCE(MAX(version),0)+1 FROM intent_events WHERE se
   OR NEW.expected_event_id IS NOT (SELECT event_id FROM intent_events WHERE session_id=NEW.session_id AND branch_id=NEW.branch_id ORDER BY version DESC LIMIT 1)
 BEGIN SELECT RAISE(ABORT,'intent-sequence-conflict'); END;
 CREATE TRIGGER immutable_intent_update BEFORE UPDATE ON intent_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
-CREATE TRIGGER immutable_intent_delete BEFORE DELETE ON intent_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER immutable_intent_delete BEFORE DELETE ON intent_events WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TABLE request_runs (
   run_id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES execution_streams(stream_id), owner_kind TEXT NOT NULL,
   owner_id TEXT NOT NULL, authorization_id TEXT NOT NULL, activity_id TEXT NOT NULL REFERENCES owner_activities(id),
   epoch INTEGER NOT NULL, budget TEXT NOT NULL, intent_event_id TEXT, intent_hash TEXT, related_run_id TEXT,
-  authorized_at TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('authorized','revoked','sealed'))
+  authorized_at TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('authorized','revoked','sealed')),
+  redacted INTEGER NOT NULL DEFAULT 0 CHECK(redacted IN (0,1))
 ) STRICT;
 CREATE TABLE request_events (
   event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES request_runs(run_id),
   seq INTEGER NOT NULL CHECK(seq>0),
   kind TEXT NOT NULL CHECK(kind IN ('capture/step@v1','agent/event@v1','run-authorized','run-revoked','run-sealed','run-recovery-gap','model/request-attempt-reconciled@v1','context/assembly@v1','model/request-attempt-started@v1','model/request-attempt-finished@v1')),
   attempt_id TEXT REFERENCES request_attempts(attempt_id), activity_id TEXT NOT NULL REFERENCES owner_activities(id),
-  created_at TEXT NOT NULL, payload TEXT NOT NULL, hash TEXT NOT NULL, UNIQUE(run_id,seq)
+  created_at TEXT NOT NULL, payload TEXT, hash TEXT, UNIQUE(run_id,seq), CHECK((payload IS NULL)=(hash IS NULL))
 ) STRICT;
 CREATE INDEX request_source_access ON request_events
   (json_extract(payload,'$.event.binding.sessionId'),json_extract(payload,'$.event.sourceEventId'))
   WHERE kind='agent/event@v1' AND json_extract(payload,'$.event.kind')='source-access';
 CREATE TABLE request_assemblies (
   assembly_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES request_runs(run_id), epoch INTEGER NOT NULL,
-  route TEXT NOT NULL, model TEXT NOT NULL, policy_hash TEXT NOT NULL, estimator TEXT NOT NULL,
-  identity_hash TEXT NOT NULL, payload_hash TEXT NOT NULL, byte_length INTEGER NOT NULL CHECK(byte_length>0),
-  estimated_tokens INTEGER NOT NULL CHECK(estimated_tokens>0), budget TEXT NOT NULL, sources TEXT NOT NULL,
-  used_memories TEXT NOT NULL,
-  intent_event_id TEXT, intent_hash TEXT, zones TEXT NOT NULL, selection TEXT NOT NULL, degradation TEXT NOT NULL,
+  route TEXT, model TEXT, policy_hash TEXT, estimator TEXT,
+  identity_hash TEXT, payload_hash TEXT, byte_length INTEGER NOT NULL CHECK(byte_length>0),
+  estimated_tokens INTEGER NOT NULL CHECK(estimated_tokens>0), budget TEXT, sources TEXT,
+  used_memories TEXT,
+  intent_event_id TEXT, intent_hash TEXT, zones TEXT, selection TEXT, degradation TEXT,
   state TEXT NOT NULL CHECK(state IN ('not-dispatched','unknown-sent','finished')),
   claim_head_event_id TEXT REFERENCES memory_events(event_id), context TEXT,
   UNIQUE(run_id,identity_hash)
@@ -368,8 +372,8 @@ CREATE TABLE request_attempts (
   attempt_id TEXT PRIMARY KEY REFERENCES execution_events(attempt_id),
   assembly_id TEXT NOT NULL REFERENCES request_assemblies(assembly_id),
   run_id TEXT NOT NULL REFERENCES request_runs(run_id), ordinal INTEGER NOT NULL CHECK(ordinal>0),
-  payload_hash TEXT NOT NULL, byte_length INTEGER NOT NULL CHECK(byte_length>0), encoding TEXT NOT NULL,
-  hash_algorithm TEXT NOT NULL, adapter_version TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
+  payload_hash TEXT, byte_length INTEGER NOT NULL CHECK(byte_length>0), encoding TEXT,
+  hash_algorithm TEXT, adapter_version TEXT, started_at TEXT NOT NULL, finished_at TEXT,
   outcome TEXT NOT NULL CHECK(outcome IN ('unknown-sent','received','cancelled-before-send')),
   UNIQUE(assembly_id,ordinal)
 ) STRICT;
@@ -401,7 +405,7 @@ CREATE TABLE memory_discovery_targets (
   FOREIGN KEY(grant_id,project_id) REFERENCES memory_discovery_projects(grant_id,project_id)
 ) STRICT;
 CREATE TRIGGER immutable_discovery_targets_update BEFORE UPDATE ON memory_discovery_targets BEGIN SELECT RAISE(ABORT,'append-only'); END;
-CREATE TRIGGER immutable_discovery_targets_delete BEFORE DELETE ON memory_discovery_targets BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_discovery_targets_delete BEFORE DELETE ON memory_discovery_targets WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_discovery_grant BEFORE UPDATE ON memory_discovery_grants
 WHEN NEW.grant_id!=OLD.grant_id OR NEW.owner_id!=OLD.owner_id OR NEW.session_id!=OLD.session_id
   OR NEW.intent_id!=OLD.intent_id OR NEW.consent!=OLD.consent OR NEW.consent_hash!=OLD.consent_hash
@@ -409,11 +413,12 @@ WHEN NEW.grant_id!=OLD.grant_id OR NEW.owner_id!=OLD.owner_id OR NEW.session_id!
   OR NEW.used_results<OLD.used_results OR NEW.used_bytes<OLD.used_bytes
 BEGIN SELECT RAISE(ABORT,'discovery-grant-immutable'); END;
 CREATE TRIGGER immutable_discovery_projects_update BEFORE UPDATE ON memory_discovery_projects BEGIN SELECT RAISE(ABORT,'append-only'); END;
-CREATE TRIGGER immutable_discovery_projects_delete BEFORE DELETE ON memory_discovery_projects BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_discovery_projects_delete BEFORE DELETE ON memory_discovery_projects WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TABLE source_query_receipts (
   grant_id TEXT NOT NULL REFERENCES memory_discovery_grants(grant_id), query_id TEXT NOT NULL,
   request_hash TEXT NOT NULL, page_hash TEXT NOT NULL, result_count INTEGER NOT NULL CHECK(result_count>=0),
-  byte_length INTEGER NOT NULL CHECK(byte_length>=0), receipt_hash TEXT NOT NULL, PRIMARY KEY(grant_id,query_id)
+  byte_length INTEGER NOT NULL CHECK(byte_length>=0), receipt_hash TEXT NOT NULL, result_refs TEXT NOT NULL,
+  PRIMARY KEY(grant_id,query_id)
 ) STRICT;
 CREATE TABLE workspaces (workspace_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL) STRICT;
 CREATE TABLE workspace_projects (
@@ -491,14 +496,20 @@ CREATE TABLE memory_heads (
   FOREIGN KEY(scope_kind,scope_id,scope_resolved) REFERENCES memory_scopes(kind,scope_id,resolved)
 ) STRICT;
 CREATE TABLE memory_events (
-  event_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), seq INTEGER NOT NULL CHECK(seq > 0), kind TEXT NOT NULL CHECK(kind IN ('capture','verify','activate','correct','auto-revise','forget','restore','conflict','rollback','comparison','corroborate','reject','supersede','stale')),
-  revision_id TEXT NOT NULL REFERENCES memory_revisions(revision_id), before_snapshot TEXT, after_snapshot TEXT NOT NULL,
-  request_hash TEXT NOT NULL UNIQUE, origin_host_id TEXT NOT NULL, origin_seq INTEGER NOT NULL CHECK(origin_seq>0),
+  event_id TEXT PRIMARY KEY, record_id TEXT REFERENCES memory_records(record_id), seq INTEGER CHECK(seq > 0), kind TEXT NOT NULL CHECK(kind IN ('capture','verify','activate','correct','auto-revise','forget','restore','conflict','rollback','comparison','corroborate','reject','supersede','stale','purge-logical-commit')),
+  revision_id TEXT REFERENCES memory_revisions(revision_id), before_snapshot TEXT, after_snapshot TEXT,
+  request_hash TEXT UNIQUE, origin_host_id TEXT, origin_seq INTEGER CHECK(origin_seq>0),
   batch_id TEXT REFERENCES activation_batches(batch_id) DEFERRABLE INITIALLY DEFERRED,
   target_event_id TEXT,
-  payload TEXT NOT NULL, payload_hash TEXT NOT NULL, source_event_id TEXT NOT NULL, created_at TEXT NOT NULL,
+  payload TEXT, payload_hash TEXT, source_event_id TEXT, created_at TEXT NOT NULL,
   batch_ordinal INTEGER CHECK(batch_ordinal>=0),
   operation_id TEXT REFERENCES pending_operations(operation_id), receipt_id TEXT UNIQUE, receipt_payload TEXT, receipt_hash TEXT,
+  CHECK((record_id IS NOT NULL AND seq IS NOT NULL AND revision_id IS NOT NULL AND after_snapshot IS NOT NULL
+    AND request_hash IS NOT NULL AND origin_host_id IS NOT NULL AND origin_seq IS NOT NULL
+    AND payload IS NOT NULL AND payload_hash IS NOT NULL AND source_event_id IS NOT NULL AND kind!='purge-logical-commit')
+    OR (record_id IS NULL AND seq IS NULL AND revision_id IS NULL AND before_snapshot IS NULL AND after_snapshot IS NULL
+      AND request_hash IS NULL AND origin_host_id IS NULL AND origin_seq IS NULL AND payload IS NULL AND payload_hash IS NULL
+      AND source_event_id IS NULL AND batch_id IS NULL AND target_event_id IS NULL AND receipt_id IS NOT NULL)),
   CHECK((batch_id IS NULL)=(batch_ordinal IS NULL)),
   CHECK((receipt_id IS NULL AND receipt_payload IS NULL AND receipt_hash IS NULL AND operation_id IS NULL)
     OR (receipt_id IS NOT NULL AND receipt_payload IS NOT NULL AND receipt_hash IS NOT NULL)),
@@ -537,9 +548,14 @@ CREATE TRIGGER presentation_event_reservation BEFORE INSERT ON presentation_targ
 WHEN (SELECT kind='inspect' FROM host_presentations WHERE presentation_id=NEW.presentation_id) != (NEW.update_event_id IS NULL)
 BEGIN SELECT RAISE(ABORT,'presentation-event-mismatch'); END;
 CREATE TABLE pending_operations (
-  operation_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, presentation_id TEXT NOT NULL UNIQUE,
-  state TEXT NOT NULL CHECK(state IN ('pending','committed','superseded','cancelled','stale','no_op','unavailable','error')),
-  result TEXT, result_hash TEXT, presentation_hash TEXT NOT NULL,
+  operation_id TEXT PRIMARY KEY, session_id TEXT, presentation_id TEXT UNIQUE,
+  state TEXT NOT NULL CHECK(state IN ('pending','committed','superseded','cancelled','stale','no_op','unavailable','error','cleaning')),
+  result TEXT, result_hash TEXT, presentation_hash TEXT,
+  kind TEXT NOT NULL DEFAULT 'memory' CHECK(kind IN ('memory','purge')), continuation TEXT, continuation_hash TEXT,
+  CHECK((kind='memory' AND session_id IS NOT NULL AND presentation_id IS NOT NULL AND presentation_hash IS NOT NULL
+    AND state!='cleaning' AND continuation IS NULL AND continuation_hash IS NULL)
+    OR (kind='purge' AND state='cleaning' AND session_id IS NULL AND presentation_id IS NULL
+      AND continuation IS NOT NULL AND continuation_hash IS NOT NULL)),
   CHECK((state='pending' AND result IS NULL AND result_hash IS NULL) OR (state!='pending' AND result IS NOT NULL AND result_hash IS NOT NULL)),
   FOREIGN KEY(session_id,presentation_id) REFERENCES host_presentations(session_id,presentation_id),
   UNIQUE(session_id,operation_id),
@@ -556,9 +572,9 @@ WHEN NEW.operation_id IS NOT OLD.operation_id OR NEW.summary_event_id IS NOT OLD
   OR (OLD.approval_source IS NOT NULL AND (NEW.approval_source IS NOT OLD.approval_source OR NEW.approval_hash IS NOT OLD.approval_hash))
   OR (OLD.model_source IS NOT NULL AND (NEW.model_source IS NOT OLD.model_source OR NEW.model_hash IS NOT OLD.model_hash))
 BEGIN SELECT RAISE(ABORT,'operation-delivery-monotonic'); END;
-CREATE TRIGGER immutable_operation_delivery_delete BEFORE DELETE ON host_operation_delivery BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_operation_delivery_delete BEFORE DELETE ON host_operation_delivery WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER operation_event_target BEFORE INSERT ON memory_events
-WHEN NEW.operation_id IS NOT NULL AND NOT EXISTS (
+WHEN NEW.operation_id IS NOT NULL AND NEW.kind!='purge-logical-commit' AND NOT EXISTS (
   SELECT 1 FROM pending_operations o JOIN host_presentations p ON p.presentation_id=o.presentation_id
   JOIN presentation_targets t ON t.presentation_id=p.presentation_id
   WHERE o.operation_id=NEW.operation_id AND o.state='pending' AND p.kind=NEW.kind AND o.presentation_hash=p.payload_hash
@@ -607,7 +623,7 @@ CREATE TABLE source_units (
 CREATE INDEX source_units_project ON source_units(owner_id,project_id,unit_id);
 CREATE INDEX source_units_source ON source_units(source_owner,source_event_id);
 CREATE TRIGGER immutable_source_units_update BEFORE UPDATE ON source_units BEGIN SELECT RAISE(ABORT,'append-only'); END;
-CREATE TRIGGER immutable_source_units_delete BEFORE DELETE ON source_units BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_source_units_delete BEFORE DELETE ON source_units WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TABLE source_projection_jobs (
   job_id TEXT PRIMARY KEY, owner_kind TEXT NOT NULL CHECK(owner_kind IN ('session','proposal')),
   unit_id TEXT NOT NULL, owner_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(project_id),
@@ -624,7 +640,7 @@ WHEN NEW.job_id IS NOT OLD.job_id OR NEW.owner_kind IS NOT OLD.owner_kind OR NEW
   OR (OLD.status='done' AND NEW.status!='done') OR (OLD.status='failed' AND NOT (NEW.status='done' AND NEW.reason='rebuild'))
   OR (OLD.status='pending' AND NEW.status NOT IN ('done','failed'))
 BEGIN SELECT RAISE(ABORT,'source-projection-job-immutable'); END;
-CREATE TRIGGER immutable_source_projection_jobs_delete BEFORE DELETE ON source_projection_jobs
+CREATE TRIGGER immutable_source_projection_jobs_delete BEFORE DELETE ON source_projection_jobs WHEN euler_purge_writer()!=1
 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TABLE search_documents (
   unit_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, record_id TEXT NOT NULL UNIQUE,
@@ -699,28 +715,28 @@ CREATE TABLE proposal_source_units (
 CREATE INDEX verification_source ON verification_evidence(source_owner,source_event_id);
 CREATE INDEX proposal_source ON proposal_evidence(source_owner,source_event_id);
 CREATE TRIGGER immutable_memory_records_update BEFORE UPDATE ON memory_records BEGIN SELECT RAISE(ABORT, 'append-only'); END;
-CREATE TRIGGER immutable_memory_records_delete BEFORE DELETE ON memory_records BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER immutable_memory_records_delete BEFORE DELETE ON memory_records WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_memory_revisions_update BEFORE UPDATE ON memory_revisions BEGIN SELECT RAISE(ABORT, 'append-only'); END;
-CREATE TRIGGER immutable_memory_revisions_delete BEFORE DELETE ON memory_revisions BEGIN SELECT RAISE(ABORT, 'append-only'); END;
-CREATE TRIGGER immutable_memory_events_update BEFORE UPDATE ON memory_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
-CREATE TRIGGER immutable_memory_events_delete BEFORE DELETE ON memory_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER immutable_memory_revisions_delete BEFORE DELETE ON memory_revisions WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER immutable_memory_events_update BEFORE UPDATE ON memory_events WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER immutable_memory_events_delete BEFORE DELETE ON memory_events WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_verification_runs_update BEFORE UPDATE ON verification_runs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
-CREATE TRIGGER immutable_verification_runs_delete BEFORE DELETE ON verification_runs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER immutable_verification_runs_delete BEFORE DELETE ON verification_runs WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_compartments_update BEFORE UPDATE ON compartments BEGIN SELECT RAISE(ABORT, 'append-only'); END;
-CREATE TRIGGER immutable_compartments_delete BEFORE DELETE ON compartments BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER immutable_compartments_delete BEFORE DELETE ON compartments WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_capture_jobs_update BEFORE UPDATE ON capture_jobs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
-CREATE TRIGGER immutable_capture_jobs_delete BEFORE DELETE ON capture_jobs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER immutable_capture_jobs_delete BEFORE DELETE ON capture_jobs WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_provenance_refs_update BEFORE UPDATE ON provenance_refs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
-CREATE TRIGGER immutable_provenance_refs_delete BEFORE DELETE ON provenance_refs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER immutable_provenance_refs_delete BEFORE DELETE ON provenance_refs WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_evolution_proposals_update BEFORE UPDATE ON evolution_proposals BEGIN SELECT RAISE(ABORT, 'append-only'); END;
-CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_proposals BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_proposals WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
-CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=23;
+PRAGMA user_version=24;
 ` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts','store_recovery_events','store_recovered_owners'].map(table => `
-CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
-CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} ${['request_events','execution_streams','store_recovery_events'].includes(table) ? 'WHEN euler_purge_writer()!=1 ' : ''}BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 `).join('') + ['memory_heads','intent_heads','owner_fences','host_operation_delivery','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
   'verification_runs','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts','host_info_batches','capture_work','compartments','store_snapshots','store_restores','store_recovery_events','store_recovered_owners'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
@@ -729,8 +745,8 @@ WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); E
 CREATE TRIGGER owned_${table}_${operation.toLowerCase()} BEFORE ${operation} ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
 `)).join('') + `
-CREATE TRIGGER immutable_presentation_delete BEFORE DELETE ON host_presentations BEGIN SELECT RAISE(ABORT,'append-only'); END;
-CREATE TRIGGER immutable_host_info_delete BEFORE DELETE ON host_info_batches BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_presentation_delete BEFORE DELETE ON host_presentations WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_host_info_delete BEFORE DELETE ON host_info_batches WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER guarded_host_info_update BEFORE UPDATE ON host_info_batches
 WHEN NEW.batch_id IS NOT OLD.batch_id OR NEW.job_id IS NOT OLD.job_id OR NEW.owner_id IS NOT OLD.owner_id
   OR NEW.scope_kind IS NOT OLD.scope_kind OR NEW.scope_id IS NOT OLD.scope_id OR NEW.digest IS NOT OLD.digest
@@ -739,7 +755,7 @@ WHEN NEW.batch_id IS NOT OLD.batch_id OR NEW.job_id IS NOT OLD.job_id OR NEW.own
     OR NEW.entry_hash IS NOT OLD.entry_hash OR NEW.delivered_at IS NOT OLD.delivered_at))
   OR (OLD.read_state='read' AND (NEW.read_state IS NOT OLD.read_state OR NEW.read_at IS NOT OLD.read_at))
 BEGIN SELECT RAISE(ABORT,'host-info-state-monotonic'); END;
-CREATE TRIGGER immutable_pending_delete BEFORE DELETE ON pending_operations BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_pending_delete BEFORE DELETE ON pending_operations WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_presentation_update BEFORE UPDATE ON host_presentations
 WHEN NEW.acknowledged<OLD.acknowledged OR ${['presentation_id','session_id','branch_id','ordinal','epoch','token','kind','operation_id',
   'originating_id','supersedes_operation_id','batch_id','batch_digest','payload','payload_hash'].map(column => `NEW.${column} IS NOT OLD.${column}`).join(' OR ')}
@@ -764,6 +780,9 @@ export class ProbeStore {
   readonly #readSource: ((input: SourceAck) => { text: string; role?: 'user' | 'assistant' | 'tool' }) | undefined;
   #depth = 0;
   #committingOperation: string | null = null;
+  #purging = false;
+  readonly #purgePreviews = new Map<string, { presentation: PurgePresentation; epoch: number; coordinator: string; presented: boolean }>();
+  readonly #purgeInputs = new WeakMap<PurgeInput, { text: string; tokens: Set<string>; epoch: number; coordinator: string }>();
 
   constructor(resources: StoreResources, storeId: string, binding: Binding, initialize = false,
     readSource?: (input: SourceAck) => { text: string; role?: 'user' | 'assistant' | 'tool' }, appId = 'euler', queryRequest?: (attempt: RequestAttempt) => RequestReconciliation) {
@@ -776,6 +795,7 @@ export class ProbeStore {
     this.#db = new DatabaseSync(resources.store.path);
     try {
       this.#db.function('euler_store_writer', () => this.#depth > 0 ? 1 : 0);
+      this.#db.function('euler_purge_writer', () => this.#depth > 0 && this.#purging ? 1 : 0);
       this.#db.exec('PRAGMA busy_timeout=2000; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;');
       const version = this.#db.prepare('PRAGMA user_version').get()!.user_version;
       if (initialize) {
@@ -789,15 +809,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,23,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,24,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 23, 'unsupported-probe-schema');
+        check(version === 24, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 23 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 24 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -1296,6 +1316,8 @@ export class ProbeStore {
     this.#verifyResources();
     const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(this.#storeId);
     check(row, 'missing-owner-fence');
+    const cleanup = this.#purgeContinuation();
+    check(row.state !== 'open' || cleanup === null, 'purge-cleanup-incomplete');
     for (const kind of ['root', 'store'] as const) {
       const resource = this.#resources[kind];
       check(row[`${kind}_path`] === resource.path && row[`${kind}_dev`] === resource.identity.dev
@@ -1381,7 +1403,9 @@ export class ProbeStore {
       return stream;
     }
     const id = randomUUID();
-    this.#db.prepare('INSERT INTO execution_streams VALUES (?,?,?,?,?,?,?,?,?)')
+    this.#db.prepare(`INSERT INTO execution_streams
+      (stream_id,store_id,owner_kind,owner_id,principal_id,origin_host_id,project_id,authorization_kind,authorization_id)
+      VALUES (?,?,?,?,?,?,?,?,?)`)
       .run(id, this.#storeId, kind, ownerId, this.#binding.ownerId, this.#binding.hostId,
         this.#binding.projectId, 'synthetic-host-command', authorizationId);
     return this.#readStream(id);
@@ -1393,7 +1417,7 @@ export class ProbeStore {
     check(row && row.principal_id === this.#binding.ownerId && row.origin_host_id === this.#binding.hostId, 'stream-owner-evidence-gap');
     return { streamId, ownerKind: row.owner_kind as ExecutionStream['ownerKind'], ownerId: String(row.owner_id),
       principalId: String(row.principal_id), originHostId: String(row.origin_host_id), projectId: String(row.project_id),
-      authorization: { kind: 'synthetic-host-command', id: String(row.authorization_id) } };
+      authorization: { kind: 'synthetic-host-command', id: String(row.authorization_id) }, replayable: row.redacted === 0 };
   }
 
   readStream(activity: Activity, streamId: string): ExecutionStream {
@@ -1422,6 +1446,7 @@ export class ProbeStore {
     uuid(runId);
     const row = this.#db.prepare('SELECT * FROM request_runs WHERE run_id=?').get(runId);
     check(row, 'unknown-run');
+    check(row.redacted === 0, 'request-logically-purged');
     check(row.stream_id === stream.streamId, 'request-scope-mismatch');
     const budget = JSON.parse(String(row.budget)) as ProbeBudget;
     validateBudget(budget);
@@ -1477,6 +1502,20 @@ export class ProbeStore {
         operations.add(plan.operationId); expected.set(key, operations);
       }
     }
+    for (const row of this.#db.prepare(`SELECT * FROM store_recovery_events e WHERE NOT EXISTS
+      (SELECT 1 FROM store_restores r WHERE r.operation_id=e.operation_id)`).all()) {
+      const owners = this.#db.prepare('SELECT kind,owner_id FROM store_recovered_owners WHERE operation_id=? ORDER BY kind,owner_id').all(row.operation_id!);
+      check(row.purged_owners_hash !== null && row.purged_owners_hash === sha256(JSON.stringify(owners))
+        && sha256(String(row.receipt)) === row.digest, 'snapshot-recovery-evidence-gap');
+      const receipt = JSON.parse(String(row.receipt)) as SnapshotRecoveryReceipt;
+      check(receipt.schema === 'store/recovered-from-snapshot@v1' && receipt.operationId === row.operation_id
+        && receipt.outcome === 'recovered_with_gap', 'snapshot-recovery-evidence-gap');
+      receipts.set(receipt.operationId, receipt);
+      for (const owner of owners) {
+        const key = `${String(owner.kind)}/${String(owner.owner_id)}`, operations = expected.get(key) ?? new Set<string>();
+        operations.add(receipt.operationId); expected.set(key, operations);
+      }
+    }
     const result = new Map<string, SnapshotRecoveryReceipt>();
     for (const row of this.#db.prepare('SELECT * FROM store_recovered_owners').all()) {
       const key = `${String(row.kind)}/${String(row.owner_id)}`, operationId = String(row.operation_id);
@@ -1505,7 +1544,7 @@ export class ProbeStore {
     // consumes that recovery decision; any unknown in the successor blocks again.
     const blockers = this.#db.prepare(`SELECT DISTINCT r.run_id FROM request_runs r
       JOIN execution_streams s ON s.stream_id=r.stream_id
-      WHERE s.project_id=? AND s.principal_id=? AND r.run_id!=?
+      WHERE s.project_id=? AND s.principal_id=? AND r.run_id!=? AND r.redacted=0
       AND NOT EXISTS(SELECT 1 FROM store_recovered_owners recovered WHERE recovered.kind=s.owner_kind AND recovered.owner_id=s.owner_id)
       AND (EXISTS(SELECT 1 FROM request_attempts a WHERE a.run_id=r.run_id AND a.outcome='unknown-sent')
         OR EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='run-recovery-gap')
@@ -1545,7 +1584,9 @@ export class ProbeStore {
       const stream = this.#readStream(activity.streamId);
       check(!this.#db.prepare('SELECT 1 FROM request_runs WHERE run_id=?').get(runId), 'run-identity-conflict');
       const authorizedAt = new Date().toISOString();
-      this.#db.prepare('INSERT INTO request_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      this.#db.prepare(`INSERT INTO request_runs
+        (run_id,stream_id,owner_kind,owner_id,authorization_id,activity_id,epoch,budget,intent_event_id,intent_hash,related_run_id,authorized_at,state)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(runId, stream.streamId, stream.ownerKind, stream.ownerId, stream.authorization.id, activity.id,
           activity.epoch, JSON.stringify(input.budget), input.intent?.eventId ?? null, input.intent?.hash ?? null,
           input.relatedRunId, authorizedAt, 'authorized');
@@ -3264,7 +3305,7 @@ export class ProbeStore {
         input: change.kind === 'correct' ? change.input : null, content: change.kind === 'correct' ? change.content : null,
         batchId: batch?.batchId ?? null, batchPayload: batch?.payload ?? null, batchDigest: batch?.digest ?? null,
         eventIds: change.kind === 'rollback' ? change.eventIds : [], updateEventIds: targets.map(() => randomUUID()) });
-      this.#db.prepare("INSERT INTO pending_operations VALUES (?,?,?,'pending',NULL,NULL,?)")
+      this.#db.prepare("INSERT INTO pending_operations (operation_id,session_id,presentation_id,state,result,result_hash,presentation_hash) VALUES (?,?,?,'pending',NULL,NULL,?)")
         .run(presentation.operationId!, presentation.sessionId, presentation.presentationId, presentation.hash);
       return presentation;
     });
@@ -3595,8 +3636,7 @@ export class ProbeStore {
       const row = this.#db.prepare('SELECT * FROM memory_events WHERE receipt_id=?').get(receiptId);
       check(row, 'receipt-evidence-gap');
       const receipt = this.#readOwnerReceipt(row);
-      const record = this.#readMemoryUnsafe(String(row.record_id));
-      this.#validateScope(record.scope);
+      if (row.record_id !== null) this.#validateScope(this.#readMemoryUnsafe(String(row.record_id)).scope);
       return receipt;
     });
   }
@@ -3604,9 +3644,12 @@ export class ProbeStore {
   #readOwnerReceipt(row: Record<string, unknown>): OwnerReceipt {
     check(sha256(String(row.receipt_payload)) === row.receipt_hash, 'receipt-evidence-gap');
     const receipt = JSON.parse(String(row.receipt_payload)) as OwnerReceipt;
-    check(receipt.schema === 'owner-receipt@1' && receipt.receiptId === row.receipt_id
-      && receipt.operationId === (row.operation_id ?? row.event_id) && receipt.kind === row.kind
-      && receipt.outcome === 'committed' && JSON.stringify(JSON.parse(String(row.payload)).ownerReceipt) === row.receipt_payload,
+    check(receipt.schema === 'owner-receipt@1' && receipt.receiptId === row.receipt_id && receipt.kind === row.kind
+      && receipt.outcome === 'committed' && (row.record_id === null
+        ? Object.keys(receipt).sort().join(',') === 'afterRevision,beforeRevision,kind,operationId,outcome,receiptId,schema,subjectRef'
+          && row.payload === null && row.operation_id === null
+        : receipt.operationId === (row.operation_id ?? row.event_id)
+          && JSON.stringify(JSON.parse(String(row.payload)).ownerReceipt) === row.receipt_payload),
     'receipt-evidence-gap');
     return receipt;
   }
@@ -3878,11 +3921,16 @@ export class ProbeStore {
   }
 
   #sourceQueryDigest(row: Record<string, unknown>): string {
-    return sha256(JSON.stringify([row.grant_id, row.query_id, row.request_hash, row.page_hash, row.result_count, row.byte_length]));
+    return sha256(JSON.stringify([row.grant_id, row.query_id, row.request_hash, row.page_hash, row.result_count, row.byte_length, row.result_refs]));
   }
 
   #readSourceQueryReceipt(row: Record<string, unknown>): void {
     check(this.#sourceQueryDigest(row) === row.receipt_hash, 'source-query-evidence-gap');
+    const refs = JSON.parse(String(row.result_refs));
+    check(Array.isArray(refs) && refs.length === row.result_count && refs.every(ref =>
+      ref && Object.keys(ref).sort().join(',') === 'contentHash,kind,unitId,version'
+      && ['source','report-section','handoff','proposal'].includes(ref.kind) && typeof ref.unitId === 'string'
+      && Number.isSafeInteger(ref.version) && ref.version > 0 && /^[a-f0-9]{64}$/u.test(ref.contentHash)), 'source-query-evidence-gap');
   }
 
   #sourceQueryReceipt(grantId: string, queryId: string) {
@@ -3891,10 +3939,12 @@ export class ProbeStore {
     return row;
   }
 
-  #recordSourceQueryReceipt(grantId: string, queryId: string, requestHash: string, pageHash: string, count: number, bytes: number): void {
+  #recordSourceQueryReceipt(grantId: string, queryId: string, requestHash: string, pageHash: string, count: number, bytes: number,
+    results: Pick<SourceSearchHit, 'unitId' | 'kind' | 'version' | 'contentHash'>[]): void {
+    const refs = JSON.stringify(results.map(({ unitId, kind, version, contentHash }) => ({ unitId, kind, version, contentHash })));
     const digest = this.#sourceQueryDigest({ grant_id: grantId, query_id: queryId, request_hash: requestHash,
-      page_hash: pageHash, result_count: count, byte_length: bytes });
-    this.#db.prepare('INSERT INTO source_query_receipts VALUES (?,?,?,?,?,?,?)').run(grantId, queryId, requestHash, pageHash, count, bytes, digest);
+      page_hash: pageHash, result_count: count, byte_length: bytes, result_refs: refs });
+    this.#db.prepare('INSERT INTO source_query_receipts VALUES (?,?,?,?,?,?,?,?)').run(grantId, queryId, requestHash, pageHash, count, bytes, digest, refs);
   }
 
   assertSourceSearchResult(activity: Activity, request: SourceSearchRequest, page: SourceSearchPage): void {
@@ -3966,7 +4016,7 @@ export class ProbeStore {
           WHERE grant_id=? AND state='active' AND used_queries<max_queries
             AND used_results+?<=max_results AND used_bytes+?<=max_bytes`)
           .run(count, bytes, request.grantId!, count, bytes).changes === 1, 'discovery-budget-stale');
-        this.#recordSourceQueryReceipt(request.grantId!, request.queryId!, requestHash, hash, count, bytes);
+        this.#recordSourceQueryReceipt(request.grantId!, request.queryId!, requestHash, hash, count, bytes, page.results);
         return page;
       };
       const ids = projects.map(() => '?').join(',');
@@ -5604,7 +5654,7 @@ export class ProbeStore {
         check(this.#db.prepare(`UPDATE memory_discovery_grants SET used_queries=used_queries+1, used_results=used_results+1, used_bytes=used_bytes+?
           WHERE grant_id=? AND state='active' AND used_queries<max_queries AND used_results+1<=max_results AND used_bytes+?<=max_bytes`)
           .run(size, request.grantId!, size).changes === 1, 'discovery-budget-stale');
-        this.#recordSourceQueryReceipt(request.grantId!, request.queryId!, requestHash, sha256(JSON.stringify(result)), 1, size);
+        this.#recordSourceQueryReceipt(request.grantId!, request.queryId!, requestHash, sha256(JSON.stringify(result)), 1, size, [result]);
       }
     }
     return result;
@@ -6021,16 +6071,16 @@ export class ProbeStore {
       const events = this.#db.prepare('SELECT seq FROM execution_events WHERE stream_id=? ORDER BY seq').all(row.stream_id!);
       check(events.every((event, index) => event.seq === index + 1), 'stream-evidence-gap');
     }
-    for (const row of this.#db.prepare('SELECT run_id,stream_id FROM request_runs').all()) {
+    for (const row of this.#db.prepare('SELECT run_id,stream_id FROM request_runs WHERE redacted=0').all()) {
       this.#readRequestLedger(this.#requestRun({ streamId: String(row.stream_id) }, String(row.run_id)));
     }
     for (const row of this.#db.prepare('SELECT record_id FROM memory_records').all()) this.#replayMemoryHead(String(row.record_id));
     for (const row of this.#db.prepare('SELECT * FROM provenance_refs').all()) sources(this.#readProvenance(row));
     for (const row of this.#db.prepare('SELECT * FROM verification_runs').all()) this.#verificationEvidence(row);
-    for (const row of this.#db.prepare("SELECT after_snapshot FROM memory_events WHERE kind='comparison'").all())
+    for (const row of this.#db.prepare("SELECT after_snapshot FROM memory_events WHERE kind='comparison' AND record_id IS NOT NULL").all())
       this.#checkComparisonEvidence(this.#parseMemorySnapshot(String(row.after_snapshot)), projects, false);
     for (const row of this.#db.prepare('SELECT * FROM feedback_events').all()) this.#readFeedbackReceipt(row);
-    for (const row of this.#db.prepare('SELECT * FROM memory_events WHERE receipt_id IS NOT NULL').all()) this.#readOwnerReceipt(row);
+    for (const row of this.#db.prepare("SELECT * FROM memory_events WHERE receipt_id IS NOT NULL AND kind!='purge-logical-commit'").all()) this.#readOwnerReceipt(row);
     for (const session of this.#db.prepare('SELECT * FROM sessions').all()) {
       const binding: Binding = { ownerId: String(session.owner_id), hostId: String(session.host_id), projectId: String(session.project_id),
         sessionId: String(session.session_id), branchId: String(session.branch_id) };
@@ -6476,6 +6526,7 @@ export class ProbeStore {
       const stage = new DatabaseSync(plan.stage.path);
       try {
         stage.function('euler_store_writer', () => 1);
+        stage.function('euler_purge_writer', () => 0);
         stage.exec('PRAGMA foreign_keys=ON; BEGIN IMMEDIATE; PRAGMA defer_foreign_keys=ON;');
         const copy = (table: string, row: Record<string, unknown>) => {
           const columns = Object.keys(row);
@@ -6500,7 +6551,7 @@ export class ProbeStore {
         stage.exec('DELETE FROM store_snapshots');
         for (const row of snapshotRows) copy('store_snapshots', row);
         const receipt = JSON.stringify(plan.receipt);
-        stage.prepare('INSERT OR IGNORE INTO store_recovery_events VALUES (?,?,?)').run(plan.operationId, receipt, sha256(receipt));
+        stage.prepare('INSERT OR IGNORE INTO store_recovery_events (operation_id,receipt,digest) VALUES (?,?,?)').run(plan.operationId, receipt, sha256(receipt));
         for (const owner of plan.owners) stage.prepare('INSERT OR IGNORE INTO store_recovered_owners VALUES (?,?,?)')
           .run(owner.kind, owner.ownerId, plan.operationId);
         stage.prepare("UPDATE owner_activities SET stop_state='absent',stop_observed_at=?,stop_method='snapshot-exclusive-recovery' WHERE id!=?")
@@ -6524,6 +6575,7 @@ export class ProbeStore {
       source.close();
       this.#db = new DatabaseSync(this.#resources.store.path);
       this.#db.function('euler_store_writer', () => this.#depth > 0 ? 1 : 0);
+      this.#db.function('euler_purge_writer', () => this.#depth > 0 && this.#purging ? 1 : 0);
       this.#db.exec('PRAGMA busy_timeout=2000; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA journal_mode=WAL;');
     }
     this.#transaction(() => {
@@ -6536,6 +6588,147 @@ export class ProbeStore {
       this.releaseMaintenance(coordinator);
     });
     return { receipt: plan.receipt, original: plan.original };
+  }
+
+  purgeResources(coordinator: string) {
+    return this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      const sources = this.#db.prepare('SELECT * FROM sessions WHERE store_id=? ORDER BY session_id').all(this.#storeId)
+        .map(row => ({ binding: { ownerId: String(row.owner_id), hostId: String(row.host_id), projectId: String(row.project_id),
+          sessionId: String(row.session_id), branchId: String(row.branch_id) },
+        source: { path: String(row.source_path), identity: { dev: String(row.source_dev), ino: String(row.source_ino) } } }));
+      return { sources, outputs: this.#controlledFiles() };
+    });
+  }
+
+  #planPurge(coordinator: string, recordId: string, carriers: PurgeCarrier[]) {
+    return this.#transaction(() => {
+      uuid(recordId);
+      check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
+      check(this.acquireMaintenance(coordinator).acquired, 'maintenance-residuals-or-participants');
+      const resources = this.purgeResources(coordinator);
+      const paths = [...resources.sources.map(item => item.source.path),
+        join(this.#resources.root.path, 'owner-info.jsonl'), join(this.#resources.root.path, 'counting-receiver.jsonl'),
+        ...resources.outputs.filter(file => file.started && file.state !== 'no_effect').map(file => file.path)];
+      check(new Set(carriers.map(carrier => carrier.file.path)).size === carriers.length
+        && JSON.stringify([...new Set(paths)].sort()) === JSON.stringify(carriers.map(carrier => carrier.file.path).sort()), 'purge-carrier-inventory-mismatch');
+      for (const carrier of carriers) {
+        const bytes = snapshotBytes(carrier.file);
+        check(bytes.length === carrier.bytes && sha256(bytes) === carrier.hash, 'purge-carrier-stale');
+      }
+      const backups = this.#db.prepare("SELECT snapshot_id FROM store_snapshots WHERE state!='deleted' ORDER BY snapshot_id").all()
+        .map(row => this.snapshotCleanupManifest(coordinator, String(row.snapshot_id)));
+      for (const row of this.#db.prepare("SELECT operation_id FROM store_restores WHERE state IN ('preparing','complete') AND original_deleted=0 ORDER BY operation_id").all())
+        backups.push(this.recoveryCleanupManifest(coordinator, String(row.operation_id)));
+      check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state='prepared'").get(), 'snapshot-recovery-in-progress');
+      const plan = planPurge(this.#db, recordId, carriers, backups, DDL);
+      check(plan.manifest.records.length === plan.selected.get('memory_records')?.length, 'memory-evidence-gap');
+      for (const record of plan.manifest.records) this.#replayMemoryHead(record.recordId);
+      return plan;
+    });
+  }
+
+  previewPurge(coordinator: string, recordId: string, carriers: PurgeCarrier[]): PurgePresentation {
+    const plan = this.#planPurge(coordinator, recordId, carriers);
+    const operationId = randomUUID(), token = randomUUID(), nonce = randomUUID();
+    const presentation: PurgePresentation = { operationId, token, nonce, phrase: `PURGE ${token} ${nonce}`,
+      manifest: plan.manifest, digest: plan.digest };
+    this.#purgePreviews.clear();
+    this.#purgePreviews.set(token, { presentation, epoch: this.fence().epoch, coordinator, presented: false });
+    return structuredClone(presentation);
+  }
+
+  acknowledgePurgePresentation(coordinator: string, token: string, digest: string): void {
+    const fence = this.#assertCoordinator(coordinator), preview = this.#purgePreviews.get(token);
+    check(preview && preview.coordinator === coordinator && preview.epoch === fence.epoch
+      && preview.presentation.digest === digest && fence.state === 'exclusive', 'purge-presentation-stale');
+    preview.presented = true;
+  }
+
+  /** Bound at the Host's actual input callback, before queuing or asynchronous output. */
+  receivePurgeInput(coordinator: string, text: string): PurgeInput {
+    const fence = this.#assertCoordinator(coordinator), input = Object.freeze({ id: randomUUID() });
+    this.#purgeInputs.set(input, { text, coordinator, epoch: fence.epoch,
+      tokens: new Set([...this.#purgePreviews].filter(([, item]) => item.presented).map(([token]) => token)) });
+    return input;
+  }
+
+  #purgeContinuation(): PurgeContinuation | null {
+    const rows = this.#db.prepare("SELECT * FROM pending_operations WHERE kind='purge' AND state='cleaning'").all();
+    check(rows.length <= 1, 'purge-operation-evidence-gap');
+    check(!this.#db.prepare(`SELECT 1 FROM memory_events e WHERE e.kind='purge-logical-commit' AND NOT EXISTS
+      (SELECT 1 FROM pending_operations o WHERE o.operation_id=e.operation_id AND o.kind='purge' AND o.state='cleaning')`).get(),
+    'purge-continuation-evidence-gap');
+    if (!rows.length) return null;
+    const row = rows[0]!;
+    check(sha256(String(row.continuation)) === row.continuation_hash, 'purge-continuation-evidence-gap');
+    const continuation = JSON.parse(String(row.continuation)) as PurgeContinuation;
+    check(continuation.schema === 'purge-continuation@1' && continuation.operationId === row.operation_id
+      && continuation.phase === 'external-cleanup', 'purge-continuation-evidence-gap');
+    return continuation;
+  }
+
+  purgeStatus(coordinator: string, operationId?: string) {
+    return this.#transaction(() => {
+      this.#assertCoordinator(coordinator);
+      const continuation = this.#purgeContinuation();
+      if (!continuation) { check(!operationId, 'purge-operation-evidence-gap'); return null; }
+      check(!operationId || operationId === continuation.operationId, 'purge-operation-evidence-gap');
+      const row = this.#db.prepare("SELECT * FROM memory_events WHERE operation_id=? AND kind='purge-logical-commit'").get(continuation.operationId);
+      check(row && row.record_id === null && sha256(String(row.receipt_payload)) === row.receipt_hash, 'purge-receipt-evidence-gap');
+      const receipt = JSON.parse(String(row.receipt_payload)) as PurgeReceipt;
+      check(JSON.stringify(receipt) === JSON.stringify({ schema: 'purge/logical-commit@1', operationId: continuation.operationId,
+        status: 'logical-commit' }), 'purge-receipt-evidence-gap');
+      return { status: 'logical-commit' as const, operationId: continuation.operationId, receipt,
+        cleanup: 'incomplete' as const, phase: continuation.phase };
+    });
+  }
+
+  commitPurge(coordinator: string, input: PurgeInput, token: string, carriers: PurgeCarrier[]) {
+    const prior = this.purgeStatus(coordinator);
+    if (prior) return { ...prior, status: 'settled' as const };
+    const live = this.#purgeInputs.get(input); this.#purgeInputs.delete(input);
+    const preview = this.#purgePreviews.get(token), fence = this.#assertCoordinator(coordinator);
+    check(live && preview && live.coordinator === coordinator && preview.coordinator === coordinator
+      && live.epoch === fence.epoch && preview.epoch === fence.epoch && live.tokens.has(token)
+      && preview.presented && live.text === preview.presentation.phrase, 'exact-live-purge-phrase-required');
+    const { operationId, manifest, digest } = preview.presentation;
+    this.#purgePreviews.delete(token);
+    const committed = this.#transaction(() => {
+      const plan = this.#planPurge(coordinator, manifest.recordId, carriers);
+      check(plan.digest === digest && JSON.stringify(plan.manifest) === JSON.stringify(manifest), 'purge-manifest-stale');
+      const continuation: PurgeContinuation = { schema: 'purge-continuation@1', operationId, phase: 'external-cleanup',
+        carriers: manifest.carriers, backups: manifest.backups, inventory: manifest.inventory.carriers };
+      const receipt: PurgeReceipt = { schema: 'purge/logical-commit@1', operationId, status: 'logical-commit' };
+      this.#purging = true;
+      try {
+        applyLogicalPurge(this.#db, plan);
+        const result = JSON.stringify({ receiptId: operationId }), continuationBytes = JSON.stringify(continuation);
+        this.#db.prepare(`INSERT INTO pending_operations
+          (operation_id,state,result,result_hash,presentation_hash,kind,continuation,continuation_hash)
+          VALUES (?,'cleaning',?,?,?,'purge',?,?)`).run(operationId, result, sha256(result), digest, continuationBytes, sha256(continuationBytes));
+        const payload = JSON.stringify(receipt);
+        this.#db.prepare(`INSERT INTO memory_events (event_id,kind,operation_id,receipt_id,receipt_payload,receipt_hash,created_at)
+          VALUES (?,'purge-logical-commit',?,?,?,?,?)`).run(operationId, operationId, operationId, payload, sha256(payload), new Date().toISOString());
+        this.#db.prepare("UPDATE owner_fences SET state='cleaning' WHERE store_id=?").run(this.#storeId);
+        check(this.#db.prepare('PRAGMA foreign_key_check').all().length === 0, 'purge-database-postcondition-failed');
+      } finally { this.#purging = false; }
+      return this.purgeStatus(coordinator, operationId)!;
+    });
+    this.#purgePreviews.clear();
+    return committed;
+  }
+
+  invalidatePurgePresentation(coordinator: string): void {
+    this.#assertCoordinator(coordinator);
+    this.#purgePreviews.clear();
+  }
+
+  cancelPurge(coordinator: string) {
+    const prior = this.purgeStatus(coordinator);
+    if (prior) return { ...prior, status: 'settled' as const };
+    this.#purgePreviews.clear();
+    return { status: 'cancelled' as const, fence: this.cancelMaintenance(coordinator) };
   }
 
   beginMaintenance(coordinator: string): Fence {
@@ -6596,7 +6789,7 @@ export class ProbeStore {
       });
       const residuals = this.#scanResiduals();
       const acquired = observations.every(item => item.absent) && residuals.every(item => item.state === 'expected');
-      this.#db.prepare('UPDATE owner_fences SET state=? WHERE store_id=?').run(acquired ? 'exclusive' : 'closing', this.#storeId);
+      this.#db.prepare('UPDATE owner_fences SET state=? WHERE store_id=?').run(acquired ? this.#purgeContinuation() ? 'cleaning' : 'exclusive' : 'closing', this.#storeId);
       return { acquired, observations, residuals };
     });
   }
@@ -6604,7 +6797,7 @@ export class ProbeStore {
   #controlledFiles(): ControlledFile[] {
     const rows = this.#db.prepare(`SELECT e.run_id,e.payload,e.hash,s.principal_id,s.project_id FROM request_events e
       JOIN request_runs r ON r.run_id=e.run_id JOIN execution_streams s ON s.stream_id=r.stream_id
-      WHERE s.store_id=? AND e.kind='agent/event@v1' ORDER BY e.run_id,e.seq`).all(this.#storeId);
+      WHERE s.store_id=? AND r.redacted=0 AND e.kind='agent/event@v1' ORDER BY e.run_id,e.seq`).all(this.#storeId);
     const runs = new Map<string, { events: AgentEvent[]; ownerId: string; projectId: string }>();
     for (const row of rows) {
       check(sha256(String(row.payload)) === row.hash, 'file-cleanup-evidence-gap');
@@ -6641,6 +6834,9 @@ export class ProbeStore {
     const known = new Set(['sandbox.json', 'counting-receiver.jsonl', 'owner-info.jsonl', ...sourceNames, basename(this.#resources.store.path),
       `${basename(this.#resources.store.path)}-wal`, `${basename(this.#resources.store.path)}-shm`]);
     const snapshots = this.#db.prepare("SELECT * FROM store_snapshots WHERE state!='deleted'").all();
+    const purge = this.#purgeContinuation();
+    for (const cleanup of purge?.backups ?? []) snapshots.push({ directory: cleanup.directory.path,
+      dev: cleanup.directory.identity.dev, ino: cleanup.directory.identity.ino });
     const recoveries = this.#db.prepare("SELECT * FROM store_restores WHERE state IN ('prepared','complete')").all().map(row => this.#readRecoveryPlan(row));
     const preparations = this.#db.prepare("SELECT * FROM store_restores WHERE state='preparing'").all().map(row => this.#readRecoveryPreparation(row));
     for (const preparation of preparations) if (preparation.original.identity) snapshots.push({
@@ -6663,6 +6859,9 @@ export class ProbeStore {
           const identityMatches = !source || (source.source_dev === stat.dev.toString() && source.source_ino === stat.ino.toString());
           const snapshot = snapshots.find(row => basename(String(row.directory)) === path);
           if (snapshot?.snapshot_id) this.#snapshotFiles(snapshot);
+          const purgeBackup = purge?.backups.find(item => basename(item.directory.path) === path);
+          if (purgeBackup) check(JSON.stringify(inspectSnapshotFiles(purgeBackup.directory, purgeBackup.files.map(file => file.name)))
+            === JSON.stringify(purgeBackup.files), 'purge-backup-stale');
           const recovery = recoveries.find(plan => basename(plan.original.path) === path);
           if (snapshot && recovery) inspectSnapshotFiles(recovery.original, recoveryFileNames(recovery));
           const preparation = preparations.find(item => basename(item.original.path) === path);
@@ -6696,6 +6895,17 @@ export class ProbeStore {
           reason: 'project-copy-reconciliation-required' });
       }
     }
+    for (const carrier of purge?.inventory ?? []) {
+      try {
+        const bytes = snapshotBytes(carrier.file);
+        check(bytes.length === carrier.bytes && sha256(bytes) === carrier.hash, 'purge-carrier-stale');
+        entries.push({ path: carrier.role === 'project-output' ? carrier.file.path : basename(carrier.file.path), state: 'expected', observedAt,
+          dev: carrier.file.identity.dev, ino: carrier.file.identity.ino, reason: 'purge-continuation-carrier' });
+      } catch {
+        entries.push({ path: carrier.role === 'project-output' ? carrier.file.path : basename(carrier.file.path), state: 'unknown', observedAt,
+          dev: carrier.file.identity.dev, ino: carrier.file.identity.ino, reason: 'purge-carrier-reconciliation-required' });
+      }
+    }
     const unique = new Map<string, (typeof entries)[number]>();
     for (const entry of entries) if (!unique.has(entry.path) || entry.state !== 'expected') unique.set(entry.path, entry);
     this.#db.prepare('DELETE FROM maintenance_residuals WHERE store_id=?').run(this.#storeId);
@@ -6726,6 +6936,7 @@ export class ProbeStore {
   }
 
   #reopenMaintenance(): Fence {
+    check(!this.#purgeContinuation(), 'purge-cleanup-incomplete');
     check(!this.#db.prepare("SELECT 1 FROM store_snapshots WHERE cleanup IS NOT NULL UNION ALL SELECT 1 FROM store_restores WHERE cleanup IS NOT NULL LIMIT 1").get(), 'snapshot-cleanup-in-progress');
     this.#db.prepare(`UPDATE owner_fences SET state='open',epoch=epoch+1,coordinator=NULL,coordinator_pid=NULL,
       coordinator_incarnation=NULL,coordinator_started_at=NULL,coordinator_activity=NULL WHERE store_id=?`).run(this.#storeId);
