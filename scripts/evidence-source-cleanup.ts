@@ -20,14 +20,16 @@ for (const scenario of fixture.cases) {
   const sandbox = createSandbox(), commands: object[] = [], assertions: string[] = [];
   const children: { name: string; cli: ReturnType<typeof startCli>; input: string[]; startedAt: string }[] = [];
   const save = (name: string, value: unknown) => writeFileSync(join(path, name), JSON.stringify(value, null, 2) + '\n');
-  const run = (name: string, args: string[], expected = 0) => {
+  const run = (name: string, args: string[], expected: number | 'crash' = 0) => {
     const start = new Date().toISOString();
     const result = spawnSync(process.execPath, args, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
     writeFileSync(join(path, name + '.stdout.jsonl'), result.stdout ?? '');
     writeFileSync(join(path, name + '.stderr.txt'), result.stderr ?? '');
     commands.push({ command: [process.execPath, ...args], startedAt: start, completedAt: new Date().toISOString(),
       exitCode: result.status, signal: result.signal, stdout: name + '.stdout.jsonl', stderr: name + '.stderr.txt' });
-    assert.equal(result.error, undefined); assert.equal(result.status, expected, result.stderr + result.stdout);
+    assert.equal(result.error, undefined);
+    if (expected === 'crash') assert.ok(result.signal === 'SIGKILL' || result.status !== 0, result.stderr + result.stdout);
+    else assert.equal(result.status, expected, result.stderr + result.stdout);
     return result.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
   };
   const start = (name: string, args: string[] = []) => {
@@ -54,6 +56,15 @@ for (const scenario of fixture.cases) {
     if (scenario.startsWith('recovered-session')) {
       const later = run('later-source', ['apps/cli/test/support/purge-recovered-source-worker.ts', sandbox.root, JSON.stringify(seeded.target.source)]).at(-1)!;
       laterSource = later.source.path;
+      if (scenario === 'recovered-session-restore-crash') {
+        const crashed = run('restore-crash', ['apps/cli/test/support/backup-worker.ts', sandbox.root, 'restore-crash', 'database'], 'crash');
+        assert.equal(crashed.at(-1)!.point, 'database');
+        const interrupted = inspect(db => ({ states: db.prepare('SELECT state FROM store_restores').all(),
+          laterSessions: db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE session_id=?').get(later.binding.sessionId)!.count }));
+        save('restore-interrupted.json', interrupted); cpSync(sandbox.root, join(path, 'restore-interrupted'), { recursive: true });
+        assert.ok(interrupted.states.some(row => row.state === 'prepared')); assert.equal(interrupted.laterSessions, 0);
+        assertions.push('After database replacement, a prepared recovery retains the later original owner and can resume after process exit.');
+      }
       run('restore', ['apps/cli/src/main.ts', 'restore-snapshot', '--sandbox', sandbox.root, '--snapshot', snapshot!]);
     }
     const point = scenario === 'recovered-session-after-delete' ? 'after-delete' : scenario;

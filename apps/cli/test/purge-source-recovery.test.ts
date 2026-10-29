@@ -6,11 +6,12 @@ import type { PurgePresentation } from '@euler/core';
 import { createSandbox } from '../src/sandbox.ts';
 import { startCli, sendCommand } from '../src/process-driver.ts';
 
-for (const { crash, related, discard } of [
-  { crash: false, related: true, discard: false }, { crash: true, related: true, discard: false },
-  { crash: false, related: true, discard: true }, { crash: false, related: false, discard: false },
+for (const { crash, related, discard, restoreCrash } of [
+  { crash: false, related: true, discard: false, restoreCrash: false }, { crash: true, related: true, discard: false, restoreCrash: false },
+  { crash: false, related: true, discard: true, restoreCrash: false }, { crash: false, related: false, discard: false, restoreCrash: false },
+  { crash: false, related: true, discard: false, restoreCrash: true },
 ])
-test(`source cleanup retains post-snapshot archive ownership after restore, crash=${crash}, related=${related}, discard=${discard}`, async () => {
+test(`source cleanup retains post-snapshot archive ownership after restore, crash=${crash}, related=${related}, discard=${discard}, restoreCrash=${restoreCrash}`, async () => {
   const sandbox = createSandbox(), children: ReturnType<typeof startCli>[] = [];
   const run = (args: string[]) => {
     const result = spawnSync(process.execPath, args, { encoding: 'utf8' });
@@ -22,6 +23,12 @@ test(`source cleanup retains post-snapshot archive ownership after restore, cras
     const snapshot = run(['apps/cli/src/main.ts', 'backup', '--sandbox', sandbox.root]).find(item => item.event === 'backup-result').snapshot;
     const later = run(['apps/cli/test/support/purge-recovered-source-worker.ts', sandbox.root, JSON.stringify(related ? fixture.target.source : fixture.unrelated)]).at(-1)!;
     const original = readFileSync(later.source.path);
+    if (restoreCrash) {
+      const killed = spawnSync(process.execPath, ['apps/cli/test/support/backup-worker.ts', sandbox.root, 'restore-crash', 'database'], { encoding: 'utf8' });
+      assert.equal(killed.error, undefined);
+      assert.ok(killed.signal === 'SIGKILL' || killed.status !== 0, killed.stderr);
+      assert.equal(JSON.parse(killed.stdout.trim()).point, 'database');
+    }
     const restored = run(['apps/cli/src/main.ts', 'restore-snapshot', '--sandbox', sandbox.root, '--snapshot', snapshot.id])
       .find(item => item.event === 'snapshot-restored');
     if (discard) run(['apps/cli/test/support/backup-worker.ts', sandbox.root, 'discard-recovery', restored.receipt.operationId]);

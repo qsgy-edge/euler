@@ -6615,7 +6615,7 @@ export class ProbeStore {
         sessionId: String(row.session_id), branchId: String(row.branch_id) },
       source: { path: String(row.source_path), identity: { dev: String(row.source_dev), ino: String(row.source_ino) } } });
     }
-    for (const row of this.#db.prepare("SELECT * FROM store_restores WHERE state='complete' ORDER BY operation_id").all()) {
+    for (const row of this.#db.prepare("SELECT * FROM store_restores WHERE state IN ('prepared','complete') ORDER BY operation_id").all()) {
       const plan = this.#readRecoveryPlanMetadata(row);
       for (const item of plan.sources) {
         check(plan.originals.some(file => file.role === 'source' && file.source.path === item.source.path
