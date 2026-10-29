@@ -26,6 +26,7 @@ import type { RequestAssembly, RequestAssemblyInput, RequestAssemblyState, Assem
 
 export interface FileIdentity { dev: string; ino: string }
 export interface BoundFile { path: string; identity: FileIdentity }
+export interface BoundSource { binding: Binding; source: BoundFile }
 export interface StoreResources { root: BoundFile; source: BoundFile; store: BoundFile }
 
 export function fileIdentity(path: string): FileIdentity {
@@ -6378,7 +6379,7 @@ export class ProbeStore {
     const plan = JSON.parse(String(row.payload)) as SnapshotRecoveryPlan;
     check(plan.operationId === row.operation_id && plan.snapshot.id === row.snapshot_id
       && plan.receipt.operationId === plan.operationId && plan.receipt.schema === 'store/recovered-from-snapshot@v1'
-      && plan.receipt.outcome === 'recovered_with_gap' && Array.isArray(plan.owners), 'snapshot-recovery-evidence-gap');
+      && plan.receipt.outcome === 'recovered_with_gap' && Array.isArray(plan.owners) && Array.isArray(plan.sources), 'snapshot-recovery-evidence-gap');
     for (const owner of plan.owners) {
       check(['session', 'job', 'maintenance', 'migration'].includes(owner.kind), 'snapshot-recovery-evidence-gap');
       uuid(owner.ownerId);
@@ -6458,9 +6459,9 @@ export class ProbeStore {
         { source: this.#resources.store, name: 'store.sqlite', role: 'source' },
         ...snapshot.files.map(({ source, name, role }) => ({ source, name, role })),
       ];
-      for (const session of this.#db.prepare('SELECT source_path,source_dev,source_ino FROM sessions WHERE store_id=?').all(this.#storeId)) {
-        if (!files.some(file => file.source.path === session.source_path)) files.push({ source: { path: String(session.source_path),
-          identity: { dev: String(session.source_dev), ino: String(session.source_ino) } }, name: `later-source-${files.length}`, role: 'source' });
+      const sources = this.#controlledSourceOwners();
+      for (const { source } of sources) {
+        if (!files.some(file => file.source.path === source.path)) files.push({ source, name: `later-source-${files.length}`, role: 'source' });
       }
       const controlledFiles = this.#controlledFiles().filter(file => file.started && file.state !== 'no_effect');
       for (const file of controlledFiles) {
@@ -6471,7 +6472,7 @@ export class ProbeStore {
       }
       for (const file of files) sameFile(file.source.path, file.source.identity);
       const operationId = randomUUID();
-      const preparation: SnapshotRecoveryPreparation = { operationId, snapshot, files, controlledFiles,
+      const preparation: SnapshotRecoveryPreparation = { operationId, snapshot, files, sources, controlledFiles,
         original: { path: join(this.#resources.root.path, `recovery-${operationId}`), identity: null },
         receipt: { schema: 'store/recovered-from-snapshot@v1', operationId, outcome: 'recovered_with_gap', createdAt: new Date().toISOString() } };
       const payload = JSON.stringify(preparation);
@@ -6514,7 +6515,7 @@ export class ProbeStore {
         owners = [...new Map(all.map(owner => [`${String(owner.kind)}/${String(owner.owner_id)}`,
           { kind: String(owner.kind) as SnapshotRecoveryPlan['owners'][number]['kind'], ownerId: String(owner.owner_id) }])).values()];
       } finally { snapshot.close(); }
-      const plan: SnapshotRecoveryPlan = { operationId: preparation.operationId, snapshot: preparation.snapshot, original, originals, owners,
+      const plan: SnapshotRecoveryPlan = { operationId: preparation.operationId, snapshot: preparation.snapshot, original, originals, owners, sources: preparation.sources,
         controlledFiles: preparation.controlledFiles, receipt: preparation.receipt, stage: { path: stagePath, identity: fileIdentity(stagePath) } };
       syncSnapshotDirectory(original.path);
       const payload = JSON.stringify(plan);
@@ -6598,14 +6599,39 @@ export class ProbeStore {
     return { receipt: plan.receipt, original: plan.original };
   }
 
+  #controlledSourceOwners(): BoundSource[] {
+    const sources = new Map<string, BoundSource>();
+    const add = (item: BoundSource) => {
+      check(item.binding.ownerId === this.#binding.ownerId && item.binding.hostId === this.#binding.hostId
+        && dirname(item.source.path) === this.#resources.root.path, 'source-owner-evidence-gap');
+      const prior = sources.get(item.source.path);
+      check(!prior || sameBinding(prior.binding, item.binding)
+        && prior.source.identity.dev === item.source.identity.dev && prior.source.identity.ino === item.source.identity.ino,
+      'source-owner-evidence-gap');
+      sources.set(item.source.path, item);
+    };
+    for (const row of this.#db.prepare('SELECT * FROM sessions WHERE store_id=? ORDER BY session_id').all(this.#storeId)) {
+      add({ binding: { ownerId: String(row.owner_id), hostId: String(row.host_id), projectId: String(row.project_id),
+        sessionId: String(row.session_id), branchId: String(row.branch_id) },
+      source: { path: String(row.source_path), identity: { dev: String(row.source_dev), ino: String(row.source_ino) } } });
+    }
+    for (const row of this.#db.prepare("SELECT * FROM store_restores WHERE state='complete' ORDER BY operation_id").all()) {
+      const plan = this.#readRecoveryPlanMetadata(row);
+      for (const item of plan.sources) {
+        check(plan.originals.some(file => file.role === 'source' && file.source.path === item.source.path
+          && file.source.identity.dev === item.source.identity.dev && file.source.identity.ino === item.source.identity.ino),
+        'source-owner-evidence-gap');
+        add(item);
+      }
+    }
+    for (const item of this.#purgeContinuation()?.sources ?? []) add(item);
+    return [...sources.values()].sort((left, right) => left.source.path.localeCompare(right.source.path));
+  }
+
   purgeResources(coordinator: string) {
     return this.#transaction(() => {
       check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
-      const sources = this.#db.prepare('SELECT * FROM sessions WHERE store_id=? ORDER BY session_id').all(this.#storeId)
-        .map(row => ({ binding: { ownerId: String(row.owner_id), hostId: String(row.host_id), projectId: String(row.project_id),
-          sessionId: String(row.session_id), branchId: String(row.branch_id) },
-        source: { path: String(row.source_path), identity: { dev: String(row.source_dev), ino: String(row.source_ino) } } }));
-      return { sources, outputs: this.#controlledFiles() };
+      return { sources: this.#controlledSourceOwners(), outputs: this.#controlledFiles() };
     });
   }
 
@@ -6629,7 +6655,7 @@ export class ProbeStore {
       for (const row of this.#db.prepare("SELECT operation_id FROM store_restores WHERE state IN ('preparing','complete') AND original_deleted=0 ORDER BY operation_id").all())
         backups.push(this.recoveryCleanupManifest(coordinator, String(row.operation_id)));
       check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state='prepared'").get(), 'snapshot-recovery-in-progress');
-      const plan = planPurge(this.#db, recordId, carriers, backups, DDL);
+      const plan = planPurge(this.#db, recordId, carriers, backups, DDL, resources.sources);
       check(plan.manifest.records.length === plan.selected.get('memory_records')?.length, 'memory-evidence-gap');
       for (const record of plan.manifest.records) this.#replayMemoryHead(record.recordId);
       return plan;
@@ -6673,7 +6699,11 @@ export class ProbeStore {
     check(sha256(String(row.continuation)) === row.continuation_hash, 'purge-continuation-evidence-gap');
     const continuation = JSON.parse(String(row.continuation)) as PurgeContinuation;
     check(continuation.schema === 'purge-continuation@1' && continuation.operationId === row.operation_id
-      && continuation.phase === 'external-cleanup', 'purge-continuation-evidence-gap');
+      && continuation.phase === 'external-cleanup' && Array.isArray(continuation.sources), 'purge-continuation-evidence-gap');
+    const sourceCarriers = continuation.inventory.filter(carrier => carrier.role === 'source');
+    check(continuation.sources.length === sourceCarriers.length && new Set(continuation.sources.map(item => item.source.path)).size === sourceCarriers.length
+      && continuation.sources.every(item => sourceCarriers.some(carrier => carrier.file.path === item.source.path
+        && carrier.file.identity.dev === item.source.identity.dev && carrier.file.identity.ino === item.source.identity.ino)), 'purge-continuation-evidence-gap');
     const seen = new Set<number>();
     for (const work of continuation.sourceCleanup ?? []) {
       const selected = continuation.carriers[work.index];
@@ -6728,7 +6758,7 @@ export class ProbeStore {
       const plan = this.#planPurge(coordinator, manifest.recordId, carriers);
       check(plan.digest === digest && JSON.stringify(plan.manifest) === JSON.stringify(manifest), 'purge-manifest-stale');
       const continuation: PurgeContinuation = { schema: 'purge-continuation@1', operationId, phase: 'external-cleanup',
-        carriers: manifest.carriers, backups: manifest.backups, inventory: manifest.inventory.carriers };
+        carriers: manifest.carriers, backups: manifest.backups, inventory: manifest.inventory.carriers, sources: manifest.inventory.sources };
       const receipt: PurgeReceipt = { schema: 'purge/logical-commit@1', operationId, status: 'logical-commit' };
       this.#purging = true;
       try {
@@ -6756,12 +6786,10 @@ export class ProbeStore {
     let continuation = this.#purgeContinuation()!;
     for (const [index, selection] of continuation.carriers.entries()) {
       if (selection.role !== 'source') continue;
-      const row = this.#db.prepare('SELECT * FROM sessions WHERE store_id=? AND source_path=? AND source_dev=? AND source_ino=?')
-        .get(this.#storeId, selection.file.path, selection.file.identity.dev, selection.file.identity.ino);
-      check(row, 'purge-source-owner-unavailable');
-      const binding: Binding = { ownerId: String(row.owner_id), hostId: String(row.host_id), projectId: String(row.project_id),
-        sessionId: String(row.session_id), branchId: String(row.branch_id) };
-      const archive = owner(binding, structuredClone(selection.file));
+      const bound = continuation.sources.find(item => item.source.path === selection.file.path
+        && item.source.identity.dev === selection.file.identity.dev && item.source.identity.ino === selection.file.identity.ino);
+      check(bound, 'purge-source-owner-unavailable');
+      const archive = owner(structuredClone(bound.binding), structuredClone(selection.file));
       check(archive, 'purge-source-owner-unavailable');
       let work = continuation.sourceCleanup?.find(item => item.index === index);
       if (!work) {
@@ -6916,7 +6944,8 @@ export class ProbeStore {
     const observedAt = new Date().toISOString();
     const entries: { path: string; state: 'expected' | 'unexpected' | 'unknown'; observedAt: string; dev: string | null; ino: string | null; reason: string }[] = [];
     // These are the existing disposable adapter's carriers, not a cleanup allowlist.
-    const sources = this.#db.prepare('SELECT source_path,source_dev,source_ino FROM sessions WHERE store_id=?').all(this.#storeId);
+    const sources = this.#controlledSourceOwners().map(({ source }) => ({ source_path: source.path,
+      source_dev: source.identity.dev, source_ino: source.identity.ino }));
     const sourceNames = sources.map(row => basename(String(row.source_path)));
     const known = new Set(['sandbox.json', 'counting-receiver.jsonl', 'owner-info.jsonl', ...sourceNames, basename(this.#resources.store.path),
       `${basename(this.#resources.store.path)}-wal`, `${basename(this.#resources.store.path)}-shm`]);
@@ -6932,10 +6961,7 @@ export class ProbeStore {
       if (this.#db.prepare('SELECT original_deleted FROM store_restores WHERE operation_id=?').get(recovery.operationId)!.original_deleted === 0) {
         snapshots.push({ directory: recovery.original.path, dev: recovery.original.identity.dev, ino: recovery.original.identity.ino });
       }
-      for (const file of recovery.originals) if (file.name.startsWith('later-source-')) sources.push({
-        source_path: file.source.path, source_dev: file.source.identity.dev, source_ino: file.source.identity.ino });
     }
-    for (const source of sources) known.add(basename(String(source.source_path)));
     try {
       const names = readdirSync(this.#resources.root.path).sort();
       check(names.length <= 1024, 'residual-enumeration-limit');

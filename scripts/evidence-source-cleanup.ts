@@ -48,14 +48,24 @@ for (const scenario of fixture.cases) {
     if (scenario === 'historian') run('historian', ['apps/cli/src/main.ts', 'historian', '--sandbox', sandbox.root]);
     const mode = ['handoff', 'historian', 'identity'].includes(scenario) ? scenario : 'separate';
     const seeded = run('seed', ['apps/cli/test/support/purge-worker.ts', sandbox.root, mode]).at(-1)!;
-    let snapshot: string | undefined;
-    if (scenario === 'backup') snapshot = run('backup', ['apps/cli/src/main.ts', 'backup', '--sandbox', sandbox.root])
+    let snapshot: string | undefined, laterSource: string | undefined;
+    if (scenario === 'backup' || scenario.startsWith('recovered-session')) snapshot = run('backup', ['apps/cli/src/main.ts', 'backup', '--sandbox', sandbox.root])
       .find(item => item.event === 'backup-result').snapshot.id;
-    const crash = ['before-delete', 'after-delete', 'after-ack', 'takeover'].includes(scenario);
-    let child = start('purge', ['--record', seeded.recordId, '--scenario', crash && scenario !== 'takeover' ? 'source-' + scenario : 'success']);
+    if (scenario.startsWith('recovered-session')) {
+      const later = run('later-source', ['apps/cli/test/support/purge-recovered-source-worker.ts', sandbox.root, JSON.stringify(seeded.target.source)]).at(-1)!;
+      laterSource = later.source.path;
+      run('restore', ['apps/cli/src/main.ts', 'restore-snapshot', '--sandbox', sandbox.root, '--snapshot', snapshot!]);
+    }
+    const point = scenario === 'recovered-session-after-delete' ? 'after-delete' : scenario;
+    const crash = ['before-delete', 'after-delete', 'after-ack', 'takeover'].includes(point);
+    let child = start('purge', ['--record', seeded.recordId, '--scenario', crash && point !== 'takeover' ? 'source-' + point : 'success']);
     const preview = await child.waitFor('purge-preview') as unknown as PurgePresentation;
     save('preview.json', preview); cpSync(sandbox.root, join(path, 'before'), { recursive: true });
     const before = preview.manifest.inventory.carriers.map(carrier => ({ ...carrier, content: readFileSync(carrier.file.path) }));
+    if (laterSource) {
+      assert.ok(preview.manifest.carriers.some(carrier => carrier.file.path === laterSource && carrier.entries.length > 0));
+      assertions.push('A post-snapshot session original retains its owner registration through recovery and is approved before logical commit.');
+    }
     if (scenario === 'handoff') {
       assert.equal(seeded.documents.length, 5);
       for (const ref of seeded.documents) assert.ok(preview.manifest.carriers.some(carrier => carrier.role === 'source'
@@ -66,12 +76,12 @@ for (const scenario of fixture.cases) {
     const logical = inspect(db => ({ receipt: db.prepare("SELECT * FROM memory_events WHERE kind='purge-logical-commit'").get(),
       operation: db.prepare("SELECT * FROM pending_operations WHERE kind='purge'").get() }));
     save('logical.json', logical);
-    if (scenario === 'takeover') {
+    if (point === 'takeover') {
       child.child.stdin.end(); await child.exit; child = start('takeover', ['--scenario', 'source-takeover']);
     } else if (crash) child.command('cleanup-source');
     if (crash) {
-      if (scenario !== 'takeover') children.find(item => item.cli === child)!.input.push('cleanup-source');
-      assert.equal((await child.waitFor('purge-source-checkpoint')).stage, scenario);
+      if (point !== 'takeover') children.find(item => item.cli === child)!.input.push('cleanup-source');
+      assert.equal((await child.waitFor('purge-source-checkpoint')).stage, point);
       const rival = start('rival'); assert.equal((await rival.exit).code, 1);
       assert.ok(rival.observations.some(item => item.reason === 'maintenance-owned'));
       child.child.kill('SIGKILL'); await child.exit;
@@ -103,6 +113,7 @@ for (const scenario of fixture.cases) {
       assert.equal(sha256(String(row.continuation)), row.continuation_hash);
       const continuation = JSON.parse(String(row.continuation)) as PurgeContinuation;
       assert.deepEqual(continuation.carriers, preview.manifest.carriers);
+      assert.deepEqual(continuation.sources, preview.manifest.inventory.sources);
       assert.deepEqual(continuation.backups, preview.manifest.backups);
       assert.equal(continuation.sourceCleanup!.length, preview.manifest.carriers.filter(carrier => carrier.role === 'source').length);
       for (const work of continuation.sourceCleanup!) {
@@ -145,7 +156,7 @@ for (const scenario of fixture.cases) {
   }
   console.log(JSON.stringify(observations.at(-1)));
 }
-const contractCommand = ['--test', '--test-concurrency=1', 'apps/cli/test/purge-source-boundary.test.ts', 'apps/cli/test/purge-source-late.test.ts'];
+const contractCommand = ['--test', '--test-concurrency=1', 'apps/cli/test/purge-source-boundary.test.ts', 'apps/cli/test/purge-source-late.test.ts', 'apps/cli/test/purge-source-recovery.test.ts'];
 const contractStarted = new Date().toISOString();
 const contracts = spawnSync(process.execPath, contractCommand, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
 writeFileSync(join(directory, 'contract-tests.stdout.txt'), contracts.stdout ?? '');

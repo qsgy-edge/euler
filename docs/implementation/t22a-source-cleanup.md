@@ -25,7 +25,7 @@ The result contains `source.status`, `source.completed` and `source.total`. Thes
 
 ## Ownership and byte deletion
 
-`ProbeStore.cleanupPurgeSources` coordinates the existing `CliArchive` owner. It accepts no caller-supplied paths: each source comes from the committed manifest and must still have the exact registered session/file identity. The owner enumerates its bounded JSONL carrier and resolves the approved event IDs and hashes to byte ranges.
+`ProbeStore.cleanupPurgeSources` coordinates the existing `CliArchive` owner. It accepts no caller-supplied paths: each source comes from the committed manifest and retains the exact source-owner/file identity recorded by session or recovery registration. The owner enumerates its bounded JSONL carrier and resolves the approved event IDs and hashes to byte ranges.
 
 The owner overwrites each selected event line with spaces, preserving its newline, the file identity and every unselected byte. No target ID or content remains in those ranges. Archive reads ignore these erased lines. The owner opens the original file for writing, checks the opened handle and path identity, writes the selected ranges, calls `fsync`, rereads the carrier and verifies the result before acknowledging it. There is no replacement-file rename, contentful staging copy or separate archive subsystem.
 
@@ -35,7 +35,7 @@ A missing owner, changed identity, unexpected bytes, denied write permission or 
 
 ## Continuation and guards
 
-The existing `pending_operations.continuation` retains the approved `carriers`, `backups` and inventory. Its `sourceCleanup` entries add only:
+The existing `pending_operations.continuation` retains the approved `carriers`, `backups`, source-owner bindings and inventory. Its `sourceCleanup` entries add only:
 
 - the selected carrier's index in the frozen manifest;
 - the selected byte offsets/lengths and expected post-cleanup hash;
@@ -47,7 +47,7 @@ The settled-operation trigger permits continuation updates only for an existing 
 
 ## Carrier coverage and handoff
 
-All currently registered session JSONL files use the same source owner. The selected closure covers original input, assistant/tool replies, report versions, handoff text, approved Markdown export snapshots, published report-section references and copies of expanded excerpts in consuming sessions. Historian raw ranges and archived replies/compartment bodies use this same carrier.
+All currently registered session JSONL files use the same source owner. Recovery plans preserve each original source binding and file identity before restoring a snapshot. Originals belonging to sessions created after that snapshot remain controlled even when those session rows disappear or the separate recovery-directory copy is discarded. Purge includes these originals and their owner routes in the preview and freezes them in the continuation; it does not reactivate the recovered sessions. The selected closure covers original input, assistant/tool replies, report versions, handoff text, approved Markdown export snapshots, published report-section references and copies of expanded excerpts in consuming sessions. Historian raw ranges and archived replies/compartment bodies use this same carrier.
 
 The fixture includes an unrelated memory, identical event UUIDs in distinct sessions, two report versions, a handoff, an approved export and a consuming-session excerpt. Assertions compare actual retained events and raw file bytes against the frozen selection. Independent source entries remain readable through the archive owner with their original acknowledgements.
 
@@ -57,6 +57,6 @@ The fixture includes an unrelated memory, identical event UUIDs in distinct sess
 
 `fixtures/t22a-source-cleanup.json` identifies the corpus and reuses `fixtures/t21-purge-cases.json`. `scripts/evidence-source-cleanup.ts` drives real CLI processes and live stdin, kills coordinators at the deletion/ack/takeover boundaries, and independently examines source bytes and SQLite continuation/receipt rows. It retains command arguments, times, exit codes/signals, raw stdout/stderr, input, before/interrupted/after copies and artifact hashes in `artifacts/t22a-<timestamp>/receipt.json`.
 
-The receipt binds the fixture digests, implementation commit/tree/working-tree state and environment. Its independent evidence copies are outside the application's purge ownership. Boundary tests cover pre-commit rejection, permission withdrawal, resource replacement, changed content, unavailable owners, forged plans/acknowledgements, an acknowledgement transaction failure, current-state revalidation and a real Windows sharing lock. Separate process tests exercise late capture/Historian archive writes and dispatch under a closing fence, then complete the source cleanup after that process exits.
+The receipt binds the fixture digests, implementation commit/tree/working-tree state and environment. Its independent evidence copies are outside the application's purge ownership. Boundary tests cover pre-commit rejection, permission withdrawal, resource replacement, changed content, unavailable owners, forged plans/acknowledgements, an acknowledgement transaction failure, current-state revalidation and a real Windows sharing lock. Separate process tests exercise late capture/Historian archive writes and dispatch under a closing fence, then complete the source cleanup after that process exits. Snapshot → later session → restore cases cover approved deletion, unrelated original retention, discarded recovery copies and a cleanup crash.
 
 The CI runs the tests and receipt command on Windows, macOS and Linux. Windows sharing-lock observations belong to the Windows receipt; other platforms report that gap explicitly. The receipt does not claim power-loss/torn-entry recovery from process-boundary crash tests. Global controlled-copy and SQLite completion remains the T22b evidence boundary.
