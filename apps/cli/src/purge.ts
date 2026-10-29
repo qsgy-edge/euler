@@ -52,7 +52,8 @@ export function readPurgeCarriers(sandbox: Sandbox, store: ProbeStore, coordinat
 }
 
 export async function runPurge(sandbox: Sandbox, recordId?: string, scenario = 'success') {
-  check(['success', 'purge-before-commit', 'purge-after-commit', 'purge-unknown'].includes(scenario), 'invalid-purge-scenario');
+  check(['success', 'purge-before-commit', 'purge-after-commit', 'purge-unknown',
+    'source-before-delete', 'source-after-delete', 'source-after-ack', 'source-takeover'].includes(scenario), 'invalid-purge-scenario');
   const store = openMaintenanceStore(sandbox);
   const coordinator = randomUUID(), lines = createInterface({ input: process.stdin });
   const emit = (event: string, fields: object) => new Promise<void>((resolve, reject) =>
@@ -64,7 +65,10 @@ export async function runPurge(sandbox: Sandbox, recordId?: string, scenario = '
       const result = store.acquireMaintenance(coordinator);
       if (!result.acquired) { await emit('maintenance-blocked', result); return; }
       const committed = store.purgeStatus(coordinator);
-      if (committed) { await emit('purge-result', committed); return; }
+      if (committed) {
+        if (scenario === 'source-takeover') killPoint('purge-source-checkpoint', 'takeover', 10000);
+        await emit('purge-result', committed); return;
+      }
       check(recordId, 'purge-target-required');
       preview = store.previewPurge(coordinator, recordId, readPurgeCarriers(sandbox, store, coordinator));
       await emit('purge-preview', { ...preview, cleanup: 'not-started' });
@@ -79,6 +83,23 @@ export async function runPurge(sandbox: Sandbox, recordId?: string, scenario = '
           if (result.status === 'cancelled') lines.close();
           return;
         }
+        if (line === 'cleanup-source') {
+          const result = store.cleanupPurgeSources(coordinator, (binding, source) => {
+            const archive = new CliArchive({ ...sandbox, sourceName: basename(source.path), archiveIdentity: source.identity,
+              fixture: { ...sandbox.fixture, ...binding } }, action => action());
+            return {
+              preparePurge: selection => archive.preparePurge(selection),
+              purge: (selection, plan) => {
+                if (scenario === 'source-before-delete') killPoint('purge-source-checkpoint', 'before-delete', 10000);
+                const ack = archive.purge(selection, plan);
+                if (scenario === 'source-after-delete') killPoint('purge-source-checkpoint', 'after-delete', 10000);
+                return ack;
+              },
+            };
+          });
+          if (scenario === 'source-after-ack') killPoint('purge-source-checkpoint', 'after-ack', 10000);
+          await emit('purge-source-result', result); return;
+        }
         const committed = store.purgeStatus(coordinator);
         if (committed) { await emit(line === 'status' ? 'purge-result' : 'purge-settled', committed); return; }
         check(preview && input, 'purge-preview-required');
@@ -90,7 +111,8 @@ export async function runPurge(sandbox: Sandbox, recordId?: string, scenario = '
         await emit('purge-result', result);
       } catch (error) {
         const committed = store.purgeStatus(coordinator);
-        if (committed) await emit('purge-result', committed);
+        if (committed) await emit(line === 'cleanup-source' ? 'purge-source-result' : 'purge-result',
+          { ...committed, error: (error as Error).message });
         else {
           const reason = (error as Error).message;
           if (reason !== 'exact-live-purge-phrase-required') {

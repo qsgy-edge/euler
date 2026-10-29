@@ -1,7 +1,7 @@
 import { closeSync, fstatSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
-import { check, sameBinding, sha256, uuid, sameFile } from '@euler/core';
-import type { SourceAck, SourceExcerpt } from '@euler/core';
+import { check, inspectPurgeSource, sameBinding, sha256, uuid, sameFile } from '@euler/core';
+import type { PurgeCarrierSelection, PurgeSourceAck, PurgeSourcePlan, SourceAck, SourceExcerpt } from '@euler/core';
 import { bindingOf } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
 
@@ -50,7 +50,7 @@ export class CliArchive {
     const header = JSON.parse(lines.shift()!);
     check(header.schema === 'cli-session@1' && sameBinding(header.binding, bindingOf(this.#sandbox)), 'archive-binding-mismatch');
     const seen = new Set<string>();
-    return lines.map(line => {
+    return lines.filter(line => !/^ +$/.test(line)).map(line => {
       const event = JSON.parse(line) as RawEvent;
       uuid(event.eventId);
       check(event.schema === 'cli-input@1' && ['user', 'assistant', 'tool'].includes(event.role) && typeof event.text === 'string'
@@ -118,6 +118,60 @@ export class CliArchive {
 
   inspect(): { eventCount: number } {
     return this.#gate(() => ({ eventCount: this.#scan().length }));
+  }
+
+  preparePurge(selection: PurgeCarrierSelection): PurgeSourcePlan {
+    return this.#gate(() => {
+      this.#scan();
+      check(selection.file.path === this.#path && selection.role === 'source', 'purge-source-owner-mismatch');
+      sameFile(this.#path, selection.file.identity);
+      const bytes = readFileSync(this.#path);
+      check(bytes.length === selection.bytes && sha256(bytes) === selection.hash, 'purge-source-carrier-changed');
+      const ranges: PurgeSourcePlan['ranges'] = [];
+      let offset = bytes.indexOf(10) + 1;
+      while (offset < bytes.length) {
+        const end = bytes.indexOf(10, offset), line = bytes.subarray(offset, end);
+        const selected = selection.entries[ranges.length];
+        if (selected && sha256(line) === selected.hash) {
+          check(JSON.parse(line.toString('utf8')).eventId === selected.id, 'purge-source-entry-changed');
+          ranges.push({ offset, bytes: line.length }); bytes.fill(32, offset, end);
+        }
+        offset = end + 1;
+      }
+      check(ranges.length === selection.entries.length, 'purge-source-evidence-gap');
+      return { ranges, afterHash: sha256(bytes) };
+    });
+  }
+
+  /** Erase approved line bytes in place; file identity and unrelated acknowledgements stay stable. */
+  purge(selection: PurgeCarrierSelection, plan: PurgeSourcePlan): PurgeSourceAck {
+    return this.#gate(() => {
+      check(selection.file.path === this.#path && selection.role === 'source', 'purge-source-owner-mismatch');
+      sameFile(this.#sandbox.root, this.#sandbox.rootIdentity);
+      sameFile(this.#path, this.#sandbox.archiveIdentity); sameFile(this.#path, selection.file.identity);
+      const fd = openSync(this.#path, 'r+');
+      try {
+        const identity = fstatSync(fd, { bigint: true });
+        check(String(identity.dev) === selection.file.identity.dev && String(identity.ino) === selection.file.identity.ino
+          && identity.nlink === 1n && identity.isFile(), 'file-identity-changed');
+        const bytes = readFileSync(fd), erased = inspectPurgeSource(selection, plan, bytes);
+        for (const range of plan.ranges) {
+          sameFile(this.#path, selection.file.identity);
+          let offset = range.offset;
+          const end = offset + range.bytes;
+          while (offset < end) {
+            const written = writeSync(fd, erased, offset, end - offset, offset);
+            check(written > 0, 'purge-source-write-failed'); offset += written;
+          }
+        }
+        fsyncSync(fd);
+        sameFile(this.#path, selection.file.identity);
+        const actual = readFileSync(this.#path);
+        check(actual.length === selection.bytes && sha256(actual) === plan.afterHash, 'purge-source-postcondition-failed');
+        this.#scan();
+        return { hash: plan.afterHash, bytes: actual.length };
+      } finally { closeSync(fd); }
+    });
   }
 
   /** Durable events in archive order, for Host backfill and referent resolution. */

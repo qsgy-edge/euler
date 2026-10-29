@@ -1,0 +1,13 @@
+{
+  "schema": "t22a-source-cleanup@1",
+  "baseFixture": "fixtures/t21-purge-cases.json",
+  "cases": ["separate", "handoff", "historian", "identity", "backup", "before-delete", "after-delete", "after-ack", "takeover"],
+  "report": {
+    "title": "T22a 合成报告",
+    "facts": "T22a 合成事实与授权来源。",
+    "inferences": "T22a 推断，待独立核验。",
+    "recommendations": "T22a 建议，仅作交接。",
+    "unresolved": "T22a 仅检验受控副本清理。"
+  },
+  "handoff": "# T22a 合成交接\n\n仅包含获准项目区段；实施需单独批准。\n"
+}

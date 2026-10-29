@@ -64,6 +64,32 @@ export interface PurgeContinuation {
   schema: 'purge-continuation@1'; operationId: string; phase: 'external-cleanup';
   carriers: PurgeCarrierSelection[]; backups: SnapshotCleanupManifest[];
   inventory: PurgeManifest['inventory']['carriers'];
+  sourceCleanup?: { index: number; plan: PurgeSourcePlan; ack: PurgeSourceAck | null }[];
+}
+export interface PurgeSourcePlan { ranges: { offset: number; bytes: number }[]; afterHash: string }
+export interface PurgeSourceAck { hash: string; bytes: number }
+export interface PurgeSourceOwner {
+  preparePurge(selection: PurgeCarrierSelection): PurgeSourcePlan;
+  purge(selection: PurgeCarrierSelection, plan: PurgeSourcePlan): PurgeSourceAck;
+}
+
+/** Verify the frozen ranges and the untouched bytes, accepting already-erased entries after a crash. */
+export function inspectPurgeSource(selection: PurgeCarrierSelection, plan: PurgeSourcePlan, bytes: Uint8Array): Buffer {
+  check(selection.role === 'source' && bytes.length === selection.bytes && plan.ranges.length === selection.entries.length,
+    'purge-source-evidence-gap');
+  const result = Buffer.from(bytes);
+  let end = 0;
+  for (const [index, range] of plan.ranges.entries()) {
+    check(Number.isSafeInteger(range.offset) && Number.isSafeInteger(range.bytes) && range.bytes > 0
+      && range.offset > end && range.offset + range.bytes < result.length
+      && result[range.offset - 1] === 10 && result[range.offset + range.bytes] === 10, 'purge-source-range-mismatch');
+    end = range.offset + range.bytes;
+    const line = result.subarray(range.offset, end);
+    check(sha256(line) === selection.entries[index]!.hash || line.every(byte => byte === 32), 'purge-source-entry-changed');
+    result.fill(32, range.offset, end);
+  }
+  check(sha256(result) === plan.afterHash, 'purge-source-carrier-changed');
+  return result;
 }
 export interface PurgePresentation {
   operationId: string; token: string; nonce: string; phrase: string; manifest: PurgeManifest; digest: string;

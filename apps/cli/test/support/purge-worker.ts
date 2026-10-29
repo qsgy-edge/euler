@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { check, MemoryCorrections } from '@euler/core';
+import { AnalysisArtifacts, check, MemoryCorrections } from '@euler/core';
+import type { AnalysisArtifact, SourceAck, SourceUnit } from '@euler/core';
 import cases from '../../../../fixtures/t21-purge-cases.json' with { type: 'json' };
+import cleanupCases from '../../../../fixtures/t22a-source-cleanup.json' with { type: 'json' };
 import { approvedSourceUnit, saveApprovedProposal } from './source-publication.ts';
 import { openProbe } from '../../src/probe.ts';
 import { bindingOf, createSandboxSession, openSandbox } from '../../src/sandbox.ts';
@@ -74,6 +76,37 @@ try {
     store.acknowledgeCorrectionModel(activity, preview.token, archive.append(delivery.summaryEventId, JSON.stringify(summary), 'tool'));
     target = store.readMemory(activity, target.recordId);
   }
+  const documents: SourceAck[] = [];
+  if (scenario === 'handoff') {
+    const goalText = 'T22a 保存合成报告与交接历史。', current = store.readIntent(activity);
+    const goal = archive.append(randomUUID(), goalText);
+    store.transitionIntent(activity, current?.eventId ?? null, goal, { status: 'active', step: 'analysis' }, current ? undefined : goalText);
+    const artifacts = new AnalysisArtifacts(store, activity, archive);
+    const request = { ref: target.source, offset: 0, limit: 4096 };
+    const evidence = [{ request, hash: store.expandSource(activity, request).excerptHash }];
+    let prior: AnalysisArtifact | undefined, priorUnit: SourceUnit | undefined;
+    for (const version of [1, 2]) {
+      const report = artifacts.saveReport({ eventId: randomUUID(), ...cleanupCases.report,
+        title: cleanupCases.report.title + version, evidence, ...(prior ? { supersedes: prior.ref } : {}) });
+      documents.push(report.ref);
+      const unit = store.publishSourceUnit(activity, approvedSourceUnit(probe, { ref: report.ref, projectId: sandbox.fixture.projectId,
+        kind: 'report-section', offset: report.bodyOffset, length: Array.from(report.body).length,
+        ...(priorUnit ? { supersedes: priorUnit.unitId } : {}) }));
+      prior = report; priorUnit = unit;
+    }
+    const handoff = artifacts.saveHandoff({ eventId: randomUUID(), title: 'T22a', markdown: cleanupCases.handoff, evidence });
+    documents.push(handoff.ref);
+    const selection = [{ unitId: priorUnit!.unitId, hash: priorUnit!.contentHash }];
+    const approval = archive.append(randomUUID(), JSON.stringify({ schema: 'analysis-export-approval@1', selection }));
+    documents.push(artifacts.exportMarkdown({ eventId: randomUUID(), selection, approval }).ref);
+    const binding = { ...bindingOf(sandbox), sessionId: randomUUID(), branchId: randomUUID() };
+    createSandboxSession(sandbox, binding);
+    const consumer = openProbe(sandbox, undefined, undefined, binding, undefined, true);
+    try {
+      const excerpt = consumer.store.expandSource(consumer.activity, { unitId: priorUnit!.unitId, offset: 0, limit: 4096 });
+      documents.push(consumer.archive.append(randomUUID(), JSON.stringify(excerpt), 'tool'));
+    } finally { consumer.close(); }
+  }
   let unrelatedBinding;
   if (scenario === 'identity' || scenario.startsWith('ambiguous-')) {
     unrelatedBinding = { ...bindingOf(sandbox), sessionId: randomUUID(), branchId: randomUUID() };
@@ -101,5 +134,5 @@ try {
   const unrelated = archive.append(randomUUID(), JSON.stringify({ id: 'mem-13', text: `prefix-${target.recordId}-suffix` }));
   store.drainSearchProjection(activity);
   deliverMemoryInfo(sandbox, probe);
-  console.log(JSON.stringify({ recordId: target.recordId, otherId: records[1]!.recordId, target, related, unrelated, unrelatedBinding, receipts }));
+  console.log(JSON.stringify({ recordId: target.recordId, otherId: records[1]!.recordId, target, related, unrelated, unrelatedBinding, receipts, documents }));
 } finally { probe.close(); }

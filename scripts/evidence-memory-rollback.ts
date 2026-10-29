@@ -54,7 +54,7 @@ function validate(root: string, token: string, expected: 'committed' | 'cancelle
   const observations = stdoutPaths.flatMap(path => readFileSync(join(destination, path), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)));
   const db = new DatabaseSync(join(root, 'probe.sqlite'), { readOnly: true });
   try {
-    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 24);
+    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 25);
     assert.equal(db.prepare('PRAGMA integrity_check').get()!.integrity_check, 'ok');
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     assert.equal(db.prepare('SELECT sqlite_version() AS version').get()!.version, process.versions.sqlite);

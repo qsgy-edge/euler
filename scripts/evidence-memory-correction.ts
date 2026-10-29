@@ -52,7 +52,7 @@ function validate(root: string, id: string, operationId: string, token: string, 
   try {
     assert.equal(db.prepare('PRAGMA integrity_check').get()!.integrity_check, 'ok');
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
-    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 24);
+    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 25);
     const events = db.prepare('SELECT * FROM memory_events WHERE record_id=? ORDER BY seq').all(id);
     let previous: string | null = null;
     for (const row of events) {

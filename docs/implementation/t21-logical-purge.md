@@ -1,6 +1,6 @@
 # Logical purge and cleanup continuation
 
-The independent maintenance CLI implements the logical purge foundation in issue #21. It accepts a memory record in a disposable synthetic store, presents the current deletion closure, and commits the database changes with a durable cleanup continuation. The returned state is `logical-commit` with `cleanup=incomplete`; physical cleanup and the final completion receipt belong to T22b.
+The independent maintenance CLI implements the logical purge foundation in issue #21. It accepts a memory record in a disposable synthetic store, presents the current deletion closure, and commits the database changes with a durable cleanup continuation. The returned state is `logical-commit` with `cleanup=incomplete`; source/archive cleanup is implemented by [T22a](t22a-source-cleanup.md); the remaining physical cleanup and final completion receipt belong to T22b.
 
 ## Run
 
@@ -59,6 +59,6 @@ The continuation stores selected carrier entry/file identities, hashes, backup c
 
 The runnable cases cover separate/shared batches, owner correction/forget/restore, rollback, published source/proposal/query references, conflict relationships, Historian metadata, qualified source identity and ambiguous partial references, nested body/scalar copies, controlled project output, backups/recovery originals, failed canonical health and damaged streams/ledgers, transaction postcondition failure, coordinator exit before commit, lost acknowledgement after commit, cancellation, changed preview and unknown carriers. The process tests also exercise old-runtime exclusion, incomplete presentation, copied approval input, unknown database schema and normal-runtime maintenance guidance.
 
-Controlled project output uses the existing Windows file Host. Other platforms record that case as an evidence gap while running the portable logical-purge cases. Physical deletion of source/Host/backups, SQLite main/WAL/free-page maintenance and the final controlled-complete gate remain unverified by this receipt. Those are the T22b cleanup boundary; T24 checks the enabled-path integration.
+Controlled project output uses the existing Windows file Host. Other platforms record that case as an evidence gap while running the portable logical-purge cases. Physical deletion of source/Host/backups, SQLite main/WAL/free-page maintenance and the final controlled-complete gate remain unverified by this receipt. Source/archive deletion has a separate T22a receipt; the other cleanup participants belong to T22b. T24 checks the enabled-path integration.
 
-Disposable schema is 24. Older disposable stores must be recreated. The separate forward-migration test copy advances to 25; it does not freeze the production v1 schema.
+Disposable schema is 25. Older disposable stores must be recreated. The separate forward-migration test copy advances to 26; it does not freeze the production v1 schema.

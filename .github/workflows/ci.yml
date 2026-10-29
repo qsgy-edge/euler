@@ -73,6 +73,9 @@ jobs:
       - name: Record logical purge and continuation observations
         if: always()
         run: npm run evidence:purge
+      - name: Record source archive cleanup and crash continuation observations
+        if: always()
+        run: npm run evidence:source-cleanup
       - uses: actions/upload-artifact@v4
         if: always()
         with:
