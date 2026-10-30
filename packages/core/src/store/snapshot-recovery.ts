@@ -1,6 +1,6 @@
 import { closeSync, fstatSync, fsyncSync, ftruncateSync, openSync, writeSync } from 'node:fs';
 import type { ControlledFile } from '../context/file-contract.ts';
-import type { BoundFile } from './probe-store.ts';
+import type { BoundFile, BoundSource } from './probe-store.ts';
 import type { StoreSnapshot, SnapshotFile } from './snapshots.ts';
 import { sameFile } from './probe-store.ts';
 import { check } from '../contracts.ts';
@@ -10,12 +10,12 @@ export interface SnapshotRecoveryReceipt {
 }
 export interface SnapshotRecoveryPlan {
   operationId: string; snapshot: StoreSnapshot; original: BoundFile; stage: BoundFile;
-  originals: SnapshotFile[]; controlledFiles: ControlledFile[]; receipt: SnapshotRecoveryReceipt;
+  originals: SnapshotFile[]; sources: BoundSource[]; controlledFiles: ControlledFile[]; receipt: SnapshotRecoveryReceipt;
   owners: { kind: 'session' | 'job' | 'maintenance' | 'migration'; ownerId: string }[];
 }
 export interface SnapshotRecoveryPreparation {
   operationId: string; snapshot: StoreSnapshot; original: { path: string; identity: BoundFile['identity'] | null };
-  files: Pick<SnapshotFile, 'source' | 'name' | 'role'>[]; controlledFiles: ControlledFile[]; receipt: SnapshotRecoveryReceipt;
+  files: Pick<SnapshotFile, 'source' | 'name' | 'role'>[]; sources: BoundSource[]; controlledFiles: ControlledFile[]; receipt: SnapshotRecoveryReceipt;
 }
 export function recoveryFileNames(recovery: SnapshotRecoveryPlan | SnapshotRecoveryPreparation): string[] {
   const files = 'originals' in recovery ? recovery.originals : recovery.files;

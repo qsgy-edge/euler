@@ -47,7 +47,9 @@ Historical attempts retain their exact outcomes. A pre-snapshot `unknown-sent` s
 
 Backup, staging and recovery directories participate in the existing maintenance inventory. Unknown files inside a registered directory remain blockers. `snapshotCleanupManifest` / `recoveryCleanupManifest` freeze the exact files and identities; the corresponding discard operation durably records that approved manifest before deleting. Changed identities or contents are rejected. Staging snapshots keep their staging state until deletion completes. A process exit before or after directory removal resumes the same recorded cleanup, and admission stays closed until cleanup completes. Recovery receipts and gap markers remain after original files are deleted.
 
-The disposable schema version is **24**. Store opening rejects other schema versions. The forward migration harness operates on an independent copy, changes that copy to version 25 with a matching `schema_meta` constraint, version and target schema hash in one SQLite transaction, and verifies successful commit plus process death before/after commit against the untouched migration checkpoint. It exercises migration/recovery primitives without introducing a production schema migration.
+Recovery preparation preserves the binding and file identity of every controlled original source, including sessions created after the selected snapshot. Restoring session rows from the snapshot does not discard that original-source ownership; purge freezes these registrations before deleting recovery metadata. Discarding the separate recovery-directory copy leaves the original source registration intact.
+
+The disposable schema version is **25**. Store opening rejects other schema versions. The forward migration harness operates on an independent copy, changes that copy to version 26 with a matching `schema_meta` constraint, version and target schema hash in one SQLite transaction, and verifies successful commit plus process death before/after commit against the untouched migration checkpoint. It exercises migration/recovery primitives without introducing a production schema migration.
 
 ## Evidence
 

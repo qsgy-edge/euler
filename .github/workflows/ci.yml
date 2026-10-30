@@ -19,12 +19,29 @@ jobs:
           node-version: 24.18.0
           cache: npm
       - run: npm ci --ignore-scripts
+      - name: Use runner scratch storage for Windows fixtures
+        if: runner.os == 'Windows'
+        id: windows_temp
+        shell: pwsh
+        run: |
+          "original=$env:TEMP" >> $env:GITHUB_OUTPUT
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
       - name: Typecheck, build and full tests
         shell: bash
         run: |
           mkdir -p artifacts
           set -o pipefail
           npm run check 2>&1 | tee artifacts/verification.log
+      - name: Check Windows short-path boundaries on the original volume
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        shell: pwsh
+        env:
+          TEMP: ${{ steps.windows_temp.outputs.original }}
+          TMP: ${{ steps.windows_temp.outputs.original }}
+        run: |
+          node --test --test-concurrency=1 apps/cli/test/file-cli.test.ts apps/cli/test/file-tools.test.ts apps/cli/test/guidance.test.ts 2>&1 | Tee-Object -FilePath artifacts/verification-windows-system-temp.log
+          exit $LASTEXITCODE
       - name: Record synthetic observations
         if: always()
         run: npm run evidence
@@ -73,6 +90,9 @@ jobs:
       - name: Record logical purge and continuation observations
         if: always()
         run: npm run evidence:purge
+      - name: Record source archive cleanup and crash continuation observations
+        if: always()
+        run: npm run evidence:source-cleanup
       - uses: actions/upload-artifact@v4
         if: always()
         with:

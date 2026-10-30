@@ -25,7 +25,8 @@
     "evidence:context": "node scripts/evidence-context.ts",
     "evidence:historian": "node scripts/evidence-historian.ts",
     "evidence:backup": "node scripts/evidence-backup.ts",
-    "evidence:purge": "node scripts/evidence-purge.ts"
+    "evidence:purge": "node scripts/evidence-purge.ts",
+    "evidence:source-cleanup": "node scripts/evidence-source-cleanup.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

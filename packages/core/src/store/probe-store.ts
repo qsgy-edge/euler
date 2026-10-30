@@ -1,5 +1,5 @@
-import { applyLogicalPurge, planPurge } from './logical-purge.ts';
-import type { PurgeCarrier, PurgeContinuation, PurgeInput, PurgePresentation, PurgeReceipt } from './logical-purge.ts';
+import { applyLogicalPurge, inspectPurgeSource, planPurge } from './logical-purge.ts';
+import type { PurgeCarrier, PurgeContinuation, PurgeInput, PurgePresentation, PurgeReceipt, PurgeSourceOwner } from './logical-purge.ts';
 import { isLiveMemoryOperation, matchesMemoryApproval, memoryOperationSummary, parseCorrectionCommand } from '../context/memory-correction.ts';
 import { parseAnalysisArtifact } from '../context/analysis-artifacts.ts';
 import { assertHistorianReply, compartmentBody, isCompartmentEvidenceGap } from '../context/historian.ts';
@@ -26,6 +26,7 @@ import type { RequestAssembly, RequestAssemblyInput, RequestAssemblyState, Assem
 
 export interface FileIdentity { dev: string; ino: string }
 export interface BoundFile { path: string; identity: FileIdentity }
+export interface BoundSource { binding: Binding; source: BoundFile }
 export interface StoreResources { root: BoundFile; source: BoundFile; store: BoundFile }
 
 export function fileIdentity(path: string): FileIdentity {
@@ -232,7 +233,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=24), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=25), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -584,8 +585,10 @@ WHEN NEW.operation_id IS NOT NULL AND NEW.kind!='purge-logical-commit' AND NOT E
 BEGIN SELECT RAISE(ABORT,'operation-target-mismatch'); END;
 CREATE UNIQUE INDEX session_pending ON pending_operations(session_id) WHERE state='pending';
 CREATE TRIGGER settled_operation_immutable BEFORE UPDATE ON pending_operations
-WHEN OLD.state!='pending' OR NEW.operation_id!=OLD.operation_id OR NEW.session_id!=OLD.session_id OR NEW.presentation_id!=OLD.presentation_id
-  OR NEW.presentation_hash!=OLD.presentation_hash
+WHEN (OLD.state!='pending' AND NOT (euler_purge_writer()=1 AND OLD.kind='purge' AND OLD.state='cleaning'
+    AND NEW.kind=OLD.kind AND NEW.state=OLD.state AND NEW.result IS OLD.result AND NEW.result_hash IS OLD.result_hash))
+  OR NEW.operation_id IS NOT OLD.operation_id OR NEW.session_id IS NOT OLD.session_id OR NEW.presentation_id IS NOT OLD.presentation_id
+  OR NEW.presentation_hash IS NOT OLD.presentation_hash
 BEGIN SELECT RAISE(ABORT,'settled-operation-immutable'); END;
 CREATE TABLE activation_batches (
   batch_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
@@ -733,7 +736,7 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=24;
+PRAGMA user_version=25;
 ` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts','store_recovery_events','store_recovered_owners'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} ${['request_events','execution_streams','store_recovery_events'].includes(table) ? 'WHEN euler_purge_writer()!=1 ' : ''}BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
@@ -809,15 +812,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,24,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,25,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 24, 'unsupported-probe-schema');
+        check(version === 25, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 24 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 25 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -6376,7 +6379,7 @@ export class ProbeStore {
     const plan = JSON.parse(String(row.payload)) as SnapshotRecoveryPlan;
     check(plan.operationId === row.operation_id && plan.snapshot.id === row.snapshot_id
       && plan.receipt.operationId === plan.operationId && plan.receipt.schema === 'store/recovered-from-snapshot@v1'
-      && plan.receipt.outcome === 'recovered_with_gap' && Array.isArray(plan.owners), 'snapshot-recovery-evidence-gap');
+      && plan.receipt.outcome === 'recovered_with_gap' && Array.isArray(plan.owners) && Array.isArray(plan.sources), 'snapshot-recovery-evidence-gap');
     for (const owner of plan.owners) {
       check(['session', 'job', 'maintenance', 'migration'].includes(owner.kind), 'snapshot-recovery-evidence-gap');
       uuid(owner.ownerId);
@@ -6456,9 +6459,9 @@ export class ProbeStore {
         { source: this.#resources.store, name: 'store.sqlite', role: 'source' },
         ...snapshot.files.map(({ source, name, role }) => ({ source, name, role })),
       ];
-      for (const session of this.#db.prepare('SELECT source_path,source_dev,source_ino FROM sessions WHERE store_id=?').all(this.#storeId)) {
-        if (!files.some(file => file.source.path === session.source_path)) files.push({ source: { path: String(session.source_path),
-          identity: { dev: String(session.source_dev), ino: String(session.source_ino) } }, name: `later-source-${files.length}`, role: 'source' });
+      const sources = this.#controlledSourceOwners();
+      for (const { source } of sources) {
+        if (!files.some(file => file.source.path === source.path)) files.push({ source, name: `later-source-${files.length}`, role: 'source' });
       }
       const controlledFiles = this.#controlledFiles().filter(file => file.started && file.state !== 'no_effect');
       for (const file of controlledFiles) {
@@ -6469,7 +6472,7 @@ export class ProbeStore {
       }
       for (const file of files) sameFile(file.source.path, file.source.identity);
       const operationId = randomUUID();
-      const preparation: SnapshotRecoveryPreparation = { operationId, snapshot, files, controlledFiles,
+      const preparation: SnapshotRecoveryPreparation = { operationId, snapshot, files, sources, controlledFiles,
         original: { path: join(this.#resources.root.path, `recovery-${operationId}`), identity: null },
         receipt: { schema: 'store/recovered-from-snapshot@v1', operationId, outcome: 'recovered_with_gap', createdAt: new Date().toISOString() } };
       const payload = JSON.stringify(preparation);
@@ -6512,7 +6515,7 @@ export class ProbeStore {
         owners = [...new Map(all.map(owner => [`${String(owner.kind)}/${String(owner.owner_id)}`,
           { kind: String(owner.kind) as SnapshotRecoveryPlan['owners'][number]['kind'], ownerId: String(owner.owner_id) }])).values()];
       } finally { snapshot.close(); }
-      const plan: SnapshotRecoveryPlan = { operationId: preparation.operationId, snapshot: preparation.snapshot, original, originals, owners,
+      const plan: SnapshotRecoveryPlan = { operationId: preparation.operationId, snapshot: preparation.snapshot, original, originals, owners, sources: preparation.sources,
         controlledFiles: preparation.controlledFiles, receipt: preparation.receipt, stage: { path: stagePath, identity: fileIdentity(stagePath) } };
       syncSnapshotDirectory(original.path);
       const payload = JSON.stringify(plan);
@@ -6596,14 +6599,39 @@ export class ProbeStore {
     return { receipt: plan.receipt, original: plan.original };
   }
 
+  #controlledSourceOwners(): BoundSource[] {
+    const sources = new Map<string, BoundSource>();
+    const add = (item: BoundSource) => {
+      check(item.binding.ownerId === this.#binding.ownerId && item.binding.hostId === this.#binding.hostId
+        && dirname(item.source.path) === this.#resources.root.path, 'source-owner-evidence-gap');
+      const prior = sources.get(item.source.path);
+      check(!prior || sameBinding(prior.binding, item.binding)
+        && prior.source.identity.dev === item.source.identity.dev && prior.source.identity.ino === item.source.identity.ino,
+      'source-owner-evidence-gap');
+      sources.set(item.source.path, item);
+    };
+    for (const row of this.#db.prepare('SELECT * FROM sessions WHERE store_id=? ORDER BY session_id').all(this.#storeId)) {
+      add({ binding: { ownerId: String(row.owner_id), hostId: String(row.host_id), projectId: String(row.project_id),
+        sessionId: String(row.session_id), branchId: String(row.branch_id) },
+      source: { path: String(row.source_path), identity: { dev: String(row.source_dev), ino: String(row.source_ino) } } });
+    }
+    for (const row of this.#db.prepare("SELECT * FROM store_restores WHERE state IN ('prepared','complete') ORDER BY operation_id").all()) {
+      const plan = this.#readRecoveryPlanMetadata(row);
+      for (const item of plan.sources) {
+        check(plan.originals.some(file => file.role === 'source' && file.source.path === item.source.path
+          && file.source.identity.dev === item.source.identity.dev && file.source.identity.ino === item.source.identity.ino),
+        'source-owner-evidence-gap');
+        add(item);
+      }
+    }
+    for (const item of this.#purgeContinuation()?.sources ?? []) add(item);
+    return [...sources.values()].sort((left, right) => left.source.path.localeCompare(right.source.path));
+  }
+
   purgeResources(coordinator: string) {
     return this.#transaction(() => {
       check(this.#assertCoordinator(coordinator).state === 'exclusive', 'maintenance-not-exclusive');
-      const sources = this.#db.prepare('SELECT * FROM sessions WHERE store_id=? ORDER BY session_id').all(this.#storeId)
-        .map(row => ({ binding: { ownerId: String(row.owner_id), hostId: String(row.host_id), projectId: String(row.project_id),
-          sessionId: String(row.session_id), branchId: String(row.branch_id) },
-        source: { path: String(row.source_path), identity: { dev: String(row.source_dev), ino: String(row.source_ino) } } }));
-      return { sources, outputs: this.#controlledFiles() };
+      return { sources: this.#controlledSourceOwners(), outputs: this.#controlledFiles() };
     });
   }
 
@@ -6627,7 +6655,7 @@ export class ProbeStore {
       for (const row of this.#db.prepare("SELECT operation_id FROM store_restores WHERE state IN ('preparing','complete') AND original_deleted=0 ORDER BY operation_id").all())
         backups.push(this.recoveryCleanupManifest(coordinator, String(row.operation_id)));
       check(!this.#db.prepare("SELECT 1 FROM store_restores WHERE state='prepared'").get(), 'snapshot-recovery-in-progress');
-      const plan = planPurge(this.#db, recordId, carriers, backups, DDL);
+      const plan = planPurge(this.#db, recordId, carriers, backups, DDL, resources.sources);
       check(plan.manifest.records.length === plan.selected.get('memory_records')?.length, 'memory-evidence-gap');
       for (const record of plan.manifest.records) this.#replayMemoryHead(record.recordId);
       return plan;
@@ -6671,7 +6699,19 @@ export class ProbeStore {
     check(sha256(String(row.continuation)) === row.continuation_hash, 'purge-continuation-evidence-gap');
     const continuation = JSON.parse(String(row.continuation)) as PurgeContinuation;
     check(continuation.schema === 'purge-continuation@1' && continuation.operationId === row.operation_id
-      && continuation.phase === 'external-cleanup', 'purge-continuation-evidence-gap');
+      && continuation.phase === 'external-cleanup' && Array.isArray(continuation.sources), 'purge-continuation-evidence-gap');
+    const sourceCarriers = continuation.inventory.filter(carrier => carrier.role === 'source');
+    check(continuation.sources.length === sourceCarriers.length && new Set(continuation.sources.map(item => item.source.path)).size === sourceCarriers.length
+      && continuation.sources.every(item => sourceCarriers.some(carrier => carrier.file.path === item.source.path
+        && carrier.file.identity.dev === item.source.identity.dev && carrier.file.identity.ino === item.source.identity.ino)), 'purge-continuation-evidence-gap');
+    const seen = new Set<number>();
+    for (const work of continuation.sourceCleanup ?? []) {
+      const selected = continuation.carriers[work.index];
+      check(Number.isSafeInteger(work.index) && selected?.role === 'source' && !seen.has(work.index)
+        && Array.isArray(work.plan.ranges) && work.plan.ranges.length === selected.entries.length
+        && (!work.ack || work.ack.hash === work.plan.afterHash && work.ack.bytes === selected.bytes), 'purge-continuation-evidence-gap');
+      seen.add(work.index);
+    }
     return continuation;
   }
 
@@ -6686,8 +6726,20 @@ export class ProbeStore {
       const receipt = JSON.parse(String(row.receipt_payload)) as PurgeReceipt;
       check(JSON.stringify(receipt) === JSON.stringify({ schema: 'purge/logical-commit@1', operationId: continuation.operationId,
         status: 'logical-commit' }), 'purge-receipt-evidence-gap');
+      const total = continuation.carriers.filter(carrier => carrier.role === 'source').length;
+      let completed = 0, reason: string | null = null;
+      for (const work of continuation.sourceCleanup ?? []) if (work.ack) {
+        try {
+          const selection = continuation.carriers[work.index]!;
+          const bytes = snapshotBytes(selection.file);
+          check(bytes.length === work.ack.bytes && sha256(bytes) === work.ack.hash, 'purge-source-postcondition-failed');
+          completed++;
+        } catch (error) { reason = (error as Error).message; }
+      }
       return { status: 'logical-commit' as const, operationId: continuation.operationId, receipt,
-        cleanup: 'incomplete' as const, phase: continuation.phase };
+        cleanup: 'incomplete' as const, phase: continuation.phase,
+        source: { status: reason ? 'blocked' as const : completed === total ? 'complete' as const : 'pending' as const,
+          completed, total, reason } };
     });
   }
 
@@ -6706,7 +6758,7 @@ export class ProbeStore {
       const plan = this.#planPurge(coordinator, manifest.recordId, carriers);
       check(plan.digest === digest && JSON.stringify(plan.manifest) === JSON.stringify(manifest), 'purge-manifest-stale');
       const continuation: PurgeContinuation = { schema: 'purge-continuation@1', operationId, phase: 'external-cleanup',
-        carriers: manifest.carriers, backups: manifest.backups, inventory: manifest.inventory.carriers };
+        carriers: manifest.carriers, backups: manifest.backups, inventory: manifest.inventory.carriers, sources: manifest.inventory.sources };
       const receipt: PurgeReceipt = { schema: 'purge/logical-commit@1', operationId, status: 'logical-commit' };
       this.#purging = true;
       try {
@@ -6725,6 +6777,61 @@ export class ProbeStore {
     });
     this.#purgePreviews.clear();
     return committed;
+  }
+
+  cleanupPurgeSources(coordinator: string, owner: (binding: Binding, file: BoundFile) => PurgeSourceOwner) {
+    check(this.purgeStatus(coordinator), 'purge-logical-commit-required');
+    check(this.acquireMaintenance(coordinator).acquired && this.#assertCoordinator(coordinator).state === 'cleaning',
+      'maintenance-residuals-or-participants');
+    let continuation = this.#purgeContinuation()!;
+    for (const [index, selection] of continuation.carriers.entries()) {
+      if (selection.role !== 'source') continue;
+      const bound = continuation.sources.find(item => item.source.path === selection.file.path
+        && item.source.identity.dev === selection.file.identity.dev && item.source.identity.ino === selection.file.identity.ino);
+      check(bound, 'purge-source-owner-unavailable');
+      const archive = owner(structuredClone(bound.binding), structuredClone(selection.file));
+      check(archive, 'purge-source-owner-unavailable');
+      let work = continuation.sourceCleanup?.find(item => item.index === index);
+      if (!work) {
+        const plan = archive.preparePurge(structuredClone(selection));
+        work = { index, plan: structuredClone(plan), ack: null };
+        this.#transaction(() => {
+          check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
+          const bytes = snapshotBytes(selection.file);
+          check(sha256(bytes) === selection.hash && bytes.length === selection.bytes, 'purge-source-carrier-changed');
+          inspectPurgeSource(selection, work!.plan, bytes);
+          continuation.sourceCleanup ??= []; continuation.sourceCleanup.push(work!);
+          this.#savePurgeContinuation(continuation);
+        });
+      }
+      check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
+      const before = snapshotBytes(selection.file);
+      inspectPurgeSource(selection, work.plan, before);
+      if (work.ack) {
+        check(sha256(before) === work.ack.hash, 'purge-source-postcondition-failed');
+        continue;
+      }
+      const ack = archive.purge(structuredClone(selection), structuredClone(work.plan));
+      this.#transaction(() => {
+        check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
+        const actual = snapshotBytes(selection.file);
+        check(ack.hash === work!.plan.afterHash && ack.bytes === selection.bytes
+          && actual.length === ack.bytes && sha256(actual) === ack.hash, 'purge-source-postcondition-failed');
+        work!.ack = { hash: ack.hash, bytes: ack.bytes };
+        this.#savePurgeContinuation(continuation);
+      });
+      continuation = this.#purgeContinuation()!;
+    }
+    return this.purgeStatus(coordinator)!;
+  }
+
+  #savePurgeContinuation(continuation: PurgeContinuation): void {
+    const bytes = JSON.stringify(continuation);
+    this.#purging = true;
+    try {
+      check(this.#db.prepare("UPDATE pending_operations SET continuation=?,continuation_hash=? WHERE operation_id=? AND kind='purge' AND state='cleaning'")
+        .run(bytes, sha256(bytes), continuation.operationId).changes === 1, 'purge-continuation-evidence-gap');
+    } finally { this.#purging = false; }
   }
 
   invalidatePurgePresentation(coordinator: string): void {
@@ -6837,7 +6944,8 @@ export class ProbeStore {
     const observedAt = new Date().toISOString();
     const entries: { path: string; state: 'expected' | 'unexpected' | 'unknown'; observedAt: string; dev: string | null; ino: string | null; reason: string }[] = [];
     // These are the existing disposable adapter's carriers, not a cleanup allowlist.
-    const sources = this.#db.prepare('SELECT source_path,source_dev,source_ino FROM sessions WHERE store_id=?').all(this.#storeId);
+    const sources = this.#controlledSourceOwners().map(({ source }) => ({ source_path: source.path,
+      source_dev: source.identity.dev, source_ino: source.identity.ino }));
     const sourceNames = sources.map(row => basename(String(row.source_path)));
     const known = new Set(['sandbox.json', 'counting-receiver.jsonl', 'owner-info.jsonl', ...sourceNames, basename(this.#resources.store.path),
       `${basename(this.#resources.store.path)}-wal`, `${basename(this.#resources.store.path)}-shm`]);
@@ -6853,10 +6961,7 @@ export class ProbeStore {
       if (this.#db.prepare('SELECT original_deleted FROM store_restores WHERE operation_id=?').get(recovery.operationId)!.original_deleted === 0) {
         snapshots.push({ directory: recovery.original.path, dev: recovery.original.identity.dev, ino: recovery.original.identity.ino });
       }
-      for (const file of recovery.originals) if (file.name.startsWith('later-source-')) sources.push({
-        source_path: file.source.path, source_dev: file.source.identity.dev, source_ino: file.source.identity.ino });
     }
-    for (const source of sources) known.add(basename(String(source.source_path)));
     try {
       const names = readdirSync(this.#resources.root.path).sort();
       check(names.length <= 1024, 'residual-enumeration-limit');
@@ -6906,7 +7011,12 @@ export class ProbeStore {
     for (const carrier of purge?.inventory ?? []) {
       try {
         const bytes = snapshotBytes(carrier.file);
-        check(bytes.length === carrier.bytes && sha256(bytes) === carrier.hash, 'purge-carrier-stale');
+        const index = purge!.carriers.findIndex(item => item.role === 'source' && item.file.path === carrier.file.path);
+        const work = purge!.sourceCleanup?.find(item => item.index === index);
+        if (work) {
+          inspectPurgeSource(purge!.carriers[index]!, work.plan, bytes);
+          if (work.ack) check(sha256(bytes) === work.ack.hash, 'purge-source-postcondition-failed');
+        } else check(bytes.length === carrier.bytes && sha256(bytes) === carrier.hash, 'purge-carrier-stale');
         entries.push({ path: carrier.role === 'project-output' ? carrier.file.path : basename(carrier.file.path), state: 'expected', observedAt,
           dev: carrier.file.identity.dev, ino: carrier.file.identity.ino, reason: 'purge-continuation-carrier' });
       } catch {

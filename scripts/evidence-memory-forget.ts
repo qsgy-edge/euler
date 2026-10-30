@@ -50,7 +50,7 @@ function validate(root: string, recordId: string, tokens: { kind: 'forget' | 're
   };
   const db = new DatabaseSync(join(root, 'probe.sqlite'), { readOnly: true });
   try {
-    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 24);
+    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 25);
     assert.equal(db.prepare('PRAGMA integrity_check').get()!.integrity_check, 'ok');
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     const revisions = db.prepare('SELECT * FROM memory_revisions WHERE record_id=?').all(recordId);
