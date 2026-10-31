@@ -1,0 +1,7 @@
+{
+  "schema": "t22b-controlled-cleanup@1",
+  "synthetic": true,
+  "baseFixtures": ["fixtures/t21-purge-cases.json", "fixtures/t22a-source-cleanup.json"],
+  "cases": ["separate", "shared", "operations", "rollback", "discovery", "handoff", "historian", "conflict", "identity", "backup", "staging-backup", "retired-backup", "migration-backup", "recovery", "project-output"],
+  "faults": ["source-before", "source-after", "info-before", "info-after", "receiver-before", "receiver-after", "backup-before", "backup-partial", "backup-after", "scrub-before", "scrub-after", "vacuum-before", "vacuum-after", "completion-before", "completion-after", "info-enospc", "sqlite-full", "output-before", "output-after"]
+}

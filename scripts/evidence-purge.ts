@@ -112,7 +112,7 @@ for (const scenario of fixture.cases) {
     const files = [...preview.manifest.inventory.carriers.map(item => item.file), ...preview.manifest.backups.flatMap(item => item.files.map(file => file.file))];
     const hashes = files.map(file => ({ path: file.path, hash: sha256(readFileSync(file.path)) }));
     const oldReceipts = inspect(db => db.prepare('SELECT receipt_id,receipt_payload,receipt_hash FROM memory_events WHERE record_id=? AND receipt_payload IS NOT NULL').all(seeded.recordId));
-    const attemptStates = inspect(db => db.prepare('SELECT attempt_id,outcome,byte_length FROM request_attempts ORDER BY attempt_id').all());
+    const attemptStates = inspect(db => db.prepare('SELECT attempt_id,assembly_id,ordinal,outcome,byte_length FROM request_attempts ORDER BY assembly_id,ordinal').all());
     const unchanged = () => { for (const file of hashes) assert.equal(sha256(readFileSync(file.path)), file.hash, file.path); };
     if (scenario === 'separate') {
       for (const input of ['同意', '永久删除并恢复', 'PURGE ' + preview.token + ' ' + randomUUID()])
@@ -165,13 +165,21 @@ for (const scenario of fixture.cases) {
     assert.deepEqual(result.receipt, { schema: 'purge/logical-commit@1', operationId: preview.operationId, status: 'logical-commit' });
     unchanged();
     inspect(db => {
-      assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 25);
+      assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 26);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       for (const record of preview.manifest.records) for (const table of ['memory_records', 'memory_revisions', 'memory_heads', 'provenance_refs', 'verification_runs', 'feedback_events', 'search_documents'])
         assert.equal(db.prepare('SELECT count(*) n FROM ' + table + ' WHERE record_id=?').get(record.recordId)!.n, 0, table);
       if (scenario !== 'conflict') assert.equal(db.prepare('SELECT count(*) n FROM memory_records WHERE record_id=?').get(seeded.otherId)!.n, 1);
       for (const receipt of oldReceipts) assert.deepEqual(db.prepare('SELECT receipt_id,receipt_payload,receipt_hash FROM memory_events WHERE receipt_id=?').get(receipt.receipt_id!), receipt);
-      assert.deepEqual(db.prepare('SELECT attempt_id,outcome,byte_length FROM request_attempts ORDER BY attempt_id').all(), attemptStates);
+      const attemptsAfter = db.prepare('SELECT attempt_id,assembly_id,ordinal,outcome,byte_length FROM request_attempts ORDER BY assembly_id,ordinal').all();
+      assert.deepEqual(attemptsAfter.map(({ attempt_id, ...facts }) => facts), attemptStates.map(({ attempt_id, ...facts }) => facts));
+      for (const [index, before] of attemptStates.entries()) {
+        if (sourceIds.includes(String(before.attempt_id))) {
+          assert.notEqual(attemptsAfter[index]!.attempt_id, before.attempt_id);
+          for (const table of ['request_attempts', 'request_events', 'execution_events'])
+            assert.equal(db.prepare(`SELECT count(*) n FROM ${table} WHERE attempt_id=?`).get(before.attempt_id!)!.n, 0);
+        } else assert.equal(attemptsAfter[index]!.attempt_id, before.attempt_id);
+      }
       const settled = db.prepare("SELECT * FROM memory_events WHERE kind='purge-logical-commit'").all(); assert.equal(settled.length, 1);
       assert.equal(settled[0]!.record_id, null); assert.equal(settled[0]!.payload, null); assert.equal(settled[0]!.source_event_id, null);
       const continuation = db.prepare("SELECT * FROM pending_operations WHERE kind='purge'").all(); assert.equal(continuation.length, 1);
@@ -179,7 +187,7 @@ for (const scenario of fixture.cases) {
       const saved = JSON.parse(String(continuation[0]!.continuation));
       assert.deepEqual(saved.carriers, preview.manifest.carriers); assert.deepEqual(saved.backups, preview.manifest.backups);
       assert.equal(saved.records, undefined); assert.equal(saved.database, undefined);
-      writeFileSync(join(path, 'logical-observation.json'), JSON.stringify({ receipt: settled, continuation, attempts: attemptStates }, null, 2) + '\n');
+      writeFileSync(join(path, 'logical-observation.json'), JSON.stringify({ receipt: settled, continuation, attempts: { before: attemptStates, after: attemptsAfter } }, null, 2) + '\n');
     });
     assert.equal((await send(child, preview.phrase, 'purge-settled')).operationId, preview.operationId);
     assert.equal((await send(child, 'cancel', 'purge-settled')).cleanup, 'incomplete');

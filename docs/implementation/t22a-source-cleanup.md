@@ -43,7 +43,7 @@ The existing `pending_operations.continuation` retains the approved `carriers`, 
 
 The plan is committed before the owner writes. The acknowledgement is committed after owner flush and independent readback. A crash after deletion but before acknowledgement is recovered from the stored plan and actual bytes. The logical receipt is unchanged throughout.
 
-The settled-operation trigger permits continuation updates only for an existing `purge` operation in `cleaning`, through the Core purge writer. Operation identity, approval digest, result and logical receipt remain immutable. Disposable schema is **25**; old disposable stores must be recreated. The independent forward-migration harness advances its copy to **26**.
+The settled-operation trigger permits continuation updates only for an existing `purge` operation in `cleaning`, through the Core purge writer. Operation identity, result and logical receipt remain immutable. The approval digest stays fixed during external cleanup and is removed with the sensitive continuation before SQLite maintenance. Disposable schema is **26**; old disposable stores must be recreated. The independent forward-migration harness advances its copy to **27**.
 
 ## Carrier coverage and handoff
 
@@ -51,7 +51,7 @@ All currently registered session JSONL files use the same source owner. Prepared
 
 The fixture includes an unrelated memory, identical event UUIDs in distinct sessions, two report versions, a handoff, an approved export and a consuming-session excerpt. Assertions compare actual retained events and raw file bytes against the frozen selection. Independent source entries remain readable through the archive owner with their original acknowledgements.
 
-`owner-info.jsonl`, `counting-receiver.jsonl`, file-tool project outputs, snapshots/recovery originals and SQLite main/WAL/free pages remain T22b participants. The current report/export API writes its durable output into the archive; it does not create another temporary export file. Registered file-tool copies remain in the frozen inventory for their file owner. T22b must verify those actual participants, remove sensitive continuation references, perform final SQLite maintenance and only then issue `controlled-complete` and reopen admission.
+`owner-info.jsonl`, `counting-receiver.jsonl`, file-tool project outputs, snapshots/recovery originals and SQLite main/WAL/free pages are handled by the [controlled cleanup path](t22b-controlled-cleanup.md). The current report/export API writes its durable output into the archive; it does not create another temporary export file. Registered file-tool copies remain in the frozen inventory for their file owner. The full `cleanup` command verifies those actual participants, removes sensitive continuation references, performs final SQLite maintenance and only then issues `controlled-complete` and reopens admission.
 
 ## Evidence
 
@@ -59,4 +59,4 @@ The fixture includes an unrelated memory, identical event UUIDs in distinct sess
 
 The receipt binds the fixture digests, implementation commit/tree/working-tree state and environment. Its independent evidence copies are outside the application's purge ownership. Boundary tests cover pre-commit rejection, permission withdrawal, resource replacement, changed content, unavailable owners, forged plans/acknowledgements, an acknowledgement transaction failure, current-state revalidation and a real Windows sharing lock. Separate process tests exercise late capture/Historian archive writes and dispatch under a closing fence, then complete the source cleanup after that process exits. Snapshot → later session → restore cases cover approved deletion, unrelated original retention, discarded recovery copies, a cleanup crash and recovery interrupted after database replacement.
 
-The CI runs the tests and receipt command on Windows, macOS and Linux. Windows sharing-lock observations belong to the Windows receipt; other platforms report that gap explicitly. The receipt does not claim power-loss/torn-entry recovery from process-boundary crash tests. Global controlled-copy and SQLite completion remains the T22b evidence boundary.
+The CI runs the tests and receipt command on Windows, macOS and Linux. Windows sharing-lock observations belong to the Windows receipt; other platforms report that gap explicitly. The receipt does not claim power-loss/torn-entry recovery from process-boundary crash tests. Global controlled-copy and SQLite completion has its own T22b receipt.

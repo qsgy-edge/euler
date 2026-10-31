@@ -101,6 +101,26 @@ for (const scenario of ['separate', 'shared', 'operations', 'rollback', 'discove
   } finally { store.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('purge removes source-addressable attempt identities while retaining content-free execution outcomes', () => {
+  const { sandbox, fixture, store, coordinator } = setup('historian');
+  const db = new DatabaseSync(join(sandbox.root, 'probe.sqlite'));
+  try {
+    const carriers = readPurgeCarriers(sandbox, store, coordinator);
+    const preview = store.previewPurge(coordinator, fixture.recordId, carriers);
+    const sources = new Set(preview.manifest.carriers.filter(carrier => carrier.role === 'source').flatMap(carrier => carrier.entries.map(entry => entry.id)));
+    const attempts = db.prepare('SELECT attempt_id,run_id,outcome FROM request_attempts').all().filter(row => sources.has(String(row.attempt_id)));
+    assert.ok(attempts.length > 0);
+    store.acknowledgePurgePresentation(coordinator, preview.token, preview.digest);
+    store.commitPurge(coordinator, store.receivePurgeInput(coordinator, preview.phrase), preview.token, carriers);
+    for (const attempt of attempts) {
+      for (const table of ['request_attempts', 'request_events', 'execution_events'])
+        assert.equal(db.prepare(`SELECT 1 FROM ${table} WHERE attempt_id=?`).get(attempt.attempt_id!), undefined, table);
+      assert.ok(db.prepare('SELECT 1 FROM request_attempts WHERE run_id=? AND outcome=?').get(attempt.run_id!, attempt.outcome!));
+    }
+    assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
+  } finally { db.close(); store.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('a conflict relation expands to both dependent records and presents both before approval', () => {
   const { sandbox, fixture, store, coordinator } = setup('conflict');
   try {

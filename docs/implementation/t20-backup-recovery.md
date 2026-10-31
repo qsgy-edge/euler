@@ -49,7 +49,7 @@ Backup, staging and recovery directories participate in the existing maintenance
 
 Recovery preparation preserves the binding and file identity of every controlled original source, including sessions created after the selected snapshot. Restoring session rows from the snapshot does not discard that original-source ownership; purge freezes these registrations before deleting recovery metadata. Discarding the separate recovery-directory copy leaves the original source registration intact.
 
-The disposable schema version is **25**. Store opening rejects other schema versions. The forward migration harness operates on an independent copy, changes that copy to version 26 with a matching `schema_meta` constraint, version and target schema hash in one SQLite transaction, and verifies successful commit plus process death before/after commit against the untouched migration checkpoint. It exercises migration/recovery primitives without introducing a production schema migration.
+The disposable schema version is **26**. Store opening rejects other schema versions. The forward migration harness operates on an independent copy, changes that copy to version 27 with a matching `schema_meta` constraint, version and target schema hash in one SQLite transaction, and verifies successful commit plus process death before/after commit against the untouched migration checkpoint. It exercises migration/recovery primitives without introducing a production schema migration.
 
 ## Evidence
 

@@ -200,7 +200,7 @@ for (const scenario of fixture.cases) {
     const snapshotDb = new DatabaseSync(snapshotPath, { readOnly: true });
     let attempts: Record<string, unknown>[], streams: Record<string, unknown>[], snapshotEpoch: number;
     try {
-      assert.equal(snapshotDb.prepare('PRAGMA user_version').get()!.user_version, 25);
+      assert.equal(snapshotDb.prepare('PRAGMA user_version').get()!.user_version, 26);
       assert.equal(snapshotDb.prepare('PRAGMA quick_check').get()!.quick_check, 'ok');
       assert.deepEqual(snapshotDb.prepare('PRAGMA foreign_key_check').all(), []);
       attempts = snapshotDb.prepare('SELECT * FROM request_attempts ORDER BY attempt_id').all();
@@ -231,12 +231,12 @@ for (const scenario of fixture.cases) {
       run('migration', ['apps/cli/test/support/backup-migration-worker.ts',candidate,point], point === 'success' ? 'success' : 'kill');
       const candidateDb = new DatabaseSync(candidate);
       try {
-        const version = point === 'before-commit' ? 25 : 26;
+        const version = point === 'before-commit' ? 26 : 27;
         assert.equal(candidateDb.prepare('PRAGMA user_version').get()!.user_version,version);
         const metadata = candidateDb.prepare('SELECT schema_version,ddl_hash FROM schema_meta').get()!;
         assert.equal(metadata.schema_version,version);
         assert.ok(String(candidateDb.prepare("SELECT sql FROM sqlite_schema WHERE name='schema_meta'").get()!.sql).includes(`CHECK(schema_version=${version})`));
-        if (version === 26) assert.equal(metadata.ddl_hash,hash(JSON.stringify(candidateDb.prepare('SELECT type,name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type,name').all())));
+        if (version === 27) assert.equal(metadata.ddl_hash,hash(JSON.stringify(candidateDb.prepare('SELECT type,name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type,name').all())));
         assert.equal(candidateDb.prepare('PRAGMA quick_check').get()!.quick_check, 'ok');
         assert.deepEqual(candidateDb.prepare('PRAGMA foreign_key_check').all(), []);
       } finally { candidateDb.close(); }

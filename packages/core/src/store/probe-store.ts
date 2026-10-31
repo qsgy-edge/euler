@@ -1,5 +1,5 @@
-import { applyLogicalPurge, inspectPurgeSource, planPurge } from './logical-purge.ts';
-import type { PurgeCarrier, PurgeContinuation, PurgeInput, PurgePresentation, PurgeReceipt, PurgeSourceOwner } from './logical-purge.ts';
+import { applyLogicalPurge, inspectPurgeLines, planPurge } from './logical-purge.ts';
+import type { PurgeCarrier, PurgeCarrierSelection, PurgeCompletion, PurgeContinuation, PurgeIncomplete, PurgeInput, PurgePresentation, PurgeReceipt, PurgeLineOwner } from './logical-purge.ts';
 import { isLiveMemoryOperation, matchesMemoryApproval, memoryOperationSummary, parseCorrectionCommand } from '../context/memory-correction.ts';
 import { parseAnalysisArtifact } from '../context/analysis-artifacts.ts';
 import { assertHistorianReply, compartmentBody, isCompartmentEvidenceGap } from '../context/historian.ts';
@@ -14,7 +14,7 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync
 import { basename, dirname, join } from 'node:path';
 import { userInfo } from 'node:os';
 import { DatabaseSync, backup } from 'node:sqlite';
-import { checkSqliteSnapshot, deleteSnapshot, inspectSnapshotFiles, removeSnapshotFiles, snapshotBytes, snapshotDataHash, syncSnapshotDirectory, syncSnapshotFile, verifySnapshot, writeSnapshotFile } from './snapshots.ts';
+import { checkSqliteSnapshot, deleteSnapshot, inspectSnapshotFiles, removeSnapshotFiles, snapshotBytes, snapshotDataHash, snapshotDirectoryExists, syncSnapshotDirectory, syncSnapshotFile, verifySnapshot, writeSnapshotFile } from './snapshots.ts';
 import type { SnapshotFile, StoreSnapshot, SnapshotCleanupManifest } from './snapshots.ts';
 import { recoveryFileNames, restoreFile } from './snapshot-recovery.ts';
 import type { SnapshotRecoveryPlan, SnapshotRecoveryPreparation, SnapshotRecoveryReceipt } from './snapshot-recovery.ts';
@@ -233,7 +233,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=25), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=26), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -497,7 +497,7 @@ CREATE TABLE memory_heads (
   FOREIGN KEY(scope_kind,scope_id,scope_resolved) REFERENCES memory_scopes(kind,scope_id,resolved)
 ) STRICT;
 CREATE TABLE memory_events (
-  event_id TEXT PRIMARY KEY, record_id TEXT REFERENCES memory_records(record_id), seq INTEGER CHECK(seq > 0), kind TEXT NOT NULL CHECK(kind IN ('capture','verify','activate','correct','auto-revise','forget','restore','conflict','rollback','comparison','corroborate','reject','supersede','stale','purge-logical-commit')),
+  event_id TEXT PRIMARY KEY, record_id TEXT REFERENCES memory_records(record_id), seq INTEGER CHECK(seq > 0), kind TEXT NOT NULL CHECK(kind IN ('capture','verify','activate','correct','auto-revise','forget','restore','conflict','rollback','comparison','corroborate','reject','supersede','stale','purge-logical-commit','purge-cleanup-incomplete','purge-controlled-complete')),
   revision_id TEXT REFERENCES memory_revisions(revision_id), before_snapshot TEXT, after_snapshot TEXT,
   request_hash TEXT UNIQUE, origin_host_id TEXT, origin_seq INTEGER CHECK(origin_seq>0),
   batch_id TEXT REFERENCES activation_batches(batch_id) DEFERRABLE INITIALLY DEFERRED,
@@ -507,7 +507,7 @@ CREATE TABLE memory_events (
   operation_id TEXT REFERENCES pending_operations(operation_id), receipt_id TEXT UNIQUE, receipt_payload TEXT, receipt_hash TEXT,
   CHECK((record_id IS NOT NULL AND seq IS NOT NULL AND revision_id IS NOT NULL AND after_snapshot IS NOT NULL
     AND request_hash IS NOT NULL AND origin_host_id IS NOT NULL AND origin_seq IS NOT NULL
-    AND payload IS NOT NULL AND payload_hash IS NOT NULL AND source_event_id IS NOT NULL AND kind!='purge-logical-commit')
+    AND payload IS NOT NULL AND payload_hash IS NOT NULL AND source_event_id IS NOT NULL AND kind NOT IN ('purge-logical-commit','purge-cleanup-incomplete','purge-controlled-complete'))
     OR (record_id IS NULL AND seq IS NULL AND revision_id IS NULL AND before_snapshot IS NULL AND after_snapshot IS NULL
       AND request_hash IS NULL AND origin_host_id IS NULL AND origin_seq IS NULL AND payload IS NULL AND payload_hash IS NULL
       AND source_event_id IS NULL AND batch_id IS NULL AND target_event_id IS NULL AND receipt_id IS NOT NULL)),
@@ -555,8 +555,9 @@ CREATE TABLE pending_operations (
   kind TEXT NOT NULL DEFAULT 'memory' CHECK(kind IN ('memory','purge')), continuation TEXT, continuation_hash TEXT,
   CHECK((kind='memory' AND session_id IS NOT NULL AND presentation_id IS NOT NULL AND presentation_hash IS NOT NULL
     AND state!='cleaning' AND continuation IS NULL AND continuation_hash IS NULL)
-    OR (kind='purge' AND state='cleaning' AND session_id IS NULL AND presentation_id IS NULL
-      AND continuation IS NOT NULL AND continuation_hash IS NOT NULL)),
+    OR (kind='purge' AND session_id IS NULL AND presentation_id IS NULL
+      AND ((state='cleaning' AND continuation IS NOT NULL AND continuation_hash IS NOT NULL)
+        OR (state='committed' AND continuation IS NULL AND continuation_hash IS NULL AND presentation_hash IS NULL)))),
   CHECK((state='pending' AND result IS NULL AND result_hash IS NULL) OR (state!='pending' AND result IS NOT NULL AND result_hash IS NOT NULL)),
   FOREIGN KEY(session_id,presentation_id) REFERENCES host_presentations(session_id,presentation_id),
   UNIQUE(session_id,operation_id),
@@ -575,7 +576,7 @@ WHEN NEW.operation_id IS NOT OLD.operation_id OR NEW.summary_event_id IS NOT OLD
 BEGIN SELECT RAISE(ABORT,'operation-delivery-monotonic'); END;
 CREATE TRIGGER immutable_operation_delivery_delete BEFORE DELETE ON host_operation_delivery WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER operation_event_target BEFORE INSERT ON memory_events
-WHEN NEW.operation_id IS NOT NULL AND NEW.kind!='purge-logical-commit' AND NOT EXISTS (
+WHEN NEW.operation_id IS NOT NULL AND NEW.kind NOT IN ('purge-logical-commit','purge-cleanup-incomplete','purge-controlled-complete') AND NOT EXISTS (
   SELECT 1 FROM pending_operations o JOIN host_presentations p ON p.presentation_id=o.presentation_id
   JOIN presentation_targets t ON t.presentation_id=p.presentation_id
   WHERE o.operation_id=NEW.operation_id AND o.state='pending' AND p.kind=NEW.kind AND o.presentation_hash=p.payload_hash
@@ -586,9 +587,10 @@ BEGIN SELECT RAISE(ABORT,'operation-target-mismatch'); END;
 CREATE UNIQUE INDEX session_pending ON pending_operations(session_id) WHERE state='pending';
 CREATE TRIGGER settled_operation_immutable BEFORE UPDATE ON pending_operations
 WHEN (OLD.state!='pending' AND NOT (euler_purge_writer()=1 AND OLD.kind='purge' AND OLD.state='cleaning'
-    AND NEW.kind=OLD.kind AND NEW.state=OLD.state AND NEW.result IS OLD.result AND NEW.result_hash IS OLD.result_hash))
+    AND NEW.kind=OLD.kind AND NEW.state IN ('cleaning','committed') AND NEW.result IS OLD.result AND NEW.result_hash IS OLD.result_hash))
   OR NEW.operation_id IS NOT OLD.operation_id OR NEW.session_id IS NOT OLD.session_id OR NEW.presentation_id IS NOT OLD.presentation_id
-  OR NEW.presentation_hash IS NOT OLD.presentation_hash
+  OR (NEW.presentation_hash IS NOT OLD.presentation_hash AND NOT (euler_purge_writer()=1 AND OLD.kind='purge'
+    AND OLD.state='cleaning' AND NEW.presentation_hash IS NULL))
 BEGIN SELECT RAISE(ABORT,'settled-operation-immutable'); END;
 CREATE TABLE activation_batches (
   batch_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_id TEXT NOT NULL,
@@ -736,9 +738,9 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=25;
+PRAGMA user_version=26;
 ` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts','store_recovery_events','store_recovered_owners'].map(table => `
-CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} ${['request_events','execution_streams','store_recovery_events'].includes(table) ? 'WHEN euler_purge_writer()!=1 ' : ''}BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} ${['request_events','execution_events','execution_streams','store_recovery_events'].includes(table) ? 'WHEN euler_purge_writer()!=1 ' : ''}BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 `).join('') + ['memory_heads','intent_heads','owner_fences','host_operation_delivery','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
   'verification_runs','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts','host_info_batches','capture_work','compartments','store_snapshots','store_restores','store_recovery_events','store_recovered_owners'].map(table => `
@@ -812,15 +814,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,25,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,26,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 25, 'unsupported-probe-schema');
+        check(version === 26, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 25 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 26 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -6083,7 +6085,9 @@ export class ProbeStore {
     for (const row of this.#db.prepare("SELECT after_snapshot FROM memory_events WHERE kind='comparison' AND record_id IS NOT NULL").all())
       this.#checkComparisonEvidence(this.#parseMemorySnapshot(String(row.after_snapshot)), projects, false);
     for (const row of this.#db.prepare('SELECT * FROM feedback_events').all()) this.#readFeedbackReceipt(row);
-    for (const row of this.#db.prepare("SELECT * FROM memory_events WHERE receipt_id IS NOT NULL AND kind!='purge-logical-commit'").all()) this.#readOwnerReceipt(row);
+    for (const row of this.#db.prepare("SELECT * FROM memory_events WHERE receipt_id IS NOT NULL AND kind NOT IN ('purge-logical-commit','purge-cleanup-incomplete','purge-controlled-complete')").all()) this.#readOwnerReceipt(row);
+    for (const row of this.#db.prepare("SELECT DISTINCT operation_id FROM memory_events WHERE kind='purge-cleanup-incomplete'").all())
+      this.#purgeFailures(String(row.operation_id));
     for (const session of this.#db.prepare('SELECT * FROM sessions').all()) {
       const binding: Binding = { ownerId: String(session.owner_id), hostId: String(session.host_id), projectId: String(session.project_id),
         sessionId: String(session.session_id), branchId: String(session.branch_id) };
@@ -6118,7 +6122,8 @@ export class ProbeStore {
     };
     const result = typeof owner === 'string' ? this.#transaction(() => {
       const fence = this.#assertCoordinator(owner);
-      check(fence.state === 'exclusive', 'maintenance-not-exclusive');
+      check(fence.state === 'exclusive' || fence.state === 'cleaning' && this.#purgeContinuation()?.phase === 'sqlite-maintenance',
+        'maintenance-not-exclusive');
       check(fence.health === 'healthy', 'store-integrity-failed');
       return inspect();
     }) : this.withActivity(owner, inspect);
@@ -6649,6 +6654,11 @@ export class ProbeStore {
       for (const carrier of carriers) {
         const bytes = snapshotBytes(carrier.file);
         check(bytes.length === carrier.bytes && sha256(bytes) === carrier.hash, 'purge-carrier-stale');
+        if (carrier.role === 'project-output') {
+          const outputs = resources.outputs.filter(output => output.path === carrier.file.path && output.started && output.state !== 'no_effect');
+          check(outputs.length > 0 && outputs.every(output => JSON.stringify(carrier.output)
+            === JSON.stringify({ root: output.root, parent: output.parent })), 'purge-project-owner-mismatch');
+        } else check(!carrier.output, 'purge-project-owner-mismatch');
       }
       const backups = this.#db.prepare("SELECT snapshot_id FROM store_snapshots WHERE state!='deleted' ORDER BY snapshot_id").all()
         .map(row => this.snapshotCleanupManifest(coordinator, String(row.snapshot_id)));
@@ -6692,27 +6702,47 @@ export class ProbeStore {
     const rows = this.#db.prepare("SELECT * FROM pending_operations WHERE kind='purge' AND state='cleaning'").all();
     check(rows.length <= 1, 'purge-operation-evidence-gap');
     check(!this.#db.prepare(`SELECT 1 FROM memory_events e WHERE e.kind='purge-logical-commit' AND NOT EXISTS
-      (SELECT 1 FROM pending_operations o WHERE o.operation_id=e.operation_id AND o.kind='purge' AND o.state='cleaning')`).get(),
+      (SELECT 1 FROM pending_operations o WHERE o.operation_id=e.operation_id AND o.kind='purge' AND o.state IN ('cleaning','committed'))`).get(),
     'purge-continuation-evidence-gap');
+    for (const operation of this.#db.prepare("SELECT operation_id FROM pending_operations WHERE kind='purge' AND state='committed'").all())
+      check(this.purgeCompletion(String(operation.operation_id)), 'purge-completion-evidence-gap');
     if (!rows.length) return null;
     const row = rows[0]!;
     check(sha256(String(row.continuation)) === row.continuation_hash, 'purge-continuation-evidence-gap');
     const continuation = JSON.parse(String(row.continuation)) as PurgeContinuation;
     check(continuation.schema === 'purge-continuation@1' && continuation.operationId === row.operation_id
-      && continuation.phase === 'external-cleanup' && Array.isArray(continuation.sources), 'purge-continuation-evidence-gap');
+      && ['external-cleanup','sqlite-maintenance'].includes(continuation.phase) && Array.isArray(continuation.sources), 'purge-continuation-evidence-gap');
+    if (continuation.phase === 'sqlite-maintenance') check(row.presentation_hash === null && JSON.stringify(continuation) === JSON.stringify({
+      schema: 'purge-continuation@1', operationId: continuation.operationId, phase: 'sqlite-maintenance',
+      carriers: [], backups: [], inventory: [], sources: [],
+    }), 'purge-continuation-evidence-gap');
     const sourceCarriers = continuation.inventory.filter(carrier => carrier.role === 'source');
     check(continuation.sources.length === sourceCarriers.length && new Set(continuation.sources.map(item => item.source.path)).size === sourceCarriers.length
       && continuation.sources.every(item => sourceCarriers.some(carrier => carrier.file.path === item.source.path
         && carrier.file.identity.dev === item.source.identity.dev && carrier.file.identity.ino === item.source.identity.ino)), 'purge-continuation-evidence-gap');
     const seen = new Set<number>();
-    for (const work of continuation.sourceCleanup ?? []) {
-      const selected = continuation.carriers[work.index];
-      check(Number.isSafeInteger(work.index) && selected?.role === 'source' && !seen.has(work.index)
-        && Array.isArray(work.plan.ranges) && work.plan.ranges.length === selected.entries.length
-        && (!work.ack || work.ack.hash === work.plan.afterHash && work.ack.bytes === selected.bytes), 'purge-continuation-evidence-gap');
-      seen.add(work.index);
+    for (const [group, roles] of [['sourceCleanup', ['source']], ['hostCleanup', ['owner-info', 'receiver']]] as const) {
+      for (const work of continuation[group] ?? []) {
+        const selected = continuation.carriers[work.index];
+        check(Number.isSafeInteger(work.index) && selected && (roles as readonly string[]).includes(selected.role) && !seen.has(work.index)
+          && Array.isArray(work.plan.ranges) && work.plan.ranges.length === selected.entries.length
+          && (!work.ack || work.ack.hash === work.plan.afterHash && work.ack.bytes === selected.bytes), 'purge-continuation-evidence-gap');
+        seen.add(work.index);
+      }
     }
+    check(new Set(continuation.backupCleanup).size === (continuation.backupCleanup?.length ?? 0)
+      && (continuation.backupCleanup ?? []).every(index => Number.isSafeInteger(index) && continuation.backups[index]), 'purge-continuation-evidence-gap');
+    check(new Set(continuation.outputCleanup).size === (continuation.outputCleanup?.length ?? 0)
+      && (continuation.outputCleanup ?? []).every(index => Number.isSafeInteger(index)
+        && continuation.carriers[index]?.role === 'project-output'), 'purge-continuation-evidence-gap');
     return continuation;
+  }
+
+  #purgeOutputAbsent(selection: PurgeCarrierSelection): boolean {
+    check(selection.role === 'project-output' && selection.output, 'purge-project-owner-mismatch');
+    sameFile(selection.output.root.path, selection.output.root.identity);
+    sameFile(selection.output.parent.path, selection.output.parent.identity);
+    return lstatSync(selection.file.path, { throwIfNoEntry: false }) === undefined;
   }
 
   purgeStatus(coordinator: string, operationId?: string) {
@@ -6726,20 +6756,39 @@ export class ProbeStore {
       const receipt = JSON.parse(String(row.receipt_payload)) as PurgeReceipt;
       check(JSON.stringify(receipt) === JSON.stringify({ schema: 'purge/logical-commit@1', operationId: continuation.operationId,
         status: 'logical-commit' }), 'purge-receipt-evidence-gap');
-      const total = continuation.carriers.filter(carrier => carrier.role === 'source').length;
+      const progress = (roles: PurgeCarrier['role'][], work: PurgeContinuation['sourceCleanup']) => {
+        const total = continuation.carriers.filter(carrier => roles.includes(carrier.role)).length;
+        let completed = 0, reason: string | null = null;
+        for (const item of work ?? []) if (item.ack) {
+          try {
+            const bytes = snapshotBytes(continuation.carriers[item.index]!.file);
+            check(bytes.length === item.ack.bytes && sha256(bytes) === item.ack.hash, 'purge-source-postcondition-failed');
+            completed++;
+          } catch (error) { reason = (error as Error).message; }
+        }
+        return { status: reason ? 'blocked' as const : completed === total ? 'complete' as const : 'pending' as const,
+          completed, total, reason };
+      };
       let completed = 0, reason: string | null = null;
-      for (const work of continuation.sourceCleanup ?? []) if (work.ack) {
+      for (const index of continuation.backupCleanup ?? []) {
         try {
-          const selection = continuation.carriers[work.index]!;
-          const bytes = snapshotBytes(selection.file);
-          check(bytes.length === work.ack.bytes && sha256(bytes) === work.ack.hash, 'purge-source-postcondition-failed');
-          completed++;
+          check(!snapshotDirectoryExists(continuation.backups[index]!.directory), 'purge-backup-postcondition-failed'); completed++;
         } catch (error) { reason = (error as Error).message; }
       }
+      const total = continuation.backups.length;
+      let outputCompleted = 0, outputReason: string | null = null;
+      for (const index of continuation.outputCleanup ?? []) {
+        try {
+          check(this.#purgeOutputAbsent(continuation.carriers[index]!), 'purge-output-postcondition-failed'); outputCompleted++;
+        } catch (error) { outputReason = (error as Error).message; }
+      }
+      const outputTotal = continuation.carriers.filter(carrier => carrier.role === 'project-output').length;
       return { status: 'logical-commit' as const, operationId: continuation.operationId, receipt,
-        cleanup: 'incomplete' as const, phase: continuation.phase,
-        source: { status: reason ? 'blocked' as const : completed === total ? 'complete' as const : 'pending' as const,
-          completed, total, reason } };
+        cleanup: 'incomplete' as const, phase: continuation.phase, failures: this.#purgeFailures(continuation.operationId),
+        source: progress(['source'], continuation.sourceCleanup), host: progress(['owner-info', 'receiver'], continuation.hostCleanup),
+        backup: { status: reason ? 'blocked' as const : completed === total ? 'complete' as const : 'pending' as const, completed, total, reason },
+        output: { status: outputReason ? 'blocked' as const : outputCompleted === outputTotal ? 'complete' as const : 'pending' as const,
+          completed: outputCompleted, total: outputTotal, reason: outputReason } };
     });
   }
 
@@ -6779,50 +6828,240 @@ export class ProbeStore {
     return committed;
   }
 
-  cleanupPurgeSources(coordinator: string, owner: (binding: Binding, file: BoundFile) => PurgeSourceOwner) {
-    check(this.purgeStatus(coordinator), 'purge-logical-commit-required');
-    check(this.acquireMaintenance(coordinator).acquired && this.#assertCoordinator(coordinator).state === 'cleaning',
-      'maintenance-residuals-or-participants');
-    let continuation = this.#purgeContinuation()!;
-    for (const [index, selection] of continuation.carriers.entries()) {
-      if (selection.role !== 'source') continue;
-      const bound = continuation.sources.find(item => item.source.path === selection.file.path
-        && item.source.identity.dev === selection.file.identity.dev && item.source.identity.ino === selection.file.identity.ino);
-      check(bound, 'purge-source-owner-unavailable');
-      const archive = owner(structuredClone(bound.binding), structuredClone(selection.file));
-      check(archive, 'purge-source-owner-unavailable');
-      let work = continuation.sourceCleanup?.find(item => item.index === index);
-      if (!work) {
-        const plan = archive.preparePurge(structuredClone(selection));
-        work = { index, plan: structuredClone(plan), ack: null };
+  #purgeFailures(operationId: string): PurgeIncomplete[] {
+    return this.#db.prepare("SELECT * FROM memory_events WHERE kind='purge-cleanup-incomplete' AND operation_id=? ORDER BY rowid").all(operationId).map(row => {
+      check(this.#db.prepare("SELECT 1 FROM pending_operations WHERE operation_id=? AND kind='purge'").get(operationId)
+        && row.record_id === null && row.event_id === row.receipt_id && sha256(String(row.receipt_payload)) === row.receipt_hash, 'purge-incomplete-receipt-evidence-gap');
+      const receipt = JSON.parse(String(row.receipt_payload)) as PurgeIncomplete;
+      uuid(String(row.receipt_id));
+      check(['source','host','output','backup','prepare-sqlite','sqlite-maintenance'].includes(receipt.stage)
+        && JSON.stringify(receipt) === JSON.stringify({ schema: 'purge/cleanup-incomplete@1', operationId,
+          receiptId: row.receipt_id, status: 'incomplete', stage: receipt.stage }), 'purge-incomplete-receipt-evidence-gap');
+      return receipt;
+    });
+  }
+
+  #purgeStep<T>(coordinator: string, stage: PurgeIncomplete['stage'], action: () => T): T {
+    const status = this.purgeStatus(coordinator);
+    check(status, 'purge-logical-commit-required');
+    try { return action(); }
+    catch (error) {
+      if (this.purgeCompletion(status.operationId)) throw error;
+      this.#transaction(() => {
+        this.#assertCoordinator(coordinator);
+        const id = randomUUID(), receipt: PurgeIncomplete = { schema: 'purge/cleanup-incomplete@1', operationId: status.operationId,
+          receiptId: id, status: 'incomplete', stage };
+        const payload = JSON.stringify(receipt);
+        this.#db.prepare(`INSERT INTO memory_events (event_id,kind,operation_id,receipt_id,receipt_payload,receipt_hash,created_at)
+          VALUES (?,'purge-cleanup-incomplete',?,?,?,?,?)`).run(id, status.operationId, id, payload, sha256(payload), new Date().toISOString());
+      });
+      throw error;
+    }
+  }
+
+  cleanupPurgeSources(coordinator: string, owner: (binding: Binding, file: BoundFile) => PurgeLineOwner) {
+    return this.#purgeStep(coordinator, 'source', () => {
+      check(this.acquireMaintenance(coordinator).acquired && this.#assertCoordinator(coordinator).state === 'cleaning',
+        'maintenance-residuals-or-participants');
+      let continuation = this.#purgeContinuation()!;
+      for (const [index, selection] of continuation.carriers.entries()) {
+        if (selection.role !== 'source') continue;
+        const bound = continuation.sources.find(item => item.source.path === selection.file.path
+          && item.source.identity.dev === selection.file.identity.dev && item.source.identity.ino === selection.file.identity.ino);
+        check(bound, 'purge-source-owner-unavailable');
+        const archive = owner(structuredClone(bound.binding), structuredClone(selection.file));
+        check(archive, 'purge-source-owner-unavailable');
+        this.#cleanupPurgeLines(coordinator, continuation, index, 'sourceCleanup', archive);
+        continuation = this.#purgeContinuation()!;
+      }
+      return this.purgeStatus(coordinator)!;
+    });
+  }
+
+  cleanupPurgeHost(coordinator: string, owners: { info: PurgeLineOwner; receiver: PurgeLineOwner }) {
+    return this.#purgeStep(coordinator, 'host', () => {
+      check(this.acquireMaintenance(coordinator).acquired && this.#assertCoordinator(coordinator).state === 'cleaning',
+        'maintenance-residuals-or-participants');
+      const continuation = this.#purgeContinuation()!;
+      for (const [index, selection] of continuation.carriers.entries()) {
+        if (selection.role !== 'owner-info' && selection.role !== 'receiver') continue;
+        const owner = selection.role === 'owner-info' ? owners.info : owners.receiver;
+        check(owner, 'purge-host-owner-unavailable');
+        this.#cleanupPurgeLines(coordinator, continuation, index, 'hostCleanup', owner);
+      }
+      return this.purgeStatus(coordinator)!;
+    });
+  }
+
+  #cleanupPurgeLines(coordinator: string, continuation: PurgeContinuation, index: number,
+    group: 'sourceCleanup' | 'hostCleanup', owner: PurgeLineOwner): void {
+    const selection = continuation.carriers[index]!;
+    let work = continuation[group]?.find(item => item.index === index);
+    if (!work) {
+      work = { index, plan: structuredClone(owner.preparePurge(structuredClone(selection))), ack: null };
+      this.#transaction(() => {
+        check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
+        const bytes = snapshotBytes(selection.file);
+        check(sha256(bytes) === selection.hash && bytes.length === selection.bytes, 'purge-source-carrier-changed');
+        inspectPurgeLines(selection, work!.plan, bytes);
+        continuation[group] ??= []; continuation[group].push(work!);
+        this.#savePurgeContinuation(continuation);
+      });
+    }
+    check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
+    const before = snapshotBytes(selection.file);
+    inspectPurgeLines(selection, work.plan, before);
+    if (work.ack) {
+      check(sha256(before) === work.ack.hash, 'purge-source-postcondition-failed');
+      return;
+    }
+    const ack = owner.purge(structuredClone(selection), structuredClone(work.plan));
+    this.#transaction(() => {
+      check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
+      const actual = snapshotBytes(selection.file);
+      check(ack.hash === work!.plan.afterHash && ack.bytes === selection.bytes
+        && actual.length === ack.bytes && sha256(actual) === ack.hash, 'purge-source-postcondition-failed');
+      work!.ack = { hash: ack.hash, bytes: ack.bytes };
+      this.#savePurgeContinuation(continuation);
+    });
+  }
+
+  cleanupPurgeBackups(coordinator: string) {
+    return this.#purgeStep(coordinator, 'backup', () => {
+      check(this.acquireMaintenance(coordinator).acquired && this.#assertCoordinator(coordinator).state === 'cleaning',
+        'maintenance-residuals-or-participants');
+      const continuation = this.#purgeContinuation()!;
+      for (const [index, manifest] of continuation.backups.entries()) {
+        check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
+        if (!continuation.backupCleanup?.includes(index)) {
+          removeSnapshotFiles(manifest);
+          syncSnapshotDirectory(this.#resources.root.path);
+        }
         this.#transaction(() => {
           check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
-          const bytes = snapshotBytes(selection.file);
-          check(sha256(bytes) === selection.hash && bytes.length === selection.bytes, 'purge-source-carrier-changed');
-          inspectPurgeSource(selection, work!.plan, bytes);
-          continuation.sourceCleanup ??= []; continuation.sourceCleanup.push(work!);
+          check(!snapshotDirectoryExists(manifest.directory), 'purge-backup-postcondition-failed');
+          continuation.backupCleanup ??= [];
+          if (!continuation.backupCleanup.includes(index)) continuation.backupCleanup.push(index);
           this.#savePurgeContinuation(continuation);
         });
       }
-      check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
-      const before = snapshotBytes(selection.file);
-      inspectPurgeSource(selection, work.plan, before);
-      if (work.ack) {
-        check(sha256(before) === work.ack.hash, 'purge-source-postcondition-failed');
-        continue;
-      }
-      const ack = archive.purge(structuredClone(selection), structuredClone(work.plan));
-      this.#transaction(() => {
+      return this.purgeStatus(coordinator)!;
+    });
+  }
+
+  cleanupPurgeOutputs(coordinator: string, owner: (selection: PurgeCarrierSelection) => { removed: true }) {
+    return this.#purgeStep(coordinator, 'output', () => {
+      check(this.acquireMaintenance(coordinator).acquired && this.#assertCoordinator(coordinator).state === 'cleaning',
+        'maintenance-residuals-or-participants');
+      const continuation = this.#purgeContinuation()!;
+      for (const [index, selection] of continuation.carriers.entries()) {
+        if (selection.role !== 'project-output') continue;
         check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
-        const actual = snapshotBytes(selection.file);
-        check(ack.hash === work!.plan.afterHash && ack.bytes === selection.bytes
-          && actual.length === ack.bytes && sha256(actual) === ack.hash, 'purge-source-postcondition-failed');
-        work!.ack = { hash: ack.hash, bytes: ack.bytes };
-        this.#savePurgeContinuation(continuation);
+        if (!this.#purgeOutputAbsent(selection)) {
+          check(!continuation.outputCleanup?.includes(index), 'purge-output-postcondition-failed');
+          const bytes = snapshotBytes(selection.file);
+          check(bytes.length === selection.bytes && sha256(bytes) === selection.hash, 'purge-project-output-changed');
+          check(owner(structuredClone(selection)).removed, 'purge-output-postcondition-failed');
+        }
+        this.#transaction(() => {
+          check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
+          check(this.#purgeOutputAbsent(selection), 'purge-output-postcondition-failed');
+          continuation.outputCleanup ??= [];
+          if (!continuation.outputCleanup.includes(index)) continuation.outputCleanup.push(index);
+          this.#savePurgeContinuation(continuation);
+        });
+      }
+      return this.purgeStatus(coordinator)!;
+    });
+  }
+
+  /** Forget external locators only after their owners' acknowledgements match actual state. */
+  preparePurgeMaintenance(coordinator: string) {
+    return this.#purgeStep(coordinator, 'prepare-sqlite', () => {
+      check(this.acquireMaintenance(coordinator).acquired && this.#assertCoordinator(coordinator).state === 'cleaning',
+        'maintenance-residuals-or-participants');
+      return this.#transaction(() => {
+        const status = this.purgeStatus(coordinator);
+        check(status && [status.source, status.host, status.backup, status.output].every(item => item.status === 'complete'), 'purge-cleanup-incomplete');
+        const continuation = this.#purgeContinuation()!;
+        if (continuation.phase === 'sqlite-maintenance') return status;
+        // Recovery originals may own a surviving archive whose session row predates the restored database.
+        for (const item of continuation.sources) {
+          if (!this.#db.prepare('SELECT 1 FROM sessions WHERE session_id=?').get(item.binding.sessionId)) this.#insertSession(item.binding, item.source);
+        }
+        const progress: PurgeContinuation = { schema: 'purge-continuation@1', operationId: continuation.operationId,
+          phase: 'sqlite-maintenance', carriers: [], backups: [], inventory: [], sources: [] };
+        const bytes = JSON.stringify(progress);
+        this.#purging = true;
+        try {
+          this.#db.prepare('DELETE FROM maintenance_residuals WHERE store_id=?').run(this.#storeId);
+          check(this.#db.prepare("UPDATE pending_operations SET presentation_hash=NULL,continuation=?,continuation_hash=? WHERE operation_id=? AND state='cleaning'")
+            .run(bytes, sha256(bytes), continuation.operationId).changes === 1, 'purge-continuation-evidence-gap');
+        } finally { this.#purging = false; }
+        this.#purgePreviews.clear();
+        return this.purgeStatus(coordinator)!;
       });
-      continuation = this.#purgeContinuation()!;
-    }
-    return this.purgeStatus(coordinator)!;
+    });
+  }
+
+  purgeCompletion(operationId?: string): PurgeCompletion | null {
+    return this.#transaction(() => {
+      if (operationId) uuid(operationId);
+      const row = this.#db.prepare(`SELECT * FROM memory_events WHERE kind='purge-controlled-complete'
+        ${operationId ? 'AND operation_id=?' : ''} ORDER BY rowid DESC LIMIT 1`).get(...operationId ? [operationId] : []);
+      if (!row) return null;
+      const id = String(row.operation_id), operation = this.#db.prepare("SELECT * FROM pending_operations WHERE operation_id=? AND kind='purge'").get(id);
+      check(operation?.state === 'committed' && operation.continuation === null && operation.continuation_hash === null
+        && operation.presentation_hash === null && row.record_id === null && sha256(String(row.receipt_payload)) === row.receipt_hash,
+      'purge-completion-evidence-gap');
+      const receipt = JSON.parse(String(row.receipt_payload)) as PurgeCompletion['receipt'];
+      check(Number.isSafeInteger(receipt.epoch) && receipt.epoch > 0 && JSON.stringify(receipt) === JSON.stringify({
+        schema: 'purge/controlled-complete@1', operationId: id, status: 'controlled-complete', storeId: this.#storeId, epoch: receipt.epoch,
+      }), 'purge-completion-evidence-gap');
+      const logical = this.#db.prepare("SELECT receipt_payload,receipt_hash FROM memory_events WHERE operation_id=? AND kind='purge-logical-commit'").get(id);
+      check(logical && sha256(String(logical.receipt_payload)) === logical.receipt_hash
+        && logical.receipt_payload === JSON.stringify({ schema: 'purge/logical-commit@1', operationId: id, status: 'logical-commit' }), 'purge-receipt-evidence-gap');
+      return { status: 'controlled-complete', operationId: id, cleanup: 'complete', receipt, failures: this.#purgeFailures(id) };
+    });
+  }
+
+  completePurge(coordinator: string, operationId: string): PurgeCompletion {
+    const prior = this.purgeCompletion(operationId);
+    if (prior) return prior;
+    return this.#purgeStep(coordinator, 'sqlite-maintenance', () => {
+      check(this.acquireMaintenance(coordinator).acquired && this.#assertCoordinator(coordinator).state === 'cleaning',
+        'maintenance-residuals-or-participants');
+      const progress = this.#purgeContinuation();
+      check(progress?.operationId === operationId && progress.phase === 'sqlite-maintenance', 'purge-cleanup-incomplete');
+      this.auditStore(coordinator);
+      this.#db.exec('PRAGMA secure_delete=ON');
+      const checkpoint = () => {
+        const result = this.#db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get()!;
+        check(result.busy === 0 && result.log === 0 && result.checkpointed === 0, 'purge-checkpoint-incomplete');
+      };
+      checkpoint();
+      this.#db.exec('VACUUM');
+      checkpoint();
+      check(checkSqliteSnapshot(this.#db) === 'healthy'
+        && this.#db.prepare('PRAGMA freelist_count').get()!.freelist_count === 0, 'purge-sqlite-postcondition-failed');
+      const wal = lstatSync(`${this.#resources.store.path}-wal`, { throwIfNoEntry: false });
+      check(!wal || wal.isFile() && !wal.isSymbolicLink() && wal.size === 0, 'purge-checkpoint-incomplete');
+      return this.#transaction(() => {
+        const fence = this.#assertCoordinator(coordinator);
+        check(fence.state === 'cleaning' && this.#purgeContinuation()?.phase === 'sqlite-maintenance', 'purge-cleanup-incomplete');
+        const receipt: PurgeCompletion['receipt'] = { schema: 'purge/controlled-complete@1', operationId,
+          status: 'controlled-complete', storeId: this.#storeId, epoch: fence.epoch + 1 };
+        const payload = JSON.stringify(receipt), id = randomUUID();
+        this.#purging = true;
+        try {
+          this.#db.prepare("UPDATE pending_operations SET state='committed',continuation=NULL,continuation_hash=NULL WHERE operation_id=?").run(operationId);
+          this.#db.prepare(`INSERT INTO memory_events (event_id,kind,operation_id,receipt_id,receipt_payload,receipt_hash,created_at)
+            VALUES (?,'purge-controlled-complete',?,?,?,?,?)`).run(id, operationId, id, payload, sha256(payload), new Date().toISOString());
+          this.#reopenMaintenance(true);
+        } finally { this.#purging = false; }
+        return this.purgeCompletion(operationId)!;
+      });
+    });
   }
 
   #savePurgeContinuation(continuation: PurgeContinuation): void {
@@ -6973,8 +7212,8 @@ export class ProbeStore {
           const snapshot = snapshots.find(row => basename(String(row.directory)) === path);
           if (snapshot?.snapshot_id) this.#snapshotFiles(snapshot);
           const purgeBackup = purge?.backups.find(item => basename(item.directory.path) === path);
-          if (purgeBackup) check(JSON.stringify(inspectSnapshotFiles(purgeBackup.directory, purgeBackup.files.map(file => file.name)))
-            === JSON.stringify(purgeBackup.files), 'purge-backup-stale');
+          if (purgeBackup) check(inspectSnapshotFiles(purgeBackup.directory, purgeBackup.files.map(file => file.name))
+            .every(file => JSON.stringify(file) === JSON.stringify(purgeBackup.files.find(expected => expected.name === file.name))), 'purge-backup-stale');
           const recovery = recoveries.find(plan => basename(plan.original.path) === path);
           if (snapshot && recovery) inspectSnapshotFiles(recovery.original, recoveryFileNames(recovery));
           const preparation = preparations.find(item => basename(item.original.path) === path);
@@ -7010,11 +7249,16 @@ export class ProbeStore {
     }
     for (const carrier of purge?.inventory ?? []) {
       try {
+        const selection = purge!.carriers.find(item => item.file.path === carrier.file.path);
+        if (selection?.role === 'project-output' && this.#purgeOutputAbsent(selection)) {
+          entries.push({ path: carrier.file.path, state: 'expected', observedAt, dev: null, ino: null, reason: 'purge-output-absent' });
+          continue;
+        }
         const bytes = snapshotBytes(carrier.file);
-        const index = purge!.carriers.findIndex(item => item.role === 'source' && item.file.path === carrier.file.path);
-        const work = purge!.sourceCleanup?.find(item => item.index === index);
+        const index = purge!.carriers.findIndex(item => item.file.path === carrier.file.path);
+        const work = [...purge!.sourceCleanup ?? [], ...purge!.hostCleanup ?? []].find(item => item.index === index);
         if (work) {
-          inspectPurgeSource(purge!.carriers[index]!, work.plan, bytes);
+          inspectPurgeLines(purge!.carriers[index]!, work.plan, bytes);
           if (work.ack) check(sha256(bytes) === work.ack.hash, 'purge-source-postcondition-failed');
         } else check(bytes.length === carrier.bytes && sha256(bytes) === carrier.hash, 'purge-carrier-stale');
         entries.push({ path: carrier.role === 'project-output' ? carrier.file.path : basename(carrier.file.path), state: 'expected', observedAt,
@@ -7053,11 +7297,12 @@ export class ProbeStore {
     });
   }
 
-  #reopenMaintenance(): Fence {
+  #reopenMaintenance(purge = false): Fence {
     check(!this.#purgeContinuation(), 'purge-cleanup-incomplete');
     check(!this.#db.prepare("SELECT 1 FROM store_snapshots WHERE cleanup IS NOT NULL UNION ALL SELECT 1 FROM store_restores WHERE cleanup IS NOT NULL LIMIT 1").get(), 'snapshot-cleanup-in-progress');
     this.#db.prepare(`UPDATE owner_fences SET state='open',epoch=epoch+1,coordinator=NULL,coordinator_pid=NULL,
-      coordinator_incarnation=NULL,coordinator_started_at=NULL,coordinator_activity=NULL WHERE store_id=?`).run(this.#storeId);
+      coordinator_incarnation=NULL,coordinator_started_at=NULL,coordinator_activity=NULL,
+      coordinator_stream=CASE WHEN ? THEN NULL ELSE coordinator_stream END WHERE store_id=?`).run(purge ? 1 : 0, this.#storeId);
     return this.fence();
   }
 

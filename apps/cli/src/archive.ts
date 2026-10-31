@@ -1,7 +1,7 @@
 import { closeSync, fstatSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
-import { check, inspectPurgeSource, sameBinding, sha256, uuid, sameFile } from '@euler/core';
-import type { PurgeCarrierSelection, PurgeSourceAck, PurgeSourcePlan, SourceAck, SourceExcerpt } from '@euler/core';
+import { check, inspectPurgeLines, sameBinding, sha256, uuid, sameFile } from '@euler/core';
+import type { PurgeCarrierSelection, PurgeLineAck, PurgeLinePlan, SourceAck, SourceExcerpt } from '@euler/core';
 import { bindingOf } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
 
@@ -24,7 +24,56 @@ export function appendDurably(path: string, line: string, maxBytes: number, carr
   } finally { closeSync(fd); }
 }
 
+/** Resolve an approved JSONL selection without changing any carrier bytes. */
+export function preparePurgeLines(selection: PurgeCarrierSelection, identity: (entry: any, index: number) => string): PurgeLinePlan {
+  sameFile(selection.file.path, selection.file.identity);
+  const bytes = readFileSync(selection.file.path);
+  check(bytes.length === selection.bytes && sha256(bytes) === selection.hash && bytes.at(-1) === 10, 'purge-source-carrier-changed');
+  const ranges: PurgeLinePlan['ranges'] = [];
+  let offset = bytes.indexOf(10) + 1, index = 0;
+  while (offset < bytes.length) {
+    const end = bytes.indexOf(10, offset), line = bytes.subarray(offset, end);
+    const present = !line.every(byte => byte === 32), selected = selection.entries[ranges.length];
+    if (selected && sha256(line) === selected.hash) {
+      check(identity(JSON.parse(line.toString('utf8')), index) === selected.id, 'purge-source-entry-changed');
+      ranges.push({ offset, bytes: line.length }); bytes.fill(32, offset, end);
+    }
+    if (present) index++;
+    offset = end + 1;
+  }
+  check(ranges.length === selection.entries.length, 'purge-source-evidence-gap');
+  return { ranges, afterHash: sha256(bytes) };
+}
+
+/** Flush approved line erasures through the bound handle and independently read them back. */
+export function purgeLines(selection: PurgeCarrierSelection, plan: PurgeLinePlan): PurgeLineAck {
+  const path = selection.file.path;
+  sameFile(path, selection.file.identity);
+  const fd = openSync(path, 'r+');
+  try {
+    const identity = fstatSync(fd, { bigint: true });
+    check(String(identity.dev) === selection.file.identity.dev && String(identity.ino) === selection.file.identity.ino
+      && identity.nlink === 1n && identity.isFile(), 'file-identity-changed');
+    const erased = inspectPurgeLines(selection, plan, readFileSync(fd));
+    for (const range of plan.ranges) {
+      sameFile(path, selection.file.identity);
+      let offset = range.offset;
+      const end = offset + range.bytes;
+      while (offset < end) {
+        const written = writeSync(fd, erased, offset, end - offset, offset);
+        check(written > 0, 'purge-source-write-failed'); offset += written;
+      }
+    }
+    fsyncSync(fd);
+    sameFile(path, selection.file.identity);
+    const actual = readFileSync(path);
+    check(actual.length === selection.bytes && sha256(actual) === plan.afterHash, 'purge-source-postcondition-failed');
+    return { hash: plan.afterHash, bytes: actual.length };
+  } finally { closeSync(fd); }
+}
+
 // The CLI owns this carrier. Core sees acknowledgements and bounded source operations.
+
 export class CliArchive {
   readonly #sandbox: Sandbox;
   readonly #gate: Gate;
@@ -120,57 +169,23 @@ export class CliArchive {
     return this.#gate(() => ({ eventCount: this.#scan().length }));
   }
 
-  preparePurge(selection: PurgeCarrierSelection): PurgeSourcePlan {
+  preparePurge(selection: PurgeCarrierSelection): PurgeLinePlan {
     return this.#gate(() => {
       this.#scan();
       check(selection.file.path === this.#path && selection.role === 'source', 'purge-source-owner-mismatch');
-      sameFile(this.#path, selection.file.identity);
-      const bytes = readFileSync(this.#path);
-      check(bytes.length === selection.bytes && sha256(bytes) === selection.hash, 'purge-source-carrier-changed');
-      const ranges: PurgeSourcePlan['ranges'] = [];
-      let offset = bytes.indexOf(10) + 1;
-      while (offset < bytes.length) {
-        const end = bytes.indexOf(10, offset), line = bytes.subarray(offset, end);
-        const selected = selection.entries[ranges.length];
-        if (selected && sha256(line) === selected.hash) {
-          check(JSON.parse(line.toString('utf8')).eventId === selected.id, 'purge-source-entry-changed');
-          ranges.push({ offset, bytes: line.length }); bytes.fill(32, offset, end);
-        }
-        offset = end + 1;
-      }
-      check(ranges.length === selection.entries.length, 'purge-source-evidence-gap');
-      return { ranges, afterHash: sha256(bytes) };
+      return preparePurgeLines(selection, entry => entry.eventId);
     });
   }
 
   /** Erase approved line bytes in place; file identity and unrelated acknowledgements stay stable. */
-  purge(selection: PurgeCarrierSelection, plan: PurgeSourcePlan): PurgeSourceAck {
+  purge(selection: PurgeCarrierSelection, plan: PurgeLinePlan): PurgeLineAck {
     return this.#gate(() => {
       check(selection.file.path === this.#path && selection.role === 'source', 'purge-source-owner-mismatch');
       sameFile(this.#sandbox.root, this.#sandbox.rootIdentity);
-      sameFile(this.#path, this.#sandbox.archiveIdentity); sameFile(this.#path, selection.file.identity);
-      const fd = openSync(this.#path, 'r+');
-      try {
-        const identity = fstatSync(fd, { bigint: true });
-        check(String(identity.dev) === selection.file.identity.dev && String(identity.ino) === selection.file.identity.ino
-          && identity.nlink === 1n && identity.isFile(), 'file-identity-changed');
-        const bytes = readFileSync(fd), erased = inspectPurgeSource(selection, plan, bytes);
-        for (const range of plan.ranges) {
-          sameFile(this.#path, selection.file.identity);
-          let offset = range.offset;
-          const end = offset + range.bytes;
-          while (offset < end) {
-            const written = writeSync(fd, erased, offset, end - offset, offset);
-            check(written > 0, 'purge-source-write-failed'); offset += written;
-          }
-        }
-        fsyncSync(fd);
-        sameFile(this.#path, selection.file.identity);
-        const actual = readFileSync(this.#path);
-        check(actual.length === selection.bytes && sha256(actual) === plan.afterHash, 'purge-source-postcondition-failed');
-        this.#scan();
-        return { hash: plan.afterHash, bytes: actual.length };
-      } finally { closeSync(fd); }
+      sameFile(this.#path, this.#sandbox.archiveIdentity);
+      const ack = purgeLines(selection, plan);
+      this.#scan();
+      return ack;
     });
   }
 
