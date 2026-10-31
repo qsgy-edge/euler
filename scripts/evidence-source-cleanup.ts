@@ -134,7 +134,7 @@ for (const scenario of fixture.cases) {
       assert.equal(db.prepare("SELECT count(*) n FROM memory_events WHERE kind='purge-logical-commit'").get()!.n, 1);
       assert.deepEqual(db.prepare("SELECT * FROM memory_events WHERE kind='purge-logical-commit'").get(), logical.receipt);
       assert.equal(db.prepare('SELECT state FROM owner_fences').get()!.state, 'cleaning');
-      assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 25);
+      assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 26);
       return { continuation, logicalReceipt: logical.receipt, fence: 'cleaning', source: cleaned.source };
     });
     save('after-observation.json', { ...after, files: fileObservations });

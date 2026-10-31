@@ -1,7 +1,7 @@
 import koffi from 'koffi';
-import { join } from 'node:path';
-import { check } from '@euler/core';
-import type { BoundFile, FileIdentity, FileTarget, FileReceipt, FileFailureReason } from '@euler/core';
+import { join, relative } from 'node:path';
+import { check, sha256 } from '@euler/core';
+import type { BoundFile, FileIdentity, FileTarget, FileReceipt, FileFailureReason, PurgeCarrierSelection } from '@euler/core';
 
 // Native calls live only in the Host. No model-controlled library, symbol or command.
 const SYNCHRONIZE = 0x100000, READ_CONTROL = 0x20000, FILE_READ_ATTRIBUTES = 0x80, FILE_TRAVERSE = 0x20;
@@ -43,6 +43,7 @@ function loadApi() {
     seek: kernel.func('int __stdcall SetFilePointerEx(void *handle, int64 distance, void *position, uint32 method)'),
     truncate: kernel.func('int __stdcall SetEndOfFile(void *handle)'),
     flush: kernel.func('int __stdcall FlushFileBuffers(void *handle)'),
+    dispose: kernel.func('int __stdcall SetFileInformationByHandle(void *handle, int infoClass, const void *buffer, uint32 size)'),
     close: kernel.func('int __stdcall CloseHandle(void *handle)'),
   };
 }
@@ -57,11 +58,12 @@ function inspect(handle: bigint, directory: boolean): { identity: FileIdentity; 
   return { identity: { dev: String(value.volume), ino: String((BigInt(value.indexHigh) << 32n) | BigInt(value.indexLow)) },
     size: value.sizeHigh * 4294967296 + value.sizeLow };
 }
-function openAt(parent: bigint, name: string, directory: boolean, write: boolean, create = false): bigint | null {
+function openAt(parent: bigint, name: string, directory: boolean, write: boolean, create = false, remove = false): bigint | null {
   check(name.length > 0 && !/[\\/:\0]/.test(name) && name !== '.' && name !== '..', 'file-invalid-component');
   const a = native();
   const handle: (bigint | null)[] = [null];
-  const status = a.openAt(handle, SYNCHRONIZE | FILE_READ_ATTRIBUTES | (directory ? FILE_TRAVERSE | READ_CONTROL : write ? FILE_WRITE_DATA : FILE_READ_DATA),
+  const access = directory ? FILE_TRAVERSE | READ_CONTROL : remove ? 0x10000 | FILE_READ_DATA : write ? FILE_WRITE_DATA : FILE_READ_DATA;
+  const status = a.openAt(handle, SYNCHRONIZE | FILE_READ_ATTRIBUTES | access,
     { Length: a.attributeSize, RootDirectory: parent, ObjectName: { Length: name.length * 2, MaximumLength: name.length * 2, Buffer: name },
       Attributes: OBJ_CASE_INSENSITIVE, SecurityDescriptor: null, SecurityQualityOfService: null }, {}, null, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
     create ? FILE_CREATE : FILE_OPEN, FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
@@ -194,5 +196,35 @@ export class WindowsFileRoot {
       };
     } catch (error) { close(); throw error; }
   }
+  /** Delete only the approved identity, through pinned root/parent/file handles. */
+  purge(selection: PurgeCarrierSelection): { removed: true } {
+    check(this.#handle && selection.role === 'project-output' && selection.output
+      && JSON.stringify(selection.output.root) === JSON.stringify(this.#root), 'purge-project-owner-mismatch');
+    const parts = relative(this.#root.path, selection.file.path).split(/[\\/]/);
+    check(parts.length > 0 && parts.length <= 32, 'file-invalid-component');
+    const handles: bigint[] = [];
+    let parent = this.#handle;
+    try {
+      for (const part of parts.slice(0, -1)) {
+        const directory = openAt(parent, part, true, false);
+        check(directory, 'file-parent-missing');
+        handles.push(directory); inspect(directory, true); parent = directory;
+      }
+      check(join(this.#root.path, ...parts.slice(0, -1)) === selection.output.parent.path
+        && JSON.stringify(inspect(parent, true).identity) === JSON.stringify(selection.output.parent.identity), 'file-parent-identity-changed');
+      const file = openAt(parent, parts.at(-1)!, false, false, false, true);
+      if (!file) return { removed: true };
+      handles.push(file);
+      const opened = inspect(file, false);
+      check(JSON.stringify(opened.identity) === JSON.stringify(selection.file.identity), 'file-identity-changed');
+      check(opened.size === selection.bytes, 'purge-project-output-changed');
+      const bytes = Buffer.alloc(selection.bytes), done = [0];
+      check(native().read(file, bytes, bytes.length, done, null) && done[0] === bytes.length
+        && sha256(bytes) === selection.hash, 'purge-project-output-changed');
+      check(native().dispose(file, 4, Buffer.from([1]), 1), 'purge-project-delete-denied');
+      return { removed: true };
+    } finally { for (const handle of handles.reverse()) native().close(handle); }
+  }
+
   close(): void { if (this.#handle) { native().close(this.#handle); this.#handle = null; } }
 }

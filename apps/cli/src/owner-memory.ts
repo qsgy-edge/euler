@@ -4,8 +4,8 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { DEFAULT_BUDGET, OWNER_MEMORY_FORMS, check, encodeOwnerAgreement, isOwnerAgreement, isOwnerDecline, isUntypedRemember,
   parseMemoryProposal, parseOwnerAgreement, parseOwnerStatement, sameFile, sha256, uuid } from '@euler/core';
-import type { ActivationBatch, HostInfo, MemoryRecord, MemoryScope, ProbeBudget, RememberResult, SourceAck } from '@euler/core';
-import { appendDurably } from './archive.ts';
+import type { ActivationBatch, HostInfo, MemoryRecord, MemoryScope, ProbeBudget, PurgeCarrierSelection, PurgeLineAck, PurgeLinePlan, RememberResult, SourceAck } from '@euler/core';
+import { appendDurably, preparePurgeLines, purgeLines } from './archive.ts';
 import { killPoint } from './kill-point.ts';
 import { scheduleCaptures } from './capture.ts';
 import { openProbe } from './probe.ts';
@@ -73,13 +73,32 @@ export class OwnerInfoLog {
     const header = JSON.parse(lines.shift()!);
     check(header?.schema === 'owner-info@1' && header.storeId === this.#sandbox.storeId, 'owner-info-evidence-gap');
     const batches = new Set<string>();
-    return lines.map(line => {
+    return lines.filter(line => !/^ +$/.test(line)).map(line => {
       const record = JSON.parse(line) as OwnerInfoRecord;
       check(record.schema === 'owner-info-entry@1' && record.kind === 'memory-activation' && sha256(record.payload) === record.digest
         && line === JSON.stringify(record) && !batches.has(record.batchId), 'owner-info-evidence-gap');
       uuid(record.entryId); uuid(record.batchId);
       batches.add(record.batchId);
       return { record, entryHash: sha256(line) };
+    });
+  }
+
+  preparePurge(selection: PurgeCarrierSelection): PurgeLinePlan {
+    return this.#gate(() => {
+      this.#entries();
+      check(selection.role === 'owner-info' && selection.file.path === this.#path, 'purge-info-owner-mismatch');
+      return preparePurgeLines(selection, entry => entry.entryId);
+    });
+  }
+
+  purge(selection: PurgeCarrierSelection, plan: PurgeLinePlan): PurgeLineAck {
+    return this.#gate(() => {
+      check(selection.role === 'owner-info' && selection.file.path === this.#path, 'purge-info-owner-mismatch');
+      sameFile(this.#sandbox.root, this.#sandbox.rootIdentity);
+      sameFile(this.#path, this.#sandbox.ownerInfoIdentity!);
+      const ack = purgeLines(selection, plan);
+      this.#entries();
+      return ack;
     });
   }
 

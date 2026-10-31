@@ -4,6 +4,7 @@ import type { SQLInputValue } from 'node:sqlite';
 import { check, sameBinding, sha256 } from '../contracts.ts';
 import type { SourceAck } from '../contracts.ts';
 import type { BoundFile, BoundSource, MemoryRecord } from './probe-store.ts';
+import type { ControlledFile } from '../context/file-contract.ts';
 import type { SnapshotCleanupManifest } from './snapshots.ts';
 import { parseAnalysisArtifact } from '../context/analysis-artifacts.ts';
 import { parseCorrectionCommand } from '../context/memory-correction.ts';
@@ -46,10 +47,11 @@ type Row = Record<string, SQLInputValue>;
 export interface PurgeCarrierEntry { id: string; value: unknown; hash: string; source?: SourceAck; content?: string }
 export interface PurgeCarrier {
   role: 'source' | 'owner-info' | 'receiver' | 'project-output'; file: BoundFile; hash: string; bytes: number;
-  entries: PurgeCarrierEntry[];
+  entries: PurgeCarrierEntry[]; output?: Pick<ControlledFile, 'root' | 'parent'>;
 }
 export interface PurgeCarrierSelection {
   role: PurgeCarrier['role']; file: BoundFile; hash: string; bytes: number; entries: { id: string; hash: string }[];
+  output?: Pick<ControlledFile, 'root' | 'parent'>;
 }
 export interface PurgeManifest {
   schema: 'purge-manifest@1'; recordId: string; records: MemoryRecord[];
@@ -60,22 +62,27 @@ export interface PurgeManifest {
 }
 export interface PurgeInput { readonly id: string }
 export interface PurgeReceipt { schema: 'purge/logical-commit@1'; operationId: string; status: 'logical-commit' }
+export interface PurgeCompletion {
+  status: 'controlled-complete'; operationId: string; cleanup: 'complete';
+  receipt: { schema: 'purge/controlled-complete@1'; operationId: string; status: 'controlled-complete'; storeId: string; epoch: number };
+}
 export interface PurgeContinuation {
-  schema: 'purge-continuation@1'; operationId: string; phase: 'external-cleanup';
+  schema: 'purge-continuation@1'; operationId: string; phase: 'external-cleanup' | 'sqlite-maintenance';
   carriers: PurgeCarrierSelection[]; backups: SnapshotCleanupManifest[];
   inventory: PurgeManifest['inventory']['carriers']; sources: BoundSource[];
-  sourceCleanup?: { index: number; plan: PurgeSourcePlan; ack: PurgeSourceAck | null }[];
+  sourceCleanup?: PurgeLineWork[]; hostCleanup?: PurgeLineWork[]; backupCleanup?: number[]; outputCleanup?: number[];
 }
-export interface PurgeSourcePlan { ranges: { offset: number; bytes: number }[]; afterHash: string }
-export interface PurgeSourceAck { hash: string; bytes: number }
-export interface PurgeSourceOwner {
-  preparePurge(selection: PurgeCarrierSelection): PurgeSourcePlan;
-  purge(selection: PurgeCarrierSelection, plan: PurgeSourcePlan): PurgeSourceAck;
+interface PurgeLineWork { index: number; plan: PurgeLinePlan; ack: PurgeLineAck | null }
+export interface PurgeLinePlan { ranges: { offset: number; bytes: number }[]; afterHash: string }
+export interface PurgeLineAck { hash: string; bytes: number }
+export interface PurgeLineOwner {
+  preparePurge(selection: PurgeCarrierSelection): PurgeLinePlan;
+  purge(selection: PurgeCarrierSelection, plan: PurgeLinePlan): PurgeLineAck;
 }
 
 /** Verify the frozen ranges and the untouched bytes, accepting already-erased entries after a crash. */
-export function inspectPurgeSource(selection: PurgeCarrierSelection, plan: PurgeSourcePlan, bytes: Uint8Array): Buffer {
-  check(selection.role === 'source' && bytes.length === selection.bytes && plan.ranges.length === selection.entries.length,
+export function inspectPurgeLines(selection: PurgeCarrierSelection, plan: PurgeLinePlan, bytes: Uint8Array): Buffer {
+  check(['source', 'owner-info', 'receiver'].includes(selection.role) && bytes.length === selection.bytes && plan.ranges.length === selection.entries.length,
     'purge-source-evidence-gap');
   const result = Buffer.from(bytes);
   let end = 0;
@@ -256,7 +263,7 @@ export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCar
       else if (table === 'request_events' && row.payload !== null) {
         const payload = JSON.parse(String(row.payload));
         if (row.kind === 'capture/step@v1') sources = payload.source;
-        else if (row.kind === 'agent/event@v1' && ['response', 'tool-result', 'file-approved', 'file-reconciled'].includes(payload.event?.kind))
+        else if (row.kind === 'agent/event@v1' && ['response', 'tool-result', 'file-prepared', 'file-approved', 'file-reconciled'].includes(payload.event?.kind))
           sources = payload.event;
       }
       for (const value of sourceValues(sources, qualifiedSources)) tokens.add(value);
@@ -293,7 +300,7 @@ export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCar
   }
   const selectedCarriers = carriers.flatMap((carrier, ci) => {
     const entries = carrier.entries.filter((_, ei) => selectedEntries.has(`${ci}/${ei}`)).map(entry => ({ id: entry.id, hash: entry.hash }));
-    return entries.length ? [{ role: carrier.role, file: carrier.file, hash: carrier.hash, bytes: carrier.bytes, entries }] : [];
+    return entries.length ? [{ role: carrier.role, file: carrier.file, hash: carrier.hash, bytes: carrier.bytes, entries, ...(carrier.output ? { output: carrier.output } : {}) }] : [];
   });
   const manifest: PurgeManifest = {
     schema: 'purge-manifest@1', recordId, records, database,
@@ -347,12 +354,20 @@ export function applyLogicalPurge(db: DatabaseSync, plan: PurgePlan): void {
     db.prepare('UPDATE request_attempts SET payload_hash=NULL,encoding=NULL,hash_algorithm=NULL,adapter_version=NULL WHERE run_id=?').run(run.run_id!);
     db.prepare(`UPDATE request_runs SET state='sealed',redacted=1,budget='{}',authorization_id='',
       intent_event_id=NULL,intent_hash=NULL,related_run_id=NULL WHERE run_id=?`).run(run.run_id!);
-    db.prepare("UPDATE execution_streams SET redacted=1,authorization_id='' WHERE stream_id=?").run(run.stream_id!);
+    db.prepare("UPDATE execution_streams SET redacted=1,authorization_id=CASE WHEN owner_kind='session' THEN authorization_id ELSE '' END WHERE stream_id=?").run(run.stream_id!);
     if (run.owner_kind === 'job' && plan.tokens.has(String(run.owner_id))) {
       const owner = randomUUID();
       db.prepare('UPDATE execution_streams SET owner_id=?,authorization_id=? WHERE stream_id=?').run(owner, '', run.stream_id!);
       db.prepare('UPDATE request_runs SET owner_id=? WHERE stream_id=? AND redacted=1').run(owner, run.stream_id!);
     }
+  }
+  const erasedSources = new Set(plan.manifest.carriers.filter(carrier => carrier.role === 'source')
+    .flatMap(carrier => carrier.entries.map(entry => entry.id)));
+  for (const attempt of plan.selected.get('request_attempts') ?? []) if (erasedSources.has(String(attempt.attempt_id))) {
+    const identity = randomUUID();
+    db.prepare('UPDATE execution_events SET attempt_id=? WHERE attempt_id=?').run(identity, attempt.attempt_id!);
+    db.prepare('UPDATE request_attempts SET attempt_id=? WHERE attempt_id=?').run(identity, attempt.attempt_id!);
+    db.prepare('UPDATE request_events SET attempt_id=? WHERE attempt_id=?').run(identity, attempt.attempt_id!);
   }
   // Every controlled snapshot can reproduce an earlier database/source state. Its exact
   // file inventory is retained by the operation before catalog references are removed.

@@ -165,7 +165,7 @@ for (const scenario of fixture.cases) {
     assert.deepEqual(result.receipt, { schema: 'purge/logical-commit@1', operationId: preview.operationId, status: 'logical-commit' });
     unchanged();
     inspect(db => {
-      assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 25);
+      assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 26);
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       for (const record of preview.manifest.records) for (const table of ['memory_records', 'memory_revisions', 'memory_heads', 'provenance_refs', 'verification_runs', 'feedback_events', 'search_documents'])
         assert.equal(db.prepare('SELECT count(*) n FROM ' + table + ' WHERE record_id=?').get(record.recordId)!.n, 0, table);

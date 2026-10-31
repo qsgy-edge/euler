@@ -58,7 +58,13 @@ test(`source cleanup retains post-snapshot archive ownership after restore, cras
     purge.child.stdin.end(); assert.equal((await purge.exit).code, 0);
     const reopened = startCli(['purge', '--sandbox', sandbox.root]); children.push(reopened);
     assert.equal(((await reopened.waitFor('purge-result')).source as { status: string }).status, 'complete');
-    reopened.child.stdin.end(); await reopened.exit;
+    const complete = await sendCommand(reopened, 'cleanup', 'purge-result');
+    assert.equal(complete.status, 'controlled-complete', JSON.stringify(complete));
+    assert.equal((await reopened.exit).code, 0, reopened.stderr());
+    const verified = run(['apps/cli/test/support/purge-complete-worker.ts', sandbox.root, JSON.stringify({
+      target: fixture.target, otherId: fixture.otherId, tokens: [], jobs: [], sources: [fixture.target.source], survivor: later.unrelated,
+    })]).at(-1)!;
+    assert.equal(verified.event, 'purge-non-resurrection');
   } finally {
     for (const child of children) {
       if (child.child.exitCode === null && child.child.signalCode === null) child.child.kill();

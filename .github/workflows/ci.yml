@@ -93,6 +93,9 @@ jobs:
       - name: Record source archive cleanup and crash continuation observations
         if: always()
         run: npm run evidence:source-cleanup
+      - name: Record controlled cleanup, SQLite maintenance and non-resurrection observations
+        if: always()
+        run: npm run evidence:controlled-cleanup
       - uses: actions/upload-artifact@v4
         if: always()
         with:

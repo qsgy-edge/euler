@@ -32,6 +32,8 @@ Owner corrections use the actual CLI input, complete previews and live approval 
 
 [Logical purge and cleanup continuation](docs/implementation/t21-logical-purge.md) use an independent maintenance process, a complete deletion preview and an exact live approval. Database commit preserves recoverable cleanup state and keeps ordinary runtime admission closed until physical cleanup. Run `npm run evidence:purge` for retained CLI, rollback, lost-acknowledgement and restart observations.
 
+[Controlled cleanup and SQLite completion](docs/implementation/t22b-controlled-cleanup.md) finish the approved purge through the existing source, Host, file and snapshot owners. The `cleanup` command resumes the same operation after interruption, removes sensitive continuation references before SQLite maintenance, and opens a new epoch only with the durable completion receipt. Run `npm run evidence:controlled-cleanup` for per-carrier byte scans, crash continuation and non-resurrection evidence.
+
 Full X-card acceptance, real provider dispatch, production schema/host acceptance, migration, and MC cutover remain unverified. CI and host results must be read from the artifact for the specific implementation and platform; this repository is not production-ready.
 
 - [Euler v1 implementation specification](docs/architecture/issues/15-euler-v1-spec.md)

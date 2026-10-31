@@ -1,8 +1,8 @@
 import { basename, join } from 'node:path';
 import { openSync, closeSync, readFileSync, writeSync, fsyncSync } from 'node:fs';
 import { API_VERSION, DEFAULT_BUDGET, ProbeSession, ProbeStore, sha256, validateBudget, check, sameFile } from '@euler/core';
-import type { Activity, Binding, SourceAck, ExecutionOwner, ProbeBudget, RequestRecovery, RequestAttempt, RequestReconciliation } from '@euler/core';
-import { CliArchive } from './archive.ts';
+import type { Activity, Binding, SourceAck, ExecutionOwner, ProbeBudget, PurgeCarrierSelection, PurgeLineAck, PurgeLinePlan, RequestRecovery, RequestAttempt, RequestReconciliation } from '@euler/core';
+import { CliArchive, preparePurgeLines, purgeLines } from './archive.ts';
 import { bindingOf, openSandbox, resourcesOf } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
 
@@ -19,7 +19,7 @@ export class CountingTransport {
     sameFile(path, this.sandbox.receiverIdentity);
     const bytes = readFileSync(path, 'utf8');
     check(bytes.endsWith('\n'), 'receiver-evidence-gap');
-    const lines = bytes.trimEnd().split('\n').map(line => JSON.parse(line));
+    const lines = bytes.slice(0, -1).split('\n').filter(line => !/^ +$/.test(line)).map(line => JSON.parse(line));
     const header = lines.shift();
     check(header?.schema === 'counting-receiver@1' && header.storeId === this.sandbox.storeId, 'receiver-evidence-gap');
     const records = lines.map(({ record, hash }) => {
@@ -29,6 +29,20 @@ export class CountingTransport {
     return { bytes, records };
   }
   inspect(): { count: number } { return { count: this.#readReceiver().records.length }; }
+  preparePurge(selection: PurgeCarrierSelection): PurgeLinePlan {
+    this.#readReceiver();
+    check(selection.role === 'receiver' && selection.file.path === join(this.sandbox!.root, 'counting-receiver.jsonl'), 'purge-receiver-owner-mismatch');
+    return preparePurgeLines(selection, (entry, index) => String(entry.record.attemptId ?? index));
+  }
+  purge(selection: PurgeCarrierSelection, plan: PurgeLinePlan): PurgeLineAck {
+    check(this.sandbox && selection.role === 'receiver'
+      && selection.file.path === join(this.sandbox.root, 'counting-receiver.jsonl'), 'purge-receiver-owner-mismatch');
+    sameFile(this.sandbox.root, this.sandbox.rootIdentity);
+    sameFile(selection.file.path, this.sandbox.receiverIdentity);
+    const ack = purgeLines(selection, plan);
+    this.#readReceiver();
+    return ack;
+  }
   query(attempt: RequestAttempt): RequestReconciliation {
     check([API_VERSION, 'capture-counting@1'].includes(attempt.adapterVersion), 'reconciliation-reader-unavailable');
     const { bytes, records } = this.#readReceiver();
