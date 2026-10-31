@@ -58,7 +58,8 @@ function inspect(handle: bigint, directory: boolean): { identity: FileIdentity; 
   return { identity: { dev: String(value.volume), ino: String((BigInt(value.indexHigh) << 32n) | BigInt(value.indexLow)) },
     size: value.sizeHigh * 4294967296 + value.sizeLow };
 }
-function openAt(parent: bigint, name: string, directory: boolean, write: boolean, create = false, remove = false): bigint | null {
+function openAt(parent: bigint, name: string, { directory = false, write = false, create = false, remove = false }:
+  { directory?: boolean; write?: boolean; create?: boolean; remove?: boolean } = {}): bigint | null {
   check(name.length > 0 && !/[\\/:\0]/.test(name) && name !== '.' && name !== '..', 'file-invalid-component');
   const a = native();
   const handle: (bigint | null)[] = [null];
@@ -140,11 +141,11 @@ export class WindowsFileRoot {
     };
     try {
       for (const part of parts.slice(0, -1)) {
-        const directory = openAt(parent, part, true, false);
+        const directory = openAt(parent, part, { directory: true });
         check(directory, 'file-parent-missing');
         handles.push(directory); inspect(directory, true); parent = directory;
       }
-      target = openAt(parent, parts.at(-1)!, false, operation === 'file.write');
+      target = openAt(parent, parts.at(-1)!, { write: operation === 'file.write' });
       check(target || operation === 'file.write', 'file-target-missing');
       const identity = target ? inspect(target, false).identity : null;
       const description = { path: join(this.#root.path, ...parts), parent: { path: join(this.#root.path, ...parts.slice(0, -1)), identity: inspect(parent, true).identity }, identity };
@@ -159,13 +160,13 @@ export class WindowsFileRoot {
             // safely rejects this call; FILE_CREATE stays outside that catch.
             try {
               checkCreatePermission(parent);
-              const existing = openAt(parent, parts.at(-1)!, false, false);
+              const existing = openAt(parent, parts.at(-1)!);
               if (existing) { native().close(existing); throw new FileOperationRejected('file-create-conflict'); }
             } catch (error) {
               if (error instanceof FileOperationRejected) throw error;
               throw new FileOperationRejected('file-create-denied');
             }
-            target = openAt(parent, parts.at(-1)!, false, true, true);
+            target = openAt(parent, parts.at(-1)!, { write: true, create: true });
           }
           check(target, 'file-create-failed');
           const opened = inspect(target, false);
@@ -206,13 +207,13 @@ export class WindowsFileRoot {
     let parent = this.#handle;
     try {
       for (const part of parts.slice(0, -1)) {
-        const directory = openAt(parent, part, true, false);
+        const directory = openAt(parent, part, { directory: true });
         check(directory, 'file-parent-missing');
         handles.push(directory); inspect(directory, true); parent = directory;
       }
       check(join(this.#root.path, ...parts.slice(0, -1)) === selection.output.parent.path
         && JSON.stringify(inspect(parent, true).identity) === JSON.stringify(selection.output.parent.identity), 'file-parent-identity-changed');
-      const file = openAt(parent, parts.at(-1)!, false, false, false, true);
+      const file = openAt(parent, parts.at(-1)!, { remove: true });
       if (!file) return { removed: true };
       handles.push(file);
       const opened = inspect(file, false);

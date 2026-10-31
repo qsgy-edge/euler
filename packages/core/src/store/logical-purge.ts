@@ -62,8 +62,12 @@ export interface PurgeManifest {
 }
 export interface PurgeInput { readonly id: string }
 export interface PurgeReceipt { schema: 'purge/logical-commit@1'; operationId: string; status: 'logical-commit' }
+export interface PurgeIncomplete {
+  schema: 'purge/cleanup-incomplete@1'; operationId: string; receiptId: string; status: 'incomplete';
+  stage: 'source' | 'host' | 'output' | 'backup' | 'prepare-sqlite' | 'sqlite-maintenance';
+}
 export interface PurgeCompletion {
-  status: 'controlled-complete'; operationId: string; cleanup: 'complete';
+  status: 'controlled-complete'; operationId: string; cleanup: 'complete'; failures: PurgeIncomplete[];
   receipt: { schema: 'purge/controlled-complete@1'; operationId: string; status: 'controlled-complete'; storeId: string; epoch: number };
 }
 export interface PurgeContinuation {

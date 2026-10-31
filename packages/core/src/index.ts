@@ -1,4 +1,4 @@
-export type { PurgeCarrier, PurgeCarrierEntry, PurgeManifest, PurgeCarrierSelection, PurgeInput, PurgePresentation, PurgeReceipt, PurgeCompletion, PurgeContinuation, PurgeLinePlan, PurgeLineAck, PurgeLineOwner } from './store/logical-purge.ts';
+export type { PurgeCarrier, PurgeCarrierEntry, PurgeManifest, PurgeCarrierSelection, PurgeInput, PurgePresentation, PurgeReceipt, PurgeCompletion, PurgeIncomplete, PurgeContinuation, PurgeLinePlan, PurgeLineAck, PurgeLineOwner } from './store/logical-purge.ts';
 export { PURGE_DATABASE_INVENTORY, purgeValues, inspectPurgeLines } from './store/logical-purge.ts';
 export { MemoryCorrections, parseCorrectionCommand, isLiveMemoryOperation } from './context/memory-correction.ts';
 export type { CorrectionInput, CorrectionCommand, CorrectionReply } from './context/memory-correction.ts';

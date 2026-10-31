@@ -12,14 +12,17 @@ import { readPurgeCarriers } from '../src/purge.ts';
 import { CountingTransport } from '../src/probe.ts';
 import { createSandbox } from '../src/sandbox.ts';
 
-function setup(receiver = false, backup = false) {
+function setup(receiver: boolean | 'unidentified' = false, backup = false) {
   const sandbox = createSandbox();
   const seeded = spawnSync(process.execPath, ['apps/cli/test/support/purge-worker.ts', sandbox.root], { encoding: 'utf8' });
   assert.equal(seeded.status, 0, seeded.stderr);
   const fixture = JSON.parse(seeded.stdout.trim().split('\n').at(-1)!);
   if (receiver) {
     const transport = new CountingTransport(sandbox);
-    transport.send(fixture.target.content, { attemptId: randomUUID(), runId: randomUUID(),
+    if (receiver === 'unidentified') {
+      transport.send('unrelated before'); transport.send(fixture.target.content);
+      transport.send('unrelated between'); transport.send(fixture.target.content);
+    } else transport.send(fixture.target.content, { attemptId: randomUUID(), runId: randomUUID(),
       payloadHash: fixture.target.contentHash, byteLength: Buffer.byteLength(fixture.target.content) });
     transport.send('unrelated synthetic receiver record');
   }
@@ -68,6 +71,20 @@ test('Core settles Info and receiver owners from actual bytes and preserves unre
     assert.equal(readFileSync(join(f.sandbox.root, 'counting-receiver.jsonl')).includes(Buffer.from(f.fixture.target.contentHash)), false);
     assert.deepEqual(f.store.cleanupPurgeHost(f.coordinator, { info, receiver }), result);
     assert.equal(f.store.fence().state, 'cleaning');
+  } finally { f.close(); }
+});
+
+test('receiver cleanup preserves ordinal identities across multiple selected records without attempt IDs', () => {
+  const f = setup('unidentified');
+  try {
+    const info = new OwnerInfoLog(f.sandbox, action => action(), () => {}), receiver = new CountingTransport(f.sandbox);
+    const selected = f.preview.manifest.carriers.find(carrier => carrier.role === 'receiver')!;
+    assert.deepEqual(selected.entries.map(entry => entry.id), ['1', '3']);
+    const result = f.store.cleanupPurgeHost(f.coordinator, { info, receiver });
+    assert.equal(result.host.status, 'complete');
+    assert.equal(receiver.inspect().count, 3);
+    assert.equal(readFileSync(selected.file.path).includes(Buffer.from(f.fixture.target.contentHash)), false);
+    assert.deepEqual(f.store.cleanupPurgeHost(f.coordinator, { info, receiver }), result);
   } finally { f.close(); }
 });
 

@@ -33,12 +33,12 @@ export function preparePurgeLines(selection: PurgeCarrierSelection, identity: (e
   let offset = bytes.indexOf(10) + 1, index = 0;
   while (offset < bytes.length) {
     const end = bytes.indexOf(10, offset), line = bytes.subarray(offset, end);
-    const selected = selection.entries[ranges.length];
+    const present = !line.every(byte => byte === 32), selected = selection.entries[ranges.length];
     if (selected && sha256(line) === selected.hash) {
       check(identity(JSON.parse(line.toString('utf8')), index) === selected.id, 'purge-source-entry-changed');
       ranges.push({ offset, bytes: line.length }); bytes.fill(32, offset, end);
     }
-    if (!line.every(byte => byte === 32)) index++;
+    if (present) index++;
     offset = end + 1;
   }
   check(ranges.length === selection.entries.length, 'purge-source-evidence-gap');

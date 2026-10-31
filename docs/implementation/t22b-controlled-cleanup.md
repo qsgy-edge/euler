@@ -1,6 +1,6 @@
 # Controlled cleanup and SQLite completion
 
-Issue: #23. Delivery path: feature branch + PR; this changes file deletion, durable purge phases, SQLite maintenance and required checks. The public boundaries are Core maintenance operations, real CLI input/process restart, and actual controlled files/SQLite bytes.
+Issue: #23. The public boundaries are Core maintenance operations, real CLI input/process restart, and actual controlled files/SQLite bytes.
 
 ## Run and resume
 
@@ -21,7 +21,7 @@ npm run evidence:controlled-cleanup
 
 `cleanup` runs the source, Info/receiver, project-file and backup owners, removes sensitive recovery references, maintains SQLite, and returns `status=controlled-complete`, `cleanup=complete`. The CLI exits after that result. Running `purge --sandbox` on a completed open store reads the durable completion without acquiring another maintenance fence. Starting another purge requires `--record` and a fresh preview/approval.
 
-`cleanup-source` remains available for the source participant alone; it does not complete the overall purge. Before completion, `status` reports the logical receipt, current phase and independently checked participant results. `cancel` can reopen admission only before logical commit. After commit it reports `settled`; stopping the process leaves the durable cleanup obligation in place.
+`cleanup-source` remains available for the source participant alone; it does not complete the overall purge. Before completion, `status` reports the logical receipt, current phase and independently checked participant results. Failed cleanup steps append immutable `purge/cleanup-incomplete@1` facts in the existing event ledger. Their `failures` list contains only random operation/receipt IDs and the bounded stage, with no raw error text or resource locator; it replays after restart and remains available with the final completion. `cancel` can reopen admission only before logical commit. After commit it reports `settled`; stopping the process leaves the durable cleanup obligation in place.
 
 ## Owners and approved inventory
 
@@ -72,7 +72,7 @@ The authoritative receipt is `artifacts/t22b-<timestamp>/receipt.json`. Its evid
 | Participant bytes, unrelated retention, identity drift, current permissions and sharing locks | `purge-copies.test.ts`, `purge-project.test.ts`, existing source-boundary tests |
 | Ready/unpublished/retired/migration backups and recovery-original copies | `backup`, `staging-backup`, `retired-backup`, `migration-backup`, `recovery` receipt cases |
 | Post-snapshot session ownership after restored or interrupted databases | `purge-source-recovery.test.ts`, including full completion and a surviving original source |
-| Before/after owner deletion, partial backup removal, scrub, vacuum and final receipt interruption | `purge-faults.test.ts`; all restarts retain one logical operation and one final receipt |
+| Before/after owner deletion, partial backup removal, scrub, vacuum and final receipt interruption | `purge-faults.test.ts`; all restarts retain one logical operation and one final receipt, and ENOSPC/SQLITE_FULL failure facts replay before and after completion |
 | SQLite main/WAL/free pages, blocked checkpoint and sensitive continuation removal | `purge-copies.test.ts` plus retained raw byte scans and SQLite observations |
 | Normal use after completion | Real CLI restart, new task dispatch, unchanged unrelated memory and clean backup |
 

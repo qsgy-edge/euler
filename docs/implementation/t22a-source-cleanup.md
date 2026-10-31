@@ -43,7 +43,7 @@ The existing `pending_operations.continuation` retains the approved `carriers`, 
 
 The plan is committed before the owner writes. The acknowledgement is committed after owner flush and independent readback. A crash after deletion but before acknowledgement is recovered from the stored plan and actual bytes. The logical receipt is unchanged throughout.
 
-The settled-operation trigger permits continuation updates only for an existing `purge` operation in `cleaning`, through the Core purge writer. Operation identity, approval digest, result and logical receipt remain immutable. Disposable schema is **26**; old disposable stores must be recreated. The independent forward-migration harness advances its copy to **27**.
+The settled-operation trigger permits continuation updates only for an existing `purge` operation in `cleaning`, through the Core purge writer. Operation identity, result and logical receipt remain immutable. The approval digest stays fixed during external cleanup and is removed with the sensitive continuation before SQLite maintenance. Disposable schema is **26**; old disposable stores must be recreated. The independent forward-migration harness advances its copy to **27**.
 
 ## Carrier coverage and handoff
 

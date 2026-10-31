@@ -38,11 +38,16 @@ for (const point of fixture.faults) test(`purge resumes the same approved operat
       NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${new URL('./support/purge-fault-hook.ts', import.meta.url).href}`,
       EULER_PURGE_TEST_POINT: point }); children.push(fault);
     assert.deepEqual((await fault.waitFor('purge-result')).receipt, committed.receipt);
+    let failures: Record<string, unknown>[] = [];
     if (point === 'info-enospc' || point === 'sqlite-full') {
       const incomplete = await sendCommand(fault, 'cleanup', 'purge-result');
       assert.equal(incomplete.outcome, 'known-committed');
       assert.equal(incomplete.cleanup, 'incomplete');
       assert.match(String(incomplete.error), /injected-/);
+      assert.ok(Array.isArray(incomplete.failures));
+      failures = incomplete.failures as Record<string, unknown>[];
+      assert.deepEqual(failures.map(({ receiptId, ...fact }) => fact), [{ schema: 'purge/cleanup-incomplete@1',
+        operationId: committed.operationId, status: 'incomplete', stage: point === 'info-enospc' ? 'host' : 'sqlite-maintenance' }]);
       fault.child.stdin.end(); assert.equal((await fault.exit).code, 0);
     } else {
       fault.command('cleanup');
@@ -65,6 +70,7 @@ for (const point of fixture.faults) test(`purge resumes the same approved operat
     } finally { db.close(); }
     const resumed = startCli(['purge', '--sandbox', sandbox.root]); children.push(resumed);
     let final = await resumed.waitFor('purge-result');
+    assert.deepEqual(final.failures, failures);
     if (point !== 'completion-after') {
       assert.deepEqual(final.receipt, committed.receipt);
       assert.equal(resumed.observations.some(row => row.event === 'purge-preview'), false);
@@ -72,7 +78,9 @@ for (const point of fixture.faults) test(`purge resumes the same approved operat
     }
     assert.equal(final.status, 'controlled-complete', JSON.stringify(final));
     assert.equal(final.operationId, committed.operationId);
+    assert.deepEqual(final.failures, failures);
     assert.equal((await resumed.exit).code, 0, resumed.stderr());
+    if (failures.length) assert.deepEqual(run(['apps/cli/src/main.ts', 'purge', '--sandbox', sandbox.root]).at(-1)!.failures, failures);
     assert.equal(existsSync(backup.directory.path), false);
     if (project) assert.equal(existsSync(join(project, 'result.md')), false);
     for (const name of readdirSync(sandbox.root)) assert.equal(readFileSync(join(sandbox.root, name)).includes(Buffer.from(fixture.target.content)), false, name);
