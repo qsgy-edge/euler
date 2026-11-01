@@ -8,6 +8,32 @@ import { AgentRun, DEFAULT_BUDGET } from '@euler/core';
 import { bindingOf, createSandbox } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 
+test('lookup preserves the original hash after settlement commits but before its ack reaches the caller', () => {
+  const sandbox = createSandbox(), path = join(sandbox.root, 'session.jsonl');
+  let probe = openProbe(sandbox);
+  const eventId = randomUUID(), gate = probe.store.withActivity.bind(probe.store);
+  let original: ReturnType<typeof probe.archive.append> | undefined;
+  try {
+    probe.store.withActivity = (activity, action) => {
+      const result = gate(activity, action);
+      if (result && typeof result === 'object' && 'schema' in result && result.schema === 'cli-source-ack@1' && !original) {
+        original = result as unknown as ReturnType<typeof probe.archive.append>;
+        throw new Error('ack-handoff-lost');
+      }
+      return result;
+    };
+    assert.throws(() => probe.archive.append(eventId, 'Original canonical content'), /ack-handoff-lost/);
+    probe.store.withActivity = gate;
+    assert.ok(original);
+    probe.close(); probe = openProbe(sandbox);
+    assert.deepEqual(probe.archive.lookup(eventId), original);
+    const bytes = fs.readFileSync(path, 'utf8');
+    fs.writeFileSync(path, bytes.replace('Original canonical content', 'Replaced canonical content'));
+    assert.throws(() => probe.archive.lookup(eventId), /archive-integrity/);
+    assert.throws(() => probe.archive.append(eventId, 'Replaced canonical content'), /archive-integrity/);
+  } finally { probe.close(); fs.rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 for (const damage of ['unrecorded-tail', 'changed-prefix', 'changed-tail', 'identity-conflict'] as const) {
   test(`archive reconciliation refuses ${damage} and preserves the damaged carrier`, () => {
     const sandbox = createSandbox(), path = join(sandbox.root, 'session.jsonl'), probe = openProbe(sandbox);
@@ -34,7 +60,10 @@ for (const damage of ['unrecorded-tail', 'changed-prefix', 'changed-tail', 'iden
       }
       const bytes = fs.readFileSync(path);
       if (damage === 'identity-conflict') assert.throws(() => probe.archive.append(eventId, 'Different bytes'), /identity-conflict/);
-      else if (damage === 'unrecorded-tail') assert.throws(() => probe.archive.append(eventId, 'Expected'), /archive-integrity/);
+      else if (damage === 'unrecorded-tail') {
+        assert.throws(() => probe.archive.reconcile(), /archive-integrity/);
+        assert.throws(() => probe.archive.append(eventId, 'Expected'), /archive-integrity/);
+      }
       else assert.throws(() => probe.archive.reconcile(), /archive-integrity/);
       assert.deepEqual(fs.readFileSync(path), bytes);
       assert.equal(probe.transport.count, 0);

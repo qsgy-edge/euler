@@ -10,7 +10,7 @@ import { createSandbox } from '../../src/sandbox.ts';
 
 const worker = fileURLToPath(new URL('./archive-crash-worker.ts', import.meta.url));
 export const archiveCrashCases = [
-  ...['reservation-uncommitted', 'reservation-committed', 'before-write', 'partial-write', 'after-write', 'after-fsync', 'after-readback', 'before-ack', 'ack-returned']
+  ...['reservation-uncommitted', 'reservation-committed', 'before-write', 'partial-write', 'after-write', 'after-fsync', 'after-readback', 'before-ack', 'ack-committed', 'ack-returned']
     .map(point => ({ scenario: 'input', point })),
   ...['owner', 'agreement', 'response', 'tool', 'file-presentation', 'file-approval', 'guidance', 'report'].flatMap(scenario =>
     ['partial-write', 'before-ack'].map(point => ({ scenario, point }))),
@@ -53,7 +53,8 @@ function inspect(root: string) {
     assert.deepEqual(db.prepare('PRAGMA quick_check').all().map(row => row.quick_check), ['ok']);
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     return {
-      pending: db.prepare('SELECT * FROM source_appends').all(),
+      pending: db.prepare("SELECT * FROM source_appends WHERE status='pending'").all(),
+      acknowledged: db.prepare("SELECT * FROM source_appends WHERE status='durable'").all(),
       captures: Number(db.prepare('SELECT count(*) AS n FROM capture_jobs').get()!.n),
       memories: Number(db.prepare('SELECT count(*) AS n FROM memory_records').get()!.n),
       offloads: Number(db.prepare("SELECT count(*) AS n FROM request_assemblies WHERE degradation IN ('compact','window')").get()!.n),
@@ -79,7 +80,7 @@ export async function runArchiveCrashCase(directory: string, scenario: string, p
       assert.equal(before.pending.length, 0); assert.equal(before.jobs.length, 1); assert.equal(before.jobs[0]!.status, 'pending');
       assert.equal(before.documents.length, 0);
     } else {
-      assert.equal(before.pending.length, ['reservation-uncommitted', 'ack-returned'].includes(point) ? 0 : 1);
+      assert.equal(before.pending.length, ['reservation-uncommitted', 'ack-committed', 'ack-returned'].includes(point) ? 0 : 1);
       if (before.pending.length) {
         const row = before.pending[0]!, pending = JSON.parse(String(row.payload));
         assert.equal(row.payload_hash, hash(String(row.payload)));
@@ -110,6 +111,16 @@ export async function runArchiveCrashCase(directory: string, scenario: string, p
     const lines = afterBytes.toString('utf8').trim().split('\n'), header = JSON.parse(lines.shift()!);
     const events = lines.map(line => ({ line, value: JSON.parse(line) }));
     assert.equal(new Set(events.map(item => item.value.eventId)).size, events.length);
+    for (const row of after.acknowledged) {
+      assert.equal(row.payload_hash, hash(String(row.payload)));
+      const ack = JSON.parse(String(row.payload)), event = events.find(item => item.value.eventId === ack.eventId)!;
+      assert.ok(event); assert.equal(ack.hash, hash(event.line)); assert.equal(ack.contentHash, hash(event.value.text));
+      assert.equal(ack.byteLength, Buffer.byteLength(event.line)); assert.deepEqual(ack.binding, header.binding);
+    }
+    if (point === 'ack-committed') {
+      assert.equal(before.acknowledged.length, 1);
+      assert.deepEqual(after.acknowledged, before.acknowledged);
+    }
     const recovered = recovery.observations.find(item => item.event === 'recovered');
     if (scenario !== 'projection') {
       assert.equal(recovered.sends, 0); assert.equal(recovered.blindAppends, 0);

@@ -50,7 +50,7 @@ The logical transaction preserves genuinely content-free execution sequence and 
 
 A crash after reference scrubbing resumes from the content-free phase and repeats SQLite maintenance; no old locator is reconstructed. Missing or corrupt operation/receipt progress blocks admission. Normal runtime, background derivation, snapshot creation and ordinary restore stay closed until the final transaction. The completion is presented by the maintenance Host, not sent back into an exited model session.
 
-The disposable schema is **26**. Earlier disposable stores must be recreated. The independent forward-migration harness advances its own copy to **27**; production schema freezing remains a separate acceptance boundary.
+See [Maintenance and schema](t20-backup-recovery.md#maintenance-and-schema) for the current disposable schema and migration boundary.
 
 ## Verification and retained evidence
 

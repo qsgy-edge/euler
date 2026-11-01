@@ -10,6 +10,7 @@ interface RawEvent { schema: 'cli-input@1'; eventId: string; role: 'user' | 'ass
 export interface ArchiveJournal {
   prepare(input: () => SourceAppend | SourceAck): SourceAppend | SourceAck;
   pending(): SourceAppend[];
+  acknowledged(eventId: string): SourceAck | null;
   settle(source: SourceAck): void;
 }
 
@@ -151,6 +152,8 @@ export class CliArchive {
       }
       const bytes = this.#bytes();
       const previous = this.#scan(bytes).find(item => item.event.eventId === eventId);
+      const witness = this.#journal!.acknowledged(eventId);
+      check(!witness || previous?.ack.hash === witness.hash, 'archive-integrity: acknowledged bytes changed');
       if (previous) {
         check(previous.event.text === text && previous.event.role === role, 'identity-conflict');
         return previous.ack;
@@ -207,7 +210,9 @@ export class CliArchive {
   /** Complete only durably reserved bytes; this never repeats a model or tool operation. */
   reconcile(): SourceAck[] {
     check(this.#journal, 'archive-journal-required');
-    return this.#journal.pending().map(pending => this.#complete(pending));
+    const acknowledgements = this.#journal.pending().map(pending => this.#complete(pending));
+    this.#gate(() => this.#scan());
+    return acknowledgements;
   }
 
   lookup(eventId: string): SourceAck | null {
@@ -216,6 +221,8 @@ export class CliArchive {
     if (pending) return this.#complete(pending);
     return this.#gate(() => {
       const found = this.#scan().find(item => item.event.eventId === eventId);
+      const witness = this.#journal?.acknowledged(eventId);
+      check(!witness || found?.ack.hash === witness.hash, 'archive-integrity: acknowledged bytes changed');
       if (!found) return null;
       return this.#syncedAck(eventId, found.ack.hash);
     });

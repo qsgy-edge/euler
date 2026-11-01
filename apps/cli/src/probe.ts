@@ -99,6 +99,7 @@ export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET
     const archive = archiveFor(binding, action => store.withActivity(activity, action), {
       prepare: input => store.prepareSourceAppend(activity, input),
       pending: () => store.sourceAppends(activity),
+      acknowledged: eventId => store.sourceAcknowledgement(activity, eventId),
       settle: source => store.settleSourceAppend(activity, source),
     });
     let session: ProbeSession | undefined = diagnosticsOnly ? undefined

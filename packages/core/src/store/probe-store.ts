@@ -616,10 +616,17 @@ CREATE TABLE host_info_batches (
   CHECK((read_state='unread' AND read_at IS NULL) OR (read_state='read' AND read_at IS NOT NULL AND delivery='delivered'))
 ) STRICT;
 CREATE TABLE source_appends (
-  source_owner TEXT PRIMARY KEY REFERENCES sessions(session_id), source_event_id TEXT NOT NULL,
-  payload TEXT NOT NULL, payload_hash TEXT NOT NULL
+  source_owner TEXT NOT NULL REFERENCES sessions(session_id), source_event_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','durable')), payload TEXT NOT NULL, payload_hash TEXT NOT NULL,
+  PRIMARY KEY(source_owner,source_event_id)
 ) STRICT;
-CREATE TRIGGER immutable_source_appends_update BEFORE UPDATE ON source_appends BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE UNIQUE INDEX one_source_append_pending ON source_appends(source_owner) WHERE status='pending';
+CREATE TRIGGER immutable_source_appends_update BEFORE UPDATE ON source_appends
+WHEN NEW.source_owner IS NOT OLD.source_owner OR NEW.source_event_id IS NOT OLD.source_event_id
+  OR OLD.status!='pending' OR NEW.status!='durable'
+BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_source_appends_delete BEFORE DELETE ON source_appends WHEN euler_purge_writer()!=1
+BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TABLE source_units (
   unit_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(project_id),
   source_owner TEXT NOT NULL REFERENCES sessions(session_id), source_event_id TEXT NOT NULL,
@@ -1320,20 +1327,35 @@ export class ProbeStore {
         check(JSON.stringify(pending[0]) === payload, 'archive-append-pending');
         return structuredClone(input);
       }
-      this.#db.prepare('INSERT INTO source_appends VALUES (?,?,?,?)')
+      this.#db.prepare("INSERT INTO source_appends VALUES (?,?,'pending',?,?)")
         .run(input.binding.sessionId, input.eventId, payload, sha256(payload));
       return structuredClone(input);
     });
   }
 
   sourceAppends(activity: Activity): SourceAppend[] {
-    return this.withActivity(activity, () => this.#db.prepare('SELECT * FROM source_appends WHERE source_owner=?')
+    return this.withActivity(activity, () => this.#db.prepare("SELECT * FROM source_appends WHERE source_owner=? AND status='pending'")
       .all(this.#binding.sessionId).map(row => {
         check(sha256(String(row.payload)) === row.payload_hash, 'archive-append-integrity');
         const input = JSON.parse(String(row.payload)) as SourceAppend;
         check(input.eventId === row.source_event_id && sameBinding(input.binding, this.#binding), 'archive-append-integrity');
         return input;
       }));
+  }
+
+  sourceAcknowledgement(activity: Activity, eventId: string): SourceAck | null {
+    return this.withActivity(activity, () => this.#sourceAcknowledgement(this.#binding, eventId));
+  }
+
+  #sourceAcknowledgement(binding: Binding, eventId: string): SourceAck | null {
+    const row = this.#db.prepare("SELECT * FROM source_appends WHERE source_owner=? AND source_event_id=? AND status='durable'")
+      .get(binding.sessionId, eventId);
+    if (!row) return null;
+    check(sha256(String(row.payload)) === row.payload_hash, 'archive-append-integrity');
+    const ack = JSON.parse(String(row.payload)) as SourceAck;
+    check(ack.schema === 'cli-source-ack@1' && ack.status === 'durable' && ack.eventId === eventId
+      && sameBinding(ack.binding, binding), 'archive-append-integrity');
+    return ack;
   }
 
   settleSourceAppend(activity: Activity, source: SourceAck): void {
@@ -1343,8 +1365,9 @@ export class ProbeStore {
       const pending = this.sourceAppends(activity).find(item => item.eventId === source.eventId);
       check(pending && source.hash === sha256(pending.bytes.slice(0, -1))
         && source.byteLength === Buffer.byteLength(pending.bytes) - 1, 'archive-ack-failed');
-      this.#db.prepare('DELETE FROM source_appends WHERE source_owner=? AND source_event_id=?')
-        .run(source.binding.sessionId, source.eventId);
+      const payload = JSON.stringify(source);
+      this.#db.prepare("UPDATE source_appends SET status='durable',payload=?,payload_hash=? WHERE source_owner=? AND source_event_id=? AND status='pending'")
+        .run(payload, sha256(payload), source.binding.sessionId, source.eventId);
       this.#archiveRef(source);
     });
   }
@@ -5725,7 +5748,7 @@ export class ProbeStore {
     const source = this.sessionSource(ref.binding);
     sameFile(source.path, source.identity);
     uuid(ref.eventId);
-    check(!this.#db.prepare('SELECT 1 FROM source_appends WHERE source_owner=? AND source_event_id=?')
+    check(!this.#db.prepare("SELECT 1 FROM source_appends WHERE source_owner=? AND source_event_id=? AND status='pending'")
       .get(ref.binding.sessionId, ref.eventId), 'archive-append-pending');
     check(/^[0-9a-f]{64}$/i.test(ref.hash) && /^[0-9a-f]{64}$/i.test(ref.contentHash)
       && typeof ref.locator === 'string' && ref.locator.length > 0
@@ -6096,7 +6119,7 @@ export class ProbeStore {
       } else for (const child of Object.values(value)) sources(child);
     };
     for (const [table, column] of [
-      ['intent_events','snapshot'], ['request_events','payload'], ['request_assemblies','sources'],
+      ['source_appends','payload'], ['intent_events','snapshot'], ['request_events','payload'], ['request_assemblies','sources'],
       ['memory_events','payload'], ['memory_revisions','source_json'], ['verification_runs','evidence_json'],
       ['capture_jobs','payload'], ['capture_work','searched_refs'], ['capture_work','expanded_refs'],
       ['compartments','source_json'], ['source_units','payload'], ['evolution_proposals','payload'],
@@ -6173,7 +6196,7 @@ export class ProbeStore {
 
   auditStore(owner: Activity | string): void {
     const inspect = () => {
-      check(!this.#db.prepare('SELECT 1 FROM source_appends LIMIT 1').get(), 'archive-append-pending');
+      check(!this.#db.prepare("SELECT 1 FROM source_appends WHERE status='pending' LIMIT 1").get(), 'archive-append-pending');
       try { return { health: this.#checkStoreIntegrity(), failure: null }; }
       catch (failure) { return { health: null, failure }; }
     };
@@ -6231,7 +6254,7 @@ export class ProbeStore {
         return { skipped: 'daily-limit' as const };
       }
       check(['daily','migration'].includes(kind), 'invalid-snapshot-kind');
-      check(!this.#db.prepare('SELECT 1 FROM source_appends LIMIT 1').get(), 'archive-append-pending');
+      check(!this.#db.prepare("SELECT 1 FROM source_appends WHERE status='pending' LIMIT 1").get(), 'archive-append-pending');
       check(this.#checkStoreIntegrity() === 'healthy', 'projection-integrity-failed');
       host.validate();
       check(host.files.length === 2 && new Set(host.files.map(item => item.role)).size === 2

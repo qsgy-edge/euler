@@ -25,6 +25,7 @@ const archiveFd = (fd: number) => {
 };
 const write = fs.writeSync, sync = fs.fsyncSync, read = fs.readFileSync;
 const exec = DatabaseSync.prototype.exec;
+const withActivity = ProbeStore.prototype.withActivity;
 const prepare = ProbeStore.prototype.prepareSourceAppend;
 const settle = ProbeStore.prototype.settleSourceAppend;
 try {
@@ -132,8 +133,13 @@ try {
       return value;
     }) as typeof fs.readFileSync;
     DatabaseSync.prototype.exec = function(sql: string) {
-      if (armed && sql === 'COMMIT' && this.prepare('SELECT 1 FROM source_appends LIMIT 1').get()) checkpoint('reservation-uncommitted');
+      if (armed && sql === 'COMMIT' && this.prepare("SELECT 1 FROM source_appends WHERE status='pending' LIMIT 1").get()) checkpoint('reservation-uncommitted');
       return exec.call(this, sql);
+    };
+    ProbeStore.prototype.withActivity = function(activity, action) {
+      const result = withActivity.call(this, activity, action);
+      if (result && typeof result === 'object' && 'schema' in result && result.schema === 'cli-source-ack@1') checkpoint('ack-committed');
+      return result as ReturnType<typeof action>;
     };
     ProbeStore.prototype.prepareSourceAppend = function(activity, input) {
       const result = prepare.call(this, activity, input); checkpoint('reservation-committed'); return result;
@@ -149,6 +155,7 @@ try {
 } finally {
   armed = false;
   fs.writeSync = write; fs.fsyncSync = sync; fs.readFileSync = read; DatabaseSync.prototype.exec = exec;
+  ProbeStore.prototype.withActivity = withActivity;
   ProbeStore.prototype.prepareSourceAppend = prepare; ProbeStore.prototype.settleSourceAppend = settle;
   syncBuiltinESMExports(); probe.close();
 }
