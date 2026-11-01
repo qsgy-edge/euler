@@ -265,6 +265,7 @@ export async function measureProviderIdentities(directory: string) {
   finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
   const report = { passed: failureHash === null && cases.every(item => item.passed), failureHash, hiddenSends: cases.reduce((sum, item) => sum + item.transportCount - item.sends, 0),
     networkCount: cases.reduce((sum, item) => sum + item.transportCount, 0), cases };
-  writeFileSync(join(directory, 'receipt.json'), JSON.stringify(report, null, 2));
+  try { writeFileSync(join(directory, 'receipt.json'), JSON.stringify(report, null, 2)); }
+  catch (error) { report.passed = false; report.failureHash = sha256(error instanceof Error ? error.message : 'identity-receipt-write-failure'); }
   return report;
 }

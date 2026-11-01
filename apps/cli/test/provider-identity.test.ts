@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import fs, { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
@@ -59,4 +60,23 @@ ServerResponse.prototype.end = function(...args) {
     assert.equal(saved.networkCount, 1);
     assert.deepEqual(saved.cases.map((item: { passed: boolean; sends: number }) => [item.passed, item.sends]), [[false, 1]]);
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('an identity receipt write failure returns a failed aggregate without losing completed sends', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'euler-provider-identity-write-'));
+  const original = fs.writeFileSync;
+  fs.writeFileSync = (path, data, options) => {
+    if (path === join(directory, 'receipt.json')) throw new Error('injected-identity-receipt-write-failure');
+    original(path, data, options);
+  };
+  syncBuiltinESMExports();
+  try {
+    const report = await measureProviderIdentities(directory);
+    assert.equal(report.passed, false);
+    assert.equal(report.networkCount, 26);
+    assert.equal(report.hiddenSends, 0);
+    assert.equal(report.cases.length, 8);
+    assert.ok(report.cases.every(item => item.passed));
+    assert.match(report.failureHash!, /^[a-f0-9]{64}$/);
+  } finally { fs.writeFileSync = original; syncBuiltinESMExports(); rmSync(directory, { recursive: true, force: true }); }
 });
