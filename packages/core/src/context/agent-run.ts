@@ -70,6 +70,7 @@ export class AgentRun {
   get signal(): AbortSignal { return this.#abort.signal; }
   remainingMs(): number { return Math.max(0, this.#budget.wallClockMs - (performance.now() - this.#started)); }
   get toolTimeoutMs(): number { return this.#budget.toolTimeoutMs; }
+  chargedTokens(): number { return this.#usageTokens(); }
   #active(): boolean {
     if (this.status().terminal) return false;
     if (this.remainingMs() <= 0) { this.stop('deadline'); return false; }

@@ -2,7 +2,8 @@
 // capture-cooperative.test.ts exercises the full prerequisite suite over real HTTP.
 import cp from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
-const cli = process.argv[1]?.replaceAll('\\', '/').endsWith('/apps/cli/src/main.ts');
+const entry = process.argv[1]?.replaceAll('\\', '/');
+const cli = entry?.endsWith('/apps/cli/src/main.ts') || entry?.endsWith('/scripts/evidence-provider.ts');
 if (cli && ['accept', 'reject'].includes(process.env.T13_PREREQUISITE_FIXTURE)) {
   const execFile = cp.execFile;
   cp.execFile = (file, args, ...rest) => {
