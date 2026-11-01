@@ -61,4 +61,4 @@ The runnable cases cover separate/shared batches, owner correction/forget/restor
 
 Controlled project output uses the existing Windows file Host. Other platforms record that case as an evidence gap while running the portable logical-purge cases. Physical deletion of source/Host/backups, SQLite main/WAL/free-page maintenance and the final controlled-complete gate remain unverified by this receipt. Source/archive deletion has a separate T22a receipt; the other cleanup participants have a separate T22b receipt. T24 checks the enabled-path integration.
 
-Disposable schema is 26. Older disposable stores must be recreated. The separate forward-migration test copy advances to 27; it does not freeze the production v1 schema.
+See [Maintenance and schema](t20-backup-recovery.md#maintenance-and-schema) for the current disposable schema and migration boundary.

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
+import { appendFileSync, existsSync, rmSync } from 'node:fs';
 import test from 'node:test';
 import { randomUUID } from 'node:crypto';
 import { createSandbox, createSandboxSession, bindingOf } from '../src/sandbox.ts';
@@ -67,6 +67,26 @@ test('the CLI presents the actual correction, accepts fresh text approval and re
 test('the actual CLI rejects buffered approval before full output, then accepts a fresh live input', async () => {
   const sandbox = createSandbox();
   const output = delayedCliOutput(sandbox, 'remember', 'memory-preview');
+  const appendHeld = `${output.preload}.append-held`;
+  appendFileSync(output.preload, `
+import { DatabaseSync } from 'node:sqlite';
+const exec = DatabaseSync.prototype.exec;
+let appendDelayed = false;
+DatabaseSync.prototype.exec = function(sql) {
+  let pause = false;
+  if (sql === 'COMMIT' && !appendDelayed && this.prepare("SELECT name FROM sqlite_schema WHERE name='source_appends'").get()) {
+    const pending = this.prepare("SELECT payload FROM source_appends WHERE status='pending'").get();
+    pause = !!pending && JSON.parse(JSON.parse(pending.payload).bytes).text.startsWith('commit ');
+  }
+  const result = exec.call(this, sql);
+  if (pause) {
+    appendDelayed = true;
+    writeFileSync(${JSON.stringify(appendHeld)}, 'held after reservation commit');
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+  }
+  return result;
+};
+`);
   const cli = startCli(['remember', '--sandbox', sandbox.root], undefined, undefined, output.env);
   const original = correctionFixture.original;
   const corrected = correctionFixture.corrected;
@@ -75,6 +95,7 @@ test('the actual CLI rejects buffered approval before full output, then accepts 
     const remembered = await send(cli, `记住偏好：${original}`, 'remember-result');
     const id = String(remembered.recordId);
     const { preview, early, rejected } = await bufferedCorrectionApproval(cli, sandbox, id, corrected, output);
+    assert.equal(existsSync(appendHeld), true, 'approval reservation commit was held before carrier write');
     assert.equal(rejected.status, 'unavailable');
     assert.equal(rejected.reason, 'presentation-before-live-input-required');
     assert.deepEqual(rejected.receiptIds, []);

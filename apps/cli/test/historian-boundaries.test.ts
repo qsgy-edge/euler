@@ -12,6 +12,16 @@ import { openProbe } from '../src/probe.ts';
 import { pumpCapture } from '../src/agent-pump.ts';
 import { approvedSourceUnit } from './support/source-publication.ts';
 
+// Construct the adversarial Host claim from changed bytes; normal lookup must reject it.
+function forgedAck(value: ReturnType<typeof setup>, eventId: string): SourceAck {
+  assert.throws(() => value.probe.archive.lookup(eventId), /archive-integrity/);
+  const lines = readFileSync(join(value.sandbox.root, 'session.jsonl'), 'utf8').trimEnd().split('\n');
+  const line = lines.find(line => JSON.parse(line).eventId === eventId)!;
+  return { schema: 'cli-source-ack@1', status: 'durable', binding: bindingOf(value.sandbox), eventId,
+    locator: `cli-jsonl@1/${value.sandbox.fixture.sessionId}/${eventId}`, hash: sha256(line),
+    byteLength: Buffer.byteLength(line), contentHash: sha256(JSON.parse(line).text) };
+}
+
 
 test('a missing raw source blocks the Historian before a model request', () => {
   const value = setup(), path = join(value.sandbox.root, 'session.jsonl'), bytes = readFileSync(path);
@@ -360,14 +370,14 @@ for (const corruption of ['none', 'text', 'user', 'tool']) test('raw recovery ex
     const hits = JSON.parse(searched.modelResult).results as { eventId: string }[];
     assert.equal(hits.some(hit => [compartment.source.eventId, compartment.attemptId].includes(hit.eventId)), false);
     agent.finishTool('search', searched.modelResult);
-    const refs = [compartment.source, value.probe.archive.lookup(compartment.attemptId)!, value.job.range[0]!];
+    const refs = [compartment.source, { eventId: compartment.attemptId }, value.job.range[0]!];
     deliver(value, agent, { text: 'Recover exact raw evidence.', calls: refs.map((ref, index) => ({
       id: 'expand-' + index, name: 'source.expand', arguments: { eventId: ref.eventId, offset: 0, limit: 4096 } })), stop: 'tools' });
     for (let index = 0; index < refs.length; index++) {
       const id = 'expand-' + index;
       agent.startTool(id); const result = agent.coreToolResult(id)!;
       assert.equal(result.outcome, index < 2 ? 'failure' : 'success');
-      if (index < 2) assert.match(result.modelResult, /source-derived/);
+      if (index < 2) assert.match(result.modelResult, corruption === 'none' ? /source-derived/ : /source-evidence-gap/);
       else assert.match(result.modelResult, /exact value 47/);
       agent.finishTool(id, result.modelResult);
     }
@@ -405,7 +415,7 @@ for (const target of ['body', 'reply'] as const) for (const operation of [
     const index = lines.findIndex(line => JSON.parse(line).eventId === eventId);
     assert.ok(index > 0); lines[index] = JSON.stringify({ ...JSON.parse(lines[index]!), role, text });
     writeFileSync(path, lines.join('\n') + '\n');
-    const input = archive.lookup(eventId)!;
+    const input = forgedAck(value, eventId);
     assert.equal(store.isCaptureOutput(activity, input), true);
     const jobs = store.listCaptureJobs(activity, 32, false, 'memory').map(job => job.jobId);
     const invoke = () => {
@@ -508,7 +518,7 @@ for (const target of ['body', 'reply'] as const) for (const boundary of ['public
       const index = lines.findIndex(line => JSON.parse(line).eventId === eventId);
       assert.ok(index > 0); lines[index] = JSON.stringify({ ...JSON.parse(lines[index]!), role: 'user', text });
       writeFileSync(path, lines.join('\n') + '\n');
-      const input = archive.lookup(eventId)!;
+      const input = forgedAck(value, eventId);
       assert.equal(store.isCaptureOutput(activity, input), true);
       assert.throws(() => invoke(input), /^Error: source-derived$/u);
       assert.equal(store.readIntent(activity)!.eventId, intent.eventId);
@@ -591,7 +601,7 @@ for (const target of ['body', 'reply'] as const) for (const field of ['task', 's
       const index = lines.findIndex(line => JSON.parse(line).eventId === eventId);
       assert.ok(index > 0); lines[index] = JSON.stringify({ ...JSON.parse(lines[index]!), role, text });
       writeFileSync(path, lines.join('\n') + '\n');
-      const derived = archive.lookup(eventId)!;
+      const derived = forgedAck(value, eventId);
       assert.equal(store.isCaptureOutput(activity, derived), true);
       if (field === 'task') header.task = derived;
       else if (field === 'supersedes') header.supersedes = derived;

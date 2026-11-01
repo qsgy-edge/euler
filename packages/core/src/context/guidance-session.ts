@@ -1,7 +1,7 @@
 import { types } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
-import { DEFAULT_BUDGET, check, sha256 } from '../contracts.ts';
+import { DEFAULT_BUDGET, check, sha256, sourceEventId } from '../contracts.ts';
 import type { SourceAck } from '../contracts.ts';
 import type { Activity, BoundFile, ProbeStore } from '../store/probe-store.ts';
 import { freezeRequestPayload } from '../store/request-ledger.ts';
@@ -187,7 +187,7 @@ export class GuidanceSession {
   }
 
   prepare(targets: GuidanceTarget[]): GuidanceAssembly {
-    return this.#store.withActivity(this.#activity, () => {
+    const prepared = this.#store.withActivity(this.#activity, () => {
       const status = this.#store.requestStatus(this.#activity, this.runId);
       check(status.run.state === 'authorized' && status.run.epoch === this.#activity.epoch, 'run-not-admissible');
       const previous = this.latest();
@@ -267,14 +267,22 @@ export class GuidanceSession {
         snapshot.guidance = [];
       }
       check(fits(), 'guidance-budget-unavailable');
-      if (previous && JSON.stringify({ ...previous.snapshot, cacheEpoch }) === JSON.stringify(snapshot)) return previous;
+      if (previous && JSON.stringify({ ...previous.snapshot, cacheEpoch }) === JSON.stringify(snapshot)) return { existing: previous };
       if (previous && JSON.stringify({ ...previous.snapshot, intent: null, cacheEpoch }) !== JSON.stringify({ ...snapshot, intent: null })) snapshot.cacheEpoch++;
       const payload = JSON.stringify(snapshot);
       check(Buffer.byteLength(payload) + DEFAULT_BUDGET.outputReserve + DEFAULT_BUDGET.safetyMargin <= DEFAULT_BUDGET.contextLimit,
         'guidance-budget-unavailable');
-      const source = this.#archive.append(randomUUID(), payload);
-      check(this.#archive.read(source).text === payload, 'guidance-archive-mismatch');
-      const frozen = freezeRequestPayload(payload);
+      return { payload, snapshot, intent, body, previousId: previous?.assemblyId ?? null };
+    });
+    if (prepared.existing) return prepared.existing;
+    const { payload, snapshot, intent, body, previousId } = prepared;
+    const source = this.#archive.append(sourceEventId('guidance', this.runId, previousId ?? '', sha256(payload)), payload);
+    check(this.#archive.read(source).text === payload, 'guidance-archive-mismatch');
+    const frozen = freezeRequestPayload(payload);
+    return this.#store.withActivity(this.#activity, () => {
+      check((this.latest()?.assemblyId ?? null) === previousId && this.#store.recoverIntent(this.#activity)?.hash === intent.hash
+        && JSON.stringify(this.#store.guidanceMembership(this.#activity, [...new Set(targets.map(target => target.projectId))].sort()))
+          === JSON.stringify(snapshot.membership), 'guidance-session-stale');
       const assembly = this.#store.appendRequestAssembly(this.#activity, {
         runId: this.runId, epoch: this.#activity.epoch, route: 'guidance-acceptance', model: 'none',
         policyHash: GUIDANCE_POLICY_HASH, estimator: 'utf8-bytes-upper-bound@1', sources: [intent.input, source],

@@ -1,12 +1,18 @@
-import { closeSync, fstatSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
+import { closeSync, constants, fstatSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { check, inspectPurgeLines, sameBinding, sha256, uuid, sameFile } from '@euler/core';
-import type { PurgeCarrierSelection, PurgeLineAck, PurgeLinePlan, SourceAck, SourceExcerpt } from '@euler/core';
+import type { PurgeCarrierSelection, PurgeLineAck, PurgeLinePlan, SourceAck, SourceExcerpt, SourceAppend } from '@euler/core';
 import { bindingOf } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
 
 type Gate = <T>(action: () => T) => T;
 interface RawEvent { schema: 'cli-input@1'; eventId: string; role: 'user' | 'assistant' | 'tool'; text: string }
+export interface ArchiveJournal {
+  prepare(input: () => SourceAppend | SourceAck): SourceAppend | SourceAck;
+  pending(): SourceAppend[];
+  acknowledged(eventId: string): SourceAck | null;
+  settle(source: SourceAck): void;
+}
 
 /** Appends one line to a CLI-owned JSONL carrier under a size cap and fsyncs it before returning. */
 export function appendDurably(path: string, line: string, maxBytes: number, carrier: string): void {
@@ -78,23 +84,38 @@ export class CliArchive {
   readonly #sandbox: Sandbox;
   readonly #gate: Gate;
   readonly #path: string;
-  constructor(sandbox: Sandbox, gate: Gate) {
+  readonly #journal: ArchiveJournal | undefined;
+  constructor(sandbox: Sandbox, gate: Gate, journal?: ArchiveJournal) {
+    this.#journal = journal;
     this.#sandbox = sandbox;
     this.#gate = gate;
     this.#path = join(sandbox.root, sandbox.sourceName ?? 'session.jsonl');
   }
 
-  #scan(): { event: RawEvent; ack: SourceAck }[] {
+  #open(flags: string | number): number {
     sameFile(this.#sandbox.root, this.#sandbox.rootIdentity);
     sameFile(this.#path, this.#sandbox.archiveIdentity);
-    const fd = openSync(this.#path, 'r');
+    const fd = openSync(this.#path, flags);
+    try {
+      const stat = fstatSync(fd, { bigint: true }), identity = this.#sandbox.archiveIdentity;
+      check(stat.isFile() && stat.nlink === 1n && String(stat.dev) === identity.dev && String(stat.ino) === identity.ino, 'file-identity-changed');
+      return fd;
+    } catch (error) { closeSync(fd); throw error; }
+  }
+
+  #bytes(): Buffer {
+    const fd = this.#open('r');
     let bytes: Buffer;
     try {
       check(fstatSync(fd).size <= 1_048_576, 'archive-limit');
       bytes = readFileSync(fd);
     } finally { closeSync(fd); }
+    return bytes;
+  }
+
+  #scan(bytes = this.#bytes()): { event: RawEvent; ack: SourceAck }[] {
+    check(bytes.at(-1) === 10, 'archive-integrity: incomplete line');
     const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-    check(text.endsWith('\n'), 'archive-integrity: incomplete line');
     const lines = text.slice(0, -1).split('\n');
     const header = JSON.parse(lines.shift()!);
     check(header.schema === 'cli-session@1' && sameBinding(header.binding, bindingOf(this.#sandbox)), 'archive-binding-mismatch');
@@ -116,40 +137,105 @@ export class CliArchive {
     });
   }
 
-  append(eventId: string, text: string, role: RawEvent['role'] = 'user'): SourceAck {
+  append(eventId: string, text: string | (() => string), role: RawEvent['role'] = 'user'): SourceAck {
     uuid(eventId);
     check(['user', 'assistant', 'tool'].includes(role), 'invalid-source-role');
-    check(typeof text === 'string' && text.length > 0 && Buffer.byteLength(text) <= 65536, 'invalid-input');
-    return this.#gate(() => {
-      const events = this.#scan();
-      const previous = events.find(item => item.event.eventId === eventId);
-      const line = JSON.stringify({ schema: 'cli-input@1', eventId, role, text }) + '\n';
+    check(typeof text === 'function' || typeof text === 'string' && text.length > 0 && Buffer.byteLength(text) <= 65536, 'invalid-input');
+    check(this.#journal, 'archive-journal-required');
+    const prepared = this.#journal.prepare(() => {
+      const pending = this.#journal!.pending()[0];
+      if (pending) {
+        check(pending.eventId === eventId, 'archive-append-pending');
+        const event = JSON.parse(pending.bytes) as RawEvent;
+        check(event.role === role && (typeof text === 'function' || event.text === text), 'identity-conflict');
+        return pending;
+      }
+      const bytes = this.#bytes();
+      const previous = this.#scan(bytes).find(item => item.event.eventId === eventId);
+      const witness = this.#journal!.acknowledged(eventId);
+      check(!witness || previous?.ack.hash === witness.hash, 'archive-integrity: acknowledged bytes changed');
       if (previous) {
-        check(previous.event.text === text && previous.event.role === role, 'identity-conflict');
-      } else appendDurably(this.#path, line, 1_048_576, 'archive');
-      // Also sync a prior append whose acknowledgement may have been lost.
-      const fd = openSync(this.#path, 'r+');
-      try { fsyncSync(fd); } finally { closeSync(fd); }
-      const recovered = this.#scan().find(item => item.event.eventId === eventId);
-      check(recovered?.event.text === text, 'archive-ack-failed');
-      return recovered.ack;
+        check(previous.event.role === role && (typeof text === 'function' || previous.event.text === text), 'identity-conflict');
+        return previous.ack;
+      }
+      // Core's local result and budget mutation commit with this exact-byte reservation.
+      const content = typeof text === 'function' ? text() : text;
+      check(typeof content === 'string' && content.length > 0 && Buffer.byteLength(content) <= 65536, 'invalid-input');
+      const line = JSON.stringify({ schema: 'cli-input@1', eventId, role, text: content }) + '\n';
+      check(bytes.length + Buffer.byteLength(line) <= 1_048_576, 'archive-limit');
+      return { eventId, binding: bindingOf(this.#sandbox), bytes: line, offset: bytes.length, prefixHash: sha256(bytes) };
     });
+    return 'schema' in prepared ? this.#gate(() => this.#syncedAck(eventId, prepared.hash)) : this.#complete(prepared);
+  }
+
+  #complete(pending: SourceAppend): SourceAck {
+    return this.#gate(() => {
+      check(this.#journal && sameBinding(pending.binding, bindingOf(this.#sandbox)), 'archive-binding-mismatch');
+      const current = this.#journal.pending()[0];
+      const lineHash = sha256(pending.bytes.slice(0, -1));
+      if (!current) return this.#syncedAck(pending.eventId, lineHash);
+      check(JSON.stringify(current) === JSON.stringify(pending), 'archive-append-pending');
+      const bytes = this.#bytes(), expected = Buffer.from(pending.bytes);
+      check(bytes.length >= pending.offset && sha256(bytes.subarray(0, pending.offset)) === pending.prefixHash,
+        'archive-integrity: append prefix changed');
+      const planned = this.#scan(Buffer.concat([bytes.subarray(0, pending.offset), expected])).at(-1);
+      check(planned?.ack.eventId === pending.eventId && planned.ack.hash === lineHash
+        && pending.offset + expected.length <= 1_048_576, 'archive-append-integrity');
+      const tail = bytes.subarray(pending.offset);
+      check(tail.length <= expected.length && tail.equals(expected.subarray(0, tail.length)), 'archive-integrity: append tail conflict');
+      const fd = this.#open(constants.O_RDWR | constants.O_APPEND);
+      try {
+        check(fstatSync(fd).size === bytes.length, 'archive-integrity: append position changed');
+        let offset = tail.length;
+        while (offset < expected.length) {
+          const written = writeSync(fd, expected, offset, expected.length - offset);
+          check(written > 0, 'archive-write-failed'); offset += written;
+        }
+        fsyncSync(fd);
+      } finally { closeSync(fd); }
+      const ack = this.#verifiedAck(pending.eventId, lineHash);
+      this.#journal.settle(ack);
+      return ack;
+    });
+  }
+
+  #verifiedAck(eventId: string, hash: string): SourceAck {
+    const recovered = this.#scan().find(item => item.event.eventId === eventId);
+    check(recovered?.ack.hash === hash, 'archive-ack-failed');
+    return recovered.ack;
+  }
+
+  #syncedAck(eventId: string, hash: string): SourceAck {
+    const fd = this.#open('r+');
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+    return this.#verifiedAck(eventId, hash);
+  }
+
+  /** Complete only durably reserved bytes; this never repeats a model or tool operation. */
+  reconcile(): SourceAck[] {
+    check(this.#journal, 'archive-journal-required');
+    const acknowledgements = this.#journal.pending().map(pending => this.#complete(pending));
+    this.#gate(() => this.#scan());
+    return acknowledgements;
   }
 
   lookup(eventId: string): SourceAck | null {
     uuid(eventId);
+    const pending = this.#journal?.pending().find(item => item.eventId === eventId);
+    if (pending) return this.#complete(pending);
     return this.#gate(() => {
       const found = this.#scan().find(item => item.event.eventId === eventId);
+      const witness = this.#journal?.acknowledged(eventId);
+      check(!witness || found?.ack.hash === witness.hash, 'archive-integrity: acknowledged bytes changed');
       if (!found) return null;
-      const fd = openSync(this.#path, 'r+');
-      try { fsyncSync(fd); } finally { closeSync(fd); }
-      return this.#scan().find(item => item.event.eventId === eventId)!.ack;
+      return this.#syncedAck(eventId, found.ack.hash);
     });
   }
 
   read(ref: SourceAck): { text: string; role: RawEvent['role'] } {
     return this.#gate(() => {
       check(sameBinding(ref.binding, bindingOf(this.#sandbox)), 'source-scope-mismatch');
+      check(!this.#journal?.pending().some(item => item.eventId === ref.eventId), 'archive-append-pending');
       const result = this.#scan().find(item => item.event.eventId === ref.eventId);
       check(result && JSON.stringify(result.ack) === JSON.stringify(ref), 'source-evidence-gap');
       return { text: result.event.text, role: result.event.role };
@@ -191,6 +277,10 @@ export class CliArchive {
 
   /** Durable events in archive order, for Host backfill and referent resolution. */
   events(): { role: RawEvent['role']; text: string; ack: SourceAck }[] {
-    return this.#gate(() => this.#scan().map(({ event, ack }) => ({ role: event.role, text: event.text, ack })));
+    return this.#gate(() => {
+      check(!this.#journal?.pending().length, 'archive-append-pending');
+      return this.#scan().map(({ event, ack }) => ({ role: event.role, text: event.text,
+        ack: this.#journal?.acknowledged(event.eventId) ?? ack }));
+    });
   }
 }

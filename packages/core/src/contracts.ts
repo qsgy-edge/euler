@@ -83,6 +83,12 @@ export function sha256(bytes: string | Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+/** A source identity derived from durable operation identities, not transient process state. */
+export function sourceEventId(...identity: string[]): string {
+  const hash = sha256(JSON.stringify(identity));
+  return `${hash.slice(0,8)}-${hash.slice(8,12)}-8${hash.slice(13,16)}-8${hash.slice(17,20)}-${hash.slice(20,32)}`;
+}
+
 export function check(condition: unknown, reason: string): asserts condition {
   if (!condition) throw new Error(reason);
 }

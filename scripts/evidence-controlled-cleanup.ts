@@ -83,7 +83,7 @@ for (const scenario of cases.cases) {
     const complete = await send('cleanup'); assert.equal(complete.status, 'controlled-complete', JSON.stringify(complete));
     assert.equal((await cli.exit).code, 0, cli.stderr());
     assert.deepEqual(db.prepare("SELECT * FROM memory_events WHERE kind='purge-logical-commit'").get(), logicalRow);
-    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 26);
+    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 27);
     assert.equal(db.prepare('PRAGMA quick_check').get()!.quick_check, 'ok');
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     assert.equal(db.prepare('PRAGMA freelist_count').get()!.freelist_count, 0);

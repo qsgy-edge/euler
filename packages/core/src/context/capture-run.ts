@@ -14,7 +14,10 @@ export interface CaptureRoute extends ModelRoute { capability: 'basic' | 'standa
 export type CaptureFailure = 'temporary-unavailable' | 'timeout' | 'rate-limit' | 'protocol' | 'permanent';
 export type CaptureConfig = { proposer: CaptureRoute[]; verifier: CaptureRoute[]; historian?: never }
   | { historian: CaptureRoute[]; proposer?: never; verifier?: never };
-type CaptureSource = HostAdapter['source'] & { append(eventId: string, text: string, role?: 'user' | 'assistant' | 'tool'): SourceAck };
+type CaptureSource = HostAdapter['source'] & {
+  /** Compute local Core changes inside the committed source reservation; never repeat an existing identity. */
+  append(eventId: string, text: string | (() => string), role?: 'user' | 'assistant' | 'tool'): SourceAck;
+};
 type ToolOutput = { schema: 'capture-tool@1'; callId: string; argumentsHash: string;
   executionState: 'not_started' | 'started'; outcome: 'success' | 'failure'; errorClass: string | null; modelResult: string };
 type Phase = 'proposer' | 'verifier' | 'historian';
@@ -141,17 +144,19 @@ export class CaptureRun {
     if (this.#prepared) return this.#prepared.request;
     const runtime = this.#store.captureRuntime(this.#lease);
     const phase = this.#phase;
-    const contextSteps = this.#steps().filter(step => step.phase === phase
+    const phaseSteps = () => this.#steps().filter(step => step.phase === phase
       && (phase !== 'verifier' || step.claimHeadEventId === this.#claimHead));
-    if (phase === 'historian' && contextSteps.some(step => step.kind === 'response' && step.outcome === 'response')) {
-      this.#publishHistorian(contextSteps.find(step => step.kind === 'response' && step.outcome === 'response')!.attemptId);
+    let steps = phaseSteps();
+    if (phase === 'historian' && steps.some(step => step.kind === 'response' && step.outcome === 'response')) {
+      this.#publishHistorian(steps.find(step => step.kind === 'response' && step.outcome === 'response')!.attemptId);
       return null;
     }
-    if (phase === 'verifier') for (const response of contextSteps.filter(step => step.kind === 'response' && step.outcome === 'response')) {
+    if (phase === 'verifier') for (const response of steps.filter(step => step.kind === 'response' && step.outcome === 'response')) {
       const reply = JSON.parse(this.#store.readCaptureOutput(this.#lease, response.source).text) as ModelReply;
-      if (!this.#store.withActivity(this.#lease.activity, () => this.#sourceTools(response, reply.calls))) return null;
+      const missing = reply.calls.some(call => !steps.some(step => step.kind === 'tool' && step.attemptId === response.attemptId && step.callId === call.id));
+      if (!this.#sourceTools(response, reply.calls)) return null;
+      if (missing) steps = phaseSteps();
     }
-    const steps = contextSteps;
     const ordinal = steps.filter(step => step.kind === 'response' && step.outcome !== 'response').length;
     const route = this.#config[phase]![ordinal];
     if (!route) { this.#store.stopCapture(this.#lease, 'blocked', 'fallback-exhausted'); return null; }
@@ -313,9 +318,9 @@ export class CaptureRun {
     this.#inflight = null;
     if (applied && inflight.phase === 'historian' && this.status().stage === 'proposing') this.#publishHistorian(attemptId);
     // A complete, durably archived response is required before any source tool executes.
-    if (applied && calls.length) this.#store.withActivity(this.#lease.activity, () => this.#sourceTools({
+    if (applied && calls.length) this.#sourceTools({
       phase: inflight.phase, route: inflight.route, kind: 'response', source, attemptId,
-      fallbackOrdinal: inflight.ordinal, outcome, callId: null }, calls));
+      fallbackOrdinal: inflight.ordinal, outcome, callId: null }, calls);
   }
 
   #publishHistorian(attemptId: string): void {
@@ -345,10 +350,7 @@ export class CaptureRun {
       const eventId = `${outputId.slice(0,8)}-${outputId.slice(8,12)}-4${outputId.slice(13,16)}-8${outputId.slice(17,20)}-${outputId.slice(20,32)}`;
       let source = this.#source.lookup(eventId);
       const argumentsHash = sha256(JSON.stringify(call.arguments));
-      if (source) {
-        const stored = JSON.parse(this.#source.read(source).text) as ToolOutput;
-        check(stored.schema === 'capture-tool@1' && stored.callId === call.id && stored.argumentsHash === argumentsHash, 'capture-tool-identity-conflict');
-      } else {
+      if (!source) source = this.#source.append(eventId, () => {
         const output: ToolOutput = { schema: 'capture-tool@1', callId: call.id, argumentsHash,
           executionState: 'not_started', outcome: 'failure', errorClass: null, modelResult: '' };
         try {
@@ -368,10 +370,16 @@ export class CaptureRun {
           output.errorClass = error instanceof Error && /^[a-z][a-z0-9-]{1,80}$/.test(error.message) ? error.message : 'source-unavailable';
           output.modelResult = JSON.stringify({ unavailable: output.errorClass });
         }
-        source = this.#source.append(eventId, JSON.stringify(output), 'tool');
-      }
-      this.#store.recordCaptureStep(this.#lease, { phase: step.phase, kind: 'tool', source, attemptId: step.attemptId, route: step.route,
-        fallbackOrdinal: step.fallbackOrdinal, configHash: this.#configHash, inputHash, outcome: 'response', callId: call.id });
+        return JSON.stringify(output);
+      }, 'tool');
+      const stored = JSON.parse(this.#source.read(source).text) as ToolOutput;
+      check(stored.schema === 'capture-tool@1' && stored.callId === call.id && stored.argumentsHash === argumentsHash, 'capture-tool-identity-conflict');
+      this.#store.withActivity(this.#lease.activity, () => {
+        this.#store.captureRuntime(this.#lease);
+        this.#store.recordCaptureStep(this.#lease, { phase: step.phase, kind: 'tool', source, attemptId: step.attemptId, route: step.route,
+          fallbackOrdinal: step.fallbackOrdinal, configHash: this.#configHash, inputHash, outcome: 'response', callId: call.id });
+      });
+      if (!this.#acceptResult()) return false;
     }
     return true;
   }
