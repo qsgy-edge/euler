@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
-import { API_VERSION, check, sha256, validateBudget } from '../contracts.ts';
+import { API_VERSION, check, sha256, sourceEventId, validateBudget } from '../contracts.ts';
 import type { Binding, HostAdapter, ProbeBudget, SourceAck } from '../contracts.ts';
 import type { Activity, ProbeStore } from '../store/probe-store.ts';
 import type { RequestAttempt, RequestRecovery, RequestAssemblyInput } from '../store/request-ledger.ts';
@@ -452,7 +452,7 @@ export class AgentRun {
     });
     check(new Set(calls.map(call => call.id)).size === calls.length && calls.every(call => !this.#calls.has(call.id)), 'duplicate-tool-call');
     // Whitelist data fields: provider metadata can never register capabilities.
-    const source = this.#appendOutput(JSON.stringify({ text: reply.text, calls, stop: reply.stop }), 'assistant');
+    const source = this.#appendOutput(attemptId, JSON.stringify({ text: reply.text, calls, stop: reply.stop }), 'assistant');
     this.#store.withActivity(this.#activity, () => {
       this.#store.finishRequestAttempt(this.#activity, { attemptId, outcome: 'received', usage: { count: 1, finishReason: reply.stop,
         ...(reply.usage ? { inputTokens: reply.usage.input, outputTokens: reply.usage.output } : {}),
@@ -496,7 +496,7 @@ export class AgentRun {
       if (this.#inflight && !this.#sent) this.#store.finishRequestAttempt(this.#activity, { attemptId: this.#inflight, outcome: 'cancelled-before-send' });
       for (const tool of this.status().tools.filter(tool => !tool.result)) {
         this.#result(tool.callId, tool.started ? 'unknown' : terminal === 'deadline' ? 'timeout' : 'cancelled',
-          tool.started ? 'Completion unknown; an effect may have occurred.' : 'Not started.', terminal);
+          tool.started ? 'Completion unknown; an effect may have occurred.' : 'Not started.', terminal, undefined, 'termination');
       }
       this.#terminal(terminal);
     } finally { this.#abort.abort(); }
@@ -562,9 +562,9 @@ export class AgentRun {
     check(target.path === join(capability.root.path, ...parts)
       && target.parent.path === join(capability.root.path, ...parts.slice(0, -1)), 'file-target-mismatch');
     const intent = this.#store.readIntent(this.#activity)!;
-    const token = randomUUID();
+    const token = sourceEventId('file-presentation', this.runId, callId);
     const presentation = { token, callId, path: target.path, existingIdentity: target.identity, content: String(call.arguments.content ?? '') };
-    const source = this.#appendOutput(JSON.stringify({ kind: 'file-presentation', ...presentation }), 'tool');
+    const source = this.#appendOutput(token, JSON.stringify({ kind: 'file-presentation', ...presentation }), 'tool');
     this.#event({ kind: 'file-prepared', admission: { callId, presentationId: token, capabilityHash: sha256(JSON.stringify(capability)),
       intentEventId: intent.eventId, intentHash: intent.hash, epoch: this.#activity.epoch,
       operation: call.name as 'file.read' | 'file.write', rawPath: String(call.arguments.path), parts,
@@ -578,7 +578,7 @@ export class AgentRun {
       && this.#host.source.read(file.admission.source).text === JSON.stringify({ kind: 'file-presentation', ...presentation }), 'file-approval-mismatch');
     check(['approved', 'rejected', 'unavailable'].includes(decision), 'file-approval-invalid');
     if (decision !== 'approved') { this.rejectFile(presentation.callId, `file-approval-${decision}`); return; }
-    const source = this.#host.source.append(randomUUID(), JSON.stringify({ kind: 'file-owner-approval', token: presentation.token,
+    const source = this.#host.source.append(sourceEventId('file-approval', presentation.token), JSON.stringify({ kind: 'file-owner-approval', token: presentation.token,
       callId: presentation.callId, ownerId: this.#host.binding.ownerId, decision }), 'user');
     this.#event({ kind: 'file-approved', callId: presentation.callId, presentationId: presentation.token, source });
   }
@@ -591,7 +591,7 @@ export class AgentRun {
   finishFileFailure(callId: string, reason: FileFailureReason): void {
     check(['file-output-too-large', 'file-invalid-utf8', 'file-create-conflict', 'file-create-denied'].includes(reason), 'file-failure-evidence-invalid');
     if (this.status().terminal) {
-      const source = this.#appendOutput(JSON.stringify({ callId, failureReason: reason }), 'tool');
+      const source = this.#appendOutput(sourceEventId('file-reconciliation', this.runId, callId), JSON.stringify({ callId, failureReason: reason }), 'tool');
       this.#event({ kind: 'file-reconciled', callId, source, failureReason: reason });
     } else this.#result(callId, 'failure', reason, reason);
   }
@@ -602,7 +602,7 @@ export class AgentRun {
       && (!file.admission.target.identity || JSON.stringify(file.admission.target.identity) === JSON.stringify(receipt.identity)), 'file-receipt-mismatch');
     const text = JSON.stringify(receipt);
     if (this.status().terminal) {
-      const source = this.#appendOutput(text, 'tool');
+      const source = this.#appendOutput(sourceEventId('file-reconciliation', this.runId, callId), text, 'tool');
       this.#event({ kind: 'file-reconciled', callId, source, receipt: structuredClone(receipt) });
     } else this.#result(callId, 'success', text, null, receipt);
   }
@@ -610,15 +610,14 @@ export class AgentRun {
     check(typeof modelResult === 'string', 'invalid-tool-result');
     this.#result(callId, outcome, modelResult, outcome === 'failure' ? 'tool-error' : null);
   }
-  #appendOutput(text: string, role: 'assistant' | 'tool'): SourceAck {
-    const eventId = randomUUID();
+  #appendOutput(eventId: string, text: string, role: 'assistant' | 'tool'): SourceAck {
     // Reserve the access dependency before appending bytes, including lost archive acknowledgements.
     if (this.#host.discoveryGrantId) this.#event({ kind: 'source-access', sourceEventId: eventId,
       binding: this.#host.binding, discoveryGrantId: this.#host.discoveryGrantId });
     this.#store.assertDispatchBoundary();
     return this.#host.source.append(eventId, text, role);
   }
-  #result(callId: string, outcome: ToolResult['outcome'], modelResult: string, errorClass: string | null, file?: FileReceipt): void {
+  #result(callId: string, outcome: ToolResult['outcome'], modelResult: string, errorClass: string | null, file?: FileReceipt, kind = 'tool-result'): void {
     const state = this.status();
     check(!state.terminal, 'late-tool-result');
     const tool = state.tools.find(tool => tool.callId === callId);
@@ -633,7 +632,7 @@ export class AgentRun {
       archivedOutcome = 'failure';
       archivedErrorClass = 'tool-result-truncated';
     }
-    const source = this.#appendOutput(encode(archivedResult, archivedOutcome), 'tool');
+    const source = this.#appendOutput(sourceEventId(kind, this.runId, callId), encode(archivedResult, archivedOutcome), 'tool');
     this.#store.withActivity(this.#activity, () => {
       this.#event({ kind: 'tool-result', result: { callId, executionState: tool.started ? 'started' : 'not_started',
         outcome: archivedOutcome, argumentsHash: tool.argumentsHash, errorClass: archivedErrorClass, source, ...(file ? { file: structuredClone(file) } : {}) } });

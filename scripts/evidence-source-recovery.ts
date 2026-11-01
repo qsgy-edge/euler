@@ -552,6 +552,18 @@ focusedSignal = focusedResult.signal;
 focusedPass = focusedResult.status === 0 && focusedResult.signal === null && !focusedResult.error;
 const focusedFinishedAt = new Date().toISOString();
 
+const appendArgs = ['scripts/evidence-archive.ts', join(directory, 'append')];
+const appendStartedAt = new Date().toISOString();
+const appendProcess = spawnSync(process.execPath, appendArgs, { cwd: repo, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+writeFileSync(join(directory, 'append-stdout.txt'), String(appendProcess.stdout ?? ''));
+writeFileSync(join(directory, 'append-stderr.txt'), String(appendProcess.stderr ?? ''));
+const appendPass = appendProcess.status === 0 && !appendProcess.error && appendProcess.signal === null
+  && JSON.parse(readFileSync(join(directory, 'append', 'receipt.json'), 'utf8')).status === 'pass';
+processes.push({ command: process.execPath, args: appendArgs, cwd: repo, startedAt: appendStartedAt,
+  finishedAt: new Date().toISOString(), code: appendProcess.status, signal: appendProcess.signal,
+  stdout: { path: 'append-stdout.txt', sha256: sha256(String(appendProcess.stdout ?? '')) },
+  stderr: { path: 'append-stderr.txt', sha256: sha256(String(appendProcess.stderr ?? '')) } });
+
 const sourceObservation = observations.source as { acknowledgement?: unknown; recoveredAck?: unknown; localStatus?: string;
   unitId?: string; replayedUnitId?: string; excerpt?: { text?: string }; unapprovedDenied?: boolean; rawDenied?: boolean;
   revoked?: boolean } | undefined;
@@ -572,12 +584,12 @@ const assertions = [
   { name: 'assembly inspect reports the frozen used snapshots', passed: !scenarioError && assemblyObservation?.state === 'finished'
       && assemblyObservation.usedSourceIds?.length === 1 && (assemblyObservation.usedMemory?.length ?? 0) === 1 },
   { name: 'focused T11 tests pass', passed: focusedPass },
+  { name: 'unknown/torn append and pending projection restart evidence passes', passed: appendPass },
 ].map(assertion => assertion.passed ? assertion : { ...assertion, error: scenarioError ?? 'assertion failed' });
 
 const runtimeStatus: 'pass' | 'fail' = !scenarioError && focusedPass && rawValidation.status === 'pass'
   && assertions.every(assertion => assertion.passed) ? 'pass' : 'fail';
 const evidenceGaps = [
-  'Unknown append outcomes and archive-flushed/pending-job restart fault injection remain unverified',
   'Real provider/Host consumers and authenticated owner UI remain unverified',
   'Report/proposal generation and export remain T13/T18 work',
   'Production schema migration and backup/purge remain outside T11',
@@ -641,7 +653,7 @@ const output = {
     database: databaseArtifacts, sidecars: sidecarArtifacts },
   independentValidation: { method: 'raw fixture/archive/SQLite recomputation and node:crypto; no Core replay or reported verdict',
     verifier: { path: 'scripts/evidence-source-recovery.ts', sha256: sha256(readFileSync(new URL('./evidence-source-recovery.ts', import.meta.url))) }, status: rawValidation.status },
-  rawValidation, observations: receiptObservations, scenarioError, focusedPass, status,
+  rawValidation, appendEvidence: { path: 'append/receipt.json', passed: appendPass }, observations: receiptObservations, scenarioError, focusedPass, status,
   exit: { code: exitCode, signal: null as string | null }, evidenceGaps, receiptError: null as string | null,
 };
 function validateReceipt(receipt: typeof output) {

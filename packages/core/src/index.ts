@@ -33,5 +33,5 @@ export type {
   MemoryScope, MemoryCaptureOptions, MemoryRecord, MemoryOperation, MemoryPromotion, MemoryComparison, CaptureJob, CaptureLease, ProposedMemory, CaptureVerification, ConflictOperation, RememberRequest, RememberVerification, RememberResult, HostInfo, HostInfoDelivery, HostInfoView,
   MemoryChange, MemoryPresentation, MemoryOperationResult, OwnerReceipt, ActivationBatch,
   EvolutionProposalInput, EvolutionProposal, SearchTarget, MemoryDiscoveryApproval, SearchRequest, SearchResult, SearchPage, SearchProjectionReceipt,
-  SourceUnitInput, SourceUnit, SourceSearchRequest, SourceSearchHit, SourceSearchPage, SourceExpandRequest, SourceUnitExcerpt,
+  SourceAppend, SourceUnitInput, SourceUnit, SourceSearchRequest, SourceSearchHit, SourceSearchPage, SourceExpandRequest, SourceUnitExcerpt,
 } from './store/probe-store.ts';

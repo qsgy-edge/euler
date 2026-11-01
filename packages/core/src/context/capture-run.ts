@@ -149,7 +149,7 @@ export class CaptureRun {
     }
     if (phase === 'verifier') for (const response of contextSteps.filter(step => step.kind === 'response' && step.outcome === 'response')) {
       const reply = JSON.parse(this.#store.readCaptureOutput(this.#lease, response.source).text) as ModelReply;
-      if (!this.#store.withActivity(this.#lease.activity, () => this.#sourceTools(response, reply.calls))) return null;
+      if (!this.#sourceTools(response, reply.calls)) return null;
     }
     const steps = contextSteps;
     const ordinal = steps.filter(step => step.kind === 'response' && step.outcome !== 'response').length;
@@ -313,9 +313,9 @@ export class CaptureRun {
     this.#inflight = null;
     if (applied && inflight.phase === 'historian' && this.status().stage === 'proposing') this.#publishHistorian(attemptId);
     // A complete, durably archived response is required before any source tool executes.
-    if (applied && calls.length) this.#store.withActivity(this.#lease.activity, () => this.#sourceTools({
+    if (applied && calls.length) this.#sourceTools({
       phase: inflight.phase, route: inflight.route, kind: 'response', source, attemptId,
-      fallbackOrdinal: inflight.ordinal, outcome, callId: null }, calls));
+      fallbackOrdinal: inflight.ordinal, outcome, callId: null }, calls);
   }
 
   #publishHistorian(attemptId: string): void {
@@ -370,8 +370,12 @@ export class CaptureRun {
         }
         source = this.#source.append(eventId, JSON.stringify(output), 'tool');
       }
-      this.#store.recordCaptureStep(this.#lease, { phase: step.phase, kind: 'tool', source, attemptId: step.attemptId, route: step.route,
-        fallbackOrdinal: step.fallbackOrdinal, configHash: this.#configHash, inputHash, outcome: 'response', callId: call.id });
+      this.#store.withActivity(this.#lease.activity, () => {
+        this.#store.captureRuntime(this.#lease);
+        this.#store.recordCaptureStep(this.#lease, { phase: step.phase, kind: 'tool', source, attemptId: step.attemptId, route: step.route,
+          fallbackOrdinal: step.fallbackOrdinal, configHash: this.#configHash, inputHash, outcome: 'response', callId: call.id });
+      });
+      if (!this.#acceptResult()) return false;
     }
     return true;
   }

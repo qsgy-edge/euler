@@ -3,6 +3,7 @@ import { openSync, closeSync, readFileSync, writeSync, fsyncSync } from 'node:fs
 import { API_VERSION, DEFAULT_BUDGET, ProbeSession, ProbeStore, sha256, validateBudget, check, sameFile } from '@euler/core';
 import type { Activity, Binding, SourceAck, ExecutionOwner, ProbeBudget, PurgeCarrierSelection, PurgeLineAck, PurgeLinePlan, RequestRecovery, RequestAttempt, RequestReconciliation } from '@euler/core';
 import { CliArchive, preparePurgeLines, purgeLines } from './archive.ts';
+import type { ArchiveJournal } from './archive.ts';
 import { bindingOf, openSandbox, resourcesOf } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
 
@@ -88,14 +89,18 @@ export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET
       store = new ProbeStore({ ...resourcesOf(sandbox), source }, sandbox.storeId, binding, false, readSource, sandbox.appId, queryRequest);
     } catch (error) { try { store.close(); } catch {} throw error; }
   }
-  function archiveFor(sourceBinding: Binding, gate: <T>(action: () => T) => T): CliArchive {
+  function archiveFor(sourceBinding: Binding, gate: <T>(action: () => T) => T, journal?: ArchiveJournal): CliArchive {
     const source = store.sessionSource(sourceBinding);
     return new CliArchive({ ...sandbox, sourceName: basename(source.path), archiveIdentity: source.identity,
-      fixture: { ...sandbox.fixture, ...sourceBinding } }, gate);
+      fixture: { ...sandbox.fixture, ...sourceBinding } }, gate, journal);
   }
   try {
     activity = typeof registration === 'string' ? store.claimChild(registration) : store.register(registration);
-    const archive = archiveFor(binding, action => store.withActivity(activity, action));
+    const archive = archiveFor(binding, action => store.withActivity(activity, action), {
+      prepare: input => store.prepareSourceAppend(activity, input),
+      pending: () => store.sourceAppends(activity),
+      settle: source => store.settleSourceAppend(activity, source),
+    });
     let session: ProbeSession | undefined = diagnosticsOnly ? undefined
       : new ProbeSession(store, activity, { version: API_VERSION, binding, source: archive, transport }, budget, recovery);
     return { store, activity, archive, transport,

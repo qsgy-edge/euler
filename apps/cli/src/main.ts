@@ -241,13 +241,13 @@ async function main() {
   const command = args.positionals[0] ?? 'success';
   const requestCommands = ['request-status', 'request-seal', 'request-reconcile', 'request-resume', 'request-gap'];
   const snapshotCommands = ['backup', 'backups', 'restore-snapshot', 'recovery-new-session'];
-  check([...snapshotCommands, ...requestCommands, 'purge', 'historian', 'historian-drain', 'context', 'capture-drain', 'capture-status', 'capture-reconcile', 'handoff', 'capture', 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
+  check([...snapshotCommands, ...requestCommands, 'archive-reconcile', 'purge', 'historian', 'historian-drain', 'context', 'capture-drain', 'capture-status', 'capture-reconcile', 'handoff', 'capture', 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');
   const options = args.values.budget ? JSON.parse(args.values.budget) as Partial<ProbeBudget> : {};
   check(!args.values['wait-child-launch'] || command === 'hold', 'hold-only-option');
   check(Object.keys(options).every(key => key in DEFAULT_BUDGET), 'invalid-budget');
   const budget = { ...DEFAULT_BUDGET, ...options };
   if (['run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'remember', 'info', 'hold', 'task', 'maintain', 'maintenance-status'].includes(command)) check(args.values.sandbox, 'sandbox-required');
-  if (snapshotCommands.includes(command)) check(args.values.sandbox, 'sandbox-required');
+  if (snapshotCommands.includes(command) || command === 'archive-reconcile') check(args.values.sandbox, 'sandbox-required');
   if (command === 'purge') check(args.values.sandbox, 'purge-sandbox-required');
   if (command === 'restore-snapshot') check(args.values.snapshot, 'snapshot-required');
   if (['historian-drain','capture-drain','capture-status','capture-reconcile'].includes(command)) check(args.values.sandbox, 'sandbox-required');
@@ -260,6 +260,12 @@ async function main() {
   if (command === 'archive-failure' || args.values.scenario === 'archive-failure') check(!args.values.sandbox, 'fault-requires-fresh-sandbox');
   const sandbox = args.values.sandbox ? openSandbox(args.values.sandbox) : createSandbox();
   emit('sandbox', { root: sandbox.root, storeId: sandbox.storeId, fixtureDigest: sandbox.fixtureDigest, mode: 'synthetic-only' });
+  if (command === 'archive-reconcile') {
+    const probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
+    try { emit('archive-reconciled', { sources: probe.archive.reconcile(), sends: probe.transport.count }); }
+    finally { probe.close(); }
+    return;
+  }
   if (command === 'backup') { emit('backup-result', await backupSandbox(sandbox)); return; }
   if (command === 'backups') { emit('backups', { snapshots: listSandboxBackups(sandbox) }); return; }
   if (command === 'restore-snapshot') { emit('snapshot-restored', await restoreSandboxSnapshot(sandbox, args.values.snapshot!)); return; }

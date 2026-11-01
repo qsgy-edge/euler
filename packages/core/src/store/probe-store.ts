@@ -150,6 +150,9 @@ export interface MemoryDiscoveryApproval {
   schema: 'memory-discovery-approval@1'; intentId: string; goalEventId: string;
   projectIds: string[]; targets: Record<string, SearchTarget>; maxResults: number; maxBytes: number;
 }
+export interface SourceAppend {
+  eventId: string; binding: Binding; bytes: string; offset: number; prefixHash: string;
+}
 export interface SourceUnitInput {
   ref: SourceAck; kind: 'source' | 'report-section' | 'handoff'; projectId: string;
   offset: number; length: number; supersedes?: string; approval: SourceAck;
@@ -233,7 +236,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=26), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=27), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -612,6 +615,11 @@ CREATE TABLE host_info_batches (
     OR (delivery='delivered' AND entry_id IS NOT NULL AND entry_hash IS NOT NULL AND delivered_at IS NOT NULL)),
   CHECK((read_state='unread' AND read_at IS NULL) OR (read_state='read' AND read_at IS NOT NULL AND delivery='delivered'))
 ) STRICT;
+CREATE TABLE source_appends (
+  source_owner TEXT PRIMARY KEY REFERENCES sessions(session_id), source_event_id TEXT NOT NULL,
+  payload TEXT NOT NULL, payload_hash TEXT NOT NULL
+) STRICT;
+CREATE TRIGGER immutable_source_appends_update BEFORE UPDATE ON source_appends BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TABLE source_units (
   unit_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(project_id),
   source_owner TEXT NOT NULL REFERENCES sessions(session_id), source_event_id TEXT NOT NULL,
@@ -738,15 +746,15 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=26;
+PRAGMA user_version=27;
 ` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts','store_recovery_events','store_recovered_owners'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} ${['request_events','execution_events','execution_streams','store_recovery_events'].includes(table) ? 'WHEN euler_purge_writer()!=1 ' : ''}BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 `).join('') + ['memory_heads','intent_heads','owner_fences','host_operation_delivery','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
-  'verification_runs','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_units','source_query_receipts','host_info_batches','capture_work','compartments','store_snapshots','store_restores','store_recovery_events','store_recovered_owners'].map(table => `
+  'verification_runs','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_appends','source_units','source_query_receipts','host_info_batches','capture_work','compartments','store_snapshots','store_restores','store_recovery_events','store_recovered_owners'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
-`).join('') + ['memory_heads','intent_heads','owner_fences','host_operation_delivery','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts','source_projection_jobs','host_info_batches','capture_work','store_snapshots','store_restores'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
+`).join('') + ['memory_heads','intent_heads','owner_fences','host_operation_delivery','memory_discovery_grants','host_presentations','pending_operations','owner_activities','maintenance_residuals','request_runs','request_assemblies','request_attempts','source_appends','source_projection_jobs','host_info_batches','capture_work','store_snapshots','store_restores'].flatMap(table => ['UPDATE','DELETE'].map(operation => `
 CREATE TRIGGER owned_${table}_${operation.toLowerCase()} BEFORE ${operation} ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
 `)).join('') + `
@@ -814,15 +822,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,26,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,27,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 26, 'unsupported-probe-schema');
+        check(version === 27, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 26 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 27 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -1293,6 +1301,52 @@ export class ProbeStore {
       .get(binding.sessionId, binding.branchId, this.#storeId, binding.ownerId, binding.hostId, binding.projectId);
     check(row, 'store-binding-mismatch');
     return { path: String(row.source_path), identity: { dev: String(row.source_dev), ino: String(row.source_ino) } };
+  }
+
+  /** Reserve the Host's exact bytes in a committed transaction before any carrier write. */
+  prepareSourceAppend(activity: Activity, prepare: () => SourceAppend | SourceAck): SourceAppend | SourceAck {
+    check(this.#depth === 0, 'archive-append-in-transaction');
+    return this.withActivity(activity, () => {
+      this.#assertStreamNotRecovered(activity.streamId);
+      const input = prepare();
+      if ('schema' in input) return input;
+      uuid(input.eventId);
+      check(sameBinding(input.binding, this.#binding) && typeof input.bytes === 'string'
+        && Buffer.byteLength(input.bytes) <= 1_048_576 && input.bytes.endsWith('\n')
+        && Number.isSafeInteger(input.offset) && input.offset > 0 && /^[a-f0-9]{64}$/.test(input.prefixHash), 'invalid-source-append');
+      const pending = this.sourceAppends(activity);
+      const payload = JSON.stringify(input);
+      if (pending.length) {
+        check(JSON.stringify(pending[0]) === payload, 'archive-append-pending');
+        return structuredClone(input);
+      }
+      this.#db.prepare('INSERT INTO source_appends VALUES (?,?,?,?)')
+        .run(input.binding.sessionId, input.eventId, payload, sha256(payload));
+      return structuredClone(input);
+    });
+  }
+
+  sourceAppends(activity: Activity): SourceAppend[] {
+    return this.withActivity(activity, () => this.#db.prepare('SELECT * FROM source_appends WHERE source_owner=?')
+      .all(this.#binding.sessionId).map(row => {
+        check(sha256(String(row.payload)) === row.payload_hash, 'archive-append-integrity');
+        const input = JSON.parse(String(row.payload)) as SourceAppend;
+        check(input.eventId === row.source_event_id && sameBinding(input.binding, this.#binding), 'archive-append-integrity');
+        return input;
+      }));
+  }
+
+  settleSourceAppend(activity: Activity, source: SourceAck): void {
+    this.withActivity(activity, () => {
+      this.#assertStreamNotRecovered(activity.streamId);
+      check(sameBinding(source.binding, this.#binding), 'source-scope-mismatch');
+      const pending = this.sourceAppends(activity).find(item => item.eventId === source.eventId);
+      check(pending && source.hash === sha256(pending.bytes.slice(0, -1))
+        && source.byteLength === Buffer.byteLength(pending.bytes) - 1, 'archive-ack-failed');
+      this.#db.prepare('DELETE FROM source_appends WHERE source_owner=? AND source_event_id=?')
+        .run(source.binding.sessionId, source.eventId);
+      this.#archiveRef(source);
+    });
   }
 
   #verifyResources(): void {
@@ -5671,6 +5725,8 @@ export class ProbeStore {
     const source = this.sessionSource(ref.binding);
     sameFile(source.path, source.identity);
     uuid(ref.eventId);
+    check(!this.#db.prepare('SELECT 1 FROM source_appends WHERE source_owner=? AND source_event_id=?')
+      .get(ref.binding.sessionId, ref.eventId), 'archive-append-pending');
     check(/^[0-9a-f]{64}$/i.test(ref.hash) && /^[0-9a-f]{64}$/i.test(ref.contentHash)
       && typeof ref.locator === 'string' && ref.locator.length > 0
       && Number.isSafeInteger(ref.byteLength) && ref.byteLength > 0, 'invalid-source-ref');
@@ -6117,6 +6173,7 @@ export class ProbeStore {
 
   auditStore(owner: Activity | string): void {
     const inspect = () => {
+      check(!this.#db.prepare('SELECT 1 FROM source_appends LIMIT 1').get(), 'archive-append-pending');
       try { return { health: this.#checkStoreIntegrity(), failure: null }; }
       catch (failure) { return { health: null, failure }; }
     };
@@ -6174,6 +6231,7 @@ export class ProbeStore {
         return { skipped: 'daily-limit' as const };
       }
       check(['daily','migration'].includes(kind), 'invalid-snapshot-kind');
+      check(!this.#db.prepare('SELECT 1 FROM source_appends LIMIT 1').get(), 'archive-append-pending');
       check(this.#checkStoreIntegrity() === 'healthy', 'projection-integrity-failed');
       host.validate();
       check(host.files.length === 2 && new Set(host.files.map(item => item.role)).size === 2

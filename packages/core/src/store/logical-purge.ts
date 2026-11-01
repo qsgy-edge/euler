@@ -18,7 +18,7 @@ export const PURGE_DATABASE_INVENTORY = {
     'memory_discovery_targets', 'source_query_receipts', 'memory_records', 'memory_revisions', 'memory_applicability',
     'capture_jobs', 'compartments', 'capture_work', 'provenance_refs', 'memory_heads', 'memory_events',
     'host_presentations', 'presentation_targets', 'pending_operations', 'host_operation_delivery', 'activation_batches',
-    'projection_jobs', 'host_info_batches', 'source_units', 'source_projection_jobs', 'search_documents',
+    'projection_jobs', 'host_info_batches', 'source_appends', 'source_units', 'source_projection_jobs', 'search_documents',
     'search_projection_jobs', 'feedback_events', 'verification_runs', 'conflict_sets', 'conflict_members',
     'evolution_proposals', 'verification_evidence', 'proposal_evidence', 'proposal_source_units'],
   ledger: ['request_runs', 'request_events', 'request_assemblies', 'request_attempts'],

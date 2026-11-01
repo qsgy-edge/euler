@@ -390,6 +390,7 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
   const commands = lines[Symbol.asyncIterator]();
   let capture: ReturnType<typeof scheduleCaptures> | undefined;
   try {
+    probe.archive.reconcile();
     const log = options.hostInfo === 'durable' ? openOwnerInfo(sandbox, probe) : null;
     host = new OwnerMemoryHost(probe, log, (OWNER_SCENARIOS as readonly string[]).includes(options.scenario)
       ? options.scenario as OwnerScenario : 'success', options.noActiveProject);
