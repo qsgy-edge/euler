@@ -34,6 +34,8 @@ Owner corrections use the actual CLI input, complete previews and live approval 
 
 [Controlled cleanup and SQLite completion](docs/implementation/t22b-controlled-cleanup.md) finish the approved purge through the existing source, Host, file and snapshot owners. The `cleanup` command resumes the same operation after interruption, removes sensitive continuation references before SQLite maintenance, and opens a new epoch only with the durable completion receipt. Run `npm run evidence:controlled-cleanup` for per-carrier byte scans, crash continuation and non-resurrection evidence.
 
+[Provider/cache measurement](docs/implementation/t23-provider-measurement.md) records fixed synthetic workload payloads, stable prefix bytes, durable attempts, reported token/cache usage and explicit price schedules. Run `npm run evidence:provider` for loopback HTTP samples; a configured real route requires its own authorization and aggregate budget. Reports preserve failed samples and unavailable metrics.
+
 Full X-card acceptance, real provider dispatch, production schema/host acceptance, migration, and MC cutover remain unverified. CI and host results must be read from the artifact for the specific implementation and platform; this repository is not production-ready.
 
 - [Euler v1 implementation specification](docs/architecture/issues/15-euler-v1-spec.md)

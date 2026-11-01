@@ -8,6 +8,18 @@ import { check, CORE_TOOLS, sha256, validateBudget } from '@euler/core';
 import type { CaptureFailure, CaptureRoute, ModelReply, ModelRequest, NeutralRequest, ProbeBudget } from '@euler/core';
 import type { AuthorizeSend } from './agent-pump.ts';
 
+export type ObservedMetric = number | 'unsupported' | 'unknown';
+export interface TransportObservation {
+  attemptId: string; payloadHash: string; byteLength: number;
+  startedAt: string; finishedAt: string; totalMs: number; firstByteMs: number | 'unknown'; ttftMs: 'unsupported';
+  httpStatus: number | null; responseHash: string | null; actualModelHash: string | 'unknown';
+  tokens: { input: ObservedMetric; output: ObservedMetric; cacheRead: ObservedMetric; cacheWrite: 'unsupported' };
+  outcome: 'received' | 'unknown'; failure: string | null;
+}
+type ResponseObservation = Pick<TransportObservation, 'httpStatus' | 'responseHash' | 'actualModelHash' | 'tokens' | 'firstByteMs'>;
+const observedToken = (value: unknown): ObservedMetric => value === undefined ? 'unsupported'
+  : Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 1_000_000 ? Number(value) : 'unknown';
+
 export function configuredTransport(path: string) {
   const raw = readFileSync(path, 'utf8');
   check(Buffer.byteLength(raw) <= 8192, 'config-too-large');
@@ -27,7 +39,11 @@ export function configuredTransport(path: string) {
     transport: new HttpModelTransport(model, config.budget, () => process.env[config.credentialEnv] ?? '') };
 }
 
-export async function verifyTransportPrerequisites(extraTests: string[] = [], event = 'agent-prerequisites', signal?: AbortSignal): Promise<void> {
+export interface TransportPrerequisites {
+  command: string[]; exitCode: number | null; elapsedMs: number; outputHash: string; passed: boolean;
+}
+export async function verifyTransportPrerequisites(extraTests: string[] = [], event = 'agent-prerequisites', signal?: AbortSignal,
+  observe?: (receipt: TransportPrerequisites) => void): Promise<void> {
   const root = fileURLToPath(new URL('../../../', import.meta.url));
   const tests = ['archive', 'persistence', 'search-projection', 'request-ledger', 'request-recovery', 'request-admission', 'request-ledger-boundaries', 'agent-run', 'agent-boundaries', 'model-transport', ...extraTests]
     .map(name => `apps/cli/test/${name}.test.ts`);
@@ -60,8 +76,10 @@ export async function verifyTransportPrerequisites(extraTests: string[] = [], ev
       elapsedMs: Date.now() - started, stdoutBytes, stderrBytes, reportedTests, lastTestHash }) + '\n'), 10000);
     timer.unref();
   });
-  process.stdout.write(JSON.stringify({ event, command: ['node', ...command], exitCode: result.status, elapsedMs: Date.now() - started,
-    outputHash: sha256((result.stdout ?? '') + (result.stderr ?? '')), passed: result.status === 0 }) + '\n');
+  const receipt = { command: ['node', ...command], exitCode: result.status, elapsedMs: Date.now() - started,
+    outputHash: sha256((result.stdout ?? '') + (result.stderr ?? '')), passed: result.status === 0 };
+  process.stdout.write(JSON.stringify({ event, ...receipt }) + '\n');
+  observe?.(receipt);
   signal?.throwIfAborted();
   check(result.status === 0, 'prerequisite-evidence-gap');
 }
@@ -103,7 +121,32 @@ export class HttpModelTransport {
     return JSON.stringify({ model: this.#model.id, stream: false, max_tokens: this.#budget.outputReserve,
       tools: request.p0.tools.map(tool => ({ type: 'function', function: { name: tool.name.replaceAll('.', '_'), description: tool.description, parameters: tool.parameters } })), messages });
   }
-  async *stream(request: ModelRequest, signal: AbortSignal, authorizeSend: AuthorizeSend): AsyncIterable<{ kind: 'complete'; reply: ModelReply; failure?: CaptureFailure; responseHash?: string }> {
+  async *stream(request: ModelRequest, signal: AbortSignal, authorizeSend: AuthorizeSend,
+    observe?: (observation: TransportObservation) => void): AsyncIterable<{ kind: 'complete'; reply: ModelReply; failure?: CaptureFailure; responseHash?: string }> {
+    let attempt: ReturnType<AuthorizeSend> | undefined, started = 0, startedAt = '', recorded = false;
+    const response: ResponseObservation = { httpStatus: null, responseHash: null, actualModelHash: 'unknown', firstByteMs: 'unknown',
+      tokens: { input: 'unknown', output: 'unknown', cacheRead: 'unknown', cacheWrite: 'unsupported' } };
+    const record = (outcome: TransportObservation['outcome'], failure: string | null) => {
+      if (!attempt || recorded) return;
+      recorded = true;
+      observe?.({ attemptId: attempt.attemptId, payloadHash: request.payloadHash, byteLength: Buffer.byteLength(request.payload),
+        startedAt, finishedAt: new Date().toISOString(), totalMs: performance.now() - started, ttftMs: 'unsupported',
+        ...structuredClone(response), outcome, failure });
+    };
+    try {
+      for await (const event of this.#receive(request, signal, payload => {
+        attempt = authorizeSend(payload); started = performance.now(); startedAt = new Date().toISOString(); return attempt;
+      }, response, () => performance.now() - started)) {
+        record('received', event.failure ?? null);
+        yield event;
+      }
+    } catch (error) {
+      record('unknown', error instanceof Error ? sha256(error.message) : 'unknown');
+      throw error;
+    }
+  }
+  async *#receive(request: ModelRequest, signal: AbortSignal, authorizeSend: AuthorizeSend,
+    observation: ResponseObservation, elapsed: () => number): AsyncIterable<{ kind: 'complete'; reply: ModelReply; failure?: CaptureFailure; responseHash?: string }> {
     const credential = this.#credential();
     check(typeof credential === 'string' && credential.length > 0 && credential.length <= 8192 && !/[\r\n]/.test(credential), 'credential-unavailable');
     const payload = request.payload; // primitive, immutable final bytes
@@ -114,8 +157,10 @@ export class HttpModelTransport {
         const send = this.#url.protocol === 'https:' ? httpsRequest : httpRequest;
         const outgoing = send(this.#url, { method: 'POST', agent: false, signal,
           headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), authorization: `Bearer ${credential}` } }, response => {
+          observation.httpStatus = response.statusCode ?? null;
           const chunks: Buffer[] = []; let length = 0;
           response.on('data', (chunk: Buffer) => {
+            if (observation.firstByteMs === 'unknown') observation.firstByteMs = elapsed();
             length += chunk.length;
             if (length > 65536) { response.destroy(new Error('response-limit')); return; }
             chunks.push(chunk);
@@ -132,6 +177,7 @@ export class HttpModelTransport {
       } catch (error) { reject(error); }
     });
     const responseHash = sha256(received.body);
+    observation.responseHash = responseHash;
     if (received.status !== 200) {
       const failure: CaptureFailure = received.status === 429 ? 'rate-limit' : received.status === 408 ? 'timeout'
         : received.status >= 500 ? 'temporary-unavailable' : 'permanent';
@@ -147,12 +193,16 @@ export class HttpModelTransport {
     let reply: ModelReply, failure: CaptureFailure | undefined;
     let usage: ModelReply['usage'], modelHash: string | undefined, responseText: string | undefined;
     try {
-      const data = JSON.parse(body) as { model?: unknown; usage?: { prompt_tokens?: unknown; completion_tokens?: unknown }; choices?: { finish_reason?: string; message?: { role?: string; content?: unknown; tool_calls?: unknown } }[] };
+      const data = JSON.parse(body) as { model?: unknown; usage?: { prompt_tokens?: unknown; completion_tokens?: unknown; prompt_tokens_details?: { cached_tokens?: unknown } }; choices?: { finish_reason?: string; message?: { role?: string; content?: unknown; tool_calls?: unknown } }[] };
       check(data && typeof data === 'object', 'invalid-provider-response');
       const observedUsage = data.usage;
-      if (observedUsage && [observedUsage.prompt_tokens, observedUsage.completion_tokens].every(value => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 1_000_000))
-        usage = { input: Number(observedUsage.prompt_tokens), output: Number(observedUsage.completion_tokens) };
+      const input = observedToken(observedUsage?.prompt_tokens), output = observedToken(observedUsage?.completion_tokens);
+      const cacheRead = observedToken(observedUsage?.prompt_tokens_details?.cached_tokens);
+      observation.tokens = { input, output, cacheWrite: 'unsupported',
+        cacheRead: typeof cacheRead === 'number' && (typeof input !== 'number' || cacheRead > input) ? 'unknown' : cacheRead };
+      if (typeof input === 'number' && typeof output === 'number') usage = { input, output };
       if (typeof data.model === 'string' && data.model.length <= 256) modelHash = sha256(data.model);
+      observation.actualModelHash = modelHash ?? 'unknown';
       check(Array.isArray(data.choices) && data.choices.length === 1 && data.choices[0], 'invalid-provider-response');
       const choice = data.choices[0]!, message = choice.message;
       check(message?.role === 'assistant' && (message.content === null || typeof message.content === 'string'), 'invalid-provider-message');

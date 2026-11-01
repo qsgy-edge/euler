@@ -1,0 +1,8 @@
+{
+  "schema": "provider-workload@1",
+  "conditions": ["initial", "repeat", "p3-change", "fresh-window"],
+  "goal": "Synthetic measurement only. Call controlled.echo with text T23-ECHO-1. After its result, call controlled.echo with text T23-ECHO-2. After the second result, reply with exactly T23-OK and no tool calls. Do not call any other tools.",
+  "changedTail": " Fixture variant B; the required calls and final answer are unchanged.",
+  "echoes": ["T23-ECHO-1", "T23-ECHO-2"],
+  "answer": "T23-OK"
+}

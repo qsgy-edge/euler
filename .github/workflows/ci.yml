@@ -96,9 +96,13 @@ jobs:
       - name: Record controlled cleanup, SQLite maintenance and non-resurrection observations
         if: always()
         run: npm run evidence:controlled-cleanup
+      - name: Record synthetic HTTP provider measurement observations
+        if: always()
+        run: npm run evidence:provider
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: synthetic-${{ matrix.os }}
           path: artifacts/
+          include-hidden-files: true
           if-no-files-found: error
