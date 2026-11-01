@@ -29,6 +29,9 @@ test('lookup preserves the original hash after settlement commits but before its
     assert.deepEqual(probe.archive.lookup(eventId), original);
     const bytes = fs.readFileSync(path, 'utf8');
     fs.writeFileSync(path, bytes.replace('Original canonical content', 'Replaced canonical content'));
+    const enumerated = probe.archive.events().find(event => event.ack.eventId === eventId)!;
+    assert.deepEqual(enumerated.ack, original);
+    assert.throws(() => probe.store.queueOwnerCapture(probe.activity, enumerated.ack), /source-evidence-gap/);
     assert.throws(() => probe.archive.lookup(eventId), /archive-integrity/);
     assert.throws(() => probe.archive.append(eventId, 'Replaced canonical content'), /archive-integrity/);
   } finally { probe.close(); fs.rmSync(sandbox.root, { recursive: true, force: true }); }

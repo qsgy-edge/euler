@@ -2942,7 +2942,6 @@ export class ProbeStore {
   }
 
   #isCaptureOutput(ref: SourceAck): boolean {
-    this.#archiveRef(ref);
     // The body uses its durable job identity even before its publication row commits.
     if (this.#db.prepare(`SELECT 1 FROM capture_jobs
       WHERE job_id=? AND consumer='historian' AND source_owner=?`).get(ref.eventId, ref.binding.sessionId)) return true;

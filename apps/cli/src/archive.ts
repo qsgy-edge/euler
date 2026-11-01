@@ -275,7 +275,8 @@ export class CliArchive {
   events(): { role: RawEvent['role']; text: string; ack: SourceAck }[] {
     return this.#gate(() => {
       check(!this.#journal?.pending().length, 'archive-append-pending');
-      return this.#scan().map(({ event, ack }) => ({ role: event.role, text: event.text, ack }));
+      return this.#scan().map(({ event, ack }) => ({ role: event.role, text: event.text,
+        ack: this.#journal?.acknowledged(event.eventId) ?? ack }));
     });
   }
 }
