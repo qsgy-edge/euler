@@ -52,7 +52,8 @@ export async function bufferedCorrectionApproval(cli: ReturnType<typeof startCli
     const text = `commit ${preview.token} ${JSON.stringify(content)}`;
     cli.command(text);
     while (Date.now() < deadline) {
-      early = probe.archive.events().find(row => row.role === 'user' && row.text === text)?.ack;
+      early = probe.store.withActivity(probe.activity, () => probe.store.sourceAppends(probe.activity).length
+        ? undefined : probe.archive.events().find(row => row.role === 'user' && row.text === text)?.ack);
       if (early) break;
       assert.equal(cli.observations.some(row => row.event === 'process-exit'), false, cli.stderr());
       await new Promise(resolve => setTimeout(resolve, 10));
