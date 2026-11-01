@@ -104,4 +104,5 @@ jobs:
         with:
           name: synthetic-${{ matrix.os }}
           path: artifacts/
+          include-hidden-files: true
           if-no-files-found: error
