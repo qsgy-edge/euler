@@ -23,7 +23,7 @@ test('inherited goal source loss blocks recovery and dispatch after a step trans
     assert.equal(probe.transport.count, 0);
     const restarted = startCli(['recover', '--sandbox', sandbox.root]);
     assert.equal((await restarted.exit).code, 1);
-    assert.match(JSON.stringify(restarted.observations), /source-evidence-gap/);
+    assert.match(JSON.stringify(restarted.observations), /archive-integrity: acknowledged bytes changed/);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
