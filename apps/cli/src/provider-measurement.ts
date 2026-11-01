@@ -119,7 +119,8 @@ export async function measureProvider(config: Configuration, options: {
             for await (const event of transport.stream(request, signal, send, observation => {
               measured.observation = observation;
               measured.cost = measuredCost(observation, options.pricing);
-              appendFileSync(join(options.directory, 'observations.jsonl'), JSON.stringify({ sampleId: id, ...observation }) + '\n', { flush: true });
+              try { appendFileSync(join(options.directory, 'observations.jsonl'), JSON.stringify({ sampleId: id, ...observation }) + '\n', { flush: true }); }
+              catch (error) { stopReason ??= `observation-write-failed:${sha256(error instanceof Error ? error.message : 'unknown')}`; }
             })) {
               if (!sample.firstDecisiveOutput && event.reply.stop !== 'tools') sample.firstDecisiveOutput = {
                 replyHash: sha256(JSON.stringify({ text: event.reply.text, calls: event.reply.calls, stop: event.reply.stop })), elapsedMs: performance.now() - started,
@@ -131,7 +132,10 @@ export async function measureProvider(config: Configuration, options: {
             check(call.name === 'controlled.echo' && call.arguments.text === workload.echoes[echoes], 'measurement-tool-mismatch');
             echoes++; return String(call.arguments.text);
           },
-          async cooperate() { if (condition === 'fresh-window' && echoes === workload.echoes.length) run.newWindow(); },
+          async cooperate() {
+            if (stopReason) run.stop('failed');
+            else if (condition === 'fresh-window' && echoes === workload.echoes.length) run.newWindow();
+          },
         });
         sample.terminal = status.terminal;
         sample.tools = status.tools.map(tool => ({ name: tool.name, outcome: tool.result?.outcome ?? null }));

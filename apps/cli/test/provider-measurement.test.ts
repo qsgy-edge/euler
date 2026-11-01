@@ -4,7 +4,7 @@ import { promisify } from 'node:util';
 import { once } from 'node:events';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -158,6 +158,40 @@ for (const scenario of ['error', 'interrupt', 'scope', 'unauthorized-tool', 'bud
           outcomes: sample.attempts.map(attempt => attempt.ledgerAttempt?.outcome) });
       }
       assert.deepEqual(summaries[0], summaries[1]);
+    } finally { server.closeAllConnections(); server.close(); await once(server, 'close'); rmSync(root, { recursive: true, force: true }); }
+  });
+
+for (const replyKind of ['final', 'tool'] as const)
+  test(`an observation write failure preserves the received ${replyKind} reply and stops further measurement sends`, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'euler-provider-observation-write-'));
+    mkdirSync(join(root, 'observations.jsonl'));
+    let calls = 0;
+    const server = createServer(async (request, response) => {
+      for await (const _chunk of request) { /* consume the actual request */ }
+      calls++;
+      const message = replyKind === 'final' ? { role: 'assistant', content: 'T23-OK' }
+        : { role: 'assistant', content: null, tool_calls: [{ id: 'fixture-call', type: 'function',
+          function: { name: 'controlled_echo', arguments: '{"text":"T23-ECHO-1"}' } }] };
+      response.end(JSON.stringify({ choices: [{ message, finish_reason: replyKind === 'final' ? 'stop' : 'tool_calls' }] }));
+    });
+    server.listen(0, '127.0.0.1'); await once(server, 'listening');
+    try {
+      const budget = { ...DEFAULT_BUDGET, contextLimit: 32000, outputReserve: 1024, maxModelAttempts: 2, maxToolCalls: 10, maxTotalTokens: 200000 };
+      const model = { api: 'openai-completions' as const, provider: 'fixture', id: 'fixture', name: 'fixture', reasoning: false,
+        input: ['text'] as ['text'], contextWindow: 32000, maxTokens: 1024,
+        baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}/v1`, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+      const result = await measureProvider({ model, budget, authNamespace: 'fixture', captureCapability: null,
+        transport: new HttpModelTransport(model, budget, () => 'synthetic-key') }, { directory: root, repetitions: 2, cacheCondition: 'fixture-off' });
+      assert.equal(calls, 1);
+      assert.equal(result.networkCount, 1);
+      assert.equal(result.samples.length, 1);
+      const sample = result.samples[0]!;
+      assert.equal(sample.attempts[0]!.observation!.outcome, 'received');
+      assert.equal(sample.attempts[0]!.ledgerAttempt!.outcome, 'received');
+      assert.match(result.stopReason!, /^observation-write-failed:[a-f0-9]{64}$/);
+      assert.equal(Boolean(sample.firstDecisiveOutput), replyKind === 'final');
+      const ledger = JSON.parse(readFileSync(join(root, sample.ledgerPath), 'utf8'));
+      assert.equal(ledger.agent.responses.length, 1);
     } finally { server.closeAllConnections(); server.close(); await once(server, 'close'); rmSync(root, { recursive: true, force: true }); }
   });
 
