@@ -10,6 +10,7 @@ import { configuredTransport, HttpModelTransport, verifyTransportPrerequisites }
 import type { TransportPrerequisites } from '../apps/cli/src/model-transport.ts';
 import { checkProviderSamples, measureProvider, readProviderPricing, summarizeProviderSamples } from '../apps/cli/src/provider-measurement.ts';
 import type { ProviderSample } from '../apps/cli/src/provider-measurement.ts';
+import { measureProviderIdentities } from './provider-identity-cases.ts';
 import workload from '../fixtures/t23-provider-workload.json' with { type: 'json' };
 
 const { values } = parseArgs({ options: { scenario: { type: 'string', default: 'synthetic' }, repetitions: { type: 'string', default: '3' },
@@ -27,9 +28,8 @@ let networkCount = 0, receiverCount = 0, failure: string | null = null;
 let prerequisites: TransportPrerequisites | null = null;
 const configurations: Record<string, unknown>[] = [];
 const gaps = ['ttft-unsupported-nonstreaming', 'provider-cache-on-off-control-unsupported',
-  'cold-cache-reset-unavailable', 'tool-schema-order-variation-unavailable-on-fixed-binding',
-  'real-interruption-and-same-payload-retry-not-observed', 'provider-model-route-auth-namespace-variation-not-measured',
-  'historian-and-guidance-lifecycle-wire-pairs-not-measured'];
+  'cold-cache-reset-unavailable', 'agent-run-dynamic-schema-order-rebind-unavailable',
+  'real-interruption-and-same-payload-retry-not-observed', 'real-provider-namespace-and-lifecycle-pairs-not-observed'];
 if (!pricing) gaps.push('pricing-not-supplied');
 if (values.scenario === 'synthetic') gaps.push('real-provider-cache-latency-cost');
 if (values.scenario === 'real' && !values['transport-config']) gaps.push('explicit-route-model-auth-budget-required');
@@ -37,7 +37,7 @@ const server = values.scenario === 'synthetic' ? createServer(async (request, re
   let body = ''; for await (const chunk of request) body += chunk;
   receiverCount++;
   appendFileSync(join(directory, 'receiver.jsonl'), JSON.stringify({ ordinal: receiverCount, payloadHash: sha256(body),
-    byteLength: Buffer.byteLength(body) }) + '\n', { flush: true });
+    byteLength: Buffer.byteLength(body), payload: body }) + '\n', { flush: true });
   const payload = JSON.parse(body) as { messages: { role: string; content: string }[] };
   const last = payload.messages.filter(message => message.role === 'tool').at(-1);
   const prior = last ? JSON.parse(last.content).result : null;
@@ -52,7 +52,7 @@ try {
   if (server) { server.listen(0, '127.0.0.1'); await once(server, 'listening'); }
   const conditions = server ? ['fixture-off', 'fixture-on'] : values['transport-config'] ? ['provider-managed'] : [];
   if (values['transport-config']) await verifyTransportPrerequisites(
-    ['context-window', 'context-boundaries', 'context-authority', 'historian'], 'provider-prerequisites', undefined,
+    ['context-window', 'context-boundaries', 'context-authority', 'historian', 'provider-identity'], 'provider-prerequisites', undefined,
     receipt => { prerequisites = receipt; writeFileSync(join(directory, 'prerequisites.json'), JSON.stringify(receipt, null, 2)); });
   for (const cacheCondition of conditions) {
     const budget = { ...DEFAULT_BUDGET, contextLimit: 32000, outputReserve: 1024, maxModelAttempts: 100,
@@ -84,14 +84,19 @@ for (const entry of readdirSync(directory, { withFileTypes: true })) {
   const saved = readdirSync(join(directory, entry.name));
   if (saved.includes('sample.json')) samples.push(JSON.parse(readFileSync(join(directory, entry.name, 'sample.json'), 'utf8')) as ProviderSample);
 }
-const checks = checkProviderSamples(samples, networkCount);
-if (checks.hiddenSends !== 0 || checks.ledgerMismatch !== 0 || checks.stablePrefixDifferences !== 0
+let identityEvidence: Awaited<ReturnType<typeof measureProviderIdentities>> | null = null;
+if (server && !failure) {
+  try { identityEvidence = await measureProviderIdentities(join(directory, 'identity')); }
+  catch (error) { failure = error instanceof Error ? sha256(error.message) : 'identity-evidence-failed'; }
+}
+const checks = checkProviderSamples(samples, networkCount, directory);
+if (checks.hiddenSends !== 0 || checks.ledgerMismatch !== 0 || checks.artifactMismatch !== 0 || checks.receiverMismatch !== 0 || checks.stablePrefixDifferences !== 0
   || server && receiverCount !== networkCount) failure ??= 'measurement-reconciliation-failed';
 const expected = repetitions * workload.conditions.length * (server ? 2 : 1);
 const complete = expected > 0 && samples.length === expected && samples.every(sample => sample.correct);
 writeFileSync(join(directory, 'workload.json'), JSON.stringify(workload, null, 2) + '\n', { flag: 'wx' });
 const implementationFiles = execFileSync('git', ['ls-files', '--cached', '--others', '--exclude-standard'], { encoding: 'utf8' }).trim().split(/\r?\n/)
-  .filter(path => /^(apps\/cli\/src\/|packages\/core\/src\/|scripts\/evidence-provider\.ts$|fixtures\/t23-provider-workload\.json$|package(-lock)?\.json$|tsconfig\.json$)/.test(path))
+  .filter(path => /^(apps\/cli\/src\/|packages\/core\/src\/|scripts\/(evidence-provider|provider-identity-cases)\.ts$|fixtures\/t23-provider-workload\.json$|package(-lock)?\.json$|tsconfig\.json$)/.test(path))
   .map(path => ({ path, sha256: sha256(readFileSync(path)) }));
 const artifacts = readdirSync(directory, { recursive: true, withFileTypes: true }).filter(entry => entry.isFile()).map(entry => {
   const path = relative(directory, join(entry.parentPath, entry.name)).replaceAll('\\', '/');
@@ -99,7 +104,8 @@ const artifacts = readdirSync(directory, { recursive: true, withFileTypes: true 
 });
 const receipt = { schema: 'provider-cache@v1', verdict: failure ? 'failed' : 'evidence-gap', startedAt, finishedAt: new Date().toISOString(),
   scenario: values.scenario, syntheticPassed: values.scenario === 'synthetic' && complete && failure === null,
-  measuredCorrect: complete, networkCount, independentReceiverCount: server ? receiverCount : 'unavailable',
+  measuredCorrect: complete, networkCount: networkCount + (identityEvidence?.networkCount ?? 0), workloadNetworkCount: networkCount,
+  independentReceiverCount: server ? receiverCount : 'unavailable', identityEvidence,
   samples, configurations, checks, statistics: summarizeProviderSamples(samples), failure, pricing, prerequisites,
   workload, fixtureDigest: sha256(JSON.stringify(workload)), repetitions,
   plannedSamples: expected, unexecutedSamples: expected - samples.length,
@@ -110,5 +116,5 @@ const receipt = { schema: 'provider-cache@v1', verdict: failure ? 'failed' : 'ev
   environment: { platform: process.platform, arch: arch(), release: release(), node: process.version },
   gaps };
 writeFileSync(join(directory, 'receipt.json'), JSON.stringify(receipt, null, 2) + '\n', { flag: 'wx' });
-console.log(JSON.stringify({ directory, verdict: receipt.verdict, syntheticPassed: receipt.syntheticPassed, networkCount, failure }));
+console.log(JSON.stringify({ directory, verdict: receipt.verdict, syntheticPassed: receipt.syntheticPassed, networkCount: receipt.networkCount, failure }));
 if (failure) process.exitCode = 1;

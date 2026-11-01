@@ -64,7 +64,7 @@ npm run evidence:provider -- --scenario real --transport-config C:\test\route.js
 - 首个可判定完整输出的 hash、时间及正确性，全部失败与未执行样本数；
 - 实现 commit、dirty 标记、相关源码逐文件 hash、fixture/config digest、系统环境及证据文件 hash。
 
-同一 epoch 的实际 wire prefix 必须逐字节一致；每个已观察的发送与账本按 attempt ID、payload hash 和字节长度对应。HTTP transport 不跟随重定向、不隐式重试；断流保留 `unknown-sent`，测量不盲目补发。首个失败停止后续样本，已有失败不会从统计中删除。
+同一 epoch 的实际 wire prefix 必须逐字节一致；每个已观察的发送按唯一 attempt ID、assembly identity、payload hash 和字节长度与复制后的 SQLite 逐项核对，并从独立 receiver 的实际 bytes 复算。HTTP transport 不跟随重定向、不隐式重试；断流保留 `unknown-sent`，测量不盲目补发。首个失败停止后续样本，已有失败不会从统计中删除。
 
 ## 指标与费用
 
@@ -93,12 +93,16 @@ npm run evidence:provider -- --scenario real --transport-config C:\test\route.js
 
 provider/model 必须匹配实际配置。该记账口径要求 input 包含 cache read，且没有另计的 cache write 费用；不适用的 provider 不使用这张表。费用为 `((input-cacheRead)×inputRate + cacheRead×cacheRate + output×outputRate)/1e6`。依据是注明来源和日期的 operator price schedule，不冒充 provider 账单；缺 usage/价格时费用保持 unknown，不能使用 Model 的零成本默认值。
 
-统计按 cache condition 与 workload condition 分组，所有发送（含失败）计算 nearest-rank p50/p95/p99，逐项列样本数、缺失 usage 数、token 合计及已知费用小计。少于 20 个 workload 样本明确标记尾部分位数证据不足。
+统计按请求 route/provider/model/auth namespace、返回型号 hash、cache condition 与 workload condition 分组，所有发送（含失败）计算 nearest-rank p50/p95/p99，逐项列样本数、缺失 usage 数、token 合计及已知费用小计。一个 workload 内出现多个返回型号时，不把其整段完成耗时归入单一型号。少于 20 个 workload 样本明确标记尾部分位数证据不足。
 
 ## 验收范围
 
 `provider-measurement.test.ts` 从落盘 payload、neutral request、ledger 与文件 digest 独立复算，覆盖费用算例、前置失败零发送、整组预算、错误/断流，以及 fixture cache on/off 下的 scope 和 capability 拒绝。`model-transport.test.ts` 覆盖真实本机 HTTP 边界、usage 缺失/非法字段和无隐藏重试。已有 context/Historian/ledger 测试继续负责对应 Core 生命周期。
 
-`syntheticPassed` 只判定固定 loopback workload。`provider-cache@v1` 的总体 verdict 保留 `evidence-gap`，并列出尚无实际样本的部分：真实 provider/cache/成本时延、cache 控制和冷缓存重置、真实中断/同 payload 重试、provider/model/route/auth namespace 变更配对、固定 tool binding 之外的 schema/order 变更，以及 Historian/指令生命周期的 wire 配对。这些缺口不被本机耗时或既有源码覆盖代替。
+默认命令另在 `identity/` 保存八组本机 HTTP/Core 配对：动态尾部与同 epoch、相同前缀的新窗口、provider/model/route/auth namespace 与固定能力绑定、AGENTS 更新和任务结束释放 Skill、后台 Historian 生成/未选用/选用、紧急指令失效、SQLite COMMIT 失败零新增发送，以及底层 ledger 的 schema/order 和同 assembly 重试。`identityEvidence` 与 workload 分列计数，`networkCount` 为两组之和。
+
+AgentRun 的 route 和固定工具集合在构造时绑定；namespace/内置 schema 集合变更按不同 run 比较。底层 ledger 用固定、已归档的合成输入验独立 schema/order 序列化及 attempt ordinal：完整收到 503 后可显式重试同一 assembly，断流 unknown 后拒绝再发。它不声称 AgentRun 支持任意工具热重绑或同 assembly 自动重试，也不为此添加插件机制。
+
+`syntheticPassed` 判定固定 loopback workload 与本地 identity 检查。`provider-cache@v1` 的总体 verdict 保留 `evidence-gap`：真实 provider/cache/成本时延、cache 控制和冷缓存重置、真实中断/重试及真实 namespace/lifecycle 配对需要对应路由的实际 receipt。现有 AgentRun 不提供动态 schema/order 重绑，报告明确列为 unavailable。
 
 本入口仅使用新建合成 sandbox，不读取 MC、真实用户数据或更改 credential/owner；不产生 D7.5 的 MC control baseline 和 T27 cutover 阈值。首次组合验收仍由 T24 汇合。

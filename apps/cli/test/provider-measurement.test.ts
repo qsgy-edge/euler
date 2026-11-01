@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { DEFAULT_BUDGET } from '@euler/core';
 import { HttpModelTransport } from '../src/model-transport.ts';
-import { measureProvider } from '../src/provider-measurement.ts';
+import { checkProviderSamples, measureProvider, summarizeProviderSamples } from '../src/provider-measurement.ts';
 
 test('provider measurement requires an explicit real route and preserves a zero-send evidence gap', () => {
   const root = mkdtempSync(join(tmpdir(), 'euler-provider-test-'));
@@ -36,7 +36,9 @@ test('synthetic measurement preserves ordered wire samples, stable prefixes and 
     const receipt = JSON.parse(readFileSync(join(directory, 'receipt.json'), 'utf8'));
     assert.equal(receipt.verdict, 'evidence-gap');
     assert.equal(receipt.syntheticPassed, true);
-    assert.equal(receipt.networkCount, 24);
+    assert.equal(receipt.workloadNetworkCount, 24);
+    assert.equal(receipt.identityEvidence.passed, true);
+    assert.equal(receipt.networkCount, 24 + receipt.identityEvidence.networkCount);
     assert.deepEqual(receipt.samples.map((sample: { condition: string }) => sample.condition),
       ['initial', 'repeat', 'p3-change', 'fresh-window', 'initial', 'repeat', 'p3-change', 'fresh-window']);
     assert.equal(receipt.checks.hiddenSends, 0);
@@ -72,6 +74,13 @@ test('synthetic measurement preserves ordered wire samples, stable prefixes and 
     assert.notEqual(fresh[1].assembly.context.cacheEpoch, fresh[2].assembly.context.cacheEpoch);
     assert.notEqual(fresh[1].p1.hash, fresh[2].p1.hash);
     assert.ok(receipt.statistics.every((row: { totalMs: { n: number }; ttftMs: string }) => row.totalMs.n === 3 && row.ttftMs === 'unsupported'));
+    const mismatched = structuredClone(receipt.samples);
+    mismatched[0].attempts[0].ledgerAttempt.attemptId = '00000000-0000-4000-8000-000000000000';
+    mismatched[1].attempts[0].assembly.payloadHash = '0'.repeat(64);
+    assert.ok(checkProviderSamples(mismatched, receipt.workloadNetworkCount, directory).ledgerMismatch >= 2);
+    const first = receipt.samples[0].attempts[0];
+    writeFileSync(join(directory, first.payloadPath), '{}');
+    assert.ok(checkProviderSamples(receipt.samples, receipt.workloadNetworkCount, directory).artifactMismatch > 0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -110,7 +119,7 @@ for (const scenario of ['error', 'interrupt', 'scope', 'unauthorized-tool', 'bud
           : { name: 'controlled_echo', arguments: { text: 'T23-ECHO-1' } };
       const message = calls === 1 ? { role: 'assistant', content: null, tool_calls: [{ id: 'fixture-call', type: 'function',
         function: { name: tool.name, arguments: JSON.stringify(tool.arguments) } }] } : { role: 'assistant', content: 'T23-OK' };
-      response.end(JSON.stringify({ choices: [{ message, finish_reason: calls === 1 ? 'tool_calls' : 'stop' }],
+      response.end(JSON.stringify({ model: calls === 1 ? 'reported-a' : 'reported-b', choices: [{ message, finish_reason: calls === 1 ? 'tool_calls' : 'stop' }],
         usage: { prompt_tokens: 100, completion_tokens: 10, prompt_tokens_details: { cached_tokens: cache } } }));
     });
     server.listen(0, '127.0.0.1'); await once(server, 'listening');
@@ -135,6 +144,9 @@ for (const scenario of ['error', 'interrupt', 'scope', 'unauthorized-tool', 'bud
         if (scenario === 'scope' || scenario === 'unauthorized-tool') {
           assert.equal(result.stopReason, 'incorrect-output');
           assert.deepEqual(sample.tools.map(tool => tool.outcome), [scenario === 'scope' ? 'failure' : 'unavailable']);
+          const groups = summarizeProviderSamples(result.samples);
+          assert.equal(groups.length, 2);
+          assert.ok(groups.every(group => group.totalMs.n === 1));
         }
         if (scenario === 'interrupt') {
           assert.equal(sample.attempts[0]!.ledgerAttempt!.outcome, 'unknown-sent');

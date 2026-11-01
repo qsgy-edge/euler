@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
-import { AgentRun, check, sha256 } from '@euler/core';
+import { AgentRun, assemblyIdentityHash, check, sha256 } from '@euler/core';
 import type { ModelReply, NeutralRequest, RequestAssembly, RequestAttempt } from '@euler/core';
 import { pumpAgent } from './agent-pump.ts';
 import { bindingOf, createSandbox } from './sandbox.ts';
@@ -162,23 +163,30 @@ function distribution(values: number[]) {
   return { n: sorted.length, p50: percentile(0.5), p95: percentile(0.95), p99: percentile(0.99), method: 'nearest-rank' };
 }
 export function summarizeProviderSamples(samples: ProviderSample[]) {
-  const groups = new Map<string, ProviderSample[]>();
-  for (const sample of samples) {
-    const key = `${sample.cacheCondition}/${sample.condition}`;
-    groups.set(key, [...(groups.get(key) ?? []), sample]);
+  const groups = new Map<string, { sample: ProviderSample; attempt: MeasuredAttempt }[]>();
+  const identity = (sample: ProviderSample, attempt: MeasuredAttempt) => JSON.stringify({
+    condition: `${sample.cacheCondition}/${sample.condition}`, route: attempt.assembly.route,
+    reportedModelHash: attempt.observation?.actualModelHash ?? 'unknown' });
+  for (const sample of samples) for (const attempt of sample.attempts) {
+    const key = identity(sample, attempt);
+    groups.set(key, [...(groups.get(key) ?? []), { sample, attempt }]);
   }
-  return [...groups].map(([condition, group]) => {
-    const measured = group.flatMap(sample => sample.attempts);
+  return [...groups].map(([key, entries]) => {
+    const { condition, route, reportedModelHash } = JSON.parse(key) as { condition: string; route: string; reportedModelHash: string };
+    const group = [...new Set(entries.map(entry => entry.sample))];
+    const wholeSamples = group.filter(sample => sample.attempts.every(attempt => identity(sample, attempt) === key));
+    const measured = entries.map(entry => entry.attempt);
     const attempts = measured.flatMap(attempt => attempt.observation ? [attempt.observation] : []);
     const knownCosts = measured.flatMap(attempt => typeof attempt.cost.amount === 'number' ? [attempt.cost.amount] : []);
     const tokens = (key: 'input' | 'output' | 'cacheRead') => {
       const reported = attempts.map(attempt => attempt.tokens[key]).filter((value): value is number => typeof value === 'number');
       return { reported: reported.length, missing: attempts.length - reported.length, sum: reported.reduce((sum, value) => sum + value, 0) };
     };
-    return { condition, samples: group.length, failures: group.filter(sample => !sample.correct).length,
+    return { condition, route: JSON.parse(route) as Record<string, string>, reportedModelHash,
+      samples: group.length, mixedIdentitySamples: group.length - wholeSamples.length, failures: group.filter(sample => !sample.correct).length,
       totalMs: distribution(attempts.map(attempt => attempt.totalMs)),
       firstByteMs: distribution(attempts.flatMap(attempt => typeof attempt.firstByteMs === 'number' ? [attempt.firstByteMs] : [])),
-      firstDecisiveOutputMs: distribution(group.flatMap(sample => sample.firstDecisiveOutput ? [sample.firstDecisiveOutput.elapsedMs] : [])),
+      firstDecisiveOutputMs: distribution(wholeSamples.flatMap(sample => sample.firstDecisiveOutput ? [sample.firstDecisiveOutput.elapsedMs] : [])),
       ttftMs: 'unsupported', inputTokens: tokens('input'), outputTokens: tokens('output'), cacheReadTokens: tokens('cacheRead'),
       cacheWriteTokens: 'unsupported',
       cost: { knownSubtotal: knownCosts.reduce((sum, cost) => sum + cost, 0), unknown: measured.length - knownCosts.length,
@@ -187,9 +195,9 @@ export function summarizeProviderSamples(samples: ProviderSample[]) {
   });
 }
 
-export function checkProviderSamples(samples: ProviderSample[], networkCount: number) {
+export function checkProviderSamples(samples: ProviderSample[], networkCount: number, directory: string) {
   const prefixes = new Map<string, string>();
-  let stablePrefixDifferences = 0;
+  let stablePrefixDifferences = 0, artifactMismatch = 0;
   const attempts = samples.flatMap(sample => sample.attempts);
   for (const attempt of attempts) {
     const epoch = attempt.assembly.context!.cacheEpoch;
@@ -198,11 +206,59 @@ export function checkProviderSamples(samples: ProviderSample[], networkCount: nu
     prefixes.set(epoch, attempt.wirePrefix.text);
   }
   const observed = attempts.filter(attempt => attempt.observation);
-  const ledgerMismatch = observed.filter(attempt => attempt.ledgerAttempt?.payloadHash !== attempt.observation!.payloadHash
-    || attempt.ledgerAttempt?.byteLength !== attempt.observation!.byteLength).length;
+  const seen = new Set<string>();
+  const ledgerMismatch = observed.filter(attempt => {
+    const observation = attempt.observation!, ledger = attempt.ledgerAttempt, assembly = attempt.assembly;
+    const duplicate = seen.has(observation.attemptId); seen.add(observation.attemptId);
+    return duplicate || ledger?.attemptId !== observation.attemptId || ledger?.assemblyId !== assembly.assemblyId
+      || ledger?.runId !== assembly.runId || ledger?.payloadHash !== observation.payloadHash || ledger?.byteLength !== observation.byteLength
+      || assembly.payloadHash !== observation.payloadHash || assembly.byteLength !== observation.byteLength
+      || assembly.identityHash !== assemblyIdentityHash(assembly) || attempt.payloadHash !== observation.payloadHash;
+  }).length;
+  for (const sample of samples) {
+    let db: DatabaseSync | undefined;
+    try {
+      db = new DatabaseSync(join(directory, sample.sandboxPath, 'probe.sqlite'), { readOnly: true });
+      for (const attempt of sample.attempts) {
+        const payload = readFileSync(join(directory, attempt.payloadPath), 'utf8');
+        const neutral = JSON.parse(readFileSync(join(directory, attempt.neutralPath), 'utf8')) as NeutralRequest;
+        check(sha256(payload) === attempt.payloadHash && attempt.assembly.runId === sample.runId
+          && attempt.wirePrefix.text === wirePrefix(payload, neutral)
+          && JSON.stringify(neutral.p0) === attempt.p0.text && JSON.stringify(neutral.p1) === attempt.p1.text
+          && [attempt.p0, attempt.p1, attempt.wirePrefix].every(part => part.bytes === Buffer.byteLength(part.text) && part.hash === sha256(part.text)), 'measurement-artifact-mismatch');
+        const assembly = db.prepare('SELECT * FROM request_assemblies WHERE assembly_id=?').get(attempt.assembly.assemblyId);
+        check(assembly?.run_id === sample.runId && assembly.identity_hash === attempt.assembly.identityHash
+          && assembly.payload_hash === sha256(payload) && assembly.byte_length === Buffer.byteLength(payload)
+          && assembly.context === JSON.stringify(attempt.assembly.context), 'measurement-assembly-mismatch');
+        if (attempt.observation) {
+          const row = db.prepare('SELECT * FROM request_attempts WHERE attempt_id=?').get(attempt.observation.attemptId);
+          check(row?.assembly_id === attempt.assembly.assemblyId && row.run_id === sample.runId
+            && row.payload_hash === sha256(payload) && row.byte_length === Buffer.byteLength(payload)
+            && row.ordinal === attempt.ledgerAttempt?.ordinal && row.outcome === attempt.ledgerAttempt?.outcome, 'measurement-attempt-mismatch');
+        }
+      }
+    } catch { artifactMismatch++; }
+    finally { db?.close(); }
+  }
+  let receiverMismatch = 0;
+  try {
+    const observations = existsSync(join(directory, 'observations.jsonl'))
+      ? readFileSync(join(directory, 'observations.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
+    check(observations.length === observed.length && observations.every((row, index) =>
+      samples.some(sample => sample.id === row.sampleId && sample.attempts.some(attempt => attempt.observation?.attemptId === row.attemptId))
+      && JSON.stringify(row) === JSON.stringify({ sampleId: row.sampleId, ...observed[index]!.observation })), 'measurement-observation-mismatch');
+    if (existsSync(join(directory, 'receiver.jsonl'))) {
+      const receiver = readFileSync(join(directory, 'receiver.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+      check(receiver.length === observed.length && receiver.every((row, index) => row.ordinal === index + 1
+        && row.payloadHash === sha256(row.payload) && row.byteLength === Buffer.byteLength(row.payload)
+        && row.payloadHash === observed[index]!.observation!.payloadHash
+        && row.byteLength === observed[index]!.observation!.byteLength
+        && row.payload === readFileSync(join(directory, observed[index]!.payloadPath), 'utf8')), 'measurement-receiver-mismatch');
+    }
+  } catch { receiverMismatch++; }
   const off = samples.filter(sample => sample.cacheCondition === 'fixture-off');
   const on = samples.filter(sample => sample.cacheCondition === 'fixture-on');
-  return { hiddenSends: networkCount - observed.length, ledgerMismatch, stablePrefixDifferences,
+  return { hiddenSends: networkCount - observed.length, ledgerMismatch, artifactMismatch, receiverMismatch, stablePrefixDifferences,
     cachePairCorrectnessEqual: off.length && off.length === on.length
       ? off.every((sample, index) => sample.correct === on[index]!.correct && JSON.stringify(sample.tools) === JSON.stringify(on[index]!.tools)) : 'unverified' };
 }
