@@ -137,17 +137,17 @@ export class CliArchive {
     });
   }
 
-  append(eventId: string, text: string, role: RawEvent['role'] = 'user'): SourceAck {
+  append(eventId: string, text: string | (() => string), role: RawEvent['role'] = 'user'): SourceAck {
     uuid(eventId);
     check(['user', 'assistant', 'tool'].includes(role), 'invalid-source-role');
-    check(typeof text === 'string' && text.length > 0 && Buffer.byteLength(text) <= 65536, 'invalid-input');
+    check(typeof text === 'function' || typeof text === 'string' && text.length > 0 && Buffer.byteLength(text) <= 65536, 'invalid-input');
     check(this.#journal, 'archive-journal-required');
-    const line = JSON.stringify({ schema: 'cli-input@1', eventId, role, text }) + '\n';
     const prepared = this.#journal.prepare(() => {
       const pending = this.#journal!.pending()[0];
       if (pending) {
         check(pending.eventId === eventId, 'archive-append-pending');
-        check(pending.bytes === line, 'identity-conflict');
+        const event = JSON.parse(pending.bytes) as RawEvent;
+        check(event.role === role && (typeof text === 'function' || event.text === text), 'identity-conflict');
         return pending;
       }
       const bytes = this.#bytes();
@@ -155,9 +155,13 @@ export class CliArchive {
       const witness = this.#journal!.acknowledged(eventId);
       check(!witness || previous?.ack.hash === witness.hash, 'archive-integrity: acknowledged bytes changed');
       if (previous) {
-        check(previous.event.text === text && previous.event.role === role, 'identity-conflict');
+        check(previous.event.role === role && (typeof text === 'function' || previous.event.text === text), 'identity-conflict');
         return previous.ack;
       }
+      // Core's local result and budget mutation commit with this exact-byte reservation.
+      const content = typeof text === 'function' ? text() : text;
+      check(typeof content === 'string' && content.length > 0 && Buffer.byteLength(content) <= 65536, 'invalid-input');
+      const line = JSON.stringify({ schema: 'cli-input@1', eventId, role, text: content }) + '\n';
       check(bytes.length + Buffer.byteLength(line) <= 1_048_576, 'archive-limit');
       return { eventId, binding: bindingOf(this.#sandbox), bytes: line, offset: bytes.length, prefixHash: sha256(bytes) };
     });
