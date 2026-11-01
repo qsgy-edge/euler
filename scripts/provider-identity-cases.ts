@@ -21,6 +21,7 @@ type Sender = Pick<AgentRun, 'nextModel' | 'startModel' | 'maySend' | 'finishMod
 export async function measureProviderIdentities(directory: string) {
   mkdirSync(directory, { recursive: true });
   const cases: { name: string; passed: boolean; sends: number; received: number; transportCount: number }[] = [];
+  let failureHash: string | null = null;
   let replies: (ModelReply | number)[] = [], received: string[] = [];
   const server = createServer(async (request, response) => {
     let body = ''; for await (const chunk of request) body += chunk;
@@ -252,16 +253,17 @@ export async function measureProviderIdentities(directory: string) {
         });
         passed = true;
       } finally {
+        cases.push({ name, passed, sends: sends.length, received: received.length,
+          transportCount: transports.reduce((sum, transport) => sum + transport.count, 0) });
         release?.();
         const ledgers = runs.map(run => probe.store.requestStatus(activities.get(run.runId)!, run.runId));
         writeFileSync(join(path, 'evidence.json'), JSON.stringify({ name, passed, sends, received, checkpoints, ledgers }, null, 2));
         probe.close(); cpSync(sandbox.root, join(path, 'sandbox'), { recursive: true }); rmSync(sandbox.root, { recursive: true, force: true });
-        cases.push({ name, passed, sends: sends.length, received: received.length,
-          transportCount: transports.reduce((sum, transport) => sum + transport.count, 0) });
       }
     }
-  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
-  const report = { passed: cases.every(item => item.passed), hiddenSends: cases.reduce((sum, item) => sum + item.transportCount - item.sends, 0),
+  } catch (error) { failureHash = sha256(error instanceof Error ? error.message : 'unknown-identity-failure'); }
+  finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+  const report = { passed: failureHash === null && cases.every(item => item.passed), failureHash, hiddenSends: cases.reduce((sum, item) => sum + item.transportCount - item.sends, 0),
     networkCount: cases.reduce((sum, item) => sum + item.transportCount, 0), cases };
   writeFileSync(join(directory, 'receipt.json'), JSON.stringify(report, null, 2));
   return report;

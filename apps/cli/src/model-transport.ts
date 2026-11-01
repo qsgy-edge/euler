@@ -196,11 +196,11 @@ export class HttpModelTransport {
       const data = JSON.parse(body) as { model?: unknown; usage?: { prompt_tokens?: unknown; completion_tokens?: unknown; prompt_tokens_details?: { cached_tokens?: unknown } }; choices?: { finish_reason?: string; message?: { role?: string; content?: unknown; tool_calls?: unknown } }[] };
       check(data && typeof data === 'object', 'invalid-provider-response');
       const observedUsage = data.usage;
-      const input = observedToken(observedUsage?.prompt_tokens), cacheRead = observedToken(observedUsage?.prompt_tokens_details?.cached_tokens);
-      observation.tokens = { input, output: observedToken(observedUsage?.completion_tokens), cacheWrite: 'unsupported',
+      const input = observedToken(observedUsage?.prompt_tokens), output = observedToken(observedUsage?.completion_tokens);
+      const cacheRead = observedToken(observedUsage?.prompt_tokens_details?.cached_tokens);
+      observation.tokens = { input, output, cacheWrite: 'unsupported',
         cacheRead: typeof cacheRead === 'number' && (typeof input !== 'number' || cacheRead > input) ? 'unknown' : cacheRead };
-      if (observedUsage && [observedUsage.prompt_tokens, observedUsage.completion_tokens].every(value => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= 1_000_000))
-        usage = { input: Number(observedUsage.prompt_tokens), output: Number(observedUsage.completion_tokens) };
+      if (typeof input === 'number' && typeof output === 'number') usage = { input, output };
       if (typeof data.model === 'string' && data.model.length <= 256) modelHash = sha256(data.model);
       observation.actualModelHash = modelHash ?? 'unknown';
       check(Array.isArray(data.choices) && data.choices.length === 1 && data.choices[0], 'invalid-provider-response');

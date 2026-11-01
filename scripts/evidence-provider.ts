@@ -86,7 +86,10 @@ for (const entry of readdirSync(directory, { withFileTypes: true })) {
 }
 let identityEvidence: Awaited<ReturnType<typeof measureProviderIdentities>> | null = null;
 if (server && !failure) {
-  try { identityEvidence = await measureProviderIdentities(join(directory, 'identity')); }
+  try {
+    identityEvidence = await measureProviderIdentities(join(directory, 'identity'));
+    if (!identityEvidence.passed) failure = 'identity-evidence-failed';
+  }
   catch (error) { failure = error instanceof Error ? sha256(error.message) : 'identity-evidence-failed'; }
 }
 const checks = checkProviderSamples(samples, networkCount, directory);
