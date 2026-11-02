@@ -130,7 +130,7 @@ export class OwnerInfoLog {
   }
 }
 
-function openOwnerInfo(sandbox: Sandbox, probe: ReturnType<typeof openProbe>): OwnerInfoLog | null {
+export function openOwnerInfo(sandbox: Sandbox, probe: ReturnType<typeof openProbe>): OwnerInfoLog | null {
   try { return new OwnerInfoLog(sandbox, action => probe.store.withActivity(probe.activity, action),
     entries => probe.store.assertHostInfoCarrier(probe.activity, entries.map(entry => ({
       batchId: entry.record.batchId, digest: entry.record.digest, entryId: entry.record.entryId, entryHash: entry.entryHash })))); }
@@ -159,7 +159,7 @@ function notice(batch: ActivationBatch) {
   });
 }
 
-class OwnerMemoryHost {
+export class OwnerMemoryHost {
   readonly probe: ReturnType<typeof openProbe>;
   readonly log: OwnerInfoLog | null;
   readonly #scenario: OwnerScenario;
@@ -268,6 +268,7 @@ class OwnerMemoryHost {
       ...(this.#noActiveProject ? { noActiveProject: true as const } : {}) };
     let result: RememberResult;
     try {
+      this.#completeAgreementInput(this.probe.archive.read(input).text);
       result = via === 'live' && this.#scenario === 'crash-before-activation-commit'
         ? store.withActivity(activity, () => { store.rememberMemory(activity, request); return killPoint('owner-checkpoint', this.#scenario, 10000); })
         : store.rememberMemory(activity, request);
@@ -284,7 +285,7 @@ class OwnerMemoryHost {
     }
     if (via === 'live' || result.status === 'activated') {
       report(via, result.status, info === 'pending-redelivery' ? 'error' : result.status === 'blocked' ? 'warning' : 'info', {
-        stage: result.stage, reason: result.reason, info, input: input.eventId, recordId: result.record.recordId, type: result.record.type,
+        stage: result.stage, reason: result.reason, info, input: result.range.at(-1)!.eventId, recordId: result.record.recordId, type: result.record.type,
         content: result.record.content, batchId: result.batchId, range: result.range.map(ref => ref.eventId),
         verifier: result.verification?.verifier ?? null });
     }
@@ -296,7 +297,7 @@ class OwnerMemoryHost {
     const events = this.probe.archive.events();
     let actionable = 0;
     for (const event of events) {
-      if (event.role !== 'user' || this.probe.store.isCaptureOutput(this.probe.activity, event.ack)) continue;
+      if (event.ack.binding.projectId !== this.probe.binding.projectId || event.role !== 'user' || this.probe.store.isCaptureOutput(this.probe.activity, event.ack)) continue;
       if (isUntypedRemember(event.text)) {
         const queued = this.probe.store.queueOwnerCapture(this.probe.activity, event.ack, this.#noActiveProject);
         report('backfill', queued.stage === 'pending' ? 'needs-input' : 'capture-status', queued.stage === 'complete' ? 'info' : 'warning',
@@ -308,6 +309,14 @@ class OwnerMemoryHost {
       }
     }
     emit('owner-backfill', { scanned: events.length, actionable });
+  }
+
+  #completeAgreementInput(text: string): void {
+    const agreement = parseOwnerAgreement(text);
+    if (!agreement?.input) return;
+    const { archive, binding } = this.probe;
+    check(agreement.input.locator === `cli-jsonl@1/${binding.sessionId}/${agreement.input.eventId}`, 'memory-agreement-evidence-gap');
+    archive.append(agreement.input.eventId, agreement.text);
   }
 
   showInfo(batchId: string): void {
@@ -337,6 +346,58 @@ class OwnerMemoryHost {
     while (store.registerHostInfo(activity).more);
     const rows = store.listHostInfo(activity);
     emit('info-list', { ...counts(rows), rows: rows.map(row => ({ batchId: row.batchId, memberCount: row.memberCount, delivery: row.delivery, read: row.read })) });
+  }
+
+  handle(raw: string, explicitOnly = false): boolean {
+    const line = raw.trim(), { store, activity, archive } = this.probe;
+    const id = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+    const explicit = new RegExp(`^(info(?: ${id})?|feedback ${id} ${id} (helpful|wrong|stale|safety)|used ${id}(?: ${id})?|source ${id}(?: [0-9]+)?)$`).test(line);
+    if (!explicitOnly || explicit) {
+      if (line === 'info') { this.listInfo(); return true; }
+      if (line.startsWith('info ')) { this.showInfo(line.slice(5).trim()); return true; }
+      if (line.startsWith('feedback ')) {
+        const fields = line.split(/\s+/);
+        check(fields.length === 4, 'invalid-memory-feedback');
+        this.feedback(fields[1]!, fields[2]!, fields[3]!); return true;
+      }
+      if (line.startsWith('used ')) {
+        const fields = line.split(/\s+/);
+        check(fields.length === 2 || fields.length === 3, 'invalid-inspect-command');
+        emit('memory-used', store.inspectAssembly(activity, fields[1]!, fields[2])); return true;
+      }
+      if (line.startsWith('source ')) {
+        const fields = line.split(/\s+/);
+        check(fields.length === 2 || fields.length === 3, 'invalid-source-command');
+        const record = store.readMemory(activity, fields[1]!);
+        emit('memory-source', { recordId: record.recordId, revisionId: record.revisionId,
+          ...store.expandSource(activity, { recordId: record.recordId, offset: Number(fields[2] ?? 0), limit: 4096 }) }); return true;
+      }
+    }
+    const appendOwner = (text: string): SourceAck | null => {
+      try { return archive.append(randomUUID(), text); }
+      catch (error) { report('live', 'error', 'error', { committed: false, reason: (error as Error).message }); return null; }
+    };
+    if (parseOwnerStatement(line)) { const ack = appendOwner(raw); if (ack) this.remember(ack, 'live'); return true; }
+    if (isUntypedRemember(line)) {
+      const ack = appendOwner(raw); if (!ack) return true;
+      const queued = store.queueOwnerCapture(activity, ack, this.#noActiveProject);
+      report('live', 'needs-input', 'warning', { ...queued, input: ack.eventId, accepted: OWNER_MEMORY_FORMS }); return true;
+    }
+    if (isOwnerAgreement(line) || isOwnerDecline(line)) {
+      const previous = archive.events().findLast(event => !store.isCaptureOutput(activity, event.ack));
+      const target = previous?.role === 'assistant' && store.readMemoryProposal(activity, previous.ack) ? previous.ack : null;
+      if (!target && explicitOnly) return false;
+      const originalId = explicitOnly && target && isOwnerAgreement(line) ? randomUUID() : undefined;
+      const agreementInput = originalId ? { eventId: originalId, locator: `cli-jsonl@1/${this.probe.binding.sessionId}/${originalId}` } : undefined;
+      const text = target && isOwnerAgreement(line) ? encodeOwnerAgreement(agreementInput ? raw : line, target, agreementInput) : raw;
+      const ack = appendOwner(text);
+      if (!ack) return true;
+      if (!target) report('live', 'not-actionable', 'warning', { reason: 'agreement-target-missing', input: ack.eventId });
+      else if (isOwnerDecline(line)) report('live', 'cancelled', 'info', { reason: 'owner-declined', input: ack.eventId, range: [target.eventId] });
+      else this.remember(ack, 'live');
+      return true;
+    }
+    return false;
   }
 
   ask(question: string): void {
@@ -403,35 +464,13 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
     emit('remember-ready', { pid: process.pid, hostInfo: log ? 'durable' : 'unavailable', infoPath: log?.path ?? null,
       ...counts(probe.store.listHostInfo(probe.activity)), syntheticProposals: options.syntheticProposals,
       commands: [...OWNER_MEMORY_FORMS, ...(options.syntheticProposals ? ['propose <text>'] : []), '同意', '取消', 'info', 'info <batchId>', 'feedback <recordId> <headEventId> helpful|wrong|stale|safety', 'ask <question>', 'used <assemblyId> [recordId]', 'source <recordId> [offset]', 'inspect <recordId>', 'correct <recordId> <JSON string>', 'forget <recordId>', 'restore <recordId>', 'rollback <batchId> <eventId> [eventId ...]', 'commit <token> <JSON string|forget|restore|rollback>', 'cancel <token>', 'replay <token>', 'model <memory command>', 'stop'] });
-    const archive = (text: string): SourceAck | null => {
-      try { return probe.archive.append(randomUUID(), text); }
-      catch (error) { report('live', 'error', 'error', { committed: false, reason: (error as Error).message }); return null; }
-    };
     for await (const raw of commands) {
       const live = liveInputs.shift();
       const line = raw.trim();
       try {
         if (live) { await corrections.handle(live, raw); continue; }
         if (line === 'stop') break;
-        if (line === 'info') { host.listInfo(); continue; }
-        if (line.startsWith('info ')) { host.showInfo(line.slice(5).trim()); continue; }
-        if (line.startsWith('feedback ')) {
-          const fields = line.split(/\s+/);
-          check(fields.length === 4, 'invalid-memory-feedback');
-          host.feedback(fields[1]!, fields[2]!, fields[3]!); continue;
-        }
-        if (line.startsWith('used ')) {
-          const fields = line.split(/\s+/);
-          check(fields.length === 2 || fields.length === 3, 'invalid-inspect-command');
-          emit('memory-used', probe.store.inspectAssembly(probe.activity, fields[1]!, fields[2])); continue;
-        }
-        if (line.startsWith('source ')) {
-          const fields = line.split(/\s+/);
-          check(fields.length === 2 || fields.length === 3, 'invalid-source-command');
-          const record = probe.store.readMemory(probe.activity, fields[1]!);
-          const page = probe.store.expandSource(probe.activity, { ref: record.source, offset: Number(fields[2] ?? 0), limit: 4096 });
-          emit('memory-source', { recordId: record.recordId, revisionId: record.revisionId, ...page }); continue;
-        }
+        if (host.handle(raw)) continue;
         if (line.startsWith('ask ')) {
           if (!await corrections.deliver()) { emit('ask-refused', { reason: 'operation-presentation-recovery-required' }); continue; }
           host.ask(line.slice(4).trim()); continue;
@@ -442,25 +481,6 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
           const text = line.slice(8).replaceAll('\\n', '\n');
           const ack = probe.archive.append(randomUUID(), text, 'assistant');
           emit('assistant-proposal', { synthetic: true, eventId: ack.eventId, actionable: Boolean(parseMemoryProposal(text)) });
-          continue;
-        }
-        if (isOwnerAgreement(line) || isOwnerDecline(line)) {
-          const previous = probe.archive.events().findLast(event => !probe.store.isCaptureOutput(probe.activity, event.ack));
-          const target = previous?.role === 'assistant' && parseMemoryProposal(previous.text) ? previous.ack : null;
-          const ack = archive(target && isOwnerAgreement(line) ? encodeOwnerAgreement(line, target) : line);
-          if (!ack) continue;
-          if (!target) report('live', 'not-actionable', 'warning', { reason: 'agreement-target-missing', input: ack.eventId });
-          else if (isOwnerDecline(line)) report('live', 'cancelled', 'info', { reason: 'owner-declined', input: ack.eventId, range: [target.eventId] });
-          else host.remember(ack, 'live');
-          continue;
-        }
-        if (parseOwnerStatement(line)) { const ack = archive(line); if (ack) host.remember(ack, 'live'); continue; }
-        if (isUntypedRemember(line)) {
-          const ack = archive(line);
-          if (ack) {
-            const queued = probe.store.queueOwnerCapture(probe.activity, ack, options.noActiveProject);
-            report('live', 'needs-input', 'warning', { ...queued, input: ack.eventId, accepted: OWNER_MEMORY_FORMS });
-          }
           continue;
         }
         emit('command-rejected', { reason: 'owner-memory-command-required', accepted: OWNER_MEMORY_FORMS });

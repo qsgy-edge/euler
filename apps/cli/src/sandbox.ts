@@ -9,6 +9,7 @@ import type { FileIdentity, StoreResources } from '@euler/core';
 import type { Binding } from '@euler/core';
 
 export interface Fixture extends Binding {
+  projectId: string;
   schema: string;
   eventId: string;
   text: string;
@@ -29,7 +30,7 @@ function syncDirectory(path: string): void {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-export interface Sandbox {
+export interface Sandbox<B extends Binding = Binding> {
   schema: 'euler-disposable@1';
   appId: string;
   storeId: string;
@@ -42,12 +43,13 @@ export interface Sandbox {
   /** Owner-facing append-only Info carrier (T12); a Host presentation, never model context. */
   ownerInfoIdentity?: FileIdentity;
   fixtureDigest: string;
-  fixture: Fixture;
+  fixture: B & Omit<Fixture, keyof Binding>;
+  sessionBinding?: B;
 }
 
-export function bindingOf(sandbox: Sandbox): Binding {
+export function bindingOf<B extends Binding>(sandbox: Sandbox<B>): B {
   const { ownerId, hostId, projectId, sessionId, branchId } = sandbox.fixture;
-  return { ownerId, hostId, projectId, sessionId, branchId };
+  return { ownerId, hostId, projectId, sessionId, branchId } as B;
 }
 
 export function resourcesOf(sandbox: Sandbox): StoreResources {
@@ -67,9 +69,18 @@ export function resolveDataRoot(appId = 'euler'): string {
   return join(base, appId);
 }
 
-export function createSandbox(appId = 'euler'): Sandbox {
+export function createSandbox(appId = 'euler'): Sandbox<Fixture> {
+  return arguments.length === 0 ? createDisposable(fixture) : createDisposable(fixture, appId);
+}
+
+export function createSessionSandbox(ownerId: string, hostId: string): Sandbox {
+  const binding = { ownerId, hostId, projectId: null, sessionId: randomUUID(), branchId: randomUUID() };
+  return createDisposable({ ...fixture, ...binding }, undefined, binding);
+}
+
+function createDisposable<B extends Binding>(identity: B & Omit<Fixture, keyof Binding>, appId?: string, sessionBinding?: B): Sandbox<B> {
   let root: string;
-  if (arguments.length === 0) root = realpathSync(mkdtempSync(join(realpathSync(tmpdir()), 'euler-t01-')));
+  if (appId === undefined) { appId = 'euler'; root = realpathSync(mkdtempSync(join(realpathSync(tmpdir()), 'euler-t01-'))); }
   else {
     check(/^euler-t04-[0-9a-f-]{36}$/.test(appId), 'synthetic-app-id-required');
     const path = resolveDataRoot(appId);
@@ -79,7 +90,7 @@ export function createSandbox(appId = 'euler'): Sandbox {
   }
   const archive = join(root, 'session.jsonl');
   const store = join(root, appId === 'euler' ? 'probe.sqlite' : 'store.sqlite3');
-  writeFileSync(archive, JSON.stringify({ schema: 'cli-session@1', binding: bindingOf({ fixture } as Sandbox) }) + '\n', { flag: 'wx', mode: 0o600 });
+  writeFileSync(archive, JSON.stringify({ schema: 'cli-session@1', binding: bindingOf({ fixture: identity } as Sandbox<B>) }) + '\n', { flag: 'wx', mode: 0o600 });
   writeFileSync(store, '', { flag: 'wx', mode: 0o600 });
   syncFile(archive);
   syncFile(store);
@@ -90,11 +101,11 @@ export function createSandbox(appId = 'euler'): Sandbox {
   const ownerInfo = join(root, OWNER_INFO_FILE);
   writeFileSync(ownerInfo, JSON.stringify({ schema: 'owner-info@1', storeId: receiverStoreId }) + '\n', { flag: 'wx', mode: 0o600 });
   syncFile(ownerInfo);
-  const sandbox: Sandbox = {
+  const sandbox: Sandbox<B> = {
     schema: 'euler-disposable@1', appId, storeId: receiverStoreId, root,
     receiverIdentity: fileIdentity(receiver), ownerInfoIdentity: fileIdentity(ownerInfo),
     rootIdentity: fileIdentity(root), archiveIdentity: fileIdentity(archive), storeIdentity: fileIdentity(store),
-    fixtureDigest, fixture,
+    fixtureDigest, fixture: identity, ...(sessionBinding ? { sessionBinding } : {}),
   };
   const initialized = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox), true, undefined, appId);
   initialized.close();
@@ -133,5 +144,5 @@ export function openSandbox(path: string): Sandbox {
   sameFile(root, sandbox.rootIdentity);
   sameFile(join(root, standard ? 'store.sqlite3' : 'probe.sqlite'), sandbox.storeIdentity);
   sameFile(join(root, 'session.jsonl'), sandbox.archiveIdentity);
-  return { ...sandbox, fixture };
+  return { ...sandbox, fixture: { ...fixture, ...(sandbox.sessionBinding ?? {}) } };
 }

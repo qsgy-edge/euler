@@ -77,7 +77,7 @@ export class GuidanceSession {
       this.#directives = latest?.snapshot.directives ?? [];
     }
     else this.#store.authorizeRequestRun(activity, this.runId, { budget: DEFAULT_BUDGET, intent: null,
-      relatedRunId: null, acceptDuplicateRisk: false });
+      relatedRunId: null, acceptDuplicateRisk: false, guidanceOnly: true });
   }
 
   newWindow(): void { this.#files.clear(); }

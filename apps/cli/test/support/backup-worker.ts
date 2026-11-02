@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import sqlite from 'node:sqlite';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
-import { ProbeStore, ProbeSession, API_VERSION, DEFAULT_BUDGET, type Binding } from '@euler/core';
+import { requireProject, ProbeStore, ProbeSession, API_VERSION, DEFAULT_BUDGET, type Binding } from '@euler/core';
 import { openSandbox, bindingOf, resourcesOf, createSandboxSession } from '../../src/sandbox.ts';
 import { openProbe } from '../../src/probe.ts';
 import { backupSandbox, restoreSandboxSnapshot } from '../../src/backup.ts';
@@ -33,7 +33,7 @@ function seedCanonicalState() {
   const probe = openProbe(sandbox, undefined, undefined, binding, undefined, true);
   try {
     const { store, activity, archive } = probe;
-    const workspaceId = randomUUID(); store.bindWorkspace(activity, workspaceId, [binding.projectId]);
+    const workspaceId = randomUUID(); store.bindWorkspace(activity, workspaceId, [requireProject(binding)]);
     const goal = archive.append(randomUUID(), 'Preserve canonical recovery relationships');
     const transition = { status: 'active' as const, step: 'inspect' };
     const intent = store.transitionIntent(activity, null, goal, transition, 'Preserve canonical recovery relationships');
@@ -46,16 +46,16 @@ function seedCanonicalState() {
       recordId: records[0]!.recordId, revisionId: records[0]!.revisionId, headEventId: records[0]!.headEventId }));
     const feedback = store.recordMemoryFeedback(activity, records[0]!.recordId, records[0]!, input);
     const text = 'Atlas bounded canonical source', ref = archive.append(randomUUID(), text);
-    const publication = approvedSourceUnit(probe, { ref, projectId: binding.projectId, kind: 'source', offset: 0, length: text.length });
+    const publication = approvedSourceUnit(probe, { ref, projectId: requireProject(binding), kind: 'source', offset: 0, length: text.length });
     const unit = store.publishSourceUnit(activity, publication);
     const proposalInput = { target: 'canonical.md', expectedChange: 'Keep local logs', owner: binding.ownerId,
-      scope: { kind: 'project' as const, id: binding.projectId, resolved: true }, evidenceRefs: [ref],
+      scope: { kind: 'project' as const, id: requireProject(binding), resolved: true }, evidenceRefs: [ref],
       evaluation: { schema: 'evaluation-contract@1' as const, level: 'L0' as const, assertions: ['Keep the log'] } };
     const proposal = saveApprovedProposal(probe, proposalInput);
     store.drainSourceProjection(activity);
     const consent = archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1', intentId: intent.intentId,
-      goalEventId: intent.goalInput.eventId, projectIds: [binding.projectId], targets: {}, maxResults: 8, maxBytes: 131072 }));
-    const { grantId } = store.authorizeMemoryDiscovery(activity, consent, [binding.projectId], 8);
+      goalEventId: intent.goalInput.eventId, projectIds: [requireProject(binding)], targets: {}, maxResults: 8, maxBytes: 131072 }));
+    const { grantId } = store.authorizeMemoryDiscovery(activity, consent, [requireProject(binding)], 8);
     const query = { query: 'Atlas', grantId, queryId: randomUUID() }, page = store.searchSources(activity, query);
     return { binding, workspaceId, intent, transition, records, feedbackId: feedback.feedbackId, publication, unit, proposalInput, proposal, query, page };
   } finally { probe.close(); }
@@ -71,7 +71,7 @@ if (action === 'seed-canonical-state') {
     try { store.assertMemoryDiscovery(activity, saved.query.grantId); } catch (error) { grantError = (error as Error).message; }
     console.log(JSON.stringify({ records: saved.records.map(record => store.readMemory(activity, record.recordId)),
       feedback: store.readMemoryFeedback(activity, saved.records[0]!.recordId), grantError,
-      membership: store.guidanceMembership(activity, [saved.binding.projectId]),
+      membership: store.guidanceMembership(activity, [requireProject(saved.binding)]),
       intent: store.transitionIntent(activity, null, saved.intent.input, saved.transition, saved.intent.goal),
       unit: store.publishSourceUnit(activity, saved.publication),
       proposal: store.saveEvolutionProposal(activity, saved.proposal.input, saved.proposalInput), sends: probe.transport.count }));
@@ -81,7 +81,7 @@ if (action === 'seed-canonical-state') {
   createSandboxSession(sandbox, bindings[1]!);
   console.log(JSON.stringify(bindings.map(binding => {
     const probe = openProbe(sandbox, undefined, undefined, binding, undefined, true);
-    try { return { binding, saved: seedBackupOperations(probe, binding.projectId) }; } finally { probe.close(); }
+    try { return { binding, saved: seedBackupOperations(probe, requireProject(binding)) }; } finally { probe.close(); }
   })));
 } else if (action === 'corrupt-operations') {
   const { token, fault } = JSON.parse(value!) as { token: string; fault: string };

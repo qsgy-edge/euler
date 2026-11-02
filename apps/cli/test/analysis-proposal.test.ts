@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import test from 'node:test';
-import { AnalysisArtifacts } from '@euler/core';
+import { requireProject, AnalysisArtifacts } from '@euler/core';
 import type { EvolutionProposalInput } from '@euler/core';
 import { createSandbox } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
@@ -18,7 +18,7 @@ function scenario(run: (probe: ReturnType<typeof openProbe>, artifacts: Analysis
 }
 function proposal(probe: ReturnType<typeof openProbe>): EvolutionProposalInput {
   return { target: 'logging.ts', expectedChange: '记录环境字段。范围：测试日志。非目标：运行策略。', owner: probe.archive.events()[0]!.ack.binding.ownerId,
-    scope: { kind: 'project', id: probe.archive.events()[0]!.ack.binding.projectId, resolved: true }, evidenceRefs: [],
+    scope: { kind: 'project', id: requireProject(probe.archive.events()[0]!.ack.binding), resolved: true }, evidenceRefs: [],
     evaluation: { schema: 'evaluation-contract@1', level: 'L1', assertions: ['日志有环境字段'] } };
 }
 
@@ -65,7 +65,7 @@ test('a legacy proposal export includes its approved raw evidence and immutable 
     assert(exported.markdown.includes(source.locator));
     assert(exported.markdown.includes(source.hash));
     assert(exported.markdown.includes(source.contentHash));
-    assert(exported.markdown.includes(source.binding.projectId));
+    assert(exported.markdown.includes(requireProject(source.binding)));
     assert(exported.markdown.includes(`范围：project/${saved.scope.id}（resolved=true）`));
     assert(exported.markdown.includes(`目标类型：${saved.targetType}`));
     assert(exported.markdown.includes(`风险：${saved.risk}`));

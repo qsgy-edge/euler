@@ -5,7 +5,7 @@ import type { SourceAck } from '../contracts.ts';
 // actionable; semantic classification of free text belongs to the normal lane.
 export type OwnerMemoryType = 'preference' | 'decision' | 'fact';
 export interface OwnerMemoryStatement { type: OwnerMemoryType; content: string }
-export interface OwnerAgreement { schema: 'owner-agreement@1'; text: string; proposal: SourceAck }
+export interface OwnerAgreement { schema: 'owner-agreement@1'; text: string; proposal: SourceAck; input?: Pick<SourceAck, 'eventId' | 'locator'> }
 
 const TYPES: Record<string, OwnerMemoryType> = { 偏好: 'preference', 决定: 'decision', 事实: 'fact' };
 /** The accepted explicit owner forms, for Host hints; the parsers below are the authority. */
@@ -37,9 +37,10 @@ export function isOwnerDecline(text: string): boolean { return DECLINE.has(text.
 /** Untyped `记住：…` is archived but needs an explicit type before the fast lane can act. */
 export function isUntypedRemember(text: string): boolean { return /^记住[：:]/u.test(text.trim()); }
 
-export function encodeOwnerAgreement(text: string, proposal: SourceAck): string {
+export function encodeOwnerAgreement(text: string, proposal: SourceAck, input?: Pick<SourceAck, 'eventId' | 'locator'>): string {
   check(isOwnerAgreement(text), 'memory-agreement-not-explicit');
-  return JSON.stringify({ schema: 'owner-agreement@1', text: text.trim(), proposal });
+  return JSON.stringify({ schema: 'owner-agreement@1', text: input ? text : text.trim(), proposal,
+    ...(input ? { input: { eventId: input.eventId, locator: input.locator } } : {}) });
 }
 
 /** Returns null for ordinary text; a malformed agreement envelope is an evidence gap, not free text. */
@@ -47,8 +48,11 @@ export function parseOwnerAgreement(text: string): OwnerAgreement | null {
   if (!text.startsWith('{"schema":"owner-agreement@1"')) return null;
   let value: OwnerAgreement;
   try { value = JSON.parse(text) as OwnerAgreement; } catch { throw new Error('memory-agreement-evidence-gap'); }
-  check(value && Object.keys(value).sort().join(',') === 'proposal,schema,text' && isOwnerAgreement(value.text)
+  check(value && Object.keys(value).sort().join(',') === (value.input === undefined ? 'proposal,schema,text' : 'input,proposal,schema,text') && isOwnerAgreement(value.text)
     && value.proposal && typeof value.proposal === 'object'
-    && text === JSON.stringify({ schema: value.schema, text: value.text, proposal: value.proposal }), 'memory-agreement-evidence-gap');
+    && (value.input === undefined || value.input && typeof value.input === 'object'
+      && Object.keys(value.input).sort().join(',') === 'eventId,locator'
+      && typeof value.input.eventId === 'string' && typeof value.input.locator === 'string')
+    && text === JSON.stringify({ schema: value.schema, text: value.text, proposal: value.proposal, ...(value.input ? { input: value.input } : {}) }), 'memory-agreement-evidence-gap');
   return value;
 }

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { copyFileSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
@@ -482,8 +482,11 @@ test('a Host without a durable Info surface does not auto-activate; a durable Ho
 
 test('source errors, declines, untyped statements and unresolved scope never activate', async () => {
   const sandbox = createSandbox();
+  const archive = join(sandbox.root, 'session.jsonl');
+  const env = { ...process.env, NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${new URL('./support/owner-source-replace.mjs', import.meta.url).href}`,
+    T12_REPLACE_SOURCE: archive };
+  const cli = startCli(['remember', '--sandbox', sandbox.root, '--no-active-project', '--synthetic-proposals'], undefined, undefined, env);
   try {
-    const cli = startCli(['remember', '--sandbox', sandbox.root, '--no-active-project', '--synthetic-proposals']);
     await cli.waitFor('remember-ready');
     const unscoped = await send(cli, '记住偏好：包管理器使用 bun', 'remember-result');
     assert.deepEqual([unscoped.status, unscoped.stage, unscoped.reason, unscoped.level], ['blocked', 'candidate', 'scope-unresolved', 'warning']);
@@ -496,12 +499,12 @@ test('source errors, declines, untyped statements and unresolved scope never act
     assert.deepEqual([declined.status, declined.reason], ['cancelled', 'owner-declined']);
     const orphan = await send(cli, '同意', 'remember-result');
     assert.deepEqual([orphan.status, orphan.reason], ['not-actionable', 'agreement-target-missing']);
-    // A same-content replacement has a new identity, so the owner input cannot be made durable.
-    const archive = join(sandbox.root, 'session.jsonl');
-    copyFileSync(archive, `${archive}.copy`);
-    renameSync(`${archive}.copy`, archive);
+    // The child replaces the archive before append, without racing its background file checks.
+    const before = statSync(archive, { bigint: true }), bytes = readFileSync(archive);
     const broken = await send(cli, '记住偏好：包管理器使用 pnpm', 'remember-result');
     assert.deepEqual([broken.status, broken.committed, broken.level, broken.reason], ['error', false, 'error', 'file-identity-changed']);
+    assert.notEqual(statSync(archive, { bigint: true }).ino, before.ino);
+    assert.deepEqual(readFileSync(archive), bytes);
     const background = await cli.waitFor('capture-error');
     assert.deepEqual([background.reason, background.halted], ['file-identity-changed', true]);
     await stop(cli);
@@ -512,5 +515,8 @@ test('source errors, declines, untyped statements and unresolved scope never act
       assert.equal(db.prepare("SELECT count(*) AS n FROM memory_heads WHERE lifecycle='active'").get()!.n, 0);
       assert.equal(db.prepare('SELECT count(*) AS n FROM activation_batches').get()!.n, 0);
     } finally { db.close(); }
-  } finally { rmSync(sandbox.root, { recursive: true, force: true }); }
+  } finally {
+    if (cli.child.exitCode === null && cli.child.signalCode === null) { cli.child.kill(); await cli.exit; }
+    rmSync(sandbox.root, { recursive: true, force: true });
+  }
 });

@@ -34,8 +34,10 @@ export function createCaptureWorker(path?: string, onFailure?: (error: unknown) 
     if (consumer === 'memory' && probe.store.captureDrainBlocked(probe.activity)) return defer('request-recovery-required');
     if (recoverInfo?.() === false) return defer('host-info-recovery-required');
     if (!prerequisites) {
+      const reservation = probe.store.reserveChild(probe.activity);
       try { await verifyTransportPrerequisites(['capture','capture-run','capture-failure','capture-pump','capture-http-protocol','analysis-proposal','proposal-approval',
-        ...(consumer === 'historian' ? ['historian'] : [])], `${consumer === 'historian' ? 'historian' : 'capture'}-prerequisites`, signal); }
+        ...(consumer === 'historian' ? ['historian'] : [])], `${consumer === 'historian' ? 'historian' : 'capture'}-prerequisites`, signal, undefined,
+        pid => probe.store.recordChildLaunch(probe.activity, reservation, pid)); }
       catch (error) { defer(signal?.aborted ? 'capture-stopped' : 'prerequisite-evidence-gap'); throw error; }
       prerequisites = true;
     }
@@ -78,7 +80,7 @@ export function scheduleCaptures(probe: Probe, path: string | undefined, recover
       } while (pending);
     })().finally(() => { running = undefined; });
   };
-  return { kick, async flush() { kick(); await running; },
+  return { kick, idle: () => running, async flush() { kick(); await running; },
     async close() { abort.abort(new Error('capture-stopped')); await running; } };
 }
 

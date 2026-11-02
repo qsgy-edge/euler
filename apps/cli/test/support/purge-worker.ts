@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { AnalysisArtifacts, check, MemoryCorrections } from '@euler/core';
+import { requireProject, AnalysisArtifacts, check, MemoryCorrections } from '@euler/core';
 import type { AnalysisArtifact, SourceAck, SourceUnit } from '@euler/core';
 import cases from '../../../../fixtures/t21-purge-cases.json' with { type: 'json' };
 import cleanupCases from '../../../../fixtures/t22a-source-cleanup.json' with { type: 'json' };
@@ -16,7 +16,7 @@ try {
     const source = ['historian', 'project-output'].includes(scenario) && index === 0
       ? archive.events().find(entry => entry.role === 'user')!.ack : archive.append(randomUUID(), text);
     const record = store.captureMemory(activity, source, scenario === 'bracket-text' ? '[T21] ' + content : content, {
-      type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [], claimKey: key,
+      type: 'fact', scope: { kind: 'project', id: requireProject(sandbox.fixture), resolved: true }, appliesTo: [], claimKey: key,
     }).record;
     return store.verifyMemory(activity, record.recordId, record, 'pass', [source]).record;
   });
@@ -29,7 +29,7 @@ try {
       store.readMemory(activity, records[1]!.recordId)).left.record;
   }
   if (scenario === 'discovery') {
-    const unit = store.publishSourceUnit(activity, approvedSourceUnit(probe, { ref: target.source, projectId: sandbox.fixture.projectId,
+    const unit = store.publishSourceUnit(activity, approvedSourceUnit(probe, { ref: target.source, projectId: requireProject(sandbox.fixture),
       kind: 'source', offset: 0, length: Array.from(archive.read(target.source).text).length }));
     saveApprovedProposal(probe, { target: 'synthetic-guidance.md', expectedChange: 'Keep the synthetic fact scoped',
       owner: sandbox.fixture.ownerId, scope: target.scope, evidenceRefs: [target.source], sourceUnits: [unit.unitId],
@@ -37,9 +37,9 @@ try {
     store.drainSourceProjection(activity);
     const intent = store.readIntent(activity)!;
     const consent = archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
-      intentId: intent.intentId, goalEventId: intent.goalInput.eventId, projectIds: [sandbox.fixture.projectId],
+      intentId: intent.intentId, goalEventId: intent.goalInput.eventId, projectIds: [requireProject(sandbox.fixture)],
       targets: {}, maxResults: 4, maxBytes: 131072 }));
-    const { grantId } = store.authorizeMemoryDiscovery(activity, consent, [sandbox.fixture.projectId], 4);
+    const { grantId } = store.authorizeMemoryDiscovery(activity, consent, [requireProject(sandbox.fixture)], 4);
     const page = store.searchSources(activity, { query: 'T21 source mem-1', grantId, queryId: randomUUID() });
     check(page.results.some(result => result.unitId === unit.unitId), 'purge-fixture-search-gap');
     store.expandSource(activity, { unitId: unit.unitId, grantId, queryId: randomUUID(), offset: 0, limit: 4096 });
@@ -89,7 +89,7 @@ try {
       const report = artifacts.saveReport({ eventId: randomUUID(), ...cleanupCases.report,
         title: cleanupCases.report.title + version, evidence, ...(prior ? { supersedes: prior.ref } : {}) });
       documents.push(report.ref);
-      const unit = store.publishSourceUnit(activity, approvedSourceUnit(probe, { ref: report.ref, projectId: sandbox.fixture.projectId,
+      const unit = store.publishSourceUnit(activity, approvedSourceUnit(probe, { ref: report.ref, projectId: requireProject(sandbox.fixture),
         kind: 'report-section', offset: report.bodyOffset, length: Array.from(report.body).length,
         ...(priorUnit ? { supersedes: priorUnit.unitId } : {}) }));
       prior = report; priorUnit = unit;

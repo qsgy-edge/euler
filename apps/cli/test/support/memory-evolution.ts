@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { API_VERSION, DEFAULT_BUDGET, ProbeSession, fileIdentity, sha256 } from '@euler/core';
+import { requireProject, API_VERSION, DEFAULT_BUDGET, ProbeSession, fileIdentity, sha256 } from '@euler/core';
 import type { MemoryComparison, MemoryRecord, SourceAck } from '@euler/core';
 import { approvedSourceUnit } from './source-publication.ts';
 import { bindingOf } from '../../src/sandbox.ts';
@@ -93,7 +93,7 @@ export function observedFact(probe: Probe, sandbox: Sandbox, content: string, bo
     event({ kind: 'tool-result', result: { callId, argumentsHash, executionState: 'started', outcome: 'success', errorClass: null,
       source, file: { identity: fileIdentity(path), text, byteLength: Buffer.byteLength(text) } } });
     event({ kind: 'terminal', terminal: 'completed' });
-    probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref: source, projectId: sandbox.fixture.projectId,
+    probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref: source, projectId: requireProject(sandbox.fixture),
       kind: 'report-section', offset: 0, length: Array.from(text).length }));
     probe.store.drainSourceProjection(probe.activity);
     return source;

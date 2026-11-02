@@ -6,7 +6,7 @@ import { bindingOf } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
 
 type Gate = <T>(action: () => T) => T;
-interface RawEvent { schema: 'cli-input@1'; eventId: string; role: 'user' | 'assistant' | 'tool'; text: string }
+interface RawEvent { schema: 'cli-input@1'; eventId: string; role: 'user' | 'assistant' | 'tool'; text: string; projectId?: string | null }
 export interface ArchiveJournal {
   prepare(input: () => SourceAppend | SourceAck): SourceAppend | SourceAck;
   pending(): SourceAppend[];
@@ -118,19 +118,24 @@ export class CliArchive {
     const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     const lines = text.slice(0, -1).split('\n');
     const header = JSON.parse(lines.shift()!);
-    check(header.schema === 'cli-session@1' && sameBinding(header.binding, bindingOf(this.#sandbox)), 'archive-binding-mismatch');
+    const current = bindingOf(this.#sandbox);
+    check(header.schema === 'cli-session@1' && sameBinding({ ...header.binding, projectId: current.projectId }, current)
+      && (header.binding.projectId === null || header.binding.projectId === current.projectId), 'archive-binding-mismatch');
     const seen = new Set<string>();
     return lines.filter(line => !/^ +$/.test(line)).map(line => {
       const event = JSON.parse(line) as RawEvent;
       uuid(event.eventId);
       check(event.schema === 'cli-input@1' && ['user', 'assistant', 'tool'].includes(event.role) && typeof event.text === 'string'
         && event.text.length > 0 && Buffer.byteLength(event.text) <= 65536, 'archive-integrity');
-      check(line === JSON.stringify({ schema: event.schema, eventId: event.eventId, role: event.role, text: event.text }),
+      const projectId = event.projectId === undefined ? header.binding.projectId : event.projectId;
+      if (projectId !== null) uuid(projectId);
+      check(line === JSON.stringify({ schema: event.schema, eventId: event.eventId, role: event.role, text: event.text,
+        ...(event.projectId === undefined ? {} : { projectId }) }),
         'archive-integrity: event bytes conflict');
       check(!seen.has(event.eventId), 'archive-integrity: duplicate identity');
       seen.add(event.eventId);
       return { event, ack: {
-        schema: 'cli-source-ack@1', status: 'durable', binding: bindingOf(this.#sandbox),
+        schema: 'cli-source-ack@1', status: 'durable', binding: { ...current, projectId },
         eventId: event.eventId, locator: `cli-jsonl@1/${this.#sandbox.fixture.sessionId}/${event.eventId}`,
         hash: sha256(line), byteLength: Buffer.byteLength(line), contentHash: sha256(event.text),
       } };
@@ -161,7 +166,8 @@ export class CliArchive {
       // Core's local result and budget mutation commit with this exact-byte reservation.
       const content = typeof text === 'function' ? text() : text;
       check(typeof content === 'string' && content.length > 0 && Buffer.byteLength(content) <= 65536, 'invalid-input');
-      const line = JSON.stringify({ schema: 'cli-input@1', eventId, role, text: content }) + '\n';
+      const line = JSON.stringify({ schema: 'cli-input@1', eventId, role, text: content,
+        ...(this.#sandbox.sessionBinding ? { projectId: bindingOf(this.#sandbox).projectId } : {}) }) + '\n';
       check(bytes.length + Buffer.byteLength(line) <= 1_048_576, 'archive-limit');
       return { eventId, binding: bindingOf(this.#sandbox), bytes: line, offset: bytes.length, prefixHash: sha256(bytes) };
     });
@@ -234,7 +240,9 @@ export class CliArchive {
 
   read(ref: SourceAck): { text: string; role: RawEvent['role'] } {
     return this.#gate(() => {
-      check(sameBinding(ref.binding, bindingOf(this.#sandbox)), 'source-scope-mismatch');
+      const binding = bindingOf(this.#sandbox);
+      check(sameBinding({ ...ref.binding, projectId: binding.projectId }, binding)
+        && (binding.projectId === null || ref.binding.projectId === null || ref.binding.projectId === binding.projectId), 'source-scope-mismatch');
       check(!this.#journal?.pending().some(item => item.eventId === ref.eventId), 'archive-append-pending');
       const result = this.#scan().find(item => item.event.eventId === ref.eventId);
       check(result && JSON.stringify(result.ack) === JSON.stringify(ref), 'source-evidence-gap');

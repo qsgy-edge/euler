@@ -4,13 +4,13 @@ import { openSync, closeSync, ftruncateSync, fsyncSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
-import { DEFAULT_BUDGET, ProbeStore, check } from '@euler/core';
+import { requireProject, DEFAULT_BUDGET, ProbeStore, check } from '@euler/core';
 import type { ProbeBudget } from '@euler/core';
-import { createSandbox, openSandbox, bindingOf, resourcesOf } from './sandbox.ts';
+import { createSandbox, createSessionSandbox, createSandboxSession, openSandbox, bindingOf, resourcesOf } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
 import { openProbe } from './probe.ts';
 import { startCli } from './process-driver.ts';
-import { AGENT_BUDGET, runAgentDemo } from './agent-cli.ts';
+import { AGENT_BUDGET, runAgentDemo, runInteractiveSession } from './agent-cli.ts';
 import { deliverMemoryInfo, runInfoDelivery, runInfoQuery, runRememberSession } from './owner-memory.ts';
 import { runHandoffDemo } from './analysis-handoff.ts';
 import { runContextDemo } from './context-cli.ts';
@@ -180,7 +180,7 @@ async function memoryDemo(sandbox: Sandbox) {
     const { intent } = probe.session.prepare(sandbox.fixture.eventId, sandbox.fixture.text);
     const input = probe.archive.append(memoryFixture.sourceEventId, memoryFixture.sourceText);
     const options = { type: 'decision' as const, claimKey: memoryFixture.claimKey,
-      scope: { kind: 'project' as const, id: sandbox.fixture.projectId, resolved: true }, appliesTo: memoryFixture.appliesTo };
+      scope: { kind: 'project' as const, id: requireProject(sandbox.fixture), resolved: true }, appliesTo: memoryFixture.appliesTo };
     const captured = probe.store.captureMemory(probe.activity, input, memoryFixture.memoryText, options);
     const verified = probe.store.verifyMemory(probe.activity, captured.record.recordId, captured.record, 'pass', [input]);
     const activated = probe.store.activateMemory(probe.activity, verified.record.recordId, verified.record);
@@ -237,7 +237,8 @@ function registeredArchiveBinding(sandbox: Sandbox, budget: ProbeBudget, session
 
 async function main() {
   const args = parseArgs({ allowPositionals: true, options: {
-    sandbox: { type: 'string' }, scenario: { type: 'string', default: 'success' }, budget: { type: 'string' },
+    sandbox: { type: 'string' }, owner: { type: 'string' }, host: { type: 'string' },
+    scenario: { type: 'string', default: 'success' }, budget: { type: 'string' },
     request: { type: 'string' }, job: { type: 'string' }, record: { type: 'string' }, reservation: { type: 'string' },
     'transport-config': { type: 'string' }, 'capture-config': { type: 'string' }, 'historian-config': { type: 'string' }, interactive: { type: 'boolean', default: false },
     attempt: { type: 'string' }, snapshot: { type: 'string' }, session: { type: 'string' },
@@ -248,6 +249,30 @@ async function main() {
   } });
   check(args.positionals.length <= 1, 'invalid-command');
   const command = args.positionals[0] ?? 'success';
+  if (command === 'session-create') {
+    const existing = args.values.sandbox ? openSandbox(args.values.sandbox) : null;
+    check(existing?.sessionBinding || args.values.owner && args.values.host, 'explicit-owner-host-required');
+    const sandbox = existing ?? createSessionSandbox(args.values.owner!, args.values.host!);
+    let binding = bindingOf(sandbox);
+    if (existing) {
+      check(existing.sessionBinding && (!args.values.owner || args.values.owner === binding.ownerId)
+        && (!args.values.host || args.values.host === binding.hostId), 'store-binding-mismatch');
+      binding = { ...binding, projectId: null, sessionId: randomUUID(), branchId: randomUUID() };
+      createSandboxSession(existing, binding);
+    }
+    emit('session-created', { root: sandbox.root, storeId: sandbox.storeId, binding, mode: 'synthetic-only' });
+    return;
+  }
+  if (command === 'session') {
+    check(args.values.sandbox, 'sandbox-required');
+    const sandbox = openSandbox(args.values.sandbox);
+    return runInteractiveSession(sandbox, {
+      ...(args.values.session ? { binding: registeredArchiveBinding(sandbox, AGENT_BUDGET, args.values.session) } : {}),
+      ...(args.values['transport-config'] ? { transportConfig: args.values['transport-config'] } : {}),
+      ...(args.values['capture-config'] ? { captureConfig: args.values['capture-config'] } : {}),
+      ...(args.values['historian-config'] ? { historianConfig: args.values['historian-config'] } : {}),
+    });
+  }
   const requestCommands = ['request-status', 'request-seal', 'request-reconcile', 'request-resume', 'request-gap'];
   const snapshotCommands = ['backup', 'backups', 'restore-snapshot', 'recovery-new-session'];
   check([...snapshotCommands, ...requestCommands, 'archive-reconcile', 'purge', 'historian', 'historian-drain', 'context', 'capture-drain', 'capture-status', 'capture-reconcile', 'handoff', 'capture', 'agent', 'agent-status', 'remember', 'info', 'create', 'run', 'recover', 'memory', 'memory-worker', 'memory-reconcile', 'hold', 'task', 'maintain', 'maintenance-status', 'success', 'blocked', 'archive-failure', 'archive-only', 'cancelled', 'maintenance'].includes(command), 'invalid-command');

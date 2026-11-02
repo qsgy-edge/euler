@@ -3,7 +3,7 @@ import { writeSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
-import { check } from '@euler/core';
+import { requireProject, check } from '@euler/core';
 import { bindingOf, createSandbox, createSandboxSession, openSandbox, resourcesOf } from '../apps/cli/src/sandbox.ts';
 import { openProbe } from '../apps/cli/src/probe.ts';
 import fixture from '../fixtures/persistence.json' with { type: 'json' };
@@ -39,7 +39,7 @@ async function main() {
       const candidates = fixture.facts.map((content, index) => {
         const source = probe.archive.append(fixture.sourceIds[index]!, content);
         const c = probe.store.captureMemory(probe.activity, source, content, {
-          type: 'decision', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
+          type: 'decision', scope: { kind: 'project', id: requireProject(sandbox.fixture), resolved: true }, appliesTo: [],
         });
         return probe.store.verifyMemory(probe.activity, c.record.recordId, c.record, 'pass', [source]).record;
       });
