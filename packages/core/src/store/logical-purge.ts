@@ -14,7 +14,7 @@ export const PURGE_DATABASE_INVENTORY = {
   control: ['schema_meta', 'owner_fences', 'maintenance_residuals', 'owner_activities', 'sessions', 'projects',
     'project_resources', 'workspaces', 'workspace_projects', 'memory_scopes', 'source_projection_health',
     'store_recovery_events', 'store_recovered_owners', 'execution_streams', 'execution_events'],
-  content: ['intent_events', 'intent_heads', 'memory_discovery_grants', 'memory_discovery_projects',
+  content: ['session_project_bindings', 'intent_events', 'intent_heads', 'memory_discovery_grants', 'memory_discovery_projects',
     'memory_discovery_targets', 'source_query_receipts', 'memory_records', 'memory_revisions', 'memory_applicability',
     'capture_jobs', 'compartments', 'capture_work', 'provenance_refs', 'memory_heads', 'memory_events',
     'host_presentations', 'presentation_targets', 'pending_operations', 'host_operation_delivery', 'activation_batches',

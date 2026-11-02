@@ -1,6 +1,6 @@
 import fixture from '../../../fixtures/t13-capture-cases.json' with { type: 'json' };
 import { randomUUID } from 'node:crypto';
-import { AnalysisArtifacts, check } from '@euler/core';
+import { requireProject, AnalysisArtifacts, check } from '@euler/core';
 import { openProbe } from './probe.ts';
 import type { Sandbox } from './sandbox.ts';
 
@@ -19,7 +19,7 @@ export function runHandoffDemo(sandbox: Sandbox, scenario: string): void {
       inferences: '日志可能需要补充环境信息。', recommendations: section, unresolved: '真实 provider 尚未验证。', evidence: [] });
     const raw = probe.archive.read(report.ref).text;
     const offset = Array.from(raw.slice(0, raw.indexOf(section))).length;
-    const publication = { ref: report.ref, projectId: goal.binding.projectId, kind: 'report-section' as const, offset, length: Array.from(section).length };
+    const publication = { ref: report.ref, projectId: requireProject(goal.binding), kind: 'report-section' as const, offset, length: Array.from(section).length };
     const approval = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'source-publication-approval@1',
       intentId: intent.intentId, goalEventId: intent.goalInput.eventId, ...publication }));
     const unit = probe.store.publishSourceUnit(probe.activity, { ...publication, approval });

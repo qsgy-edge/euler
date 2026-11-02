@@ -53,7 +53,9 @@ export function parseFileCall(call: ToolCall): { parts: string[]; operation: 'fi
 }
 export function validateFileCapability(capability: FileCapability, binding: Binding): void {
   check(capability.schema === 'file-capability@1' && sameBinding(capability.binding, binding)
-    && sameBinding(capability.source.binding, binding) && /^[0-9a-f-]{36}$/.test(capability.grantId), 'file-owner-mismatch');
+    && sameBinding({ ...capability.source.binding, projectId: binding.projectId }, binding)
+    && (capability.source.binding.projectId === null || capability.source.binding.projectId === binding.projectId)
+    && /^[0-9a-f-]{36}$/.test(capability.grantId), 'file-owner-mismatch');
   check(typeof capability.root.path === 'string' && capability.root.path.length <= 2048
     && /^\d+$/.test(capability.root.identity.dev) && /^\d+$/.test(capability.root.identity.ino), 'file-root-identity-required');
 }

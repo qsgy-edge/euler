@@ -9,7 +9,7 @@ export interface CompartmentBody {
   decisions: { eventId: string; text: string; precedingResponse: string | null }[];
   results: { eventId: string; text: string }[];
   citations: SourceAck[];
-  applicability: { ownerId: string; projectId: string; sessionId: string; runId: string };
+  applicability: { ownerId: string; projectId: string | null; sessionId: string; runId: string };
 }
 export interface Compartment {
   jobId: string; runId: string; firstResponse: number; endResponse: number;

@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
-import { API_VERSION, check, sha256, sourceEventId, validateBudget } from '../contracts.ts';
+import { API_VERSION, check, requireProject, sha256, sourceEventId, validateBudget } from '../contracts.ts';
 import type { Binding, HostAdapter, ProbeBudget, SourceAck } from '../contracts.ts';
 import type { Activity, ProbeStore } from '../store/probe-store.ts';
-import type { RequestAttempt, RequestRecovery, RequestAssemblyInput } from '../store/request-ledger.ts';
+import type { RequestAttempt, RequestRecovery, RequestAssemblyInput, RequestStatus } from '../store/request-ledger.ts';
 import { coreToolSchemas, controlledToolSchema } from './tool-schemas.ts';
 import type { ToolSchema } from './tool-schemas.ts';
 import { fileToolSchemas, parseFileCall, validateFileCapability } from './file-contract.ts';
@@ -27,8 +27,9 @@ export interface AgentHost {
   discoveryGrantId?: string;
   files?: FileCapability;
   memoryCorrections?: boolean;
+  conversation?: boolean;
   historian?: { bounds: import('./historian.ts').HistorianBounds; onError(error: unknown): void };
-  guidance?: { session: GuidanceSession; targets: GuidanceTarget[]; operation: GuidanceOperation };
+  guidance?: { session: GuidanceSession; targets: GuidanceTarget[]; operation: GuidanceOperation; selectFiles?: boolean };
 }
 export interface NeutralRequest extends ModelRoute {
   schema: 'euler-model@1';
@@ -57,10 +58,12 @@ export class AgentRun {
   readonly #budget: ProbeBudget;
   readonly #prepared = new WeakMap<ModelRequest, { digest: string; summaryHash: string; guidanceHash: string | null }>();
   #inflightGuidanceHash: string | null = null;
+  #fileGuidanceDirty = false;
   #inflightSummaryHash: string | null = null;
   #inflight: string | null = null;
   readonly #calls = new Map<string, ToolCall>();
   readonly #retrievalChecks = new Map<string, () => void>();
+  readonly #conversationChecks = new Set<string>();
   readonly #executionMode: 'parallel-safe' | 'sequential';
   readonly #abort = new AbortController();
   readonly #started = performance.now();
@@ -93,10 +96,15 @@ export class AgentRun {
     options: { executionMode?: 'parallel-safe' | 'sequential'; recovery?: RequestRecovery } = {}) {
     validateBudget(budget);
     this.#store = store; this.#activity = activity; this.#host = { ...host, binding: structuredClone(host.binding),
-      ...(host.guidance ? { guidance: { session: host.guidance.session, targets: structuredClone(host.guidance.targets), operation: structuredClone(host.guidance.operation) } } : {}),
+      ...(host.guidance ? { guidance: { session: host.guidance.session, targets: structuredClone(host.guidance.targets), operation: structuredClone(host.guidance.operation), ...(host.guidance.selectFiles ? { selectFiles: true } : {}) } } : {}),
       ...(host.files ? { files: structuredClone(host.files) } : {}) };
     if (host.files) {
       validateFileCapability(host.files, host.binding);
+      if (host.files.source.binding.projectId === null) {
+        const project = store.sessionProject(activity);
+        check(project?.projectId === host.binding.projectId && JSON.stringify(project.root) === JSON.stringify(host.files.root)
+          && JSON.stringify(project.confirmation) === JSON.stringify(host.files.source), 'file-project-confirmation-required');
+      }
       // The protected store can be bound through a Windows 8.3 spelling.
       // Compare its native canonical path with the canonical project root;
       // the Host independently rejects noncanonical project-root aliases.
@@ -135,6 +143,7 @@ export class AgentRun {
     try {
       if (this.#host.discoveryGrantId) this.#store.assertMemoryDiscovery(this.#activity, this.#host.discoveryGrantId);
       for (const verify of this.#retrievalChecks.values()) verify();
+      for (const runId of this.#conversationChecks) this.#store.assertConversationRun(this.#activity, runId);
     } catch (error) {
       this.#invalidateCache('retrieval-stale');
       throw error;
@@ -204,7 +213,7 @@ export class AgentRun {
           });
         } else {
           check(this.#host.guidance, 'guidance-unavailable');
-          result = this.#host.guidance.session.search(this.#host.binding.projectId, query, 8, cursor);
+          result = this.#host.guidance.session.search(requireProject(this.#host.binding), query, 8, cursor);
         }
       }
       const modelResult = JSON.stringify(result);
@@ -264,6 +273,23 @@ export class AgentRun {
     this.#host.guidance?.session.newWindow();
     return windowId;
   }
+  #turns(ledger: RequestStatus, state: AgentStatus) {
+    return state.responses.map(response => {
+      const inputs = responseInputIds(ledger, response.attemptId).map(id => state.inputs.find(input => input.source.eventId === id)!.source);
+      const results = state.tools.filter(tool => tool.attemptId === response.attemptId).map(tool => {
+        check(tool.result, 'unsettled-tool-batch'); return tool.result.source;
+      });
+      const turn: NeutralRequest['p2'][number] = {
+        inputs: inputs.map(source => ({ role: 'user', content: this.#host.source.read(source).text })),
+        assistant: JSON.parse(this.#host.source.read(response.source).text),
+        results: results.map(ref => {
+          const { callId, outcome, modelResult } = JSON.parse(this.#host.source.read(ref).text);
+          return { callId, outcome, modelResult };
+        }),
+      };
+      return { turn, inputs, sources: [...inputs, response.source, ...results] };
+    });
+  }
   nextModel(): ModelRequest | null {
     if (!this.#active()) return null;
     this.#checkRetrieval();
@@ -298,26 +324,10 @@ export class AgentRun {
         activations: snapshot.activations, references: snapshot.references, constraints: snapshot.constraints,
         resolutions: snapshot.resolutions, directives: snapshot.directives, operation: this.#host.guidance!.operation } } : {}) };
     const ledger = this.#store.requestStatus(this.#activity, this.runId);
-    const priorInputs = new Set<string>();
-    const turnSources: SourceAck[][] = [];
-    const p2 = state.responses.map(response => {
-      const refs: SourceAck[] = [response.source];
-      turnSources.push(refs);
-      const inputs = responseInputIds(ledger, response.attemptId).map(id => {
-        priorInputs.add(id);
-        const source = state.inputs.find(input => input.source.eventId === id)!.source;
-        refs.push(source);
-        return { role: 'user' as const, content: this.#host.source.read(source).text };
-      });
-      const assistant = JSON.parse(this.#host.source.read(response.source).text) as ModelReply;
-      const results = state.tools.filter(tool => tool.attemptId === response.attemptId).map(tool => {
-        check(tool.result, 'unsettled-tool-batch');
-        refs.push(tool.result.source);
-        const raw = JSON.parse(this.#host.source.read(tool.result.source).text) as { callId: string; outcome: string; modelResult: string };
-        return { callId: raw.callId, outcome: raw.outcome, modelResult: raw.modelResult };
-      });
-      return { inputs, assistant, results };
-    });
+    const turns = this.#turns(ledger, state);
+    const priorInputs = new Set(turns.flatMap(turn => turn.inputs.map(source => source.eventId)));
+    const turnSources = turns.map(turn => turn.sources);
+    const p2 = turns.map(turn => turn.turn);
     const p3 = { intent: { goal: intent.goal, constraints: intent.constraints, step: intent.step },
       messages: state.inputs.filter(input => input.mode === 'steer' && !priorInputs.has(input.source.eventId)).map(input => ({ role: 'user' as const, content: this.#host.source.read(input.source).text })) };
     const operationSummaries = this.#store.correctionModelSummaries(this.#activity);
@@ -336,7 +346,6 @@ export class AgentRun {
     const activeInputs = state.inputs.filter(input => input.mode === 'steer'
       && priorInputs.has(input.source.eventId) && !retained.has(input.source.eventId));
     sources.push(...activeInputs.map(input => input.source));
-    const selectedSources = [...new Map(sources.map(source => [source.eventId, source])).values()];
     const neutral: NeutralRequest = { schema: 'euler-model@1', ...this.#route, p0,
       p1: { ...(operationSummaries.length ? operationContext : {}),
         ...(compartments.length ? { compartments: compartments.map(item => item.body) } : {}),
@@ -346,6 +355,27 @@ export class AgentRun {
       p2: p2.slice(window.firstResponse), p3 };
     let degradation: RequestAssemblyInput['degradation'] = state.windows.length > 1 ? 'window' : operationContext.operationArchive ? 'compact' : 'none';
     const encode = (value = neutral) => this.#host.encode ? this.#host.encode(structuredClone(value)) : JSON.stringify(value);
+    this.#conversationChecks.clear();
+    if (this.#host.conversation && window.reason === 'initial') {
+      // Keep complete preceding exchanges only while the actual encoded request fits. The archive remains searchable.
+      for (const prior of this.#store.sessionAgentRuns(this.#activity).reverse()) {
+        if (prior.run.runId === this.runId) continue;
+        const previous = this.#store.agentStatus(this.#activity, prior.run.runId);
+        if (previous.terminal !== 'completed' || previous.discoveryGrantId || previous.inputs.every(input => input.state !== 'bound-to-assembly')) break;
+        try { this.#store.assertConversationRun(this.#activity, prior.run.runId); }
+        catch (error) {
+          if (error instanceof Error && ['memory-stale','memory-not-current','source-scope-mismatch','discovery-not-authorized','conversation-unavailable'].includes(error.message)) break;
+          throw error;
+        }
+        const history = this.#turns(prior, previous);
+        const candidate = [...history.map(turn => turn.turn), ...neutral.p2];
+        if (Buffer.byteLength(encode({ ...neutral, p2: candidate })) + this.#budget.outputReserve + this.#budget.safetyMargin > this.#budget.contextLimit) break;
+        neutral.p2 = candidate;
+        sources.push(...history.flatMap(turn => turn.sources));
+        this.#conversationChecks.add(prior.run.runId);
+      }
+    }
+    const selectedSources = [...new Map(sources.map(source => [source.eventId, source])).values()];
     let payload = encode();
     let byteLength = Buffer.byteLength(payload);
     let reserved = byteLength + this.#budget.outputReserve + this.#budget.safetyMargin;
@@ -406,12 +436,13 @@ export class AgentRun {
       this.#checkGuidance(this.#prepared.get(request)!.guidanceHash);
       this.#checkRetrieval();
       attempt = this.#store.startRequestAttempt(this.#activity, { runId: this.runId, assemblyId: request.assemblyId,
-        payloadHash: sha256(payload), byteLength: Buffer.byteLength(payload), adapterVersion: API_VERSION });
+        payloadHash: sha256(payload), byteLength: Buffer.byteLength(payload), adapterVersion: this.#host.conversation ? 'session-http@1' : API_VERSION });
     } catch (error) {
       this.#invalidateCache('admission-snapshot-stale');
       throw error;
     }
     this.#inflightGuidanceHash = this.#prepared.get(request)!.guidanceHash;
+    this.#fileGuidanceDirty = false;
     this.#inflightSummaryHash = this.#prepared.get(request)!.summaryHash;
     this.#prepared.delete(request);
     this.#ready = null;
@@ -467,6 +498,14 @@ export class AgentRun {
       this.#terminal(reply.stop === 'length' ? 'needs-input' : 'completed');
     }
   }
+  continue(eventId: string, text: string, mode: 'steer' | 'queue' = 'steer'): AgentRun {
+    check(this.status().terminal === 'completed' && !this.#followed, 'run-continuation-not-admissible');
+    const next = new AgentRun(this.#store, this.#activity, this.#host, this.#route, this.#budget,
+      { executionMode: this.#executionMode, recovery: { relatedRunId: this.runId, acceptDuplicateRisk: false } });
+    next.receive(eventId, text, mode);
+    this.#followed = true;
+    return next;
+  }
   followUp(): AgentRun | null {
     const state = this.status();
     if (state.terminal !== 'completed' || this.#followed) return null;
@@ -511,6 +550,7 @@ export class AgentRun {
   }
   startTool(callId: string): ToolCall | null {
     if (!this.#active()) return null;
+    if (this.#fileGuidanceDirty) { this.#result(callId, 'unavailable', 'file-guidance-refresh-required', 'guidance-changed'); return null; }
     this.#checkGuidance(this.#inflightGuidanceHash);
     this.#checkRetrieval();
     const state = this.status();
@@ -550,6 +590,20 @@ export class AgentRun {
     check(call && tool && !tool.started && !tool.result, 'file-not-admissible');
     this.#store.assertToolAdmission(this.#activity, this.runId);
     const parsed = parseFileCall(call);
+    const guidance = this.#host.guidance;
+    if (guidance?.selectFiles) {
+      const path = join(this.#host.files.root.path, ...parsed.parts);
+      const before = this.#guidance()!;
+      if (!guidance.targets.some(target => target.path === path)) {
+        guidance.targets.push({ projectId: requireProject(this.#host.binding), path });
+      }
+      guidance.operation = { name: parsed.operation === 'file.write' ? 'synthetic.write' : 'synthetic.read', targets: [path] };
+      const after = this.#guidance()!;
+      this.#fileGuidanceDirty ||= after.snapshotHash !== before.snapshotHash;
+      this.#inflightGuidanceHash = after.snapshotHash;
+      // A call chosen without the newly discovered local rules must be reconsidered by the model before I/O.
+      check(!this.#fileGuidanceDirty, 'file-guidance-refresh-required');
+    }
     validateFileCapability(this.#host.files, this.#host.binding);
     this.#host.source.read(this.#host.files.source);
     const stream = this.#store.readStream(this.#activity, this.#activity.streamId);

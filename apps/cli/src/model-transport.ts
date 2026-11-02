@@ -43,7 +43,7 @@ export interface TransportPrerequisites {
   command: string[]; exitCode: number | null; elapsedMs: number; outputHash: string; passed: boolean;
 }
 export async function verifyTransportPrerequisites(extraTests: string[] = [], event = 'agent-prerequisites', signal?: AbortSignal,
-  observe?: (receipt: TransportPrerequisites) => void): Promise<void> {
+  observe?: (receipt: TransportPrerequisites) => void, launched?: (pid: number) => void): Promise<void> {
   const root = fileURLToPath(new URL('../../../', import.meta.url));
   const tests = ['archive', 'persistence', 'search-projection', 'request-ledger', 'request-recovery', 'request-admission', 'request-ledger-boundaries', 'agent-run', 'agent-boundaries', 'model-transport', ...extraTests]
     .map(name => `apps/cli/test/${name}.test.ts`);
@@ -51,7 +51,7 @@ export async function verifyTransportPrerequisites(extraTests: string[] = [], ev
   const command = ['--test', '--test-concurrency=4', ...tests];
   const env = { ...process.env }; delete env.NODE_TEST_CONTEXT;
   const started = Date.now();
-  const result = await new Promise<{ status: number | null; stdout: string; stderr: string }>(resolve => {
+  const result = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
     let timer: ReturnType<typeof setInterval> | undefined;
     let stdoutBytes = 0, stderrBytes = 0, reportedTests = 0, pending = '';
     let lastTestHash: string | null = null;
@@ -60,6 +60,9 @@ export async function verifyTransportPrerequisites(extraTests: string[] = [], ev
       clearInterval(timer);
       resolve({ status: error ? typeof error.code === 'number' ? error.code : null : 0, stdout, stderr });
     });
+    if (launched && child.pid !== undefined) {
+      try { launched(child.pid); } catch (error) { child.kill(); reject(error); }
+    }
     child.stdout?.on('data', (chunk: string) => {
       stdoutBytes += Buffer.byteLength(chunk);
       const lines = (pending + chunk).split(/\r?\n/u);
@@ -216,7 +219,7 @@ export class HttpModelTransport {
         const name = call.function.name, argumentsValue: unknown = JSON.parse(call.function.arguments);
         check(argumentsValue && typeof argumentsValue === 'object' && !Array.isArray(argumentsValue), 'invalid-provider-tool');
         // Exact fixed namespace mapping; unknown names stay unknown to Core.
-        const known = ['controlled.echo', ...CORE_TOOLS];
+        const known = ['controlled.echo', 'file.read', 'file.write', ...CORE_TOOLS];
         return { id: call.id, name: known.find(candidate => candidate.replaceAll('.', '_') === name) ?? name,
           arguments: argumentsValue as Record<string, unknown> };
       });

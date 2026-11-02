@@ -5,7 +5,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { runRememberSession } from '../../src/owner-memory.ts';
 import { DatabaseSync } from 'node:sqlite';
-import { AgentRun, AnalysisArtifacts, DEFAULT_BUDGET, GuidanceSession, fileIdentity, ProbeStore } from '@euler/core';
+import { requireProject, AgentRun, AnalysisArtifacts, DEFAULT_BUDGET, GuidanceSession, fileIdentity, ProbeStore } from '@euler/core';
 import { openSandbox, bindingOf } from '../../src/sandbox.ts';
 import { openProbe } from '../../src/probe.ts';
 import { killPoint } from '../../src/kill-point.ts';
@@ -93,18 +93,18 @@ try {
         const project = join(sandbox.root, 'project'); fs.mkdirSync(project);
         const guidance = new GuidanceSession(probe.store, probe.activity, probe.archive, {
           dataRoot: { path: sandbox.root, identity: fileIdentity(sandbox.root) },
-          projects: [{ projectId: sandbox.fixture.projectId, root: { path: project, identity: fileIdentity(project) } }],
+          projects: [{ projectId: requireProject(sandbox.fixture), root: { path: project, identity: fileIdentity(project) } }],
           sharedSkills: null, sources: [],
         });
         runId = guidance.runId;
-        perform = () => guidance.prepare([{ projectId: sandbox.fixture.projectId, path: join(project, 'target.ts') }]);
+        perform = () => guidance.prepare([{ projectId: requireProject(sandbox.fixture), path: join(project, 'target.ts') }]);
       } else if (scenario === 'report') {
         const artifacts = new AnalysisArtifacts(probe.store, probe.activity, probe.archive);
         perform = () => artifacts.saveReport({ eventId, title: 'Atlas', facts: 'Original evidence.', inferences: 'None.',
           recommendations: 'Keep the source.', unresolved: 'None.', evidence: [] });
       } else if (scenario === 'projection') {
         const source = probe.archive.append(eventId, 'Atlas source publication before projection.');
-        const input = { ref: source, projectId: sandbox.fixture.projectId, kind: 'source' as const, offset: 0, length: 5 };
+        const input = { ref: source, projectId: requireProject(sandbox.fixture), kind: 'source' as const, offset: 0, length: 5 };
         const approval = probe.archive.append(randomUUID(), JSON.stringify({ schema: 'source-publication-approval@1',
           intentId: intent.intentId, goalEventId: intent.goalInput.eventId, ...input }));
         perform = () => {

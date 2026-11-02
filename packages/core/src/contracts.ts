@@ -9,9 +9,23 @@ export const CORE_TOOLS = [
 export interface Binding {
   ownerId: string;
   hostId: string;
-  projectId: string;
+  projectId: string | null;
   sessionId: string;
   branchId: string;
+}
+
+export function localProjects(binding: Binding): string[] {
+  return binding.projectId === null ? [] : [binding.projectId];
+}
+
+export function localScope(binding: Binding): { kind: 'session' | 'project'; id: string; resolved: boolean } {
+  return binding.projectId === null ? { kind: 'session', id: binding.sessionId, resolved: false }
+    : { kind: 'project', id: binding.projectId, resolved: true };
+}
+
+export function requireProject(binding: Binding): string {
+  check(binding.projectId !== null, 'project-unbound');
+  return binding.projectId;
 }
 
 export interface SourceAck {

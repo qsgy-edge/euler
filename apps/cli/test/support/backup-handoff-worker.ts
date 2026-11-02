@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { AnalysisArtifacts, sha256 } from '@euler/core';
+import { requireProject, AnalysisArtifacts, sha256 } from '@euler/core';
 import type { Binding, AnalysisArtifact, SourceUnit, EvolutionProposal } from '@euler/core';
 import { openSandbox, bindingOf, createSandboxSession } from '../../src/sandbox.ts';
 import { openProbe } from '../../src/probe.ts';
@@ -45,7 +45,7 @@ if (action === 'seed') {
 } else if (action === 'verify') {
   const history = JSON.parse(encoded!) as History;
   const origin = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
-  const targetBinding = session(history.target.projectId), unrelatedBinding = session(randomUUID());
+  const targetBinding = session(requireProject(history.target)), unrelatedBinding = session(randomUUID());
   const target = openProbe(sandbox, undefined, undefined, targetBinding, undefined, true);
   const unrelated = openProbe(sandbox, undefined, undefined, unrelatedBinding, undefined, true);
   const reads: { reader: Binding; request: unknown; result?: unknown; error?: string }[] = [];

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AgentRun, AnalysisArtifacts, GuidanceSession, check, fileIdentity, sha256 } from '@euler/core';
+import { requireProject, AgentRun, AnalysisArtifacts, GuidanceSession, check, fileIdentity, sha256 } from '@euler/core';
 import type { Binding, ModelReply, SourceAck, SourceUnitInput } from '@euler/core';
 import { bindingOf, createSandboxSession } from './sandbox.ts';
 import type { Sandbox } from './sandbox.ts';
@@ -68,7 +68,7 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
   try {
     begin(source, 'Publish the fixed synthetic Atlas capability description for controlled analysis.');
     const rawEvidence = source.archive.append(randomUUID(), fixture.evidence);
-    const evidenceUnit = publish(source, rawEvidence, sourceBinding.projectId, 'source', fixture.evidence);
+    const evidenceUnit = publish(source, rawEvidence, requireProject(sourceBinding), 'source', fixture.evidence);
     source.store.rememberMemory(source.activity, { input: source.archive.append(randomUUID(), '记住偏好：' + fixture.preference), hostInfo: 'durable' });
     deliverMemoryInfo(sandbox, source);
     source.store.drainSearchProjection(source.activity); source.store.drainSourceProjection(source.activity);
@@ -81,7 +81,7 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
       + `recommendations must equal this preapproved synthetic section exactly: ${fixture.approvedSection} `
       + `Keep inferences separate and state that current source conditions require review. No network verification or implementation is authorized.`;
     const intent = begin(origin, goal);
-    const projects = [sourceBinding.projectId], targets = {};
+    const projects = [requireProject(sourceBinding)], targets = {};
     const approval = origin.archive.append(randomUUID(), JSON.stringify({ schema: 'memory-discovery-approval@1',
       intentId: intent.intentId, goalEventId: intent.goalInput.eventId, projectIds: projects, targets, maxResults: 64, maxBytes: 131072 }));
     const { grantId } = origin.store.authorizeMemoryDiscovery(origin.activity, approval, projects, 64, targets, 131072);
@@ -92,12 +92,12 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
     writeFileSync(join(skillRoot, 'SKILL.md'), fixture.skillBody);
     const guidance = new GuidanceSession(origin.store, origin.activity, origin.archive, {
       dataRoot: { path: resources, identity: fileIdentity(resources) },
-      projects: [{ projectId: sandbox.fixture.projectId, root: { path: projectRoot, identity: fileIdentity(projectRoot) } }],
+      projects: [{ projectId: requireProject(sandbox.fixture), root: { path: projectRoot, identity: fileIdentity(projectRoot) } }],
       sharedSkills: null, sources: [],
     });
-    guidance.activate(guidance.select('context-check', sandbox.fixture.projectId).selected, sandbox.fixture.projectId, 'owner-explicit');
+    guidance.activate(guidance.select('context-check', requireProject(sandbox.fixture)).selected, requireProject(sandbox.fixture), 'owner-explicit');
     const run = new AgentRun(origin.store, origin.activity, { binding: bindingOf(sandbox), source: origin.archive, discoveryGrantId: grantId,
-      guidance: { session: guidance, targets: [{ projectId: sandbox.fixture.projectId, path: join(projectRoot, 'fixture.ts') }],
+      guidance: { session: guidance, targets: [{ projectId: requireProject(sandbox.fixture), path: join(projectRoot, 'fixture.ts') }],
         operation: { name: 'synthetic.read', targets: [join(projectRoot, 'fixture.ts')] } },
       ...(transport ? { encode: transport.encode.bind(transport) } : {}) }, route, budget);
     activeRun = run; run.receive(intent.goalInput.eventId, goal);
@@ -149,15 +149,15 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
     const report = artifacts.saveReport({ eventId: randomUUID(), title: 'Atlas synthetic analysis',
       facts: reportValue.facts as string, inferences: reportValue.inferences as string, recommendations: reportValue.recommendations as string,
       unresolved: reportValue.unresolved as string, evidence: [{ request: evidenceRequest, hash: evidence.excerptHash }] });
-    const firstUnit = publish(origin, report.ref, sourceBinding.projectId, 'report-section', fixture.approvedSection);
+    const firstUnit = publish(origin, report.ref, requireProject(sourceBinding), 'report-section', fixture.approvedSection);
     const updated = artifacts.saveReport({ eventId: randomUUID(), title: 'Atlas synthetic analysis', facts: reportValue.facts as string,
       inferences: reportValue.inferences as string, recommendations: fixture.approvedNextSection, unresolved: fixture.unresolved,
       evidence: [{ request: evidenceRequest, hash: evidence.excerptHash }], supersedes: report.ref });
-    const currentUnit = publish(origin, updated.ref, sourceBinding.projectId, 'report-section', fixture.approvedNextSection, firstUnit.unitId);
+    const currentUnit = publish(origin, updated.ref, requireProject(sourceBinding), 'report-section', fixture.approvedNextSection, firstUnit.unitId);
     const temporary = join(resources, 'handoff.md');
     writeFileSync(temporary, '# Ordinary Markdown handoff\n\n' + fixture.approvedNextSection);
     const handoff = artifacts.saveHandoff({ eventId: randomUUID(), title: 'Ordinary handoff', markdown: readFileSync(temporary, 'utf8'), evidence: [] });
-    const handoffUnit = publish(origin, handoff.ref, sourceBinding.projectId, 'handoff', handoff.body);
+    const handoffUnit = publish(origin, handoff.ref, requireProject(sourceBinding), 'handoff', handoff.body);
     rmSync(temporary);
     origin.store.drainSourceProjection(origin.activity);
     const completed = origin.archive.append(randomUUID(), 'Finish the synthetic analysis; restore local access.');
@@ -201,7 +201,7 @@ export async function runContextDemo(sandbox: Sandbox, scenario: string, configP
     check(assessment.assessment === 'requires-current-source-review' && assessment.authority === 'local-only'
       && deletedHandoffRecovered && reportVersionsRecovered, 'handoff-evidence-gap');
     const proposalValue = { target: 'src/logging.ts', targetType: 'code' as const, owner: targetBinding.ownerId,
-      scope: { kind: 'project' as const, id: targetBinding.projectId, resolved: true },
+      scope: { kind: 'project' as const, id: requireProject(targetBinding), resolved: true },
       expectedChange: fixture.approvedNextSection, evidenceRefs: [], sourceUnits: [currentUnit.unitId],
       evaluation: { schema: 'evaluation-contract@1' as const, level: 'L1' as const, assertions: ['PROPOSAL-T18: Review current synthetic source conditions before any implementation.'] } };
     const proposalApproval = target.archive.append(randomUUID(), JSON.stringify({ schema: 'analysis-proposal-approval@1', proposal: proposalValue }));

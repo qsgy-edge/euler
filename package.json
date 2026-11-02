@@ -29,7 +29,8 @@
     "evidence:purge": "node scripts/evidence-purge.ts",
     "evidence:source-cleanup": "node scripts/evidence-source-cleanup.ts",
     "evidence:controlled-cleanup": "node scripts/evidence-controlled-cleanup.ts",
-    "evidence:provider": "node scripts/evidence-provider.ts"
+    "evidence:provider": "node scripts/evidence-provider.ts",
+    "evidence:session": "node scripts/evidence-session.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

@@ -1,4 +1,4 @@
-import { check, sameBinding, sha256, uuid } from '../contracts.ts';
+import { check, requireProject, sameBinding, sha256, uuid } from '../contracts.ts';
 import type { HostAdapter, SourceAck } from '../contracts.ts';
 import type { Activity, ProbeStore, SourceExpandRequest } from '../store/probe-store.ts';
 
@@ -77,7 +77,7 @@ export class AnalysisArtifacts {
         : this.#store.expandSource(this.#activity, item.request);
       check(excerpt.excerptHash === item.hash, 'analysis-evidence-stale');
       return { request: structuredClone(item.request), hash: item.hash,
-        projectId: 'projectId' in excerpt ? excerpt.projectId : excerpt.ref.binding.projectId };
+        projectId: 'projectId' in excerpt ? excerpt.projectId : requireProject(excerpt.ref.binding) };
     });
     const header: AnalysisHeader = { schema: 'analysis-artifact@1', kind, artifactId: prior?.artifactId ?? eventId,
       version: prior ? prior.version + 1 : 1, task: intent.goalInput, intentId: intent.intentId,

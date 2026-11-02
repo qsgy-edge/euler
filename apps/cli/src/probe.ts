@@ -75,7 +75,7 @@ export class CountingTransport {
 export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET, registration?: ExecutionOwner | string, selectedBinding?: Binding, recovery?: RequestRecovery, diagnosticsOnly = false) {
   validateBudget(budget);
   sandbox = openSandbox(sandbox.root);
-  const binding = selectedBinding ?? bindingOf(sandbox);
+  let binding = selectedBinding ?? bindingOf(sandbox);
   let activity: Activity;
   const transport = new CountingTransport(sandbox);
   const queryRequest = (attempt: RequestAttempt) => transport.query(attempt);
@@ -89,6 +89,7 @@ export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET
       store = new ProbeStore({ ...resourcesOf(sandbox), source }, sandbox.storeId, binding, false, readSource, sandbox.appId, queryRequest);
     } catch (error) { try { store.close(); } catch {} throw error; }
   }
+  binding = store.currentBinding(binding.sessionId);
   function archiveFor(sourceBinding: Binding, gate: <T>(action: () => T) => T, journal?: ArchiveJournal): CliArchive {
     const source = store.sessionSource(sourceBinding);
     return new CliArchive({ ...sandbox, sourceName: basename(source.path), archiveIdentity: source.identity,
@@ -104,7 +105,7 @@ export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET
     });
     let session: ProbeSession | undefined = diagnosticsOnly ? undefined
       : new ProbeSession(store, activity, { version: API_VERSION, binding, source: archive, transport }, budget, recovery);
-    return { store, activity, archive, transport,
+    return { store, activity, archive, transport, binding,
       get session() { return session ??= new ProbeSession(store, activity, { version: API_VERSION, binding, source: archive, transport }, budget, recovery); },
       close: () => { try { session?.close(); } finally { store.close(); } } };
   } catch (error) { store.close(); throw error; }

@@ -10,8 +10,8 @@ import type { AgentEvent, AgentStatus } from '../context/agent-state.ts';
 import { isUntypedRemember, parseMemoryProposal, parseOwnerAgreement, parseOwnerStatement } from '../context/owner-memory.ts';
 import type { OwnerMemoryStatement } from '../context/owner-memory.ts';
 import { randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { existsSync, realpathSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { userInfo } from 'node:os';
 import { DatabaseSync, backup } from 'node:sqlite';
 import { checkSqliteSnapshot, deleteSnapshot, inspectSnapshotFiles, removeSnapshotFiles, snapshotBytes, snapshotDataHash, snapshotDirectoryExists, syncSnapshotDirectory, syncSnapshotFile, verifySnapshot, writeSnapshotFile } from './snapshots.ts';
@@ -19,7 +19,7 @@ import type { SnapshotFile, StoreSnapshot, SnapshotCleanupManifest } from './sna
 import { recoveryFileNames, restoreFile } from './snapshot-recovery.ts';
 import type { SnapshotRecoveryPlan, SnapshotRecoveryPreparation, SnapshotRecoveryReceipt } from './snapshot-recovery.ts';
 import type { ControlledFile } from '../context/file-contract.ts';
-import { check, sameBinding, sha256, uuid, validateBudget } from '../contracts.ts';
+import { check, localProjects, localScope, requireProject, sameBinding, sha256, uuid, validateBudget } from '../contracts.ts';
 import type { Binding, ProbeBudget, SourceAck, SourceExcerpt } from '../contracts.ts';
 import { REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, assemblyIdentityHash, chargedRequestTokens, deriveAssemblyState, freezeRequestPayload } from './request-ledger.ts';
 import type { RequestAssembly, RequestAssemblyInput, RequestAssemblyState, AssemblyMemoryUse, RequestAttempt, RequestEvent, RequestEventKind, RequestRun, RequestStatus, RequestReconciliation } from './request-ledger.ts';
@@ -27,6 +27,7 @@ import type { RequestAssembly, RequestAssemblyInput, RequestAssemblyState, Assem
 export interface FileIdentity { dev: string; ino: string }
 export interface BoundFile { path: string; identity: FileIdentity }
 export interface BoundSource { binding: Binding; source: BoundFile }
+export interface SessionProject { projectId: string; root: BoundFile | null; confirmation: SourceAck | null }
 export interface StoreResources { root: BoundFile; source: BoundFile; store: BoundFile }
 
 export function fileIdentity(path: string): FileIdentity {
@@ -55,7 +56,7 @@ export interface ExecutionOwner {
 }
 export interface ExecutionStream {
   streamId: string; ownerKind: 'session' | 'job' | 'maintenance' | 'migration'; ownerId: string;
-  principalId: string; originHostId: string; projectId: string;
+  principalId: string; originHostId: string; projectId: string | null;
   authorization: { kind: 'synthetic-host-command'; id: string }; replayable: boolean;
 }
 export interface AttemptOwnership {
@@ -169,14 +170,14 @@ function sameSourceAck(left: SourceAck | undefined, right: SourceAck | undefined
 }
 export interface SourceSearchRequest { query: string; limit?: number; byteBudget?: number; cursor?: string; grantId?: string; queryId?: string }
 export interface SourceSearchHit { unitId: string; locator: string; kind: SourceUnitInput['kind'] | 'proposal'; projectId: string;
-  sourceProjectId: string; version: number; contentHash: string; range: { offset: number; end: number; total: number };
+  sourceProjectId: string | null; version: number; contentHash: string; range: { offset: number; end: number; total: number };
   status: 'available' | 'inert'; preview: string }
 export interface SourceSearchPage { status: 'ready' | 'dirty' | 'unavailable'; results: SourceSearchHit[];
   coverage: SearchPage['coverage']; truncated: boolean; nextCursor: string | null }
 export type SourceExpandRequest = { ref: SourceAck; offset: number; limit: number }
   | { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string };
 export interface SourceUnitExcerpt { unitId: string; locator: string; kind: SourceSearchHit['kind']; version: number;
-  projectId: string; sourceProjectId: string; sourceOwnerId: string; sourceSessionId: string;
+  projectId: string; sourceProjectId: string | null; sourceOwnerId: string; sourceSessionId: string;
   contentHash: string; text: string; offset: number; end: number; total: number; truncated: boolean; excerptHash: string }
 export interface SearchRequest { query: string; limit?: number; byteBudget?: number; cursor?: string; grantId?: string;
   noActiveProject?: true; target?: SearchTarget }
@@ -236,7 +237,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=27), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=28), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -285,11 +286,12 @@ CREATE TABLE maintenance_residuals (
 CREATE TABLE execution_streams (
   stream_id TEXT PRIMARY KEY, store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
   owner_kind TEXT NOT NULL CHECK(owner_kind IN ('session','job','maintenance','migration')), owner_id TEXT NOT NULL,
-  principal_id TEXT NOT NULL, origin_host_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(project_id),
+  principal_id TEXT NOT NULL, origin_host_id TEXT NOT NULL, project_id TEXT REFERENCES projects(project_id),
   authorization_kind TEXT NOT NULL CHECK(authorization_kind='synthetic-host-command'), authorization_id TEXT NOT NULL,
   redacted INTEGER NOT NULL DEFAULT 0 CHECK(redacted IN (0,1)),
-  UNIQUE(store_id,owner_kind,owner_id), UNIQUE(store_id,stream_id)
+  UNIQUE(store_id,owner_kind,owner_id,project_id), UNIQUE(store_id,stream_id)
 ) STRICT;
+CREATE UNIQUE INDEX unbound_execution_owner ON execution_streams(store_id,owner_kind,owner_id) WHERE project_id IS NULL;
 CREATE TABLE execution_events (
   event_id TEXT PRIMARY KEY, stream_id TEXT NOT NULL REFERENCES execution_streams(stream_id),
   seq INTEGER NOT NULL CHECK(seq>0), kind TEXT NOT NULL CHECK(kind='attempt-bound'),
@@ -316,10 +318,17 @@ CREATE TABLE owner_activities (
 ) STRICT;
 CREATE TABLE sessions (
   session_id TEXT PRIMARY KEY, branch_id TEXT NOT NULL, store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  owner_id TEXT NOT NULL, host_id TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(project_id),
+  owner_id TEXT NOT NULL, host_id TEXT NOT NULL, project_id TEXT REFERENCES projects(project_id),
   source_path TEXT NOT NULL UNIQUE, source_dev TEXT NOT NULL, source_ino TEXT NOT NULL,
   UNIQUE(session_id,branch_id), UNIQUE(session_id,branch_id,project_id)
 ) STRICT;
+CREATE TABLE session_project_bindings (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(session_id), project_id TEXT NOT NULL REFERENCES projects(project_id),
+  confirmation TEXT NOT NULL, confirmation_hash TEXT NOT NULL, root_json TEXT
+) STRICT;
+CREATE VIEW session_scopes AS SELECT s.session_id,s.branch_id,s.store_id,s.owner_id,s.host_id,
+  coalesce(s.project_id,b.project_id) AS project_id,s.source_path,s.source_dev,s.source_ino
+  FROM sessions s LEFT JOIN session_project_bindings b ON s.session_id=b.session_id;
 CREATE TABLE intent_events (
   event_id TEXT PRIMARY KEY, intent_id TEXT NOT NULL, version INTEGER NOT NULL CHECK(version>0),
   session_id TEXT NOT NULL, branch_id TEXT NOT NULL,
@@ -445,7 +454,7 @@ CREATE TABLE memory_records (
 CREATE TABLE memory_revisions (
   revision_id TEXT PRIMARY KEY, record_id TEXT NOT NULL REFERENCES memory_records(record_id), revision INTEGER NOT NULL CHECK(revision > 0),
   content TEXT NOT NULL, content_hash TEXT NOT NULL, type TEXT NOT NULL CHECK(type IN ('fact','preference','decision','insight','episode')),
-  valid_from TEXT, valid_until TEXT, source_project_id TEXT NOT NULL REFERENCES projects(project_id),
+  valid_from TEXT, valid_until TEXT, source_project_id TEXT REFERENCES projects(project_id),
   scope_kind TEXT NOT NULL CHECK(scope_kind IN ('project','workspace','personal','session')), scope_id TEXT NOT NULL,
   scope_resolved INTEGER NOT NULL CHECK(scope_resolved IN (0,1)), source_json TEXT NOT NULL,
   source_event_id TEXT NOT NULL, source_hash TEXT NOT NULL, source_content_hash TEXT NOT NULL, source_locator TEXT NOT NULL,
@@ -753,11 +762,11 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=27;
-` + ['workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts','store_recovery_events','store_recovered_owners'].map(table => `
+PRAGMA user_version=28;
+` + ['session_project_bindings','workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts','store_recovery_events','store_recovered_owners'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} ${['request_events','execution_events','execution_streams','store_recovery_events'].includes(table) ? 'WHEN euler_purge_writer()!=1 ' : ''}BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
-`).join('') + ['memory_heads','intent_heads','owner_fences','host_operation_delivery','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
+`).join('') + ['session_project_bindings','memory_heads','intent_heads','owner_fences','host_operation_delivery','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
   'verification_runs','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_appends','source_units','source_query_receipts','host_info_batches','capture_work','compartments','store_snapshots','store_restores','store_recovery_events','store_recovered_owners'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
@@ -829,41 +838,45 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,27,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,28,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 27, 'unsupported-probe-schema');
+        check(version === 28, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 27 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 28 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
       check(JSON.stringify(this.sessionSource(binding)) === JSON.stringify(resources.source), 'store-binding-mismatch');
+      this.#binding.projectId = this.currentBinding(binding.sessionId).projectId;
       this.fence();
     } catch (error) { this.#db.close(); throw error; }
   }
 
   #insertSession(binding: Binding, source: BoundFile): void {
-    for (const value of Object.values(binding)) uuid(value);
+    for (const [key, value] of Object.entries(binding)) if (key !== 'projectId' || value !== null) uuid(value);
     check(Object.keys(binding).length === 5 && binding.ownerId === this.#binding.ownerId
       && binding.hostId === this.#binding.hostId, 'store-binding-mismatch');
     check(dirname(source.path) === this.#resources.root.path, 'store-resource-mismatch');
     sameFile(source.path, source.identity);
-    const project = this.#db.prepare('SELECT owner_id FROM projects WHERE project_id=?').get(binding.projectId);
-    check(!project || project.owner_id === binding.ownerId, 'store-binding-mismatch');
-    this.#db.prepare('INSERT OR IGNORE INTO projects VALUES (?,?)').run(binding.projectId, binding.ownerId);
-    this.#db.prepare('INSERT OR IGNORE INTO project_resources VALUES (?,?,?,?)')
-      .run(binding.projectId, this.#resources.root.path, this.#resources.root.identity.dev, this.#resources.root.identity.ino);
+    if (binding.projectId !== null) {
+      const project = this.#db.prepare('SELECT owner_id FROM projects WHERE project_id=?').get(binding.projectId);
+      check(!project || project.owner_id === binding.ownerId, 'store-binding-mismatch');
+      this.#db.prepare('INSERT OR IGNORE INTO projects VALUES (?,?)').run(binding.projectId, binding.ownerId);
+      this.#db.prepare('INSERT OR IGNORE INTO project_resources VALUES (?,?,?,?)')
+        .run(binding.projectId, this.#resources.root.path, this.#resources.root.identity.dev, this.#resources.root.identity.ino);
+      this.#db.prepare('INSERT OR IGNORE INTO memory_scopes(kind,scope_id,resolved,owner_id,project_id,session_id) VALUES (?,?,?,?,?,?)')
+        .run('project', binding.projectId, 1, binding.ownerId, binding.projectId, null);
+    }
     this.#db.prepare('INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?)')
       .run(binding.sessionId, binding.branchId, this.#storeId, binding.ownerId, binding.hostId, binding.projectId,
         source.path, source.identity.dev, source.identity.ino);
     this.#db.prepare(`INSERT OR IGNORE INTO memory_scopes(kind,scope_id,resolved,owner_id,project_id,session_id)
-      VALUES (?,?,?,?,?,?), (?,?,?,?,?,?), (?,?,?,?,?,?)`)
-      .run('project', binding.projectId, 1, binding.ownerId, binding.projectId, null,
-        'personal', binding.ownerId, 1, binding.ownerId, null, null,
+      VALUES (?,?,?,?,?,?), (?,?,?,?,?,?)`)
+      .run('personal', binding.ownerId, 1, binding.ownerId, null, null,
         'session', binding.sessionId, 0, binding.ownerId, null, binding.sessionId);
   }
 
@@ -872,8 +885,65 @@ export class ProbeStore {
     this.withActivity(activity, () => this.#insertSession(binding, source));
   }
 
+  currentBinding(sessionId: string): Binding {
+    const row = this.#db.prepare('SELECT * FROM session_scopes WHERE session_id=? AND store_id=? AND owner_id=? AND host_id=?')
+      .get(sessionId, this.#storeId, this.#binding.ownerId, this.#binding.hostId);
+    check(row, 'store-binding-mismatch');
+    return { ownerId: this.#binding.ownerId, hostId: this.#binding.hostId, projectId: row.project_id === null ? null : String(row.project_id),
+      sessionId, branchId: String(row.branch_id) };
+  }
+
+  sessionProject(activity: Activity): SessionProject | null {
+    return this.withActivity(activity, () => {
+      const row = this.#db.prepare('SELECT * FROM session_project_bindings WHERE session_id=?').get(this.#binding.sessionId);
+      if (!row) return this.#binding.projectId === null ? null : { projectId: this.#binding.projectId, root: null, confirmation: null };
+      check(sha256(String(row.confirmation)) === row.confirmation_hash, 'session-project-evidence-gap');
+      const confirmation = JSON.parse(String(row.confirmation)) as SourceAck;
+      const root = row.root_json === null ? null : JSON.parse(String(row.root_json)) as BoundFile;
+      this.#checkConfirmation(confirmation, String(row.project_id), root);
+      return { projectId: String(row.project_id), root, confirmation };
+    });
+  }
+
+  #checkConfirmation(confirmation: SourceAck, projectId: string, root: BoundFile | null, binding = this.#binding): void {
+    check(sameBinding(confirmation.binding, { ...binding, projectId: null }), 'project-confirmation-required');
+    const source = this.#archiveRef(confirmation);
+    check(source.role === 'user' && source.text.startsWith('/bind '), 'project-confirmation-required');
+    const command = JSON.parse(source.text.slice(6)) as { projectId: string; root: string | null };
+    check(command && Object.keys(command).sort().join(',') === 'projectId,root' && command.projectId === projectId, 'invalid-project-binding');
+    uuid(projectId);
+    check(command.root === null && root === null || typeof command.root === 'string' && root
+      && isAbsolute(command.root) && realpathSync.native(command.root) === root.path, 'project-root-mismatch');
+    if (root) {
+      sameFile(root.path, root.identity);
+      check(lstatSync(root.path).isDirectory(), 'project-directory-required');
+      const data = realpathSync.native(this.#resources.root.path);
+      for (const distance of [relative(data, root.path), relative(root.path, data)]) {
+        check(distance === '..' || distance.startsWith('..' + sep) || isAbsolute(distance), 'file-product-root-overlap');
+      }
+    }
+  }
+
+  confirmSessionProject(activity: Activity, confirmation: SourceAck, projectId: string, root: BoundFile | null): void {
+    this.withActivity(activity, () => {
+      check(this.#binding.projectId === null, 'session-project-already-bound');
+      this.#requestRecoveryGate(activity, null);
+      this.#checkConfirmation(confirmation, projectId, root);
+      check(!this.#db.prepare("SELECT 1 FROM request_runs WHERE stream_id=? AND state='authorized' LIMIT 1").get(activity.streamId), 'project-binding-run-active');
+      const project = this.#db.prepare('SELECT owner_id FROM projects WHERE project_id=?').get(projectId);
+      check(!project || project.owner_id === this.#binding.ownerId, 'store-binding-mismatch');
+      this.#db.prepare('INSERT OR IGNORE INTO projects VALUES (?,?)').run(projectId, this.#binding.ownerId);
+      this.#db.prepare('INSERT OR IGNORE INTO memory_scopes(kind,scope_id,resolved,owner_id,project_id,session_id) VALUES (?,?,?,?,?,?)')
+        .run('project', projectId, 1, this.#binding.ownerId, projectId, null);
+      const payload = JSON.stringify(confirmation);
+      this.#db.prepare('INSERT INTO session_project_bindings VALUES (?,?,?,?,?)')
+        .run(this.#binding.sessionId, projectId, payload, sha256(payload), root ? JSON.stringify(root) : null);
+    });
+  }
+
   guidanceMembership(activity: Activity, projectIds: string[]): { ownerId: string; projects: { projectId: string; workspaceId: string | null }[] } {
     return this.withActivity(activity, () => {
+      check(this.#binding.projectId !== null || !projectIds.length, 'project-unbound');
       check(projectIds.length <= 32 && new Set(projectIds).size === projectIds.length, 'guidance-scope-unresolved');
       return { ownerId: this.#binding.ownerId, projects: projectIds.map(projectId => this.#projectMembership(projectId)) };
     });
@@ -894,6 +964,7 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       const intent = this.readIntent(activity);
       check(intent?.status === 'active' && !this.#discoveryTaskCompleted(intent.intentId), 'discovery-consent-required');
+      requireProject(this.#binding);
       const approval = this.#readDiscoveryApproval(consent, intent);
       check(JSON.stringify(approval.projectIds) === JSON.stringify(projectIds) && approval.maxResults === maxResults
         && approval.maxBytes === maxBytes && JSON.stringify(approval.targets) === JSON.stringify(targets), 'discovery-consent-required');
@@ -929,7 +1000,7 @@ export class ProbeStore {
 
   #readDiscoveryApproval(consent: SourceAck, intent: Intent, binding: Binding = this.#binding): MemoryDiscoveryApproval {
     check(sameBinding(consent?.binding, binding) && consent.eventId !== intent.goalInput.eventId, 'discovery-consent-required');
-    this.#validateRawSource(consent, undefined, { kind: 'project', id: binding.projectId, resolved: true }, [binding.projectId], binding);
+    this.#validateRawSource(consent, undefined, localScope(binding), localProjects(binding), binding);
     const source = this.#archiveRef(consent);
     check(source.role === 'user', 'discovery-consent-required');
     const text = source.text;
@@ -973,7 +1044,7 @@ export class ProbeStore {
 
   assertSourceAccess(activity: Activity, ref: SourceAck, grantId?: string): void {
     this.withActivity(activity, () => {
-      const projects = grantId ? this.#discoveryProjects(activity, grantId).projects : [this.#binding.projectId];
+      const projects = grantId ? this.#discoveryProjects(activity, grantId).projects : localProjects(this.#binding);
       this.#validateSource(ref);
       this.#assertRawSourceAccess(activity, ref, projects);
       const artifact = parseAnalysisArtifact(this.#archiveRef(ref).text);
@@ -985,7 +1056,7 @@ export class ProbeStore {
 
   assertRetrievedMemory(activity: Activity, snapshot: MemoryRecord, grantId?: string): void {
     this.withActivity(activity, () => {
-      const projects = grantId ? this.#discoveryProjects(activity, grantId).projects : [this.#binding.projectId];
+      const projects = grantId ? this.#discoveryProjects(activity, grantId).projects : localProjects(this.#binding);
       const current = this.#readMemoryUnsafe(snapshot.recordId, projects);
       check(current.headEventId === snapshot.headEventId && current.hash === snapshot.hash
         && current.lifecycle === 'active' && current.verification === 'verified' && !current.conflictSetId
@@ -1270,7 +1341,7 @@ export class ProbeStore {
           check(rendered.hash === item.hash, 'source-version-stale');
           return rendered.markdown;
         }
-        const proposal = this.#proposalForProjects(item.unitId, [this.#binding.projectId]);
+        const proposal = this.#proposalForProjects(item.unitId, localProjects(this.#binding));
         check(proposal.scope.kind === 'project' && proposal.scope.id === this.#binding.projectId && proposal.hash === item.hash, 'source-version-stale');
         const context = [
           ...(proposal.sourceUnits ?? []).map(id => renderUnit(id).markdown),
@@ -1288,7 +1359,7 @@ export class ProbeStore {
     this.withActivity(activity, () => {
       uuid(workspaceId);
       check(Array.isArray(projectIds) && projectIds.length > 0 && projectIds.length <= 32
-        && projectIds.includes(this.#binding.projectId) && new Set(projectIds).size === projectIds.length, 'invalid-workspace-membership');
+        && projectIds.includes(requireProject(this.#binding)) && new Set(projectIds).size === projectIds.length, 'invalid-workspace-membership');
       for (const projectId of projectIds) {
         uuid(projectId);
         const project = this.#db.prepare('SELECT owner_id FROM projects WHERE project_id=?').get(projectId);
@@ -1304,8 +1375,9 @@ export class ProbeStore {
   sessionSource(binding: Binding): BoundFile {
     check(binding.ownerId === this.#binding.ownerId && binding.hostId === this.#binding.hostId, 'store-binding-mismatch');
     const row = this.#db.prepare(`SELECT * FROM sessions WHERE session_id=? AND branch_id=? AND store_id=?
-      AND owner_id=? AND host_id=? AND project_id=?`)
-      .get(binding.sessionId, binding.branchId, this.#storeId, binding.ownerId, binding.hostId, binding.projectId);
+      AND owner_id=? AND host_id=? AND (project_id IS ? OR EXISTS(SELECT 1 FROM session_project_bindings b
+        WHERE b.session_id=sessions.session_id AND b.project_id=?))`)
+      .get(binding.sessionId, binding.branchId, this.#storeId, binding.ownerId, binding.hostId, binding.projectId, binding.projectId);
     check(row, 'store-binding-mismatch');
     return { path: String(row.source_path), identity: { dev: String(row.source_dev), ino: String(row.source_ino) } };
   }
@@ -1354,7 +1426,7 @@ export class ProbeStore {
     check(sha256(String(row.payload)) === row.payload_hash, 'archive-append-integrity');
     const ack = JSON.parse(String(row.payload)) as SourceAck;
     check(ack.schema === 'cli-source-ack@1' && ack.status === 'durable' && ack.eventId === eventId
-      && sameBinding(ack.binding, binding), 'archive-append-integrity');
+      && sameBinding({ ...ack.binding, projectId: binding.projectId }, binding), 'archive-append-integrity');
     return ack;
   }
 
@@ -1477,8 +1549,8 @@ export class ProbeStore {
 
   #ensureStream(kind: ExecutionStream['ownerKind'], ownerId: string, authorizationId: string): ExecutionStream {
     uuid(ownerId); uuid(authorizationId);
-    const existing = this.#db.prepare('SELECT stream_id FROM execution_streams WHERE store_id=? AND owner_kind=? AND owner_id=?')
-      .get(this.#storeId, kind, ownerId);
+    const existing = this.#db.prepare('SELECT stream_id FROM execution_streams WHERE store_id=? AND owner_kind=? AND owner_id=? AND project_id IS ?')
+      .get(this.#storeId, kind, ownerId, this.#binding.projectId);
     if (existing) {
       const stream = this.#readStream(String(existing.stream_id));
       check(stream.authorization.id === authorizationId && stream.projectId === this.#binding.projectId, 'stream-authorization-conflict');
@@ -1498,7 +1570,7 @@ export class ProbeStore {
     const row = this.#db.prepare('SELECT * FROM execution_streams WHERE stream_id=? AND store_id=?').get(streamId, this.#storeId);
     check(row && row.principal_id === this.#binding.ownerId && row.origin_host_id === this.#binding.hostId, 'stream-owner-evidence-gap');
     return { streamId, ownerKind: row.owner_kind as ExecutionStream['ownerKind'], ownerId: String(row.owner_id),
-      principalId: String(row.principal_id), originHostId: String(row.origin_host_id), projectId: String(row.project_id),
+      principalId: String(row.principal_id), originHostId: String(row.origin_host_id), projectId: row.project_id === null ? null : String(row.project_id),
       authorization: { kind: 'synthetic-host-command', id: String(row.authorization_id) }, replayable: row.redacted === 0 };
   }
 
@@ -1529,7 +1601,11 @@ export class ProbeStore {
     const row = this.#db.prepare('SELECT * FROM request_runs WHERE run_id=?').get(runId);
     check(row, 'unknown-run');
     check(row.redacted === 0, 'request-logically-purged');
-    check(row.stream_id === stream.streamId, 'request-scope-mismatch');
+    if (row.stream_id !== stream.streamId) {
+      const owner = this.#readStream(String(row.stream_id)), current = this.#readStream(stream.streamId);
+      check(owner.ownerKind === 'session' && current.ownerKind === 'session' && owner.ownerId === current.ownerId
+        && (owner.projectId === null || owner.projectId === current.projectId), 'request-scope-mismatch');
+    }
     const budget = JSON.parse(String(row.budget)) as ProbeBudget;
     validateBudget(budget);
     return {
@@ -1626,7 +1702,7 @@ export class ProbeStore {
     // consumes that recovery decision; any unknown in the successor blocks again.
     const blockers = this.#db.prepare(`SELECT DISTINCT r.run_id FROM request_runs r
       JOIN execution_streams s ON s.stream_id=r.stream_id
-      WHERE s.project_id=? AND s.principal_id=? AND r.run_id!=? AND r.redacted=0
+      WHERE (s.project_id=? OR (s.owner_kind='session' AND s.owner_id=?)) AND s.principal_id=? AND r.run_id!=? AND r.redacted=0
       AND NOT EXISTS(SELECT 1 FROM store_recovered_owners recovered WHERE recovered.kind=s.owner_kind AND recovered.owner_id=s.owner_id)
       AND (EXISTS(SELECT 1 FROM request_attempts a WHERE a.run_id=r.run_id AND a.outcome='unknown-sent')
         OR EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='run-recovery-gap')
@@ -1634,12 +1710,12 @@ export class ProbeStore {
           AND (NOT EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='agent/event@v1' AND json_extract(e.payload,'$.event.kind')='terminal')
             OR EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='agent/event@v1' AND json_extract(e.payload,'$.event.result.outcome')='unknown'))))
       AND NOT EXISTS(SELECT 1 FROM request_runs child WHERE child.related_run_id=r.run_id)`)
-      .all(stream.projectId, stream.principalId, currentRunId ?? '');
+      .all(stream.projectId, this.#binding.sessionId, stream.principalId, currentRunId ?? '');
     check(blockers.every(row => row.run_id === relatedRunId || this.#liveCapture(String(row.run_id))
       || this.#historianParentIsLive(activity, String(row.run_id))), 'request-recovery-required');
   }
 
-  authorizeRequestRun(activity: Activity, runId: string, input: { budget: ProbeBudget; intent: { eventId: string; hash: string } | null; relatedRunId: string | null; acceptDuplicateRisk?: boolean }): RequestRun {
+  authorizeRequestRun(activity: Activity, runId: string, input: { budget: ProbeBudget; intent: { eventId: string; hash: string } | null; relatedRunId: string | null; acceptDuplicateRisk?: boolean; guidanceOnly?: true }): RequestRun {
     return this.withActivity(activity, () => {
       this.#assertStreamNotRecovered(activity.streamId);
       uuid(runId);
@@ -1661,7 +1737,8 @@ export class ProbeStore {
           || input.acceptDuplicateRisk === true, 'duplicate-risk-approval-required');
         this.#verifyRequestSources(previous.assemblies, undefined, null);
       }
-      this.#requestRecoveryGate(activity, input.relatedRunId);
+      if (input.guidanceOnly) check(input.intent === null && input.relatedRunId === null && !input.acceptDuplicateRisk, 'invalid-guidance-authorization');
+      else this.#requestRecoveryGate(activity, input.relatedRunId);
       if (input.intent) { uuid(input.intent.eventId); check(input.intent.hash.length === 64, 'invalid-intent-ref'); }
       const stream = this.#readStream(activity.streamId);
       check(!this.#db.prepare('SELECT 1 FROM request_runs WHERE run_id=?').get(runId), 'run-identity-conflict');
@@ -1676,15 +1753,26 @@ export class ProbeStore {
         streamId: stream.streamId, ownerKind: stream.ownerKind, ownerId: stream.ownerId,
         authorizationId: stream.authorization.id, activityId: activity.id, epoch: activity.epoch,
         budget: input.budget, intent: input.intent, relatedRunId: input.relatedRunId,
-        acceptDuplicateRisk: input.acceptDuplicateRisk === true, authorizedAt }), activity.id);
+        acceptDuplicateRisk: input.acceptDuplicateRisk === true, authorizedAt, ...(input.guidanceOnly ? { purpose: 'guidance-only' } : {}) }), activity.id);
       return this.#requestRun(activity, runId);
     });
+  }
+
+  #guidanceOnly(runId: string): boolean {
+    const row = this.#db.prepare('SELECT payload,hash FROM request_events WHERE run_id=? AND seq=1').get(runId);
+    check(row && sha256(String(row.payload)) === row.hash, 'ledger-evidence-gap');
+    return JSON.parse(String(row.payload)).purpose === 'guidance-only';
   }
 
   agentMemoryUses(activity: Activity, runId: string, sources: SourceAck[]): AssemblyMemoryUse[] {
     return this.withActivity(activity, () => {
       const uses = new Map<string, AssemblyMemoryUse>();
-      for (const tool of this.agentStatus(activity, runId).tools) {
+      const usedRuns = this.#db.prepare(`SELECT DISTINCT r.run_id FROM request_events e JOIN request_runs r ON r.run_id=e.run_id
+        JOIN execution_streams s ON s.stream_id=r.stream_id WHERE s.owner_kind='session' AND s.owner_id=? AND r.redacted=0
+        AND e.kind='agent/event@v1' AND json_extract(e.payload,'$.event.kind')='tool-result'
+        AND json_extract(e.payload,'$.event.result.source.eventId') IN (SELECT value FROM json_each(?)) ORDER BY r.rowid`)
+        .all(this.#binding.sessionId, JSON.stringify(sources.map(ref => ref.eventId)));
+      for (const id of new Set([runId, ...usedRuns.map(row => String(row.run_id))])) for (const tool of this.agentStatus(activity, id).tools) {
         if (tool.name !== 'memory.search' || tool.result?.outcome !== 'success'
           || !sources.some(ref => sameSourceAck(ref, tool.result!.source))) continue;
         const raw = JSON.parse(this.#archiveRef(tool.result.source).text);
@@ -1736,6 +1824,7 @@ export class ProbeStore {
         && new Set(usedMemories.map(item => item.recordId)).size === usedMemories.length, 'invalid-assembly-selection');
       const projects = input.context?.discoveryGrantId ? this.#discoveryProjects(activity, input.context.discoveryGrantId).projects : undefined;
       const snapshots = usedMemories.map(use => this.#assemblyMemory(use, true, projects));
+      check(!this.#guidanceOnly(input.runId) || input.route === 'guidance-acceptance' && !input.context, 'guidance-only-authorization');
       if (input.route === 'local-counting') {
         let payload: { schema?: string; memories?: unknown; operationSummaries?: unknown; operationArchive?: unknown; messages?: { role?: string; content?: unknown }[] };
         try { payload = JSON.parse(input.payload) as typeof payload; }
@@ -1818,6 +1907,7 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       const run = this.#requestRun(activity, input.runId);
       check(run.state === 'authorized' && run.epoch === activity.epoch, 'run-not-admissible');
+      check(!this.#guidanceOnly(input.runId), 'guidance-only-authorization');
       uuid(input.assemblyId);
       check(input.payloadHash.length === 64 && input.byteLength > 0 && input.adapterVersion.length > 0, 'invalid-attempt');
       const status = this.requestStatus(activity, input.runId);
@@ -1975,7 +2065,7 @@ export class ProbeStore {
     });
   }
 
-  #assemblyMemory(use: AssemblyMemoryUse, requireCurrent = false, projects: readonly string[] = [this.#binding.projectId]): MemoryRecord {
+  #assemblyMemory(use: AssemblyMemoryUse, requireCurrent = false, projects: readonly string[] = localProjects(this.#binding)): MemoryRecord {
     check(use && Object.keys(use).sort().join(',') === 'contentHash,hash,headEventId,reason,recordId,revisionId'
       && ['selected-memory', 'retrieved-memory'].includes(use.reason), 'invalid-assembly-selection');
     uuid(use.recordId);
@@ -2049,7 +2139,7 @@ export class ProbeStore {
           this.#validateSource(ref, undefined, scope);
           if (activity) {
             if (assembly.context && !projects) projects = assembly.context.discoveryGrantId
-              ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : [this.#binding.projectId];
+              ? this.#discoveryProjects(activity, assembly.context.discoveryGrantId).projects : localProjects(this.#binding);
             this.#assertRawSourceAccess(activity, ref, projects);
           }
         }
@@ -2099,6 +2189,27 @@ export class ProbeStore {
     });
   }
 
+  sessionAgentRuns(activity: Activity): RequestStatus[] {
+    return this.withActivity(activity, () => this.#db.prepare(`SELECT r.run_id FROM request_runs r JOIN execution_streams s ON s.stream_id=r.stream_id
+      WHERE s.owner_kind='session' AND s.owner_id=? AND s.principal_id=? AND r.redacted=0
+        AND EXISTS(SELECT 1 FROM request_events e WHERE e.run_id=r.run_id AND e.kind='agent/event@v1') ORDER BY r.rowid`)
+      .all(this.#binding.sessionId, this.#binding.ownerId)
+      .map(row => this.requestStatus(activity, String(row.run_id))));
+  }
+
+  assertConversationRun(activity: Activity, runId: string): void {
+    this.withActivity(activity, () => {
+      const ledger = this.requestStatus(activity, runId), state = this.#readAgentLedger(ledger);
+      const current = this.readIntent(activity);
+      const previous = ledger.assemblies[0]?.intent;
+      check(state.terminal === 'completed' && !state.discoveryGrantId && previous
+        && this.#db.prepare('SELECT intent_id FROM intent_events WHERE event_id=?').get(previous.eventId)?.intent_id === current?.intentId, 'conversation-unavailable');
+      for (const assembly of ledger.assemblies) for (const memory of assembly.usedMemories) this.#assemblyMemory(memory, true);
+      for (const ref of [...state.inputs.map(input => input.source), ...state.responses.map(response => response.source),
+        ...state.tools.flatMap(tool => tool.result ? [tool.result.source] : [])]) this.assertSourceAccess(activity, ref);
+    });
+  }
+
   requestStatus(activity: Activity, runId: string): RequestStatus {
     return this.withActivity(activity, () => this.#readRequestLedger(this.#requestRun(activity, runId)));
   }
@@ -2106,7 +2217,7 @@ export class ProbeStore {
   #readProjectRequestLedger(runId: string, binding: Binding = this.#binding): RequestStatus {
     const row = this.#db.prepare(`SELECT r.stream_id FROM request_runs r
       JOIN execution_streams s ON s.stream_id=r.stream_id
-      WHERE r.run_id=? AND s.principal_id=? AND s.project_id=?`)
+      WHERE r.run_id=? AND s.principal_id=? AND s.project_id IS ?`)
       .get(runId, binding.ownerId, binding.projectId);
     check(row, 'request-scope-mismatch');
     return this.#readRequestLedger(this.#requestRun({ streamId: String(row.stream_id) }, runId));
@@ -2238,6 +2349,7 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       const ledger = this.requestStatus(activity, runId);
       check(ledger.run.activityId === activity.id, 'agent-owner-mismatch');
+      check(!this.#guidanceOnly(runId), 'guidance-only-authorization');
       if (event.kind === 'tool-started' || event.kind === 'file-prepared' || event.kind === 'file-approved') this.assertToolAdmission(activity, runId);
       const events = ledger.events.filter(item => item.kind === 'agent/event@v1')
         .map(item => JSON.parse(item.payload).event as AgentEvent);
@@ -2320,6 +2432,7 @@ export class ProbeStore {
       // Exclusive coordinators remain fenced; owner kind never bypasses it.
       check(stream.projectId === this.#binding.projectId
         && (stream.ownerKind !== 'session' || stream.ownerId === this.#binding.sessionId), 'stream-owner-evidence-gap');
+      check(this.currentBinding(this.#binding.sessionId).projectId === this.#binding.projectId, 'session-binding-changed');
       return action();
     });
   }
@@ -2357,11 +2470,12 @@ export class ProbeStore {
       && intent.goalInput.eventId === row.goal_input_event_id && intent.goalInput.hash === row.goal_input_hash
       && intent.goalInput.contentHash === row.goal_input_content_hash
       && intent.goalInput.locator === row.goal_input_locator && intent.goalInput.byteLength === row.goal_input_bytes
-      && sameBinding(intent.input.binding, binding) && sameBinding(intent.goalInput.binding, binding)
-      && sameBinding(intent.binding, binding), 'intent-evidence-gap');
-    const scope: MemoryScope = { kind: 'project', id: binding.projectId, resolved: true };
-    this.#validateSource(intent.input, undefined, scope, [binding.projectId], binding);
-    this.#validateSource(intent.goalInput, undefined, scope, [binding.projectId], binding);
+      && [intent.input.binding, intent.goalInput.binding, intent.binding].every(ref =>
+        sameBinding({ ...ref, projectId: binding.projectId }, binding)
+        && (ref.projectId === null || ref.projectId === binding.projectId)), 'intent-evidence-gap');
+    const scope: MemoryScope = { kind: 'session', id: binding.sessionId, resolved: false };
+    this.#validateSource(intent.input, undefined, scope, localProjects(binding), binding);
+    this.#validateSource(intent.goalInput, undefined, scope, localProjects(binding), binding);
     check(!this.#isCaptureOutput(intent.input) && !this.#isCaptureOutput(intent.goalInput), 'source-derived');
     return { ...intent, hash: String(row.hash) };
   }
@@ -2423,7 +2537,8 @@ export class ProbeStore {
       const snapshot: Omit<Intent, 'hash'> = {
         schema: 'intent@1', intentId: newTask ? randomUUID() : current?.intentId ?? randomUUID(), eventId: randomUUID(),
         version: (current?.version ?? 0) + 1, binding: this.#binding,
-        goal: newTask ? initialGoal! : current?.goal ?? initialGoal!, constraints: current?.constraints ?? ['synthetic-only', 'local-counting-transport-only'],
+        goal: newTask ? initialGoal! : current?.goal ?? initialGoal!, constraints: current?.constraints ?? (this.#db.prepare('SELECT 1 FROM sessions WHERE session_id=? AND project_id IS NULL').get(this.#binding.sessionId)
+          ? ['synthetic-only', 'explicitly-configured-transport-only'] : ['synthetic-only', 'local-counting-transport-only']),
         step: transition.step, status: transition.status, input, goalInput: newTask ? input : current?.goalInput ?? input,
       };
       const bytes = JSON.stringify(snapshot);
@@ -2511,7 +2626,7 @@ export class ProbeStore {
           && input.state === 'bound-to-assembly') ? item.source : item.kind === 'response' ? item.source : item.kind === 'tool-result' ? item.result.source : null;
         if (ref && !range.some(existing => sameSourceAck(existing, ref))) range.push(ref);
       }
-      const scope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true };
+      const scope: MemoryScope = localScope(this.#binding);
       for (const ref of range) this.#validateSource(ref, undefined, scope);
       const existing = this.#db.prepare("SELECT job_id FROM capture_jobs WHERE source_owner=? AND source_event_id=? AND consumer='memory'")
         .get(source.binding.sessionId, source.eventId);
@@ -2565,7 +2680,7 @@ export class ProbeStore {
         }
         appendResponse(response);
       }
-      const scope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true };
+      const scope: MemoryScope = localScope(this.#binding);
       let bytes = 0;
       for (const ref of range) {
         check(sameBinding(ref.binding, this.#binding), 'source-scope-mismatch');
@@ -2605,7 +2720,7 @@ export class ProbeStore {
     const payload = JSON.parse(String(this.#db.prepare('SELECT payload FROM capture_jobs WHERE job_id=?').get(job.jobId)!.payload));
     check(payload.lane === 'historian' && payload.rawHash === sha256(JSON.stringify(job.range)), 'historian-source-gap');
     const raw = job.range.map(ref => {
-      this.#validateSource(ref, undefined, job.scope, [binding.projectId], binding);
+      this.#validateSource(ref, undefined, job.scope, localProjects(binding), binding);
       return { ref, ...this.#archiveRef(ref) };
     });
     return compartmentBody(raw, payload.runId, reply.summary);
@@ -2731,9 +2846,9 @@ export class ProbeStore {
   listCaptureJobs(activity: Activity, limit = 16, pendingOnly = false, consumer: CaptureJob['consumer'] = 'memory'): CaptureJob[] {
     return this.withActivity(activity, () => {
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= 32, 'invalid-capture-limit');
-      return this.#db.prepare(`SELECT j.job_id FROM capture_jobs j JOIN sessions s ON s.session_id=j.source_owner
+      return this.#db.prepare(`SELECT j.job_id FROM capture_jobs j JOIN session_scopes s ON s.session_id=j.source_owner
         LEFT JOIN capture_work w ON w.job_id=j.job_id
-        WHERE s.owner_id=? AND s.project_id=? AND j.consumer=? AND (?=0 OR (j.status='pending' AND (w.stage IS NULL OR w.stage IN ('pending','proposing','verifying','comparing'))
+        WHERE s.owner_id=? AND json_extract(j.payload,'$.source.binding.projectId') IS ? AND j.consumer=? AND (?=0 OR (j.status='pending' AND (w.stage IS NULL OR w.stage IN ('pending','proposing','verifying','comparing'))
           AND NOT EXISTS(SELECT 1 FROM store_recovered_owners recovered WHERE recovered.kind='job' AND recovered.owner_id=j.job_id)))
           AND (json_extract(j.payload,'$.scope.kind') IS NOT 'session' OR j.source_owner=?)
           AND (j.consumer='memory' OR j.source_owner=?)
@@ -2771,7 +2886,7 @@ export class ProbeStore {
       ? this.#db.prepare('SELECT scope_kind,scope_id,scope_resolved FROM memory_heads WHERE record_id=?').get(String(recordId)) : null;
     const scope: MemoryScope = payload.scope ?? record?.scope ?? (head ? {
       kind: head.scope_kind as MemoryScopeKind, id: String(head.scope_id), resolved: Boolean(head.scope_resolved) } : null);
-    this.#validateScope(scope, [binding.projectId], binding);
+    this.#validateScope(scope, localProjects(binding), binding);
     if ((work?.stage ?? row.status) !== 'complete'
       && this.#requestRecoveryStatus('job', jobId).recovery) unavailable = 'recovered_with_gap';
     return { jobId, consumer: row.consumer as CaptureJob['consumer'], ownerId: binding.ownerId, scope: structuredClone(scope), source: payload.source,
@@ -2948,7 +3063,7 @@ export class ProbeStore {
     const steps = this.#db.prepare(`SELECT e.payload,e.hash FROM request_events e
       JOIN capture_work w ON w.run_id=e.run_id JOIN capture_jobs j ON j.job_id=w.job_id
       JOIN sessions s ON s.session_id=j.source_owner
-      WHERE e.kind='capture/step@v1' AND json_extract(e.payload,'$.source.eventId')=? AND s.owner_id=? AND s.project_id=?`)
+      WHERE e.kind='capture/step@v1' AND json_extract(e.payload,'$.source.eventId')=? AND s.owner_id=? AND json_extract(j.payload,'$.source.binding.projectId') IS ?`)
       .all(ref.eventId, ref.binding.ownerId, ref.binding.projectId);
     if (steps.length) return steps.some(row => {
       check(sha256(String(row.payload)) === row.hash, 'capture-evidence-gap');
@@ -2958,7 +3073,7 @@ export class ProbeStore {
     return !!this.#db.prepare(`SELECT 1 FROM request_attempts a
       JOIN capture_work w ON w.run_id=a.run_id JOIN capture_jobs j ON j.job_id=w.job_id
       JOIN sessions s ON s.session_id=j.source_owner
-      WHERE a.attempt_id=? AND s.owner_id=? AND s.project_id=?`).get(ref.eventId, ref.binding.ownerId, ref.binding.projectId);
+      WHERE a.attempt_id=? AND s.owner_id=? AND json_extract(j.payload,'$.source.binding.projectId') IS ?`).get(ref.eventId, ref.binding.ownerId, ref.binding.projectId);
   }
 
   readCaptureOutput(lease: CaptureLease, ref: SourceAck): { text: string; role?: 'user' | 'assistant' | 'tool' } {
@@ -3219,7 +3334,7 @@ export class ProbeStore {
         return { jobId: status.jobId, stage: status.stage, reason: status.reason };
       }
       const scope: MemoryScope = noActiveProject ? { kind: 'session', id: this.#binding.sessionId, resolved: false }
-        : { kind: 'project', id: this.#binding.projectId, resolved: true };
+        : localScope(this.#binding);
       this.#validateScope(scope);
       const jobId = randomUUID();
       // No guessed type, claim or verified memory: the normal lane owns extraction from this durable job.
@@ -3257,7 +3372,7 @@ export class ProbeStore {
       }
       const scope: MemoryScope = request.noActiveProject
         ? { kind: 'session', id: this.#binding.sessionId, resolved: false }
-        : { kind: 'project', id: this.#binding.projectId, resolved: true };
+        : localScope(this.#binding);
       this.#validateScope(scope);
       const existing = this.#db.prepare("SELECT record_id,payload,payload_hash FROM capture_jobs WHERE source_owner=? AND source_event_id=? AND consumer='memory'")
         .get(input.binding.sessionId, input.eventId);
@@ -3525,7 +3640,7 @@ export class ProbeStore {
       check(sha256(payload) === row[`${field}_hash`], 'operation-delivery-evidence-gap');
       const ref = JSON.parse(payload) as SourceAck;
       check(sameBinding(ref.binding, binding), 'operation-delivery-evidence-gap');
-      if (field === 'approval') this.#validateRawSource(ref, undefined, { kind: 'project', id: binding.projectId, resolved: true }, [binding.projectId], binding);
+      if (field === 'approval') this.#validateRawSource(ref, undefined, localScope(binding), localProjects(binding), binding);
       else this.#archiveRef(ref);
       return ref;
     };
@@ -3867,7 +3982,7 @@ export class ProbeStore {
 
   rebuildSourceProjection(activity: Activity): number {
     return this.withActivity(activity, () => {
-      const projectId = this.#binding.projectId;
+      const projectId = requireProject(this.#binding);
       const sources = this.#db.prepare('SELECT unit_id FROM source_units WHERE owner_id=? AND project_id=? ORDER BY rowid')
         .all(this.#binding.ownerId, projectId);
       const proposals = this.#db.prepare(`SELECT proposal_id FROM evolution_proposals
@@ -4080,7 +4195,7 @@ export class ProbeStore {
       }
       const grant = baseGrant && receipt ? { ...baseGrant, remaining: baseGrant.remaining + Number(receipt.result_count),
         remainingBytes: baseGrant.remainingBytes + Number(receipt.byte_length), remainingQueries: baseGrant.remainingQueries + 1 } : baseGrant;
-      const projects = grant?.projects ?? [this.#binding.projectId];
+      const projects = grant?.projects ?? localProjects(this.#binding);
       const coverage: SourceSearchPage['coverage'] = { allowedProjects: projects, inspectedProjects: [], unavailableProjects: [],
         candidateCount: null, complete: false, reason: null };
       const unavailable = (reason: string, status: SourceSearchPage['status'] = 'unavailable'): SourceSearchPage =>
@@ -4229,12 +4344,12 @@ export class ProbeStore {
       const groups = searchGroups(request.query);
       const grant = request.grantId ? this.#discoveryProjects(activity, request.grantId) : null;
       check(!grant || request.target === undefined, 'invalid-search-target');
-      const projects = grant?.projects ?? [this.#binding.projectId];
+      const projects = grant?.projects ?? localProjects(this.#binding);
       const coverage: SearchPage['coverage'] = { allowedProjects: projects, inspectedProjects: [], unavailableProjects: [],
         candidateCount: null, complete: false, reason: null };
       const unavailableCoverage = (reason: string): SearchPage['coverage'] =>
         ({ ...coverage, unavailableProjects: projects, reason });
-      if (!grant && request.noActiveProject) return { status: 'ready', results: [],
+      if (this.#binding.projectId === null || !grant && request.noActiveProject) return { status: 'ready', results: [],
         coverage: { ...coverage, allowedProjects: [], inspectedProjects: [], reason: 'no-active-project' },
         truncated: false, nextCursor: null };
       if (grant) {
@@ -4318,7 +4433,7 @@ export class ProbeStore {
           words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text) ? [index] : []);
         if (!numericContextMatches(groups, words) || matchingGroups.length === 0) continue;
         const rank = -matchingGroups.length;
-        const projectId = record.source.binding.projectId;
+        const projectId = requireProject(record.source.binding);
         const targetProjects = record.scope.kind === 'project' ? [record.scope.id]
           : record.scope.kind === 'personal' ? projects
           : record.scope.kind === 'workspace' ? this.#db.prepare(`SELECT project_id FROM workspace_projects
@@ -4431,7 +4546,7 @@ export class ProbeStore {
       }));
   }
 
-  #validateMemoryOutbox(row: Record<string, unknown>, projects: readonly string[] = [this.#binding.projectId]): ActivationBatch | null {
+  #validateMemoryOutbox(row: Record<string, unknown>, projects: readonly string[] = localProjects(this.#binding)): ActivationBatch | null {
     check(sha256(String(row.payload)) === row.payload_hash, 'outbox-evidence-gap');
     const manifest = JSON.parse(String(row.payload));
     const event = this.#db.prepare(`SELECT e.payload,e.payload_hash,e.batch_id,e.record_id,r.owner_id FROM memory_events e
@@ -4523,8 +4638,8 @@ export class ProbeStore {
         (SELECT 1 FROM workspace_projects w WHERE w.workspace_id=${alias}.scope_id AND w.project_id=?)))`;
   }
 
-  #scopeParameters(): string[] {
-    return [this.#binding.projectId, this.#binding.ownerId, this.#binding.sessionId, this.#binding.projectId];
+  #scopeParameters(): (string | null)[] {
+    return [this.#binding.projectId, this.#binding.projectId === null ? null : this.#binding.ownerId, this.#binding.sessionId, this.#binding.projectId];
   }
 
   recoverMemories(activity: Activity): MemoryRecord[] {
@@ -4542,7 +4657,7 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       check(boundary && Object.keys(boundary).every(key => key === 'noActiveProject')
         && (boundary.noActiveProject === undefined || boundary.noActiveProject === true), 'invalid-search-request');
-      if (boundary.noActiveProject) return { records: [], truncated: false };
+      if (this.#binding.projectId === null || boundary.noActiveProject) return { records: [], truncated: false };
       const limit = PINNED_DELTA_LIMIT;
       const rows = this.#db.prepare(`SELECT h.record_id FROM memory_heads h
         JOIN projection_jobs j ON j.kind='search' AND j.event_id=h.head_event_id
@@ -4831,7 +4946,7 @@ export class ProbeStore {
         const event = this.#db.prepare('SELECT payload FROM memory_events WHERE event_id=?').get(current.headEventId)!;
         const rejection = JSON.parse(String(event.payload));
         if (rejection.kind !== 'reject' || rejection.reason !== 'duplicate-claim') return true;
-        this.#checkComparisonEvidence(current, [this.#binding.projectId], false);
+        this.#checkComparisonEvidence(current, localProjects(this.#binding), false);
         const proof = this.#db.prepare('SELECT payload FROM memory_events WHERE event_id=?').get(rejection.comparisonEventId)!;
         const compared = JSON.parse(String(proof.payload)).input as MemoryComparison;
         const target = this.#readMemoryHead(rejection.corroborates);
@@ -5206,7 +5321,7 @@ export class ProbeStore {
       && batch.scope.kind === info.scope.kind && batch.scope.id === info.scope.id, 'host-info-evidence-gap');
   }
 
-  #readActivationBatch(batchId: string, projects: readonly string[] = [this.#binding.projectId]): ActivationBatch {
+  #readActivationBatch(batchId: string, projects: readonly string[] = localProjects(this.#binding)): ActivationBatch {
     uuid(batchId);
     const row = this.#db.prepare('SELECT * FROM activation_batches WHERE batch_id=? AND owner_id=?').get(batchId, this.#binding.ownerId);
     check(row && sha256(String(row.payload)) === row.payload_hash, 'batch-evidence-gap');
@@ -5652,7 +5767,8 @@ export class ProbeStore {
       if ('unitId' in request) return this.#expandSourceUnit(activity, request);
       check(Object.keys(request).sort().join(',') === 'limit,offset,ref', 'invalid-source-request');
       const { ref } = request;
-      check(sameBinding(ref?.binding, this.#binding), 'source-scope-mismatch');
+      check(ref?.binding && sameBinding({ ...ref.binding, projectId: this.#binding.projectId }, this.#binding)
+        && (ref.binding.projectId === null || ref.binding.projectId === this.#binding.projectId), 'source-scope-mismatch');
       this.#validateSource(ref);
       check(!this.#isCaptureOutput(ref), 'source-derived');
       this.#assertRawSourceAccess(activity, ref);
@@ -5695,7 +5811,7 @@ export class ProbeStore {
       }
       throw error;
     }
-    const projects = grant?.projects ?? [this.#binding.projectId];
+    const projects = grant?.projects ?? localProjects(this.#binding);
     const published = this.#db.prepare('SELECT project_id FROM source_units WHERE unit_id=? AND owner_id=?')
       .get(request.unitId, this.#binding.ownerId);
     let kind: SourceUnitExcerpt['kind'], version: number, contentHash: string, full: string;
@@ -5711,7 +5827,7 @@ export class ProbeStore {
         const row = this.#db.prepare('SELECT payload FROM evolution_proposals WHERE proposal_id=?').get(request.unitId)!;
         kind = 'proposal'; version = proposal.version; contentHash = proposal.hash; full = String(row.payload);
         expectedSource = proposal.input;
-        projectId = proposal.scope.kind === 'project' ? proposal.scope.id : this.#binding.projectId;
+        projectId = proposal.scope.kind === 'project' ? proposal.scope.id : requireProject(this.#binding);
       }
     } catch (error) {
       if (receipt) throw new Error('source-query-result-stale', { cause: error });
@@ -5764,7 +5880,8 @@ export class ProbeStore {
   }
 
   #validateSource(input: SourceAck, content?: string,
-    targetScope: MemoryScope = { kind: 'project', id: this.#binding.projectId, resolved: true }, projects: readonly string[] = [this.#binding.projectId],
+    targetScope: MemoryScope = input?.binding.sessionId === this.#binding.sessionId
+      ? { kind: 'session', id: this.#binding.sessionId, resolved: false } : localScope(this.#binding), projects: readonly string[] = localProjects(this.#binding),
     binding: Binding = this.#binding): void {
     check(input?.schema === 'cli-source-ack@1' && input.status === 'durable'
       && input.binding.ownerId === binding.ownerId && input.binding.hostId === binding.hostId, 'source-scope-mismatch');
@@ -5784,17 +5901,17 @@ export class ProbeStore {
   #sourceAllowedForScope(binding: Binding, scope: MemoryScope): boolean {
     if (scope.kind === 'project') return binding.projectId === scope.id;
     if (scope.kind === 'session') return binding.sessionId === scope.id;
-    if (scope.kind === 'personal') return binding.ownerId === scope.id;
+    if (scope.kind === 'personal') return binding.projectId !== null && binding.ownerId === scope.id;
     return Boolean(this.#db.prepare(`SELECT 1 FROM workspace_projects m JOIN workspaces w ON w.workspace_id=m.workspace_id
       WHERE m.workspace_id=? AND m.project_id=? AND w.owner_id=?`).get(scope.id, binding.projectId, this.#binding.ownerId));
   }
 
-  #validateScope(scope: MemoryScope, projects: readonly string[] = [this.#binding.projectId], binding: Binding = this.#binding): MemoryScope {
+  #validateScope(scope: MemoryScope, projects: readonly string[] = localProjects(this.#binding), binding: Binding = this.#binding): MemoryScope {
     check(scope && ['project', 'workspace', 'personal', 'session'].includes(scope.kind) && typeof scope.id === 'string', 'invalid-memory-scope');
     uuid(scope.id);
     check(Object.keys(scope).every(key => ['kind','id','resolved'].includes(key)) && typeof scope.resolved === 'boolean', 'invalid-memory-scope');
     if (scope.kind === 'project') check(projects.includes(scope.id) && scope.resolved, 'invalid-memory-scope');
-    if (scope.kind === 'personal') check(scope.id === binding.ownerId && scope.resolved, 'invalid-memory-scope');
+    if (scope.kind === 'personal') check(projects.length > 0 && scope.id === binding.ownerId && scope.resolved, 'invalid-memory-scope');
     if (scope.kind === 'session') check(scope.id === binding.sessionId && !scope.resolved, 'invalid-memory-scope');
     if (scope.kind === 'workspace') {
       check(scope.resolved && this.#db.prepare(`SELECT 1 FROM workspace_projects m JOIN workspaces w ON w.workspace_id=m.workspace_id
@@ -5819,7 +5936,7 @@ export class ProbeStore {
     check(!memoryTemporalStatus(record, Date.now()), 'memory-not-current');
     this.#validateMemorySources(record);
   }
-  #validateMemorySources(record: MemoryRecord, projects: readonly string[] = [this.#binding.projectId],
+  #validateMemorySources(record: MemoryRecord, projects: readonly string[] = localProjects(this.#binding),
     sourceChecks: MemorySourceCheck = new Map()): void {
     const key = `${record.recordId}/${record.headEventId}`;
     check(sourceChecks.get(key) !== 'checking', 'comparison-evidence-gap');
@@ -5843,7 +5960,7 @@ export class ProbeStore {
     this.#checkEvidenceRows('verification_evidence', 'run_id', String(row.run_id), evidence);
     return evidence;
   }
-  #checkVerification(record: MemoryRecord, readSources = false, projects: readonly string[] = [this.#binding.projectId],
+  #checkVerification(record: MemoryRecord, readSources = false, projects: readonly string[] = localProjects(this.#binding),
     sourceChecks?: MemorySourceCheck): void {
     if (!record.verificationRunId) { check(!['verified','conflicted'].includes(record.verification), 'verification-evidence-gap'); return; }
     const row = this.#db.prepare('SELECT * FROM verification_runs WHERE run_id=?').get(record.verificationRunId);
@@ -5907,7 +6024,7 @@ export class ProbeStore {
       }
     }
   }
-  #validateVerificationSource(ref: SourceAck, scope: MemoryScope, sourceUnits: string[], projects: readonly string[] = [this.#binding.projectId]): void {
+  #validateVerificationSource(ref: SourceAck, scope: MemoryScope, sourceUnits: string[], projects: readonly string[] = localProjects(this.#binding)): void {
     if (this.#sourceAllowedForScope(ref.binding, scope)) { this.#validateRawSource(ref, undefined, scope, projects); return; }
     this.#validateScope(scope, projects);
     const units = sourceUnits.map(id => this.#sourceUnit(id).unit);
@@ -5972,7 +6089,7 @@ export class ProbeStore {
     check(current, 'memory-evidence-gap');
     return current;
   }
-  #readMemoryUnsafe(recordId: string, projects: readonly string[] = [this.#binding.projectId]): MemoryRecord {
+  #readMemoryUnsafe(recordId: string, projects: readonly string[] = localProjects(this.#binding)): MemoryRecord {
     const record = this.#readMemoryHead(recordId, projects);
     if (record.verification !== 'stale') {
       this.#validateRawSource(record.source, undefined, record.scope, projects);
@@ -5980,7 +6097,7 @@ export class ProbeStore {
     }
     return record;
   }
-  #readMemoryHead(recordId: string, projects: readonly string[] = [this.#binding.projectId]): MemoryRecord {
+  #readMemoryHead(recordId: string, projects: readonly string[] = localProjects(this.#binding)): MemoryRecord {
     const record = this.#replayMemoryHead(recordId);
     this.#validateScope(record.scope, projects);
     return record;
@@ -6099,7 +6216,7 @@ export class ProbeStore {
 
   snapshotSources(activity: Activity): { binding: Binding; source: BoundFile }[] {
     return this.withActivity(activity, () => this.#db.prepare('SELECT * FROM sessions WHERE store_id=? ORDER BY session_id').all(this.#storeId)
-      .map(row => ({ binding: { ownerId: String(row.owner_id), hostId: String(row.host_id), projectId: String(row.project_id),
+      .map(row => ({ binding: { ownerId: String(row.owner_id), hostId: String(row.host_id), projectId: row.project_id === null ? null : String(row.project_id),
         sessionId: String(row.session_id), branchId: String(row.branch_id) },
       source: { path: String(row.source_path), identity: { dev: String(row.source_dev), ino: String(row.source_ino) } } })));
   }
@@ -6166,9 +6283,15 @@ export class ProbeStore {
     for (const row of this.#db.prepare("SELECT * FROM memory_events WHERE receipt_id IS NOT NULL AND kind NOT IN ('purge-logical-commit','purge-cleanup-incomplete','purge-controlled-complete')").all()) this.#readOwnerReceipt(row);
     for (const row of this.#db.prepare("SELECT DISTINCT operation_id FROM memory_events WHERE kind='purge-cleanup-incomplete'").all())
       this.#purgeFailures(String(row.operation_id));
-    for (const session of this.#db.prepare('SELECT * FROM sessions').all()) {
-      const binding: Binding = { ownerId: String(session.owner_id), hostId: String(session.host_id), projectId: String(session.project_id),
+    for (const session of this.#db.prepare('SELECT * FROM session_scopes').all()) {
+      const binding: Binding = { ownerId: String(session.owner_id), hostId: String(session.host_id), projectId: session.project_id === null ? null : String(session.project_id),
         sessionId: String(session.session_id), branchId: String(session.branch_id) };
+      const confirmed = this.#db.prepare('SELECT * FROM session_project_bindings WHERE session_id=?').get(binding.sessionId);
+      if (confirmed) {
+        check(sha256(String(confirmed.confirmation)) === confirmed.confirmation_hash, 'session-project-evidence-gap');
+        this.#checkConfirmation(JSON.parse(String(confirmed.confirmation)), String(confirmed.project_id),
+          confirmed.root_json === null ? null : JSON.parse(String(confirmed.root_json)), binding);
+      }
       for (const row of this.#db.prepare('SELECT token FROM host_presentations WHERE session_id=?').all(binding.sessionId))
         this.#readMemoryPresentation(String(row.token), binding);
       for (const row of this.#db.prepare(`SELECT o.*,p.token FROM pending_operations o
@@ -6639,7 +6762,7 @@ export class ProbeStore {
           check(activity && activity.parent_id === null, 'snapshot-control-evidence-gap');
           const stream = this.#db.prepare('SELECT * FROM execution_streams WHERE stream_id=?').get(activity.stream_id!);
           check(stream, 'snapshot-control-evidence-gap');
-          copy('projects', this.#db.prepare('SELECT * FROM projects WHERE project_id=?').get(stream.project_id!)!);
+          if (stream.project_id !== null) copy('projects', this.#db.prepare('SELECT * FROM projects WHERE project_id=?').get(stream.project_id!)!);
           copy('execution_streams', stream); copy('owner_activities', activity);
         }
         stage.exec('DELETE FROM store_snapshots');
@@ -6696,7 +6819,7 @@ export class ProbeStore {
       sources.set(item.source.path, item);
     };
     for (const row of this.#db.prepare('SELECT * FROM sessions WHERE store_id=? ORDER BY session_id').all(this.#storeId)) {
-      add({ binding: { ownerId: String(row.owner_id), hostId: String(row.host_id), projectId: String(row.project_id),
+      add({ binding: { ownerId: String(row.owner_id), hostId: String(row.host_id), projectId: row.project_id === null ? null : String(row.project_id),
         sessionId: String(row.session_id), branchId: String(row.branch_id) },
       source: { path: String(row.source_path), identity: { dev: String(row.source_dev), ino: String(row.source_ino) } } });
     }

@@ -41,7 +41,7 @@ function rawSnapshot(snapshot: string, check: (db: DatabaseSync) => void) {
     try {
       assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
       assert.equal(db.prepare('PRAGMA integrity_check').get()!.integrity_check, 'ok');
-      assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 27);
+      assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 28);
       const streams = db.prepare('SELECT * FROM execution_streams').all();
       assert.ok(streams.length > 0);
       for (const stream of streams) {
