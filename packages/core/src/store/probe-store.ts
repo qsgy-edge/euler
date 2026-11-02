@@ -3389,8 +3389,8 @@ export class ProbeStore {
         statement = this.#memoryProposal(proposal);
         check(statement, 'memory-proposal-not-explicit');
         if (agreement.input) {
-          const original = agreement.input;
-          check(original.binding && sameBinding(original.binding, this.#binding)
+          const original = this.#sourceAcknowledgement(this.#binding, agreement.input.eventId);
+          check(original && original.locator === agreement.input.locator && sameBinding(original.binding, this.#binding)
             && original.eventId !== input.eventId && original.eventId !== proposal.eventId, 'memory-agreement-evidence-gap');
           this.#validateRawSource(original);
           const source = this.#archiveRef(original);

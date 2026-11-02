@@ -268,6 +268,7 @@ export class OwnerMemoryHost {
       ...(this.#noActiveProject ? { noActiveProject: true as const } : {}) };
     let result: RememberResult;
     try {
+      this.#completeAgreementInput(this.probe.archive.read(input).text);
       result = via === 'live' && this.#scenario === 'crash-before-activation-commit'
         ? store.withActivity(activity, () => { store.rememberMemory(activity, request); return killPoint('owner-checkpoint', this.#scenario, 10000); })
         : store.rememberMemory(activity, request);
@@ -308,6 +309,14 @@ export class OwnerMemoryHost {
       }
     }
     emit('owner-backfill', { scanned: events.length, actionable });
+  }
+
+  #completeAgreementInput(text: string): void {
+    const agreement = parseOwnerAgreement(text);
+    if (!agreement?.input) return;
+    const { archive, binding } = this.probe;
+    check(agreement.input.locator === `cli-jsonl@1/${binding.sessionId}/${agreement.input.eventId}`, 'memory-agreement-evidence-gap');
+    archive.append(agreement.input.eventId, agreement.text);
   }
 
   showInfo(batchId: string): void {
@@ -378,13 +387,10 @@ export class OwnerMemoryHost {
       const previous = archive.events().findLast(event => !store.isCaptureOutput(activity, event.ack));
       const target = previous?.role === 'assistant' && store.readMemoryProposal(activity, previous.ack) ? previous.ack : null;
       if (!target && explicitOnly) return false;
-      let agreementInput: SourceAck | undefined;
-      if (explicitOnly && target && isOwnerAgreement(line)) {
-        const original = appendOwner(raw);
-        if (!original) return true;
-        agreementInput = original;
-      }
-      const ack = appendOwner(target && isOwnerAgreement(line) ? encodeOwnerAgreement(agreementInput ? raw : line, target, agreementInput) : raw);
+      const originalId = explicitOnly && target && isOwnerAgreement(line) ? randomUUID() : undefined;
+      const agreementInput = originalId ? { eventId: originalId, locator: `cli-jsonl@1/${this.probe.binding.sessionId}/${originalId}` } : undefined;
+      const text = target && isOwnerAgreement(line) ? encodeOwnerAgreement(agreementInput ? raw : line, target, agreementInput) : raw;
+      const ack = appendOwner(text);
       if (!ack) return true;
       if (!target) report('live', 'not-actionable', 'warning', { reason: 'agreement-target-missing', input: ack.eventId });
       else if (isOwnerDecline(line)) report('live', 'cancelled', 'info', { reason: 'owner-declined', input: ack.eventId, range: [target.eventId] });

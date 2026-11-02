@@ -60,6 +60,7 @@ test('explicit disposable session bootstrap reopens the same unbound identity wi
 
 test('configured ordinary stdin reaches the durable archive and HTTP route unchanged, then accepts another request', async t => {
   const session = await createSession(t), bodies: string[] = [];
+  let agreedRecordId: string;
   const server = createServer(async (request, response) => {
     let body = ''; for await (const chunk of request) body += chunk;
     bodies.push(body);
@@ -123,18 +124,17 @@ test('configured ordinary stdin reaches the durable archive and HTTP route uncha
     const accepted = await Promise.race(['remember-result', 'session-result', 'session-command-rejected'].map(event => cli.waitFor(event, beforeAgreement)));
     assert.equal(accepted.status, 'activated', JSON.stringify(accepted));
     assert.equal(accepted.content, 'T54 agreed synthetic examples.');
+    agreedRecordId = accepted.recordId as string;
     assert.equal((accepted.range as string[])[0], (proposed.status as { responses: { source: { eventId: string } }[] }).responses.at(-1)!.source.eventId);
     assert.equal(bodies.length, 8);
     const agreementSource = await sendCommand(cli, '/expand ' + JSON.stringify({ eventId: (accepted.range as string[]).at(-1), offset: 0, limit: 512 }), 'session-source');
     assert.equal(agreementSource.text, ownerAgreement);
-    const probe = openProbe(openSandbox(session.root), AGENT_BUDGET, undefined, undefined, undefined, true);
-    try {
-      const ledger = probe.store.requestStatus(probe.activity, result.runId as string);
-      assert.equal(ledger.attempts.length, 1);
-      const status = probe.store.agentStatus(probe.activity, result.runId as string);
-      assert.equal(status.inputs[0]!.state, 'bound-to-assembly');
-      assert.equal(probe.archive.read(status.inputs[0]!.source).text, first);
-    } finally { probe.close(); }
+    const persisted = await sendCommand(cli, `/request ${result.runId}`, 'session-request');
+    assert.equal((persisted.ledger as { attempts: unknown[] }).attempts.length, 1);
+    const firstInput = (persisted.status as { inputs: { state: string; source: { eventId: string } }[] }).inputs[0]!;
+    assert.equal(firstInput.state, 'bound-to-assembly');
+    const original = await sendCommand(cli, '/expand ' + JSON.stringify({ eventId: firstInput.source.eventId, offset: 0, limit: 512 }), 'session-source');
+    assert.equal(original.text, first);
   } finally {
     cli.command('/exit'); cli.child.stdin.end(); await cli.exit;
     server.closeAllConnections(); server.close(); await once(server, 'close');
@@ -146,6 +146,20 @@ test('configured ordinary stdin reaches the durable archive and HTTP route uncha
   } finally { reopened.command('/exit'); await reopened.exit; }
   const backup = startCli(['backup', '--sandbox', session.root]);
   assert.equal((await backup.exit).code, 0, JSON.stringify(backup.observations));
+  const purge = startCli(['purge', '--sandbox', session.root, '--record', agreedRecordId!]);
+  try {
+    const preview = await purge.waitFor('purge-preview');
+    assert.equal((await sendCommand(purge, preview.phrase as string, 'purge-result')).status, 'logical-commit');
+    const cleaned = await sendCommand(purge, 'cleanup', 'purge-result');
+    assert.equal(cleaned.status, 'controlled-complete', JSON.stringify(purge.observations));
+    await purge.exit;
+  } finally { if (purge.child.exitCode === null) { purge.child.stdin.end(); await purge.exit; } }
+  const cleaned = startCli(['session', '--sandbox', session.root]);
+  try {
+    await cleaned.waitFor('session-ready');
+    const found = await sendCommand(cleaned, '/memory T54 agreed', 'session-memory');
+    assert.equal((found.results as { unitId: string }[]).some(record => record.unitId === agreedRecordId), false);
+  } finally { cleaned.command('/exit'); await cleaned.exit; }
 });
 
 test('configured model and approved native files share one bound session with guidance and later stdin', { skip: process.platform !== 'win32' }, async t => {
@@ -284,6 +298,16 @@ test('configured capture resumes queued owner input at startup and after the nex
     const second = await cli.waitFor('capture-queue', at);
     assert.ok((second.jobs as { stage: string }[]).some(job => job.stage === 'complete'), JSON.stringify(second));
     assert.equal(bodies.length, 2);
+    const buffered = await createSession(t);
+    const cancelled = startCli(['session', '--sandbox', buffered.root, '--capture-config', config], 150000, undefined,
+      { ...process.env, EULER_SESSION_TEST_KEY: 'synthetic-session-test-key' });
+    try {
+      await cancelled.waitFor('session-ready');
+      cancelled.child.stdin.write('/bind ' + JSON.stringify({ projectId: randomUUID(), root: null }) + '\n记住：T54 cancelled owner job.\n/cancel\n/drain\n');
+      await cancelled.waitFor('session-drained');
+      assert.equal(bodies.length, 2, JSON.stringify(cancelled.observations));
+      assert.equal((await sendCommand(cancelled, '/status', 'session-status')).project, null);
+    } finally { cancelled.command('/exit'); await cancelled.exit; }
   } finally {
     cli.command('/exit'); await cli.exit;
     server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));

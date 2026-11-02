@@ -129,11 +129,12 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
         if (live?.error) throw live.error;
         if (line === '/exit') break;
         if (line === '/cancel') continue;
+        if (line === '/status') { emit('session-status', state()); continue; }
+        check(live?.epoch === inputEpoch, 'input-cancelled');
         if (/^(approve|reject) [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(line)) {
           check(pendingApproval && live?.fileToken === pendingApproval.token && line === `${line.split(' ')[0]} ${pendingApproval.token}`, 'file-approval-stale');
           pendingApproval.decide(line.startsWith('approve ') ? 'approved' : 'rejected'); continue;
         }
-        if (line === '/status') { emit('session-status', state()); continue; }
         if (line === '/drain') {
           check(!pumping, 'foreground-run-active'); await capture.flush(); await historian?.flush();
           emit('session-drained', { capture: probe.store.listCaptureJobs(probe.activity),
@@ -223,6 +224,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
           const confirmation = probe.archive.append(randomUUID(), line, 'user');
           const resource = root ? { path: root, identity: fileIdentity(root) } : null;
           await Promise.all([capture.idle(), historian?.idle()]);
+          check(live?.epoch === inputEpoch, 'input-cancelled');
           probe.store.confirmSessionProject(probe.activity, confirmation, command.projectId, resource);
           await capture.close(); await historian?.close();
           probe.close(); probe = openProbe(sandbox, budget, undefined, options.binding, undefined, true); run = undefined;
@@ -230,7 +232,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
           owner = new OwnerMemoryHost(probe, openOwnerInfo(sandbox, probe), 'success', false);
           corrections = new CorrectionHost(probe, { recoverInfo: () => owner.deliver() });
           owner.drain(); owner.deliver(); await corrections.recover();
-          ({ capture, historian } = startWorkers());
+          if (live?.epoch === inputEpoch) ({ capture, historian } = startWorkers());
           emit('session-bound', state()); continue;
         }
         check(configured && route, 'explicit-route-model-auth-budget-required');

@@ -56,10 +56,10 @@ async function fixture(t: TestContext, respond: (response: ServerResponse, ordin
     baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}/v1`,
     authNamespace: 'synthetic-test', credentialEnv: 'EULER_RECOVERY_TEST_KEY', contextWindow: 32000, maxTokens: 1024,
     authorization: 'synthetic-test-only', budget }));
-  async function launch() {
+  async function launch(environment: NodeJS.ProcessEnv = {}) {
     // Match interactive-session.test.ts: configured startup runs the real prerequisite suite.
     const cli = startCli(['session', '--sandbox', root, '--transport-config', config], 150000, undefined,
-      { ...process.env, EULER_RECOVERY_TEST_KEY: 'synthetic-recovery-key' });
+      { ...process.env, EULER_RECOVERY_TEST_KEY: 'synthetic-recovery-key', ...environment });
     clients.push(cli);
     const ready = await cli.waitFor('session-ready');
     assert.deepEqual(ready.binding, created!.binding);
@@ -157,6 +157,31 @@ test('session cancellation received in a buffered stdin batch prevents earlier q
   assert.equal((status.runs as DurableRun[]).flatMap(run => run.attempts).length, 0);
   await closeCli(cli);
   assert.equal(f.bodies.length, 0);
+});
+
+for (const cut of ['before', 'after']) test(`session recovers an agreement interrupted ${cut} the original source without duplicating memory or Info`, async t => {
+  const f = await fixture(t, response => answer(response, '建议记住偏好：T54 synthetic crash preference.'));
+  const preload = new URL('./support/agreement-crash.mjs', import.meta.url).href;
+  const cli = await f.launch({ NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${preload}`, T54_AGREEMENT_CUT: cut });
+  await sendCommand(cli, '/bind ' + JSON.stringify({ projectId: randomUUID(), root: null }), 'session-bound');
+  const proposed = await sendCommand(cli, 'Propose a synthetic preference.', 'session-result');
+  cli.command('  同意  ');
+  await cli.waitFor('agreement-checkpoint');
+  cli.child.kill('SIGKILL'); await cli.exit;
+  const reopened = await f.launch();
+  const recovered = reopened.observations.find(event => event.event === 'remember-result' && event.status === 'activated');
+  assert.ok(recovered, JSON.stringify(reopened.observations));
+  assert.equal((recovered.range as string[])[0], (proposed.status as AgentStatus).responses.at(-1)!.source.eventId);
+  const original = await sendCommand(reopened, '/expand ' + JSON.stringify({ eventId: (recovered.range as string[])[1], offset: 0, limit: 512 }), 'session-source');
+  assert.equal(original.text, '  同意  ');
+  const info = await sendCommand(reopened, '/info', 'info-list');
+  assert.equal((info.rows as unknown[]).length, 1);
+  await closeCli(reopened);
+  const again = await f.launch();
+  assert.deepEqual((await sendCommand(again, '/info', 'info-list')).rows, info.rows);
+  assert.equal(again.observations.some(event => event.event === 'remember-result' && event.status === 'activated'), false);
+  await closeCli(again);
+  assert.equal(f.bodies.length, 1);
 });
 
 test('session /cancel keeps an in-flight HTTP attempt unknown and ignores a late tool response', async t => {
