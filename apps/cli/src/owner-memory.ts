@@ -339,7 +339,7 @@ export class OwnerMemoryHost {
     emit('info-list', { ...counts(rows), rows: rows.map(row => ({ batchId: row.batchId, memberCount: row.memberCount, delivery: row.delivery, read: row.read })) });
   }
 
-  handle(raw: string): boolean {
+  handle(raw: string, requireAgreementTarget = false): boolean {
     const line = raw.trim(), { store, activity, archive } = this.probe;
     if (line === 'info') { this.listInfo(); return true; }
     if (line.startsWith('info ')) { this.showInfo(line.slice(5).trim()); return true; }
@@ -358,18 +358,24 @@ export class OwnerMemoryHost {
       check(fields.length === 2 || fields.length === 3, 'invalid-source-command');
       const record = store.readMemory(activity, fields[1]!);
       emit('memory-source', { recordId: record.recordId, revisionId: record.revisionId,
-        ...store.expandSource(activity, { ref: record.source, offset: Number(fields[2] ?? 0), limit: 4096 }) }); return true;
+        ...store.expandSource(activity, { recordId: record.recordId, offset: Number(fields[2] ?? 0), limit: 4096 }) }); return true;
     }
-    if (parseOwnerStatement(line)) { this.remember(archive.append(randomUUID(), raw), 'live'); return true; }
+    const appendOwner = (text: string): SourceAck | null => {
+      try { return archive.append(randomUUID(), text); }
+      catch (error) { report('live', 'error', 'error', { committed: false, reason: (error as Error).message }); return null; }
+    };
+    if (parseOwnerStatement(line)) { const ack = appendOwner(raw); if (ack) this.remember(ack, 'live'); return true; }
     if (isUntypedRemember(line)) {
-      const ack = archive.append(randomUUID(), raw);
+      const ack = appendOwner(raw); if (!ack) return true;
       const queued = store.queueOwnerCapture(activity, ack, this.#noActiveProject);
       report('live', 'needs-input', 'warning', { ...queued, input: ack.eventId, accepted: OWNER_MEMORY_FORMS }); return true;
     }
     if (isOwnerAgreement(line) || isOwnerDecline(line)) {
       const previous = archive.events().findLast(event => !store.isCaptureOutput(activity, event.ack));
       const target = previous?.role === 'assistant' && parseMemoryProposal(previous.text) ? previous.ack : null;
-      const ack = archive.append(randomUUID(), target && isOwnerAgreement(line) ? encodeOwnerAgreement(line, target) : raw);
+      if (!target && requireAgreementTarget) return false;
+      const ack = appendOwner(target && isOwnerAgreement(line) ? encodeOwnerAgreement(line, target) : raw);
+      if (!ack) return true;
       if (!target) report('live', 'not-actionable', 'warning', { reason: 'agreement-target-missing', input: ack.eventId });
       else if (isOwnerDecline(line)) report('live', 'cancelled', 'info', { reason: 'owner-declined', input: ack.eventId, range: [target.eventId] });
       else this.remember(ack, 'live');

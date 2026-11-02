@@ -45,6 +45,11 @@ test('explicit disposable session bootstrap reopens the same unbound identity wi
     const missing = await sendCommand(cli, 'Explain this synthetic session.', 'session-command-rejected');
     assert.equal(missing.reason, 'explicit-route-model-auth-budget-required');
     assert.equal(missing.sends, 0);
+    for (const text of ["Don't use jargon; explain this synthetic example.", '不要术语，解释合成示例。', '是否可以简化？', '同意']) {
+      const at = cli.observations.length; cli.command(text);
+      const refused = await Promise.race(['session-command-rejected', 'memory-result', 'remember-result'].map(event => cli.waitFor(event, at)));
+      assert.equal(refused.reason, 'explicit-route-model-auth-budget-required', JSON.stringify(refused));
+    }
   } finally {
     cli.command('/exit');
     cli.child.stdin.end();
@@ -58,7 +63,11 @@ test('configured ordinary stdin reaches the durable archive and HTTP route uncha
     let body = ''; for await (const chunk of request) body += chunk;
     bodies.push(body);
     response.setHeader('content-type', 'application/json');
-    response.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'Synthetic answer ' + bodies.length }, finish_reason: 'stop' }] }));
+    const result = JSON.parse(body).messages.filter((message: { role: string }) => message.role === 'tool').at(-1);
+    const call = bodies.length === 5 ? { name: 'source_search', arguments: JSON.stringify({ query: '蓝色', scope: 'session' }) }
+      : bodies.length === 6 && JSON.parse(JSON.parse(result.content).result).results?.length ? { name: 'source_expand', arguments: JSON.stringify({ eventId: JSON.parse(JSON.parse(result.content).result).results[0].eventId, offset: 0, limit: 512 }) } : null;
+    response.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: call ? null : 'Synthetic answer ' + bodies.length,
+      ...(call ? { tool_calls: [{ id: 'raw-' + bodies.length, type: 'function', function: call }] } : {}) }, finish_reason: call ? 'tool_calls' : 'stop' }] }));
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const directory = temporary(t, 'euler-t54-http-'), config = join(directory, 'route.json');
@@ -67,7 +76,7 @@ test('configured ordinary stdin reaches the durable archive and HTTP route uncha
     authorization: 'synthetic-test-only', budget: AGENT_BUDGET }));
   const cli = startCli(['session', '--sandbox', session.root, '--transport-config', config], 150000, undefined,
     { ...process.env, EULER_SESSION_TEST_KEY: 'synthetic-session-test-key' });
-  const first = '  Explain my synthetic question exactly: 蓝色 17.  ', second = 'What was my previous question?';
+  const first = '  Explain my synthetic question exactly: 蓝色 17.  ', second = '不要术语，解释我刚才的合成问题。';
   try {
     const ready = await cli.waitFor('session-ready');
     assert.ok(ready.route, JSON.stringify(cli.observations));
@@ -87,6 +96,16 @@ test('configured ordinary stdin reaches the durable archive and HTTP route uncha
     const boundResult = await sendCommand(cli, 'Now continue in the confirmed project.', 'session-result');
     assert.equal(boundResult.terminal, 'completed', JSON.stringify(cli.observations));
     assert.equal(bodies.length, 3);
+    const at = cli.observations.length; cli.command('同意');
+    const agreement = await Promise.race(['session-result', 'remember-result', 'memory-result'].map(event => cli.waitFor(event, at)));
+    assert.equal(agreement.event, 'session-result', JSON.stringify(agreement));
+    assert.equal(bodies.length, 4);
+    assert.equal(JSON.parse(JSON.parse(bodies[3]!).messages.at(-1).content).input, '同意');
+    const recovered = await sendCommand(cli, 'Find and recover the original blue question.', 'session-result');
+    assert.equal(recovered.terminal, 'completed', JSON.stringify(recovered.status));
+    assert.equal(bodies.length, 7, JSON.stringify(recovered.status));
+    const raw = JSON.parse(bodies[6]!).messages.filter((message: { role: string }) => message.role === 'tool').at(-1);
+    assert.equal(JSON.parse(JSON.parse(raw.content).result).text, first);
     const memory = await sendCommand(cli, '记住偏好：T54 concise examples are preferred.', 'remember-result');
     assert.equal(memory.status, 'activated', JSON.stringify(cli.observations));
     const inspect = await sendCommand(cli, `inspect ${memory.recordId}`, 'memory-inspect');
@@ -189,6 +208,8 @@ test('configured capture and Historian drain through the ordinary session and pr
   try {
     await cli.waitFor('session-ready');
     await sendCommand(cli, '/bind ' + JSON.stringify({ projectId: randomUUID(), root: null }), 'session-bound');
+    const invalidBinding = await sendCommand(cli, '/bind ' + JSON.stringify({ projectId: randomUUID(), root: null }), 'session-command-rejected');
+    assert.equal(invalidBinding.reason, 'session-project-already-bound');
     const response = await sendCommand(cli, 'T54 keep this synthetic original.', 'session-result');
     assert.equal(response.terminal, 'completed');
     cli.command('/drain'); await sendCommand(cli, '/status', 'session-status');
@@ -230,14 +251,26 @@ test('a later unbound session selects an existing project without inheriting its
   try {
     await next.waitFor('session-ready');
     assert.deepEqual((await sendCommand(next, '/memory T54', 'session-memory')).results, []);
+    const deniedSource = await sendCommand(next, `source ${remembered.recordId}`, 'session-command-rejected');
+    assert.equal(deniedSource.reason, 'invalid-memory-scope');
+    const goal = await sendCommand(next, '/task Compare synthetic project evidence.', 'session-task');
     await sendCommand(next, '/bind ' + JSON.stringify({ projectId, root: null }), 'session-bound');
     const found = await sendCommand(next, '/memory T54', 'session-memory');
     assert.equal((found.results as { unitId: string }[])[0]!.unitId, remembered.recordId);
-    const goal = await sendCommand(next, '/task Compare synthetic project evidence.', 'session-task');
+    const beforeSource = next.observations.length; next.command(`source ${remembered.recordId}`);
+    const recovered = await Promise.race(['memory-source', 'session-command-rejected'].map(event => next.waitFor(event, beforeSource)));
+    assert.equal(recovered.event, 'memory-source', JSON.stringify(recovered));
+    assert.equal(recovered.text, '记住偏好：T54 shared project examples.');
     const grant = await sendCommand(next, '/grant ' + JSON.stringify({ projectIds: [projectId], targets: {}, maxResults: 8, maxBytes: 8192 }), 'session-grant');
     assert.ok(goal.intentId && grant.grantId);
-    await sendCommand(next, '/revoke ' + grant.grantId, 'session-grant-revoked');
+    const at = next.observations.length;
+    next.command('/memory T54');
+    const granted = await Promise.race(['session-memory', 'session-command-rejected'].map(event => next.waitFor(event, at)));
+    assert.equal(granted.event, 'session-memory', JSON.stringify(granted));
+    assert.equal((granted.results as { unitId: string }[])[0]!.unitId, remembered.recordId);
   } finally { next.command('/exit'); await next.exit; }
+  const backup = startCli(['backup', '--sandbox', first.root]);
+  assert.equal((await backup.exit).code, 0, JSON.stringify(backup.observations));
 });
 
 test('purge removes a bound-session memory and its backup without erasing the confirmed project', async t => {
@@ -265,6 +298,30 @@ test('purge removes a bound-session memory and its backup without erasing the co
     assert.equal((ready.project as { projectId: string }).projectId, projectId);
     assert.deepEqual((await sendCommand(reopened, '/memory T54', 'session-memory')).results, []);
   } finally { reopened.command('/exit'); await reopened.exit; }
+});
+
+test('pre-binding cancelled correction delivery survives binding, restart and backup without promoting its candidate', async t => {
+  const session = await createSession(t), cli = startCli(['session', '--sandbox', session.root]);
+  try {
+    await cli.waitFor('session-ready');
+    const candidate = await sendCommand(cli, '记住偏好：T54 unresolved correction source.', 'remember-result');
+    assert.equal(candidate.reason, 'scope-unresolved');
+    const preview = await sendCommand(cli, `correct ${candidate.recordId} "T54 proposed new text."`, 'memory-preview');
+    const cancelled = await sendCommand(cli, `cancel ${preview.token}`, 'memory-result');
+    assert.equal(cancelled.status, 'cancelled');
+    await sendCommand(cli, '/bind ' + JSON.stringify({ projectId: randomUUID(), root: null }), 'session-bound');
+    const at = cli.observations.length; cli.command(`replay ${preview.token}`);
+    const replayed = await Promise.race(['memory-result', 'memory-delivery-error', 'session-command-rejected'].map(event => cli.waitFor(event, at)));
+    assert.equal(replayed.status, 'cancelled', JSON.stringify(replayed));
+    const inspected = await sendCommand(cli, `inspect ${candidate.recordId}`, 'memory-inspect');
+    assert.deepEqual((inspected.targets as { scope: unknown }[])[0]!.scope, { kind: 'session', id: session.binding.sessionId, resolved: false });
+    assert.deepEqual((await sendCommand(cli, '/memory T54', 'session-memory')).results, []);
+  } finally { cli.command('/exit'); await cli.exit; }
+  const reopened = startCli(['session', '--sandbox', session.root]);
+  try { await reopened.waitFor('session-ready'); assert.equal(reopened.observations.some(event => event.event === 'memory-delivery-error'), false); }
+  finally { reopened.command('/exit'); await reopened.exit; }
+  const backup = startCli(['backup', '--sandbox', session.root]);
+  assert.equal((await backup.exit).code, 0, JSON.stringify(backup.observations));
 });
 
 test('unbound and confirmed session identities participate in public backup and restore', async t => {

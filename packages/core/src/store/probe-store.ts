@@ -1089,7 +1089,8 @@ export class ProbeStore {
 
   #readDiscoveryGrant(row: Record<string, unknown>, intent: Intent): { projects: string[]; remaining: number; remainingBytes: number;
     remainingQueries: number; targets: Map<string, SearchTarget> } {
-    const grantId = String(row.grant_id), binding = intent.binding;
+    const grantId = String(row.grant_id), binding = this.currentBinding(intent.binding.sessionId);
+    requireProject(binding);
     check(row.owner_id === binding.ownerId && row.session_id === binding.sessionId && row.intent_id === intent.intentId
       && sha256(String(row.consent)) === row.consent_hash, 'discovery-not-authorized');
     const consent = JSON.parse(String(row.consent)) as SourceAck;
@@ -3051,7 +3052,8 @@ export class ProbeStore {
   /** Distinguishes background archive entries by durable job ownership, including an unrecorded response append. */
   isCaptureOutput(activity: Activity, ref: SourceAck): boolean {
     return this.withActivity(activity, () => {
-      check(sameBinding(ref.binding, this.#binding), 'source-scope-mismatch');
+      check(sameBinding({ ...ref.binding, projectId: this.#binding.projectId }, this.#binding)
+        && (ref.binding.projectId === null || ref.binding.projectId === this.#binding.projectId), 'source-scope-mismatch');
       return this.#isCaptureOutput(ref);
     });
   }
@@ -3639,8 +3641,9 @@ export class ProbeStore {
       const payload = String(row[`${field}_source`]);
       check(sha256(payload) === row[`${field}_hash`], 'operation-delivery-evidence-gap');
       const ref = JSON.parse(payload) as SourceAck;
-      check(sameBinding(ref.binding, binding), 'operation-delivery-evidence-gap');
-      if (field === 'approval') this.#validateRawSource(ref, undefined, localScope(binding), localProjects(binding), binding);
+      check(sameBinding({ ...ref.binding, projectId: binding.projectId }, binding)
+        && (ref.binding.projectId === null || ref.binding.projectId === binding.projectId), 'operation-delivery-evidence-gap');
+      if (field === 'approval') this.#validateRawSource(ref, undefined, { kind: 'session', id: binding.sessionId, resolved: false }, localProjects(binding), binding);
       else this.#archiveRef(ref);
       return ref;
     };
@@ -5758,17 +5761,20 @@ export class ProbeStore {
       || record.content.trim().normalize('NFC') === claimKey) ?? null;
   }
   expandSource(activity: Activity, request: { ref: SourceAck; offset: number; limit: number }): SourceExcerpt;
+  expandSource(activity: Activity, request: { recordId: string; offset: number; limit: number }): SourceExcerpt;
   expandSource(activity: Activity, request: { unitId: string; offset: number; limit: number; grantId?: string; queryId?: string }): SourceUnitExcerpt;
-  expandSource(activity: Activity, request: SourceExpandRequest): SourceExcerpt | SourceUnitExcerpt {
+  expandSource(activity: Activity, request: SourceExpandRequest | { recordId: string; offset: number; limit: number }): SourceExcerpt | SourceUnitExcerpt {
     return this.withActivity(activity, () => {
       check(request && typeof request === 'object', 'invalid-source-request');
       const { offset, limit } = request;
       check(Number.isSafeInteger(offset) && offset >= 0 && Number.isSafeInteger(limit) && limit > 0 && limit <= 4096, 'invalid-range');
       if ('unitId' in request) return this.#expandSourceUnit(activity, request);
-      check(Object.keys(request).sort().join(',') === 'limit,offset,ref', 'invalid-source-request');
-      const { ref } = request;
-      check(ref?.binding && sameBinding({ ...ref.binding, projectId: this.#binding.projectId }, this.#binding)
-        && (ref.binding.projectId === null || ref.binding.projectId === this.#binding.projectId), 'source-scope-mismatch');
+      const record = 'recordId' in request ? this.#readMemoryUnsafe(request.recordId) : null;
+      check(Object.keys(request).sort().join(',') === (record ? 'limit,offset,recordId' : 'limit,offset,ref'), 'invalid-source-request');
+      const ref = record ? record.source : (request as { ref: SourceAck }).ref;
+      const localSession = ref?.binding && sameBinding({ ...ref.binding, projectId: this.#binding.projectId }, this.#binding)
+        && (ref.binding.projectId === null || ref.binding.projectId === this.#binding.projectId);
+      check(localSession || record && this.#binding.projectId !== null && ref.binding.projectId === this.#binding.projectId, 'source-scope-mismatch');
       this.#validateSource(ref);
       check(!this.#isCaptureOutput(ref), 'source-derived');
       this.#assertRawSourceAccess(activity, ref);

@@ -77,6 +77,7 @@ The entry point reuses `OwnerMemoryHost`, `CorrectionHost`, Core retrieval and d
 /info
 /info <batchId>
 inspect <recordId>
+source <recordId> [offset]
 correct <recordId> "完整的新正文"
 forget <recordId>
 restore <recordId>
@@ -90,6 +91,8 @@ replay <previewToken>
 /source-search <query>
 /expand {"eventId":"<original eventId>","offset":0,"limit":512}
 ```
+
+Only complete explicit correction commands use the memory-operation path. Ordinary questions such as `不要术语，解释这个示例。` and an agreement without a memory proposal keep the ordinary model route. `source <recordId>` recovers that canonical memory’s bounded original event, including another session in the same confirmed project; an unbound session cannot use it to reach project memory.
 
 Correction/forget/restore/rollback retain their existing preview and live-approval checks. Objective `记住事实` statements still require independent evidence. Corrected content remains unverified until reverification. Model tool calls to `memory.search`, `source.search`, `source.expand`, and `skill.search` go through Core; owner commands do not send a counting-model substitute.
 

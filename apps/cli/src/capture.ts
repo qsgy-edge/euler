@@ -80,7 +80,7 @@ export function scheduleCaptures(probe: Probe, path: string | undefined, recover
       } while (pending);
     })().finally(() => { running = undefined; });
   };
-  return { kick, async flush() { kick(); await running; },
+  return { kick, idle: () => running, async flush() { kick(); await running; },
     async close() { abort.abort(new Error('capture-stopped')); await running; } };
 }
 

@@ -482,8 +482,8 @@ test('a Host without a durable Info surface does not auto-activate; a durable Ho
 
 test('source errors, declines, untyped statements and unresolved scope never activate', async () => {
   const sandbox = createSandbox();
+  const cli = startCli(['remember', '--sandbox', sandbox.root, '--no-active-project', '--synthetic-proposals']);
   try {
-    const cli = startCli(['remember', '--sandbox', sandbox.root, '--no-active-project', '--synthetic-proposals']);
     await cli.waitFor('remember-ready');
     const unscoped = await send(cli, '记住偏好：包管理器使用 bun', 'remember-result');
     assert.deepEqual([unscoped.status, unscoped.stage, unscoped.reason, unscoped.level], ['blocked', 'candidate', 'scope-unresolved', 'warning']);
@@ -512,5 +512,8 @@ test('source errors, declines, untyped statements and unresolved scope never act
       assert.equal(db.prepare("SELECT count(*) AS n FROM memory_heads WHERE lifecycle='active'").get()!.n, 0);
       assert.equal(db.prepare('SELECT count(*) AS n FROM activation_batches').get()!.n, 0);
     } finally { db.close(); }
-  } finally { rmSync(sandbox.root, { recursive: true, force: true }); }
+  } finally {
+    if (cli.child.exitCode === null && cli.child.signalCode === null) { cli.child.kill(); await cli.exit; }
+    rmSync(sandbox.root, { recursive: true, force: true });
+  }
 });

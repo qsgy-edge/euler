@@ -31,7 +31,8 @@ export class CorrectionHost {
     if (this.#scenario === point) killPoint('correction-checkpoint', point, 10000);
   }
 
-  receive(text: string): CorrectionInput | null {
+  receive(text: string, explicitOnly = false): CorrectionInput | null {
+    if (explicitOnly) return parseCorrectionCommand(text) ? this.core.receive(text) : null;
     if (text.trim() === 'stop') { this.#setupAbort.abort(); this.#run?.cancel(); return null; }
     return /^(inspect|correct|forget|restore|rollback|purge|commit|cancel|replay|model)(?: |$)/.test(text.trim()) || /^(把 |不要|别|是否|帮我判断|恢复被|撤销彻底|隐私清除|彻底清除|永久删除|do not |don't )/i.test(text)
       ? this.core.receive(text) : null;

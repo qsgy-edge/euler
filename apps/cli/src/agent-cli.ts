@@ -113,7 +113,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
     lines.on('line', text => {
       try {
         if (text === '/cancel' || text === '/exit') stop();
-        liveInputs.push({ input: corrections.receive(text), ...(pendingApproval?.presented ? { fileToken: pendingApproval.token } : {}) });
+        liveInputs.push({ input: corrections.receive(text, true), ...(pendingApproval?.presented ? { fileToken: pendingApproval.token } : {}) });
       } catch (error) { liveInputs.push({ input: null, error }); }
     });
     lines.on('close', () => { inputClosed = true; pendingApproval?.decide('unavailable'); });
@@ -182,7 +182,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
           emit('session-grant-revoked', { grantId }); continue;
         }
         if (live?.input) { await corrections.handle(live.input, line); continue; }
-        if (owner.handle(line.startsWith('/') ? line.slice(1) : line)) continue;
+        if (owner.handle(line.startsWith('/') ? line.slice(1) : line, true)) continue;
         if (line.startsWith('/memory ')) {
           emit('session-memory', probe.store.searchMemories(probe.activity, { query: line.slice(8), ...(discoveryGrantId ? { grantId: discoveryGrantId } : {}) })); continue;
         }
@@ -211,9 +211,10 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
           const command = JSON.parse(line.slice(6)) as { projectId: string; root: string | null };
           const root = command.root === null ? null : realpathSync.native(command.root);
           const confirmation = probe.archive.append(randomUUID(), line, 'user');
+          const resource = root ? { path: root, identity: fileIdentity(root) } : null;
+          await Promise.all([capture.idle(), historian?.idle()]);
+          probe.store.confirmSessionProject(probe.activity, confirmation, command.projectId, resource);
           await capture.close(); await historian?.close();
-          probe.store.confirmSessionProject(probe.activity, confirmation, command.projectId,
-            root ? { path: root, identity: fileIdentity(root) } : null);
           probe.close(); probe = openProbe(sandbox, budget, undefined, options.binding, undefined, true); run = undefined;
           project = probe.store.sessionProject(probe.activity); guidance = undefined;
           owner = new OwnerMemoryHost(probe, openOwnerInfo(sandbox, probe), 'success', false);
