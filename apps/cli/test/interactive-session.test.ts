@@ -455,4 +455,3 @@ test('an unbound session confirms an explicitly selected project and reopens wit
     assert.equal(rejected.reason, 'session-project-already-bound');
   } finally { reopened.command('/exit'); reopened.child.stdin.end(); assert.equal((await reopened.exit).code, 0); }
 });
-
