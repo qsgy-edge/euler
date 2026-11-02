@@ -92,7 +92,7 @@ replay <previewToken>
 /expand {"eventId":"<original eventId>","offset":0,"limit":512}
 ```
 
-Only complete explicit correction commands use the memory-operation path. Ordinary questions such as `不要术语，解释这个示例。` and an agreement without a memory proposal keep the ordinary model route. `source <recordId>` recovers that canonical memory’s bounded original event, including another session in the same confirmed project; an unbound session cannot use it to reach project memory.
+Only complete explicit command forms use the memory-operation path. Ordinary questions such as `不要术语，解释这个示例。`, `feedback on this design, please`, and an agreement without a memory proposal keep the ordinary model route. An explicit assistant proposal such as `建议记住偏好：使用合成示例。` followed by `同意` uses the owner lane and retains both original source ACKs as its evidence range. `source <recordId>` recovers that canonical memory’s bounded original event, including another session in the same confirmed project; an unbound session cannot use it to reach project memory.
 
 Correction/forget/restore/rollback retain their existing preview and live-approval checks. Objective `记住事实` statements still require independent evidence. Corrected content remains unverified until reverification. Model tool calls to `memory.search`, `source.search`, `source.expand`, and `skill.search` go through Core; owner commands do not send a counting-model substitute.
 
@@ -103,7 +103,7 @@ node apps/cli/src/main.ts session --sandbox $store --transport-config 'D:/synthe
   --capture-config 'D:/synthetic/capture.json' --historian-config 'D:/synthetic/historian.json'
 ```
 
-Background configurations use the existing capture route contract and `captureCapability`. Memory capture waits for foreground boundaries. `/drain` waits for the configured workers and reports both queues; `/cancel` stops them. Prerequisite subprocess launches are recorded in the existing process/maintenance fence. No configured worker means no background provider send.
+Background configurations use the existing capture route contract and `captureCapability`. Startup recovery and owner input schedule eligible queued work; memory capture waits for foreground boundaries. `/drain` waits for the configured workers and reports both queues; `/cancel` stops them. Prerequisite subprocess launches are recorded in the existing process/maintenance fence. No configured worker means no background provider send.
 
 Cross-project discovery still requires an active task and a structured owner grant:
 

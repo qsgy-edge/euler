@@ -46,8 +46,11 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
     return { guidance: { session: guidance, selectFiles: true, targets: [{ projectId: project.projectId, path: project.root.path }],
       operation: { name: 'synthetic.read' as const, targets: [project.root.path] } } };
   };
-  let capture = scheduleCaptures(probe, options.captureConfig, () => owner.deliver());
-  let historian = options.historianConfig ? scheduleCaptures(probe, options.historianConfig, () => owner.deliver(), 'historian') : undefined;
+  const startWorkers = () => ({
+    capture: scheduleCaptures(probe, options.captureConfig, () => owner.deliver()),
+    historian: options.historianConfig ? scheduleCaptures(probe, options.historianConfig, () => owner.deliver(), 'historian') : undefined,
+  });
+  let { capture, historian } = startWorkers();
   let pendingApproval: { token: string; presented: boolean; decide(decision: FileDecision): void } | undefined;
   const setup = new AbortController();
   const stop = () => { setup.abort(); run?.cancel(); void capture.close(); void historian?.close(); };
@@ -118,13 +121,14 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
     });
     lines.on('close', () => { inputClosed = true; pendingApproval?.decide('unavailable'); });
     emit('session-ready', state());
+    capture.kick(); historian?.kick();
     for await (const line of lines) {
       const live = liveInputs.shift();
       try {
         if (live?.error) throw live.error;
         if (line === '/exit') { stop(); break; }
         if (line === '/cancel') { stop(); continue; }
-        if (/^(approve|reject) /.test(line)) {
+        if (/^(approve|reject) [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(line)) {
           check(pendingApproval && live?.fileToken === pendingApproval.token && line === `${line.split(' ')[0]} ${pendingApproval.token}`, 'file-approval-stale');
           pendingApproval.decide(line.startsWith('approve ') ? 'approved' : 'rejected'); continue;
         }
@@ -181,8 +185,13 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
           if (discoveryGrantId === grantId) { stop(); await pumping; run = undefined; discoveryGrantId = undefined; }
           emit('session-grant-revoked', { grantId }); continue;
         }
-        if (live?.input) { await corrections.handle(live.input, line); continue; }
-        if (owner.handle(line.startsWith('/') ? line.slice(1) : line, true)) continue;
+        if (live?.input) {
+          await corrections.handle(live.input, line);
+          capture.kick(Boolean(pumping)); historian?.kick(Boolean(pumping)); continue;
+        }
+        if (owner.handle(line.startsWith('/') ? line.slice(1) : line, true)) {
+          capture.kick(Boolean(pumping)); historian?.kick(Boolean(pumping)); continue;
+        }
         if (line.startsWith('/memory ')) {
           emit('session-memory', probe.store.searchMemories(probe.activity, { query: line.slice(8), ...(discoveryGrantId ? { grantId: discoveryGrantId } : {}) })); continue;
         }
@@ -220,8 +229,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
           owner = new OwnerMemoryHost(probe, openOwnerInfo(sandbox, probe), 'success', false);
           corrections = new CorrectionHost(probe, { recoverInfo: () => owner.deliver() });
           owner.drain(); owner.deliver(); await corrections.recover();
-          capture = scheduleCaptures(probe, options.captureConfig, () => owner.deliver());
-          historian = options.historianConfig ? scheduleCaptures(probe, options.historianConfig, () => owner.deliver(), 'historian') : undefined;
+          ({ capture, historian } = startWorkers());
           emit('session-bound', state()); continue;
         }
         check(configured && route, 'explicit-route-model-auth-budget-required');
@@ -233,8 +241,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
           probe.archive.append(randomUUID(), line);
           probe.store.requestStatus(probe.activity, resume.relatedRunId);
           await capture.close(); await historian?.close();
-          capture = scheduleCaptures(probe, options.captureConfig, () => owner.deliver());
-          historian = options.historianConfig ? scheduleCaptures(probe, options.historianConfig, () => owner.deliver(), 'historian') : undefined;
+          ({ capture, historian } = startWorkers());
         }
         const control = /^\/(steer|follow-up|queue) ([\s\S]*)$/.exec(line);
         const mode = control ? control[1] as 'steer' | 'follow-up' | 'queue' : 'steer';

@@ -339,26 +339,30 @@ export class OwnerMemoryHost {
     emit('info-list', { ...counts(rows), rows: rows.map(row => ({ batchId: row.batchId, memberCount: row.memberCount, delivery: row.delivery, read: row.read })) });
   }
 
-  handle(raw: string, requireAgreementTarget = false): boolean {
+  handle(raw: string, explicitOnly = false): boolean {
     const line = raw.trim(), { store, activity, archive } = this.probe;
-    if (line === 'info') { this.listInfo(); return true; }
-    if (line.startsWith('info ')) { this.showInfo(line.slice(5).trim()); return true; }
-    if (line.startsWith('feedback ')) {
-      const fields = line.split(/\s+/);
-      check(fields.length === 4, 'invalid-memory-feedback');
-      this.feedback(fields[1]!, fields[2]!, fields[3]!); return true;
-    }
-    if (line.startsWith('used ')) {
-      const fields = line.split(/\s+/);
-      check(fields.length === 2 || fields.length === 3, 'invalid-inspect-command');
-      emit('memory-used', store.inspectAssembly(activity, fields[1]!, fields[2])); return true;
-    }
-    if (line.startsWith('source ')) {
-      const fields = line.split(/\s+/);
-      check(fields.length === 2 || fields.length === 3, 'invalid-source-command');
-      const record = store.readMemory(activity, fields[1]!);
-      emit('memory-source', { recordId: record.recordId, revisionId: record.revisionId,
-        ...store.expandSource(activity, { recordId: record.recordId, offset: Number(fields[2] ?? 0), limit: 4096 }) }); return true;
+    const id = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
+    const explicit = new RegExp(`^(info(?: ${id})?|feedback ${id} ${id} (helpful|wrong|stale|safety)|used ${id}(?: ${id})?|source ${id}(?: [0-9]+)?)$`).test(line);
+    if (!explicitOnly || explicit) {
+      if (line === 'info') { this.listInfo(); return true; }
+      if (line.startsWith('info ')) { this.showInfo(line.slice(5).trim()); return true; }
+      if (line.startsWith('feedback ')) {
+        const fields = line.split(/\s+/);
+        check(fields.length === 4, 'invalid-memory-feedback');
+        this.feedback(fields[1]!, fields[2]!, fields[3]!); return true;
+      }
+      if (line.startsWith('used ')) {
+        const fields = line.split(/\s+/);
+        check(fields.length === 2 || fields.length === 3, 'invalid-inspect-command');
+        emit('memory-used', store.inspectAssembly(activity, fields[1]!, fields[2])); return true;
+      }
+      if (line.startsWith('source ')) {
+        const fields = line.split(/\s+/);
+        check(fields.length === 2 || fields.length === 3, 'invalid-source-command');
+        const record = store.readMemory(activity, fields[1]!);
+        emit('memory-source', { recordId: record.recordId, revisionId: record.revisionId,
+          ...store.expandSource(activity, { recordId: record.recordId, offset: Number(fields[2] ?? 0), limit: 4096 }) }); return true;
+      }
     }
     const appendOwner = (text: string): SourceAck | null => {
       try { return archive.append(randomUUID(), text); }
@@ -372,8 +376,8 @@ export class OwnerMemoryHost {
     }
     if (isOwnerAgreement(line) || isOwnerDecline(line)) {
       const previous = archive.events().findLast(event => !store.isCaptureOutput(activity, event.ack));
-      const target = previous?.role === 'assistant' && parseMemoryProposal(previous.text) ? previous.ack : null;
-      if (!target && requireAgreementTarget) return false;
+      const target = previous?.role === 'assistant' && store.readMemoryProposal(activity, previous.ack) ? previous.ack : null;
+      if (!target && explicitOnly) return false;
       const ack = appendOwner(target && isOwnerAgreement(line) ? encodeOwnerAgreement(line, target) : raw);
       if (!ack) return true;
       if (!target) report('live', 'not-actionable', 'warning', { reason: 'agreement-target-missing', input: ack.eventId });

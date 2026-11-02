@@ -44,7 +44,7 @@ export function startCli(args: string[], timeoutMs = 15000, cwd?: string, env?: 
       function check() {
         const value = observations.find((item, index) => index >= from && item.event === event);
         if (value) finish(undefined, value);
-        else if (failure || exited) finish(failure ?? new Error(`process exited before ${event}: ${stderr}`));
+        else if (failure || exited) finish(failure ?? new Error(`process exited before ${event}: ${JSON.stringify(observations.slice(-4))}; ${stderr}`));
       }
       waiters.add(check);
       check();

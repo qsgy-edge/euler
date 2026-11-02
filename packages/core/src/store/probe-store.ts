@@ -3348,6 +3348,26 @@ export class ProbeStore {
     });
   }
 
+  readMemoryProposal(activity: Activity, ref: SourceAck): OwnerMemoryStatement | null {
+    return this.withActivity(activity, () => {
+      this.#validateRawSource(ref);
+      return this.#memoryProposal(ref);
+    });
+  }
+
+  #memoryProposal(ref: SourceAck): OwnerMemoryStatement | null {
+    const raw = this.#archiveRef(ref);
+    check(raw.role === 'assistant', 'memory-proposal-role-required');
+    const response = this.#db.prepare(`SELECT r.run_id,r.stream_id FROM request_events e JOIN request_runs r ON r.run_id=e.run_id
+      WHERE e.kind='agent/event@v1' AND json_extract(e.payload,'$.event.kind')='response'
+        AND json_extract(e.payload,'$.event.source.eventId')=?
+        AND json_extract(e.payload,'$.event.source.binding.sessionId')=?`).get(ref.eventId, ref.binding.sessionId);
+    if (!response) return parseMemoryProposal(raw.text);
+    const ledger = this.#readRequestLedger(this.#requestRun({ streamId: String(response.stream_id) }, String(response.run_id)));
+    check(this.#readAgentLedger(ledger).responses.some(item => sameSourceAck(item.source, ref)), 'source-evidence-gap');
+    return parseMemoryProposal((JSON.parse(raw.text) as { text: string }).text);
+  }
+
   rememberMemory(activity: Activity, request: RememberRequest): RememberResult {
     return this.withActivity(activity, () => {
       check(request && typeof request === 'object' && Object.keys(request).every(key => ['input', 'hostInfo', 'noActiveProject'].includes(key))
@@ -3366,9 +3386,7 @@ export class ProbeStore {
         const proposal = agreement.proposal;
         check(proposal.binding && sameBinding(proposal.binding, this.#binding) && proposal.eventId !== input.eventId, 'memory-proposal-scope-mismatch');
         this.#validateRawSource(proposal);
-        const proposed = this.#archiveRef(proposal);
-        check(proposed.role === 'assistant', 'memory-proposal-role-required');
-        statement = parseMemoryProposal(proposed.text);
+        statement = this.#memoryProposal(proposal);
         check(statement, 'memory-proposal-not-explicit');
         range = [proposal, input];
       }

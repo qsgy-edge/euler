@@ -240,7 +240,9 @@ export class CliArchive {
 
   read(ref: SourceAck): { text: string; role: RawEvent['role'] } {
     return this.#gate(() => {
-      check(sameBinding({ ...ref.binding, projectId: bindingOf(this.#sandbox).projectId }, bindingOf(this.#sandbox)), 'source-scope-mismatch');
+      const binding = bindingOf(this.#sandbox);
+      check(sameBinding({ ...ref.binding, projectId: binding.projectId }, binding)
+        && (binding.projectId === null || ref.binding.projectId === null || ref.binding.projectId === binding.projectId), 'source-scope-mismatch');
       check(!this.#journal?.pending().some(item => item.eventId === ref.eventId), 'archive-append-pending');
       const result = this.#scan().find(item => item.event.eventId === ref.eventId);
       check(result && JSON.stringify(result.ack) === JSON.stringify(ref), 'source-evidence-gap');

@@ -45,7 +45,8 @@ test('explicit disposable session bootstrap reopens the same unbound identity wi
     const missing = await sendCommand(cli, 'Explain this synthetic session.', 'session-command-rejected');
     assert.equal(missing.reason, 'explicit-route-model-auth-budget-required');
     assert.equal(missing.sends, 0);
-    for (const text of ["Don't use jargon; explain this synthetic example.", '不要术语，解释合成示例。', '是否可以简化？', '同意']) {
+    for (const text of ["Don't use jargon; explain this synthetic example.", '不要术语，解释合成示例。', '是否可以简化？', '同意',
+      'feedback on this design, please', 'approve this approach', 'info about this example', 'used as a synthetic example', 'source of this idea?']) {
       const at = cli.observations.length; cli.command(text);
       const refused = await Promise.race(['session-command-rejected', 'memory-result', 'remember-result'].map(event => cli.waitFor(event, at)));
       assert.equal(refused.reason, 'explicit-route-model-auth-budget-required', JSON.stringify(refused));
@@ -66,7 +67,7 @@ test('configured ordinary stdin reaches the durable archive and HTTP route uncha
     const result = JSON.parse(body).messages.filter((message: { role: string }) => message.role === 'tool').at(-1);
     const call = bodies.length === 5 ? { name: 'source_search', arguments: JSON.stringify({ query: '蓝色', scope: 'session' }) }
       : bodies.length === 6 && JSON.parse(JSON.parse(result.content).result).results?.length ? { name: 'source_expand', arguments: JSON.stringify({ eventId: JSON.parse(JSON.parse(result.content).result).results[0].eventId, offset: 0, limit: 512 }) } : null;
-    response.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: call ? null : 'Synthetic answer ' + bodies.length,
+    response.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: call ? null : bodies.length === 8 ? '建议记住偏好：T54 agreed synthetic examples.' : 'Synthetic answer ' + bodies.length,
       ...(call ? { tool_calls: [{ id: 'raw-' + bodies.length, type: 'function', function: call }] } : {}) }, finish_reason: call ? 'tool_calls' : 'stop' }] }));
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
@@ -115,6 +116,14 @@ test('configured ordinary stdin reaches the durable archive and HTTP route uncha
     assert.equal(committed.status, 'committed');
     const restored = await sendCommand(cli, `restore ${memory.recordId}`, 'memory-preview');
     assert.equal((await sendCommand(cli, `commit ${restored.token} restore`, 'memory-result')).status, 'committed');
+    const proposed = await sendCommand(cli, 'Propose a synthetic preference to remember.', 'session-result');
+    assert.equal(proposed.text, '建议记住偏好：T54 agreed synthetic examples.');
+    const beforeAgreement = cli.observations.length; cli.command('同意');
+    const accepted = await Promise.race(['remember-result', 'session-result', 'session-command-rejected'].map(event => cli.waitFor(event, beforeAgreement)));
+    assert.equal(accepted.status, 'activated', JSON.stringify(accepted));
+    assert.equal(accepted.content, 'T54 agreed synthetic examples.');
+    assert.equal((accepted.range as string[])[0], (proposed.status as { responses: { source: { eventId: string } }[] }).responses.at(-1)!.source.eventId);
+    assert.equal(bodies.length, 8);
     const probe = openProbe(openSandbox(session.root), AGENT_BUDGET, undefined, undefined, undefined, true);
     try {
       const ledger = probe.store.requestStatus(probe.activity, result.runId as string);
@@ -231,6 +240,43 @@ test('configured capture and Historian drain through the ordinary session and pr
   } finally {
     cli.command('/exit'); cli.child.stdin.end(); await cli.exit;
     server.closeAllConnections(); server.close(); await once(server, 'close');
+  }
+});
+
+test('configured capture resumes queued owner input at startup and after the next owner command', async t => {
+  const session = await createSession(t), seed = startCli(['session', '--sandbox', session.root]);
+  await seed.waitFor('session-ready');
+  await sendCommand(seed, '/bind ' + JSON.stringify({ projectId: randomUUID(), root: null }), 'session-bound');
+  await sendCommand(seed, '记住：T54 pending before restart.', 'remember-result');
+  seed.command('/exit'); await seed.exit;
+  const bodies: string[] = [];
+  const server = createServer(async (request, response) => {
+    let body = ''; for await (const chunk of request) body += chunk; bodies.push(body);
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'null' }, finish_reason: 'stop' }] }));
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const config = join(temporary(t, 'euler-t54-auto-capture-'), 'route.json');
+  writeFileSync(config, JSON.stringify({ provider: 'fixture', model: 'owner-capture', baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}/v1`,
+    authNamespace: 'synthetic-test', credentialEnv: 'EULER_SESSION_TEST_KEY', contextWindow: 32000, maxTokens: 1024,
+    authorization: 'synthetic-test-only', captureCapability: 'standard', budget: AGENT_BUDGET }));
+  const cli = startCli(['session', '--sandbox', session.root, '--capture-config', config], 150000, undefined,
+    { ...process.env, EULER_SESSION_TEST_KEY: 'synthetic-session-test-key' });
+  try {
+    await cli.waitFor('session-ready');
+    const started = await Promise.race([cli.waitFor('capture-prerequisites-started'), new Promise<null>(resolve => { const timer = setTimeout(() => resolve(null), 5000); timer.unref(); })]);
+    assert.ok(started, 'startup did not schedule the pending owner job');
+    const first = await cli.waitFor('capture-queue');
+    assert.ok((first.jobs as { stage: string }[]).some(job => job.stage === 'complete'), JSON.stringify(first));
+    assert.equal(bodies.length, 1);
+    const at = cli.observations.length;
+    await sendCommand(cli, '记住：T54 new live owner job.', 'remember-result');
+    const second = await cli.waitFor('capture-queue', at);
+    assert.ok((second.jobs as { stage: string }[]).some(job => job.stage === 'complete'), JSON.stringify(second));
+    assert.equal(bodies.length, 2);
+  } finally {
+    cli.command('/exit'); await cli.exit;
+    server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
   }
 });
 
