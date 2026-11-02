@@ -3373,7 +3373,7 @@ export class ProbeStore {
       check(request && typeof request === 'object' && Object.keys(request).every(key => ['input', 'hostInfo', 'noActiveProject'].includes(key))
         && ['durable', 'unavailable'].includes(request.hostInfo)
         && (request.noActiveProject === undefined || request.noActiveProject === true), 'invalid-remember-request');
-      const { input } = request;
+      let { input } = request;
       check(input && typeof input === 'object' && input.binding && sameBinding(input.binding, this.#binding), 'source-scope-mismatch');
       this.#validateRawSource(input);
       const owner = this.#archiveRef(input);
@@ -3388,6 +3388,15 @@ export class ProbeStore {
         this.#validateRawSource(proposal);
         statement = this.#memoryProposal(proposal);
         check(statement, 'memory-proposal-not-explicit');
+        if (agreement.input) {
+          const original = agreement.input;
+          check(original.binding && sameBinding(original.binding, this.#binding)
+            && original.eventId !== input.eventId && original.eventId !== proposal.eventId, 'memory-agreement-evidence-gap');
+          this.#validateRawSource(original);
+          const source = this.#archiveRef(original);
+          check(source.role === 'user' && source.text === agreement.text, 'memory-agreement-evidence-gap');
+          input = original;
+        }
         range = [proposal, input];
       }
       const scope: MemoryScope = request.noActiveProject

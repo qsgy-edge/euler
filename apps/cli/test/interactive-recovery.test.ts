@@ -148,6 +148,17 @@ test('session /follow-up and /queue preserve Core modes while only follow-up sta
   assert.equal(f.bodies.length, 2);
 });
 
+test('session cancellation received in a buffered stdin batch prevents earlier queued admission', async t => {
+  const f = await fixture(t, response => answer(response, 'Must not be sent.')), cli = await f.launch();
+  const from = cli.observations.length;
+  cli.child.stdin.write('Synthetic buffered question.\n/cancel\n/status\n');
+  const status = await cli.waitFor('session-status', from);
+  assert.equal(status.networkCount, 0, JSON.stringify(cli.observations.slice(from)));
+  assert.equal((status.runs as DurableRun[]).flatMap(run => run.attempts).length, 0);
+  await closeCli(cli);
+  assert.equal(f.bodies.length, 0);
+});
+
 test('session /cancel keeps an in-flight HTTP attempt unknown and ignores a late tool response', async t => {
   const f = await fixture(t, () => {}), cli = await f.launch();
   const { runId, held, before } = await cancelledRequest(f, cli);

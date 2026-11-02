@@ -284,7 +284,7 @@ export class OwnerMemoryHost {
     }
     if (via === 'live' || result.status === 'activated') {
       report(via, result.status, info === 'pending-redelivery' ? 'error' : result.status === 'blocked' ? 'warning' : 'info', {
-        stage: result.stage, reason: result.reason, info, input: input.eventId, recordId: result.record.recordId, type: result.record.type,
+        stage: result.stage, reason: result.reason, info, input: result.range.at(-1)!.eventId, recordId: result.record.recordId, type: result.record.type,
         content: result.record.content, batchId: result.batchId, range: result.range.map(ref => ref.eventId),
         verifier: result.verification?.verifier ?? null });
     }
@@ -378,7 +378,13 @@ export class OwnerMemoryHost {
       const previous = archive.events().findLast(event => !store.isCaptureOutput(activity, event.ack));
       const target = previous?.role === 'assistant' && store.readMemoryProposal(activity, previous.ack) ? previous.ack : null;
       if (!target && explicitOnly) return false;
-      const ack = appendOwner(target && isOwnerAgreement(line) ? encodeOwnerAgreement(line, target) : raw);
+      let agreementInput: SourceAck | undefined;
+      if (explicitOnly && target && isOwnerAgreement(line)) {
+        const original = appendOwner(raw);
+        if (!original) return true;
+        agreementInput = original;
+      }
+      const ack = appendOwner(target && isOwnerAgreement(line) ? encodeOwnerAgreement(agreementInput ? raw : line, target, agreementInput) : raw);
       if (!ack) return true;
       if (!target) report('live', 'not-actionable', 'warning', { reason: 'agreement-target-missing', input: ack.eventId });
       else if (isOwnerDecline(line)) report('live', 'cancelled', 'info', { reason: 'owner-declined', input: ack.eventId, range: [target.eventId] });

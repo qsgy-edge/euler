@@ -33,7 +33,8 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
   let run: AgentRun | undefined, pumping: Promise<void> | undefined, windowRequested = false;
   let owner = new OwnerMemoryHost(probe, openOwnerInfo(sandbox, probe), 'success', probe.binding.projectId === null);
   let corrections = new CorrectionHost(probe, { recoverInfo: () => owner.deliver() });
-  const liveInputs: ({ input: ReturnType<CorrectionHost['receive']>; fileToken?: string; error?: unknown })[] = [];
+  let inputEpoch = 0;
+  const liveInputs: ({ input: ReturnType<CorrectionHost['receive']>; epoch: number; fileToken?: string; error?: unknown })[] = [];
   let project = probe.store.sessionProject(probe.activity);
   let guidance: GuidanceSession | undefined, discoveryGrantId: string | undefined;
   const fileCapability = (): FileCapability | undefined => project?.root && project.confirmation && process.platform === 'win32'
@@ -53,7 +54,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
   let { capture, historian } = startWorkers();
   let pendingApproval: { token: string; presented: boolean; decide(decision: FileDecision): void } | undefined;
   const setup = new AbortController();
-  const stop = () => { setup.abort(); run?.cancel(); void capture.close(); void historian?.close(); };
+  const stop = () => { inputEpoch++; setup.abort(); run?.cancel(); void capture.close(); void historian?.close(); };
   process.on('SIGINT', stop);
   let lines: ReturnType<typeof createInterface> | undefined, inputClosed = false;
   const state = () => ({ binding: options.binding ?? bindingOf(sandbox), project: probe.store.sessionProject(probe.activity), route,
@@ -116,8 +117,8 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
     lines.on('line', text => {
       try {
         if (text === '/cancel' || text === '/exit') stop();
-        liveInputs.push({ input: corrections.receive(text, true), ...(pendingApproval?.presented ? { fileToken: pendingApproval.token } : {}) });
-      } catch (error) { liveInputs.push({ input: null, error }); }
+        liveInputs.push({ input: corrections.receive(text, true), epoch: inputEpoch, ...(pendingApproval?.presented ? { fileToken: pendingApproval.token } : {}) });
+      } catch (error) { liveInputs.push({ input: null, epoch: inputEpoch, error }); }
     });
     lines.on('close', () => { inputClosed = true; pendingApproval?.decide('unavailable'); });
     emit('session-ready', state());
@@ -126,8 +127,8 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
       const live = liveInputs.shift();
       try {
         if (live?.error) throw live.error;
-        if (line === '/exit') { stop(); break; }
-        if (line === '/cancel') { stop(); continue; }
+        if (line === '/exit') break;
+        if (line === '/cancel') continue;
         if (/^(approve|reject) [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(line)) {
           check(pendingApproval && live?.fileToken === pendingApproval.token && line === `${line.split(' ')[0]} ${pendingApproval.token}`, 'file-approval-stale');
           pendingApproval.decide(line.startsWith('approve ') ? 'approved' : 'rejected'); continue;
@@ -234,6 +235,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
         }
         check(configured && route, 'explicit-route-model-auth-budget-required');
         check(await corrections.deliver() && owner.deliver(), 'operation-presentation-recovery-required');
+        check(live?.epoch === inputEpoch, 'input-cancelled');
         const resume = line.startsWith('/resume ') ? JSON.parse(line.slice(8)) as { relatedRunId: string; acceptDuplicateRisk: boolean; input: string } : null;
         if (resume) {
           check(!pumping && Object.keys(resume).sort().join(',') === 'acceptDuplicateRisk,input,relatedRunId'
@@ -241,7 +243,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
           probe.archive.append(randomUUID(), line);
           probe.store.requestStatus(probe.activity, resume.relatedRunId);
           await capture.close(); await historian?.close();
-          ({ capture, historian } = startWorkers());
+          check(live?.epoch === inputEpoch, 'input-cancelled');
         }
         const control = /^\/(steer|follow-up|queue) ([\s\S]*)$/.exec(line);
         const mode = control ? control[1] as 'steer' | 'follow-up' | 'queue' : 'steer';
@@ -260,6 +262,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
           resume ? { recovery: { relatedRunId: resume.relatedRunId, acceptDuplicateRisk: resume.acceptDuplicateRisk } } : {});
           run.receive(eventId, text, mode);
         }
+        if (resume) ({ capture, historian } = startWorkers());
         if (windowRequested) { run.newWindow(); windowRequested = false; }
         emit('session-input', { runId: run.runId, source: probe.archive.lookup(eventId), mode });
         capture.kick(true); historian?.kick(true);

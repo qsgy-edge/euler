@@ -52,7 +52,7 @@ node apps/cli/src/main.ts session --sandbox $store --session '<new sessionId>' -
 | `/request RUN_ID` | Shows the existing Core status and request ledger. |
 | `/window` | At an idle boundary, requests a fresh Core window before the next input sends. |
 | `/task TEXT` | Explicitly completes the previous intent and creates a new goal; does not inherit its task grant. |
-| `/cancel` | Stops the run and configured background workers. Sent attempts keep their delivery state. |
+| `/cancel` | Immediately stops the run and configured background workers, including admission of earlier buffered input. Sent attempts keep their delivery state. |
 | `/exit` | Stops active work and closes the CLI. EOF refuses any pending file approval and waits for the active pump to settle. |
 
 Windows uses the existing native handle-based file Host for the confirmed root. A file-write call produces `file-approval` with exact path, content and token. Only a live input received after presentation can approve it:
@@ -92,7 +92,7 @@ replay <previewToken>
 /expand {"eventId":"<original eventId>","offset":0,"limit":512}
 ```
 
-Only complete explicit command forms use the memory-operation path. Ordinary questions such as `不要术语，解释这个示例。`, `feedback on this design, please`, and an agreement without a memory proposal keep the ordinary model route. An explicit assistant proposal such as `建议记住偏好：使用合成示例。` followed by `同意` uses the owner lane and retains both original source ACKs as its evidence range. `source <recordId>` recovers that canonical memory’s bounded original event, including another session in the same confirmed project; an unbound session cannot use it to reach project memory.
+Only complete explicit command forms use the memory-operation path. Ordinary questions such as `不要术语，解释这个示例。`, `feedback on this design, please`, and an agreement without a memory proposal keep the ordinary model route. An explicit assistant proposal such as `建议记住偏好：使用合成示例。` followed by `同意` uses the owner lane and retains both original source ACKs as its evidence range. The agreement's exact input, including whitespace, is archived before its separate proposal-association envelope. `source <recordId>` recovers that canonical memory’s bounded original event, including another session in the same confirmed project; an unbound session cannot use it to reach project memory.
 
 Correction/forget/restore/rollback retain their existing preview and live-approval checks. Objective `记住事实` statements still require independent evidence. Corrected content remains unverified until reverification. Model tool calls to `memory.search`, `source.search`, `source.expand`, and `skill.search` go through Core; owner commands do not send a counting-model substitute.
 

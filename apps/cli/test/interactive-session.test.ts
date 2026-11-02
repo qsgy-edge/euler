@@ -118,12 +118,15 @@ test('configured ordinary stdin reaches the durable archive and HTTP route uncha
     assert.equal((await sendCommand(cli, `commit ${restored.token} restore`, 'memory-result')).status, 'committed');
     const proposed = await sendCommand(cli, 'Propose a synthetic preference to remember.', 'session-result');
     assert.equal(proposed.text, '建议记住偏好：T54 agreed synthetic examples.');
-    const beforeAgreement = cli.observations.length; cli.command('同意');
+    const ownerAgreement = '  同意  ';
+    const beforeAgreement = cli.observations.length; cli.command(ownerAgreement);
     const accepted = await Promise.race(['remember-result', 'session-result', 'session-command-rejected'].map(event => cli.waitFor(event, beforeAgreement)));
     assert.equal(accepted.status, 'activated', JSON.stringify(accepted));
     assert.equal(accepted.content, 'T54 agreed synthetic examples.');
     assert.equal((accepted.range as string[])[0], (proposed.status as { responses: { source: { eventId: string } }[] }).responses.at(-1)!.source.eventId);
     assert.equal(bodies.length, 8);
+    const agreementSource = await sendCommand(cli, '/expand ' + JSON.stringify({ eventId: (accepted.range as string[]).at(-1), offset: 0, limit: 512 }), 'session-source');
+    assert.equal(agreementSource.text, ownerAgreement);
     const probe = openProbe(openSandbox(session.root), AGENT_BUDGET, undefined, undefined, undefined, true);
     try {
       const ledger = probe.store.requestStatus(probe.activity, result.runId as string);
@@ -136,6 +139,13 @@ test('configured ordinary stdin reaches the durable archive and HTTP route uncha
     cli.command('/exit'); cli.child.stdin.end(); await cli.exit;
     server.closeAllConnections(); server.close(); await once(server, 'close');
   }
+  const reopened = startCli(['session', '--sandbox', session.root]);
+  try {
+    await reopened.waitFor('session-ready');
+    assert.equal(reopened.observations.some(event => event.event === 'remember-result' && event.status === 'error'), false, JSON.stringify(reopened.observations));
+  } finally { reopened.command('/exit'); await reopened.exit; }
+  const backup = startCli(['backup', '--sandbox', session.root]);
+  assert.equal((await backup.exit).code, 0, JSON.stringify(backup.observations));
 });
 
 test('configured model and approved native files share one bound session with guidance and later stdin', { skip: process.platform !== 'win32' }, async t => {
