@@ -4,7 +4,7 @@ import test from 'node:test';
 import type { TestContext } from 'node:test';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AGENT_BUDGET } from '../src/agent-cli.ts';
@@ -334,7 +334,17 @@ test('a later unbound session selects an existing project without inheriting its
     const deniedSource = await sendCommand(next, `source ${remembered.recordId}`, 'session-command-rejected');
     assert.equal(deniedSource.reason, 'invalid-memory-scope');
     const goal = await sendCommand(next, '/task Compare synthetic project evidence.', 'session-task');
-    await sendCommand(next, '/bind ' + JSON.stringify({ projectId, root: null }), 'session-bound');
+    const beforeBind = next.observations.length;
+    next.command('/bind ' + JSON.stringify({ projectId, root: null }) + `\ninspect ${remembered.recordId}\ncorrect ${remembered.recordId} "T54 buffered correction"`);
+    const bound = await Promise.race(['session-bound', 'session-command-rejected'].map(event => next.waitFor(event, beforeBind)));
+    assert.equal(bound.event, 'session-bound', JSON.stringify(bound));
+    const inspected = await Promise.race(['memory-inspect', 'memory-result', 'session-command-rejected'].map(event => next.waitFor(event, beforeBind)));
+    assert.equal(inspected.event, 'memory-inspect', JSON.stringify(inspected));
+    assert.equal((inspected.targets as { recordId: string }[])[0]!.recordId, remembered.recordId);
+    const preview = await Promise.race(['memory-preview', 'memory-result', 'session-command-rejected'].map(event => next.waitFor(event, beforeBind)));
+    assert.equal(preview.event, 'memory-preview', JSON.stringify(preview));
+    assert.equal(preview.content, 'T54 buffered correction');
+    assert.equal((await sendCommand(next, `cancel ${preview.token}`, 'memory-result')).status, 'cancelled');
     const found = await sendCommand(next, '/memory T54', 'session-memory');
     assert.equal((found.results as { unitId: string }[])[0]!.unitId, remembered.recordId);
     const beforeSource = next.observations.length; next.command(`source ${remembered.recordId}`);
@@ -351,6 +361,42 @@ test('a later unbound session selects an existing project without inheriting its
   } finally { next.command('/exit'); await next.exit; }
   const backup = startCli(['backup', '--sandbox', first.root]);
   assert.equal((await backup.exit).code, 0, JSON.stringify(backup.observations));
+});
+
+for (const change of ['renamed', 'removed', 'replaced']) test(`a ${change} project directory does not block saved conversation recovery or backup`, async t => {
+  const session = await createSession(t), parent = temporary(t, 'euler-t54-project-move-'), projectId = randomUUID();
+  const root = join(parent, 'project'); mkdirSync(root);
+  const cli = startCli(['session', '--sandbox', session.root]);
+  let recordId: string;
+  try {
+    await cli.waitFor('session-ready');
+    await sendCommand(cli, '/bind ' + JSON.stringify({ projectId, root }), 'session-bound');
+    recordId = (await sendCommand(cli, '记住偏好：T54 retain this archived example.', 'remember-result')).recordId as string;
+  } finally { cli.command('/exit'); await cli.exit; }
+  if (change === 'removed') rmSync(root, { recursive: true });
+  else renameSync(root, join(parent, 'original-project'));
+  if (change === 'replaced') mkdirSync(root);
+  const backup = startCli(['backup', '--sandbox', session.root]);
+  assert.equal((await backup.exit).code, 0, JSON.stringify(backup.observations));
+  const reopened = startCli(['session', '--sandbox', session.root]);
+  try {
+    const ready = await reopened.waitFor('session-ready');
+    assert.equal((ready.project as { projectId: string; root: { path: string } }).projectId, projectId);
+    assert.equal((ready.project as { root: { path: string } }).root.path, root);
+    assert.equal(ready.files, 'unavailable');
+    assert.ok(ready.projectRootError);
+    const original = await sendCommand(reopened, `source ${recordId!}`, 'memory-source');
+    assert.equal(original.text, '记住偏好：T54 retain this archived example.');
+    const denied = await sendCommand(reopened, '/skills', 'session-command-rejected');
+    assert.equal(denied.reason, 'project-root-unavailable');
+    assert.equal((await sendCommand(reopened, '/status', 'session-status')).networkCount, 0);
+    if (change === 'renamed') {
+      renameSync(join(parent, 'original-project'), root);
+      const restored = await sendCommand(reopened, '/status', 'session-status');
+      assert.equal(restored.projectRootError, null);
+      assert.equal(restored.files, process.platform === 'win32' ? 'windows-handles' : 'unavailable');
+    }
+  } finally { reopened.command('/exit'); reopened.child.stdin.end(); await reopened.exit; }
 });
 
 test('purge removes a bound-session memory and its backup without erasing the confirmed project', async t => {

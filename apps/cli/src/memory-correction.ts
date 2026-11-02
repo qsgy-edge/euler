@@ -15,7 +15,7 @@ const emit = (event: string, value: object): Promise<void> => new Promise((resol
 /** The existing CLI input loop owns this adapter; all operation identity, approval and CAS stay in Core. */
 export class CorrectionHost {
   readonly core: MemoryCorrections;
-  readonly #probe: ReturnType<typeof openProbe>;
+  #probe: ReturnType<typeof openProbe>;
   readonly #scenario: string;
   readonly #transportConfig: string | undefined;
   readonly #recoverInfo: () => boolean;
@@ -27,12 +27,17 @@ export class CorrectionHost {
     this.#recoverInfo = options.recoverInfo ?? (() => true);
     this.core = new MemoryCorrections(probe.store, probe.activity, probe.archive);
   }
+  reopen(probe: ReturnType<typeof openProbe>): void {
+    this.core.reopen(probe.store, probe.activity, probe.archive);
+    this.#probe = probe;
+  }
+
   #checkpoint(point: string): void {
     if (this.#scenario === point) killPoint('correction-checkpoint', point, 10000);
   }
 
-  receive(text: string, explicitOnly = false): CorrectionInput | null {
-    if (explicitOnly) return parseCorrectionCommand(text) ? this.core.receive(text) : null;
+  receive(text: string, options: { explicitOnly?: boolean; deferArchive?: boolean } = {}): CorrectionInput | null {
+    if (options.explicitOnly) return parseCorrectionCommand(text) ? this.core.receive(text, options.deferArchive) : null;
     if (text.trim() === 'stop') { this.#setupAbort.abort(); this.#run?.cancel(); return null; }
     return /^(inspect|correct|forget|restore|rollback|purge|commit|cancel|replay|model)(?: |$)/.test(text.trim()) || /^(把 |不要|别|是否|帮我判断|恢复被|撤销彻底|隐私清除|彻底清除|永久删除|do not |don't )/i.test(text)
       ? this.core.receive(text) : null;

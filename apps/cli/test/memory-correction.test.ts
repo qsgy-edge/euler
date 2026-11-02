@@ -52,6 +52,29 @@ test('Core requires a live post-presentation event with the exact submitted text
   } finally { f.close(); }
 });
 
+test('reopening the same correction session preserves receipt-time inputs without upgrading early approval', () => {
+  const f = fixture();
+  let reopened: ReturnType<typeof openProbe> | undefined;
+  try {
+    const preview = f.preview();
+    const early = f.core.receive(`commit ${preview.token} "使用 pnpm"`, true);
+    const inspect = f.core.receive(`inspect ${f.record.recordId}`, true);
+    assert.equal(f.probe.archive.lookup(early.eventId), null);
+    reopened = openProbe(f.sandbox);
+    f.core.reopen(reopened.store, reopened.activity, reopened.archive);
+    f.core.presented(preview);
+    assert.equal(f.core.handle(inspect).kind, 'inspect');
+    const rejected = f.core.handle(early);
+    assert.equal(f.status(rejected), 'unavailable');
+    assert.equal(rejected.kind === 'result' && rejected.result.reason, 'presentation-before-live-input-required');
+    assert.equal(f.status(f.core.handle({ eventId: early.eventId })), 'invalid_identity');
+    assert.equal(f.status(f.core.handle(f.core.receive(`commit ${preview.token} "使用 pnpm"`))), 'committed');
+    const other = fixture();
+    try { assert.throws(() => f.core.reopen(other.probe.store, other.probe.activity, other.probe.archive), /correction-session-mismatch/); }
+    finally { other.close(); }
+  } finally { reopened?.close(); f.close(); }
+});
+
 test('investigation, denial, opposing directions and no-op do not create pending operations', () => {
   const f = fixture();
   try {

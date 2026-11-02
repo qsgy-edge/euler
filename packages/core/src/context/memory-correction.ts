@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { check } from '../contracts.ts';
-import type { HostAdapter, SourceAck } from '../contracts.ts';
+import { check, sameBinding } from '../contracts.ts';
+import type { Binding, HostAdapter, SourceAck } from '../contracts.ts';
 import type { Activity, MemoryOperationResult, MemoryPresentation, ProbeStore } from '../store/probe-store.ts';
 import type { ToolCall } from './agent-state.ts';
 
@@ -75,19 +75,30 @@ export function memoryOperationSummary(presentation: MemoryPresentation, result:
 }
 
 export class MemoryCorrections {
-  readonly #store: ProbeStore;
-  readonly #activity: Activity;
-  readonly #source: HostAdapter['source'];
-  readonly #live = new WeakMap<CorrectionInput, { text: string; source: SourceAck; tokens: Set<string> }>();
+  #store: ProbeStore;
+  #activity: Activity;
+  #source: HostAdapter['source'];
+  readonly #binding: Binding;
+  readonly #live = new WeakMap<CorrectionInput, { text: string; source: SourceAck | null; tokens: Set<string> }>();
   readonly #presented = new Set<string>();
   constructor(store: ProbeStore, activity: Activity, source: HostAdapter['source']) {
+    this.#store = store; this.#activity = activity; this.#source = source; this.#binding = store.currentBinding();
+  }
+
+  /** Reopen the same session without recreating live input or its presentation-time authority. */
+  reopen(store: ProbeStore, activity: Activity, source: HostAdapter['source']): void {
+    const before = this.#activity;
+    const binding = store.currentBinding();
+    check(sameBinding({ ...binding, projectId: this.#binding.projectId }, this.#binding) && activity.root.path === before.root.path
+      && activity.root.identity.dev === before.root.identity.dev && activity.root.identity.ino === before.root.identity.ino,
+    'correction-session-mismatch');
     this.#store = store; this.#activity = activity; this.#source = source;
   }
 
-  /** Called only by the Host's live input callback, before asynchronous processing or buffering. */
-  receive(text: string): CorrectionInput {
+  /** Snapshot live authority at receipt; a queued prior binding may defer archival until handling. */
+  receive(text: string, deferArchive = false): CorrectionInput {
     const eventId = randomUUID();
-    const source = this.#source.append(eventId, text);
+    const source = deferArchive ? null : this.#source.append(eventId, text);
     const input = Object.freeze({ eventId });
     this.#live.set(input, { text, source, tokens: new Set(this.#presented) });
     return input;
@@ -119,7 +130,8 @@ export class MemoryCorrections {
   handle(input: CorrectionInput, intent?: ToolCall): CorrectionReply {
     const live = this.#live.get(input);
     if (!live) return this.#reject('invalid_identity', 'live-input-required');
-    const source = this.#source.read(live.source);
+    const inputSource = live.source ??= this.#source.append(input.eventId, live.text);
+    const source = this.#source.read(inputSource);
     check(source.role === 'user' && source.text === live.text, 'live-input-evidence-gap');
     const command = parseCorrectionCommand(live.text);
     if (!command) {
@@ -152,7 +164,7 @@ export class MemoryCorrections {
       if (Buffer.byteLength(JSON.stringify(command.content)) > 60000) return this.#reject('unavailable', 'correction-content-too-large');
       const presentation = this.#store.withActivity(this.#activity, () => {
         const preview = this.#store.previewMemoryOperation(this.#activity, inspected.token,
-          { kind: 'correct', input: live.source, content: command.content });
+          { kind: 'correct', input: inputSource, content: command.content });
         this.#store.registerCorrectionDelivery(this.#activity, preview.token);
         return preview;
       });
@@ -208,7 +220,7 @@ export class MemoryCorrections {
     // No source scan can create this live capability. A fresh event carries the actual text and opaque token.
     this.#live.delete(input);
     this.#store.withActivity(this.#activity, () => {
-      this.#store.recordCorrectionApproval(this.#activity, command.token, live.source);
+      this.#store.recordCorrectionApproval(this.#activity, command.token, inputSource);
       this.#store.commitMemoryOperation(this.#activity, command.token, { reverify: true });
     });
     return this.result(command.token);

@@ -237,7 +237,7 @@ interface Fence {
 const DDL = `
 CREATE TABLE schema_meta (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), store_id TEXT NOT NULL REFERENCES owner_fences(store_id),
-  schema_version INTEGER NOT NULL CHECK(schema_version=28), ddl_hash TEXT NOT NULL,
+  schema_version INTEGER NOT NULL CHECK(schema_version=29), ddl_hash TEXT NOT NULL,
   app_id TEXT NOT NULL, os_user TEXT NOT NULL
 ) STRICT;
 CREATE TABLE owner_fences (
@@ -762,7 +762,7 @@ CREATE TRIGGER immutable_evolution_proposals_delete BEFORE DELETE ON evolution_p
 CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_projection_jobs BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
-PRAGMA user_version=28;
+PRAGMA user_version=29;
 ` + ['session_project_bindings','workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts','store_recovery_events','store_recovered_owners'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} ${['request_events','execution_events','execution_streams','store_recovery_events'].includes(table) ? 'WHEN euler_purge_writer()!=1 ' : ''}BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
@@ -838,15 +838,15 @@ export class ProbeStore {
             .run(storeId, binding.ownerId, binding.hostId, resources.root.path, resources.root.identity.dev, resources.root.identity.ino,
               resources.store.path, resources.store.identity.dev, resources.store.identity.ino);
           this.#insertSession(binding, resources.source);
-          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,28,?,?,?)')
+          this.#db.prepare('INSERT INTO schema_meta VALUES (1,?,29,?,?,?)')
             .run(storeId, probeSchemaDigest, appId, userInfo().username);
         });
       } else {
-        check(version === 28, 'unsupported-probe-schema');
+        check(version === 29, 'unsupported-probe-schema');
         check(this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode === 'wal', 'invalid-journal-mode');
       }
       const schema = this.#db.prepare('SELECT * FROM schema_meta WHERE singleton=1').get();
-      check(schema && schema.store_id === storeId && schema.schema_version === 28 && schema.ddl_hash === probeSchemaDigest
+      check(schema && schema.store_id === storeId && schema.schema_version === 29 && schema.ddl_hash === probeSchemaDigest
         && schema.app_id === appId && schema.os_user === userInfo().username, 'store-schema-identity-mismatch');
       const row = this.#db.prepare('SELECT * FROM owner_fences WHERE store_id=?').get(storeId);
       check(row && row.owner_id === binding.ownerId && row.host_id === binding.hostId, 'store-binding-mismatch');
@@ -885,7 +885,7 @@ export class ProbeStore {
     this.withActivity(activity, () => this.#insertSession(binding, source));
   }
 
-  currentBinding(sessionId: string): Binding {
+  currentBinding(sessionId = this.#binding.sessionId): Binding {
     const row = this.#db.prepare('SELECT * FROM session_scopes WHERE session_id=? AND store_id=? AND owner_id=? AND host_id=?')
       .get(sessionId, this.#storeId, this.#binding.ownerId, this.#binding.hostId);
     check(row, 'store-binding-mismatch');
@@ -897,7 +897,7 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       const row = this.#db.prepare('SELECT * FROM session_project_bindings WHERE session_id=?').get(this.#binding.sessionId);
       if (!row) return this.#binding.projectId === null ? null : { projectId: this.#binding.projectId, root: null, confirmation: null };
-      check(sha256(String(row.confirmation)) === row.confirmation_hash, 'session-project-evidence-gap');
+      check(this.#confirmationHash(String(row.confirmation), row.root_json === null ? null : String(row.root_json)) === row.confirmation_hash, 'session-project-evidence-gap');
       const confirmation = JSON.parse(String(row.confirmation)) as SourceAck;
       const root = row.root_json === null ? null : JSON.parse(String(row.root_json)) as BoundFile;
       this.#checkConfirmation(confirmation, String(row.project_id), root);
@@ -905,7 +905,11 @@ export class ProbeStore {
     });
   }
 
-  #checkConfirmation(confirmation: SourceAck, projectId: string, root: BoundFile | null, binding = this.#binding): void {
+  #confirmationHash(confirmation: string, root: string | null): string {
+    return sha256(JSON.stringify([confirmation, root]));
+  }
+
+  #checkConfirmation(confirmation: SourceAck, projectId: string, root: BoundFile | null, binding = this.#binding) {
     check(sameBinding(confirmation.binding, { ...binding, projectId: null }), 'project-confirmation-required');
     const source = this.#archiveRef(confirmation);
     check(source.role === 'user' && source.text.startsWith('/bind '), 'project-confirmation-required');
@@ -913,31 +917,36 @@ export class ProbeStore {
     check(command && Object.keys(command).sort().join(',') === 'projectId,root' && command.projectId === projectId, 'invalid-project-binding');
     uuid(projectId);
     check(command.root === null && root === null || typeof command.root === 'string' && root
-      && isAbsolute(command.root) && realpathSync.native(command.root) === root.path, 'project-root-mismatch');
+      && isAbsolute(command.root) && typeof root.path === 'string' && isAbsolute(root.path)
+      && /^\d+$/.test(root.identity?.dev) && /^\d+$/.test(root.identity?.ino), 'project-root-mismatch');
     if (root) {
-      sameFile(root.path, root.identity);
-      check(lstatSync(root.path).isDirectory(), 'project-directory-required');
       const data = realpathSync.native(this.#resources.root.path);
       for (const distance of [relative(data, root.path), relative(root.path, data)]) {
         check(distance === '..' || distance.startsWith('..' + sep) || isAbsolute(distance), 'file-product-root-overlap');
       }
     }
+    return command;
   }
 
   confirmSessionProject(activity: Activity, confirmation: SourceAck, projectId: string, root: BoundFile | null): void {
     this.withActivity(activity, () => {
       check(this.#binding.projectId === null, 'session-project-already-bound');
       this.#requestRecoveryGate(activity, null);
-      this.#checkConfirmation(confirmation, projectId, root);
+      const command = this.#checkConfirmation(confirmation, projectId, root);
+      if (root) {
+        check(realpathSync.native(command.root!) === root.path, 'project-root-mismatch');
+        sameFile(root.path, root.identity);
+        check(lstatSync(root.path).isDirectory(), 'project-directory-required');
+      }
       check(!this.#db.prepare("SELECT 1 FROM request_runs WHERE stream_id=? AND state='authorized' LIMIT 1").get(activity.streamId), 'project-binding-run-active');
       const project = this.#db.prepare('SELECT owner_id FROM projects WHERE project_id=?').get(projectId);
       check(!project || project.owner_id === this.#binding.ownerId, 'store-binding-mismatch');
       this.#db.prepare('INSERT OR IGNORE INTO projects VALUES (?,?)').run(projectId, this.#binding.ownerId);
       this.#db.prepare('INSERT OR IGNORE INTO memory_scopes(kind,scope_id,resolved,owner_id,project_id,session_id) VALUES (?,?,?,?,?,?)')
         .run('project', projectId, 1, this.#binding.ownerId, projectId, null);
-      const payload = JSON.stringify(confirmation);
+      const payload = JSON.stringify(confirmation), rootJson = root ? JSON.stringify(root) : null;
       this.#db.prepare('INSERT INTO session_project_bindings VALUES (?,?,?,?,?)')
-        .run(this.#binding.sessionId, projectId, payload, sha256(payload), root ? JSON.stringify(root) : null);
+        .run(this.#binding.sessionId, projectId, payload, this.#confirmationHash(payload, rootJson), rootJson);
     });
   }
 
@@ -6321,7 +6330,7 @@ export class ProbeStore {
         sessionId: String(session.session_id), branchId: String(session.branch_id) };
       const confirmed = this.#db.prepare('SELECT * FROM session_project_bindings WHERE session_id=?').get(binding.sessionId);
       if (confirmed) {
-        check(sha256(String(confirmed.confirmation)) === confirmed.confirmation_hash, 'session-project-evidence-gap');
+        check(this.#confirmationHash(String(confirmed.confirmation), confirmed.root_json === null ? null : String(confirmed.root_json)) === confirmed.confirmation_hash, 'session-project-evidence-gap');
         this.#checkConfirmation(JSON.parse(String(confirmed.confirmation)), String(confirmed.project_id),
           confirmed.root_json === null ? null : JSON.parse(String(confirmed.root_json)), binding);
       }

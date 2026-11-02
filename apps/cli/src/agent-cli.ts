@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, realpathSync } from 'node:fs';
+import { lstatSync, mkdtempSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
-import { AgentRun, GuidanceSession, check, fileIdentity, sha256 } from '@euler/core';
+import { AgentRun, GuidanceSession, check, fileIdentity, sameFile, sha256 } from '@euler/core';
 import type { Binding, FileCapability, FileDecision, MemoryDiscoveryApproval } from '@euler/core';
 import { createFileToolHost } from './file-tools.ts';
 import filesFixture from '../../../fixtures/controlled-files.json' with { type: 'json' };
@@ -32,16 +32,30 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
   let probe = openProbe(sandbox, budget, undefined, options.binding, undefined, true);
   let run: AgentRun | undefined, pumping: Promise<void> | undefined, windowRequested = false;
   let owner = new OwnerMemoryHost(probe, openOwnerInfo(sandbox, probe), 'success', probe.binding.projectId === null);
-  let corrections = new CorrectionHost(probe, { recoverInfo: () => owner.deliver() });
-  let inputEpoch = 0;
-  const liveInputs: ({ input: ReturnType<CorrectionHost['receive']>; epoch: number; fileToken?: string; error?: unknown })[] = [];
+  const corrections = new CorrectionHost(probe, { recoverInfo: () => owner.deliver() });
+  let inputEpoch = 0, pendingBindings = 0;
+  const liveInputs: ({ input: ReturnType<CorrectionHost['receive']>; epoch: number; bindsProject: boolean; fileToken?: string; error?: unknown })[] = [];
   let project = probe.store.sessionProject(probe.activity);
   let guidance: GuidanceSession | undefined, discoveryGrantId: string | undefined;
-  const fileCapability = (): FileCapability | undefined => project?.root && project.confirmation && process.platform === 'win32'
+  const projectRootError = (): string | null => {
+    if (!project?.root) return null;
+    try {
+      sameFile(project.root.path, project.root.identity);
+      check(lstatSync(project.root.path).isDirectory(), 'project-directory-required');
+      check(realpathSync.native(project.root.path) === project.root.path, 'project-root-mismatch');
+      return null;
+    } catch (error) {
+      const reason = (error as NodeJS.ErrnoException).code ?? (error as Error).message;
+      if (['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'file-identity-changed', 'unsafe-file-identity', 'project-directory-required', 'project-root-mismatch'].includes(reason)) return reason;
+      throw error;
+    }
+  };
+  const fileCapability = (): FileCapability | undefined => project?.root && project.confirmation && process.platform === 'win32' && !projectRootError()
     ? { schema: 'file-capability@1', grantId: project.confirmation.eventId, binding: probe.binding,
       root: project.root, source: project.confirmation } : undefined;
   const guidanceHost = () => {
     if (!project?.root) return {};
+    check(!projectRootError(), 'project-root-unavailable');
     guidance ??= new GuidanceSession(probe.store, probe.activity, probe.archive, { dataRoot: probe.activity.root,
       projects: [{ projectId: project.projectId, root: project.root }], sources: [], sharedSkills: null });
     return { guidance: { session: guidance, selectFiles: true, targets: [{ projectId: project.projectId, path: project.root.path }],
@@ -59,7 +73,8 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
   let lines: ReturnType<typeof createInterface> | undefined, inputClosed = false;
   const state = () => ({ binding: options.binding ?? bindingOf(sandbox), project: probe.store.sessionProject(probe.activity), route,
     intent: probe.store.readIntent(probe.activity), discoveryGrantId: discoveryGrantId ?? null,
-    files: fileCapability() ? 'windows-handles' : 'unavailable', runId: run?.runId ?? null, status: run?.status() ?? null, networkCount: configured?.transport.count ?? 0,
+    files: fileCapability() ? 'windows-handles' : 'unavailable', projectRootError: projectRootError(),
+    runId: run?.runId ?? null, status: run?.status() ?? null, networkCount: configured?.transport.count ?? 0,
     runs: probe.store.sessionAgentRuns(probe.activity).map(ledger => ({ runId: ledger.run.runId, sealed: ledger.sealed,
       relatedRunId: ledger.run.relatedRunId, terminal: probe.store.agentStatus(probe.activity, ledger.run.runId).terminal, attempts: ledger.attempts })) });
   const rejected = (error: unknown): void => { emit('session-command-rejected', { reason: (error as Error).message, sends: configured?.transport.count ?? 0 }); };
@@ -115,10 +130,13 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
     }
     lines = createInterface({ input: process.stdin });
     lines.on('line', text => {
+      const bindsProject = text.startsWith('/bind ');
+      if (bindsProject) pendingBindings++;
       try {
         if (text === '/cancel' || text === '/exit') stop();
-        liveInputs.push({ input: corrections.receive(text, true), epoch: inputEpoch, ...(pendingApproval?.presented ? { fileToken: pendingApproval.token } : {}) });
-      } catch (error) { liveInputs.push({ input: null, epoch: inputEpoch, error }); }
+        liveInputs.push({ input: corrections.receive(text, { explicitOnly: true, deferArchive: pendingBindings > 0 }),
+          epoch: inputEpoch, bindsProject, ...(pendingApproval?.presented ? { fileToken: pendingApproval.token } : {}) });
+      } catch (error) { liveInputs.push({ input: null, epoch: inputEpoch, bindsProject, error }); }
     });
     lines.on('close', () => { inputClosed = true; pendingApproval?.decide('unavailable'); });
     emit('session-ready', state());
@@ -230,7 +248,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
           probe.close(); probe = openProbe(sandbox, budget, undefined, options.binding, undefined, true); run = undefined;
           project = probe.store.sessionProject(probe.activity); guidance = undefined;
           owner = new OwnerMemoryHost(probe, openOwnerInfo(sandbox, probe), 'success', false);
-          corrections = new CorrectionHost(probe, { recoverInfo: () => owner.deliver() });
+          corrections.reopen(probe);
           owner.drain(); owner.deliver(); await corrections.recover();
           if (live?.epoch === inputEpoch) ({ capture, historian } = startWorkers());
           emit('session-bound', state()); continue;
@@ -270,6 +288,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
         capture.kick(true); historian?.kick(true);
         if (!pumping && mode !== 'queue') drive();
       } catch (error) { rejected(error); }
+      finally { if (live?.bindsProject) pendingBindings--; }
     }
     await pumping;
   } finally {
