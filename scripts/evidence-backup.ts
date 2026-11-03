@@ -231,12 +231,12 @@ for (const scenario of fixture.cases) {
       run('migration', ['apps/cli/test/support/backup-migration-worker.ts',candidate,point], point === 'success' ? 'success' : 'kill');
       const candidateDb = new DatabaseSync(candidate);
       try {
-        const version = point === 'before-commit' ? 29 : 30;
+        const version = point === 'before-commit' ? 30 : 31;
         assert.equal(candidateDb.prepare('PRAGMA user_version').get()!.user_version,version);
         const metadata = candidateDb.prepare('SELECT schema_version,ddl_hash FROM schema_meta').get()!;
         assert.equal(metadata.schema_version,version);
         assert.ok(String(candidateDb.prepare("SELECT sql FROM sqlite_schema WHERE name='schema_meta'").get()!.sql).includes(`CHECK(schema_version=${version})`));
-        if (version === 30) assert.equal(metadata.ddl_hash,hash(JSON.stringify(candidateDb.prepare('SELECT type,name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type,name').all())));
+        if (version === 31) assert.equal(metadata.ddl_hash,hash(JSON.stringify(candidateDb.prepare('SELECT type,name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type,name').all())));
         assert.equal(candidateDb.prepare('PRAGMA quick_check').get()!.quick_check, 'ok');
         assert.deepEqual(candidateDb.prepare('PRAGMA foreign_key_check').all(), []);
       } finally { candidateDb.close(); }
