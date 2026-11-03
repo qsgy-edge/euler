@@ -22,6 +22,12 @@ Blocked by: 01, 03, 05, 06
 3. 五种 durable memory 都允许自动产生 candidate，但证据边界不同：`fact` 来自用户陈述或可核验工具结果，`preference` 来自明确偏好或多次稳定表现，`decision` 来自用户明确拍板或人工批准 ADR，`insight` 是从一个或多个 source 推导的可复用结论，`episode` 只在任务完成且有可观察结果后形成。当前 task/goal/note、活动 instruction/policy、原始 archive、秘密、临时措辞与外部内容中的指令不得被包装成普通 memory；外部内容只能保留为不可信 source/evidence。
 4. 所有自动提取结果先进入最窄可确定 scope 的 `lifecycle=candidate + verification=unverified`；logical project 未确定时只绑定当前 session 的 unresolved candidate queue，不进入跨会话检索。后续 intent、实际资源 owner 或 manifest 确认 project 后才转入对应 scope 的验证管线；该 queue 是系统内部待定状态，不要求用户维护，也不影响原始 archive 保存。
 
+4a. Session-local unresolved → project 是同一候选的归属确认：保留 `record_id`，追加新的 immutable revision 与 `resolve-scope` event；原 source binding/locator/hash、旧 revision/event/receipt 不变。新 revision 仍为 candidate + unverified，确认本身不代表验证通过。尚无 record 的 untyped/普通 capture 保留原 job identity，确定归属后才按原管线形成候选。
+
+确认复用可信项目绑定，冻结源 owner/session、当前 task identity 与覆盖的原始输入范围；没有 intent 的初始输入区段独立于后来的任务。只续办被该确认覆盖的工作，不把同 session 的旧任务、另一 project 或确认后追加的输入追溯纳入。Core 持久关联确认依据、精确 source identity/hash、原 head 与归属结果；current head、事件和后续工作同事务结算，变化的 head、冲突归属或来源缺口保持可观察阻塞。原始输入重放仍幂等，不创建副本，也不能绕开同源抑制。
+
+续办沿用 cooperative capture 的有界批次、lease/generation 和恢复接点；明确 owner preference/decision 走确定性 fast lane，客观 fact 与普通语义候选走独立来源验证和晋升 gate。成功 activation 仍与固定 batch、search/Info outbox 原子提交。确认和逐项归属关系进入现有 backup/purge 闭包；共享确认不扩大独立候选的删除范围，清除后的迟到工作不得复活内容。此转移不提供 scope 编辑或已激活记忆搬迁。
+
 ## Decisions — Independent verification
 
 5. Verifier 前先运行确定性 integrity gate，核对 immutable source locator/hash、Harness 生成的 provenance、scope、owner、receipt schema 与目标宿主覆盖；失败直接 `block/evidence-gap`，不得交给 LLM 猜测。需要语义判断时，Verifier 使用与 Proposer 隔离的上下文并自行拥有 `source.search/source.expand` 权限，不能只看 Proposer 挑选的证据；同模型在低风险候选上允许复用，但不得共享推理或候选选择上下文。
@@ -63,6 +69,7 @@ Blocked by: 01, 03, 05, 06
 | 操作 | 前置与结果 | 同事务事实 |
 |---|---|---|
 | Capture | durable source/scope 合格后创建 candidate + unverified；scope 未确定仅 session-local | 新 record/revision/event 与必要 job；重放 source identity 幂等 |
+| Resolve scope | 可信 project 确认覆盖当前任务及精确原始来源；仅 unresolved candidate，保留 record ID、新增 project revision，仍为 unverified | 确认关联、原 head CAS、resolve-scope event、新 head 与后续工作；保留历史和原 job 幂等身份 |
 | Verify | 对固定 revision/source 独立取证；pass 标 verified，block/evidence-gap 记录理由，不自动得到 active | verification event/evidence 与 head_event_id；旧输入结果不能覆盖新 head |
 | Activate/自动修订 | verified 且满足当前资格，无 unresolved conflict；新 head 为 active | event/head、冻结 before/after、batch 和 host-info/search outbox 原子提交 |
 | Correct | 唯一非 tombstoned current 目标、实际新正文、真实批准与 CAS；新 revision 保留 lifecycle，先标 unverified 待复验 | correction receipt 只说修改/排入复验；不把旧 verification 复制给新正文；当前未验证版本不注入 |
