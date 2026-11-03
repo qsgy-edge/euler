@@ -3122,7 +3122,8 @@ export class ProbeStore {
               after?.recordId ?? null, after?.headEventId ?? null);
         }
         if (payload.lane === 'owner-fast-lane' && this.#captureJob(jobId).record?.type !== 'fact') {
-          const result = this.rememberMemory(activity, { input: payload.source, hostInfo });
+          const record = this.#readMemoryUnsafe(String(resolution.recordId));
+          const result = this.#finishOwnerCapture(activity, record, payload.range ?? [payload.source], hostInfo, jobId);
           this.#db.prepare('UPDATE capture_work SET stage=?,reason=?,expected_head_id=? WHERE job_id=?')
             .run(result.record.lifecycle === 'active' ? 'complete' : 'blocked', result.reason, result.record.headEventId, jobId);
         } else if (hostInfo === 'unavailable') {
@@ -3745,50 +3746,54 @@ export class ProbeStore {
         this.#insertCandidate(record, { lane: 'owner-fast-lane', range },
           this.#requestDigest('remember-capture', null, { input, statement, range }), range.slice(0, -1));
       }
-      // Only the fast lane's own capture/verify head may resume; any later event (rollback, correct,
-      // forget, conflict, another lane) is the owner's current state and a replay must not undo it.
-      const head = this.#fastLaneHead(record);
-      if (!head) return this.#rememberResult('no_op', record, range, 'later-memory-change');
-      if (head === 'activate') return this.#rememberResult('no_op', record, range, null);
-      if (!record.scope.resolved) return this.#rememberResult('blocked', record, range, 'scope-unresolved');
-      if (record.verification === 'unverified') {
-        const prior = record.verificationRunId ? this.#verificationOf(record) : null;
-        if (prior?.verifier === 'owner-fast-lane@1') return this.#rememberResult('blocked', record, range, prior.reason);
-      }
-      if (record.verification === 'verified' && request.hostInfo !== 'durable')
-        return this.#rememberResult('blocked', record, range, 'host-info-unavailable');
-      this.#assertStreamNotRecovered(activity.streamId);
-      check(!existing || !this.#requestRecoveryStatus('job', String(existing.job_id)).recovery, 'recovered-stream-blocked');
-      if (record.verification === 'unverified') {
-        const ambiguous = this.#suppressionPeers(range, record.scope, record.appliesTo).length > 0;
-        const reason = ambiguous ? 'suppression-identity-evidence-gap'
-          : statement.type === 'fact' ? 'objective-fact-authority-required' : null;
-        const result = reason ? 'evidence-gap' : 'pass';
-        const runId = this.#saveVerification(record, result, range, 'owner-fast-lane@1', reason);
-        const verified = this.#withMemoryHash({ ...record, verificationRunId: runId,
-          verification: result === 'pass' ? 'verified' : 'unverified', headEventId: randomUUID() });
-        this.#appendMemoryEvent(record, verified, 'verify', record.source.eventId,
-          { runId, result, evidence: structuredClone(range), verifier: 'owner-fast-lane@1', reason, lane: 'owner-fast-lane' },
-          this.#requestDigest('remember-verify', record, { runId }));
-        record = verified;
-        if (result !== 'pass') return this.#rememberResult('blocked', record, range, reason);
-      }
-      if (request.hostInfo !== 'durable') return this.#rememberResult('blocked', record, range, 'host-info-unavailable');
-      if (this.#suppressed(record.claimKey, this.#memorySources(record), record.scope, record.appliesTo)) {
-        return this.#rememberResult('blocked', record, range, 'memory-suppressed');
-      }
-      if (this.#suppressionPeers(this.#memorySources(record), record.scope, record.appliesTo).length) {
-        return this.#rememberResult('blocked', record, range, 'suppression-identity-evidence-gap');
-      }
-      if (this.#activeClaim(record.claimKey, statement, record.scope, record.recordId)) {
-        return this.#rememberResult('blocked', record, range, 'claim-already-active');
-      }
-      const active = this.#withMemoryHash({ ...record, lifecycle: 'active', headEventId: randomUUID() });
-      this.#eligible(active);
-      this.#appendMemoryEvent(record, active, 'activate', record.source.eventId, { automatic: true, lane: 'owner-fast-lane' },
-        this.#requestDigest('remember-activate', record, { recordId: record.recordId }));
-      return this.#rememberResult('activated', active, range, null);
+      return this.#finishOwnerCapture(activity, record, range, request.hostInfo, existing ? String(existing.job_id) : null);
     });
+  }
+
+  #finishOwnerCapture(activity: Activity, record: MemoryRecord, range: SourceAck[], hostInfo: RememberRequest['hostInfo'], jobId: string | null): RememberResult {
+    // Only the fast lane's own continuation heads may resume; any later event (rollback, correct,
+    // forget, conflict, another lane) is the owner's current state and a replay must not undo it.
+    const head = this.#fastLaneHead(record);
+    if (!head) return this.#rememberResult('no_op', record, range, 'later-memory-change');
+    if (head === 'activate') return this.#rememberResult('no_op', record, range, null);
+    if (!record.scope.resolved) return this.#rememberResult('blocked', record, range, 'scope-unresolved');
+    if (record.verification === 'unverified') {
+      const prior = record.verificationRunId ? this.#verificationOf(record) : null;
+      if (prior?.verifier === 'owner-fast-lane@1') return this.#rememberResult('blocked', record, range, prior.reason);
+    }
+    if (record.verification === 'verified' && hostInfo !== 'durable')
+      return this.#rememberResult('blocked', record, range, 'host-info-unavailable');
+    this.#assertStreamNotRecovered(activity.streamId);
+    check(!jobId || !this.#requestRecoveryStatus('job', jobId).recovery, 'recovered-stream-blocked');
+    if (record.verification === 'unverified') {
+      const ambiguous = this.#suppressionPeers(range, record.scope, record.appliesTo).length > 0;
+      const reason = ambiguous ? 'suppression-identity-evidence-gap'
+        : record.type === 'fact' ? 'objective-fact-authority-required' : null;
+      const result = reason ? 'evidence-gap' : 'pass';
+      const runId = this.#saveVerification(record, result, range, 'owner-fast-lane@1', reason);
+      const verified = this.#withMemoryHash({ ...record, verificationRunId: runId,
+        verification: result === 'pass' ? 'verified' : 'unverified', headEventId: randomUUID() });
+      this.#appendMemoryEvent(record, verified, 'verify', record.source.eventId,
+        { runId, result, evidence: structuredClone(range), verifier: 'owner-fast-lane@1', reason, lane: 'owner-fast-lane' },
+        this.#requestDigest('remember-verify', record, { runId }));
+      record = verified;
+      if (result !== 'pass') return this.#rememberResult('blocked', record, range, reason);
+    }
+    if (hostInfo !== 'durable') return this.#rememberResult('blocked', record, range, 'host-info-unavailable');
+    if (this.#suppressed(record.claimKey, this.#memorySources(record), record.scope, record.appliesTo)) {
+      return this.#rememberResult('blocked', record, range, 'memory-suppressed');
+    }
+    if (this.#suppressionPeers(this.#memorySources(record), record.scope, record.appliesTo).length) {
+      return this.#rememberResult('blocked', record, range, 'suppression-identity-evidence-gap');
+    }
+    if (this.#activeClaim(record.claimKey, { type: record.type as OwnerMemoryStatement['type'], content: record.content }, record.scope, record.recordId)) {
+      return this.#rememberResult('blocked', record, range, 'claim-already-active');
+    }
+    const active = this.#withMemoryHash({ ...record, lifecycle: 'active', headEventId: randomUUID() });
+    this.#eligible(active);
+    this.#appendMemoryEvent(record, active, 'activate', record.source.eventId, { automatic: true, lane: 'owner-fast-lane' },
+      this.#requestDigest('remember-activate', record, { recordId: record.recordId }));
+    return this.#rememberResult('activated', active, range, null);
   }
 
   inspectMemory(activity: Activity, recordId: string) {

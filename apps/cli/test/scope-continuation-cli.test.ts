@@ -32,6 +32,55 @@ test('an existing Host detects a missing Info carrier before its first backgroun
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('ordinary CLI continues an unbound raw owner agreement after binding without asking for agreement again', async () => {
+  const sandbox = createSessionSandbox(randomUUID(), randomUUID()), directory = mkdtempSync(join(tmpdir(), 'euler-scope-agreement-'));
+  const clients: ReturnType<typeof startCli>[] = [];
+  let requests = 0;
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) { /* Consume the actual foreground request. */ }
+    requests++;
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: '建议记住偏好：T55 agreed examples stay concise.' }, finish_reason: 'stop' }] }));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const start = (args: string[]) => {
+    const cli = startCli(['session', '--sandbox', sandbox.root, ...args], 150000, undefined,
+      { ...process.env, EULER_SCOPE_TEST_KEY: 'synthetic-scope-only' });
+    clients.push(cli); return cli;
+  };
+  try {
+    const config = join(directory, 'route.json');
+    writeFileSync(config, JSON.stringify({ provider: 'fixture', model: 'scope-agreement',
+      baseUrl: `http://127.0.0.1:${(server.address() as { port: number }).port}/v1`, authNamespace: 'synthetic',
+      credentialEnv: 'EULER_SCOPE_TEST_KEY', contextWindow: 32000, maxTokens: 1024, authorization: 'synthetic-test-only', budget: AGENT_BUDGET }));
+    const cli = start(['--transport-config', config]); await cli.waitFor('session-ready');
+    await sendCommand(cli, 'Propose a synthetic preference to remember.', 'session-result');
+    const agreement = '  同意  ';
+    const pending = await sendCommand(cli, agreement, 'remember-result');
+    assert.equal(pending.reason, 'scope-unresolved');
+    const bind = '/bind ' + JSON.stringify({ projectId: randomUUID(), root: null });
+    await sendCommand(cli, bind, 'session-bound');
+    await sendCommand(cli, '/drain', 'session-drained');
+    const page = await sendCommand(cli, '/memory concise', 'session-memory');
+    assert.deepEqual((page.results as { unitId: string }[]).map(item => item.unitId), [pending.recordId], JSON.stringify({ page, errors: cli.observations.filter(item => item.event === 'capture-error') }));
+    assert.equal((await sendCommand(cli, `source ${pending.recordId}`, 'memory-source')).text, agreement);
+    assert.equal(((await sendCommand(cli, '/info', 'info-list')).rows as unknown[]).length, 1);
+    assert.equal(requests, 1);
+    cli.command('/exit'); assert.equal((await cli.exit).code, 0);
+    const reopened = start([]); await reopened.waitFor('session-ready');
+    await sendCommand(reopened, bind, 'session-bound');
+    await sendCommand(reopened, '/drain', 'session-drained');
+    assert.deepEqual(((await sendCommand(reopened, '/memory concise', 'session-memory')).results as { unitId: string }[]).map(item => item.unitId), [pending.recordId]);
+    assert.equal(((await sendCommand(reopened, '/info', 'info-list')).rows as unknown[]).length, 1);
+    assert.equal(requests, 1);
+    reopened.command('/exit'); assert.equal((await reopened.exit).code, 0);
+  } finally {
+    for (const cli of clients) if (cli.child.exitCode === null && cli.child.signalCode === null) { cli.child.kill(); await cli.exit; }
+    server.closeAllConnections(); const closed = once(server, 'close'); server.close(); await closed;
+    rmSync(sandbox.root, { recursive: true, force: true }); rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('ordinary CLI resumes untyped capture through HTTP proposal and independent raw-source verification after binding', async () => {
   const sandbox = createSessionSandbox(randomUUID(), randomUUID()), directory = mkdtempSync(join(tmpdir(), 'euler-scope-http-'));
   const clients: ReturnType<typeof startCli>[] = [], requests: string[] = [];

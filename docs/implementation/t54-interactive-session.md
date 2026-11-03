@@ -43,7 +43,7 @@ node apps/cli/src/main.ts session --sandbox $store --session '<new sessionId>' -
 
 ## Pending captures after project confirmation
 
-An unbound session can accept `记住偏好：回答使用合成示例。`. It remains a session-local, unverified candidate until `/bind` confirms the project. The same record then gains a project-scoped revision and a `resolve-scope` event; the old revision, original source ACK and archive bytes remain unchanged. Deterministic owner preference/decision verification can finish without a model route. Successful activation produces the usual durable Info and becomes available to `/memory` and later requests.
+An unbound session can accept `记住偏好：回答使用合成示例。`. It remains a session-local, unverified candidate until `/bind` confirms the project. The same record then gains a project-scoped revision and a `resolve-scope` event; the old revision, original source ACK and archive bytes remain unchanged. Deterministic owner preference/decision verification can finish without a model route. An already captured agreement to an assistant memory proposal continues from its frozen proposal/raw-owner-source pair; the owner does not need to agree again. Successful activation produces the usual durable Info and becomes available to `/memory` and later requests.
 
 Only the current task is covered. If you capture a shop decision, use `/task` to start a game task, and then bind the game project, the shop decision remains unresolved. Inputs captured before any intent belong to the initial session segment; beginning a task does not retroactively claim that segment. The binding is not a general scope editor.
 
