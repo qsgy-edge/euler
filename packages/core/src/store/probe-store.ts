@@ -6240,20 +6240,21 @@ export class ProbeStore {
   #validateSource(input: SourceAck, content?: string,
     targetScope: MemoryScope = input?.binding.sessionId === this.#binding.sessionId
       ? { kind: 'session', id: this.#binding.sessionId, resolved: false } : localScope(this.#binding), projects: readonly string[] = localProjects(this.#binding),
-    binding: Binding = this.#binding): void {
+    binding: Binding = this.#binding): { text: string; role?: 'user' | 'assistant' | 'tool' } {
     check(input?.schema === 'cli-source-ack@1' && input.status === 'durable'
       && input.binding.ownerId === binding.ownerId && input.binding.hostId === binding.hostId, 'source-scope-mismatch');
     this.#validateScope(targetScope, projects, binding);
     check(this.#sourceAllowedForScope(input, targetScope), 'source-scope-mismatch');
-    this.#archiveRef(input);
+    const source = this.#archiveRef(input);
     if (content !== undefined) {
       check(typeof content === 'string' && content.length > 0 && Buffer.byteLength(content) <= 65536, 'invalid-memory-content');
     }
+    return source;
   }
   #validateRawSource(input: SourceAck, content?: string, targetScope?: MemoryScope, projects?: readonly string[], binding: Binding = this.#binding): void {
-    this.#validateSource(input, content, targetScope, projects, binding);
+    const source = this.#validateSource(input, content, targetScope, projects, binding);
     check(!this.#isCaptureOutput(input), 'source-derived');
-    this.#analysisReferences(this.#archiveRef(input).text);
+    this.#analysisReferences(source.text);
   }
 
   #sourceAllowedForScope(ref: SourceAck, scope: MemoryScope): boolean {

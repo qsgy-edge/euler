@@ -79,8 +79,13 @@ export function openProbe(sandbox: Sandbox, budget: ProbeBudget = DEFAULT_BUDGET
   let activity: Activity;
   const transport = new CountingTransport(sandbox);
   const queryRequest = (attempt: RequestAttempt) => transport.query(attempt);
+  let sourceReader: { key: string; archive: CliArchive } | undefined;
   // Core invokes this reader inside its admission transaction; direct Host reads use the gated archive below.
-  const readSource = (input: SourceAck) => archiveFor(input.binding, action => action()).read(input);
+  const readSource = (input: SourceAck): ReturnType<CliArchive['read']> => {
+    const key = JSON.stringify([input.binding, store.sessionSource(input.binding)]);
+    if (sourceReader?.key !== key) sourceReader = { key, archive: archiveFor(input.binding, action => action()) };
+    return sourceReader.archive.read(input);
+  };
   let store = new ProbeStore(resourcesOf(sandbox), sandbox.storeId, bindingOf(sandbox), false, readSource, sandbox.appId, queryRequest);
   if (selectedBinding) {
     try {
