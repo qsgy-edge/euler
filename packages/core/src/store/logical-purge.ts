@@ -16,7 +16,7 @@ export const PURGE_DATABASE_INVENTORY = {
     'store_recovery_events', 'store_recovered_owners', 'execution_streams', 'execution_events'],
   content: ['session_project_bindings', 'intent_events', 'intent_heads', 'memory_discovery_grants', 'memory_discovery_projects',
     'memory_discovery_targets', 'source_query_receipts', 'memory_records', 'memory_revisions', 'memory_applicability',
-    'capture_jobs', 'compartments', 'capture_work', 'provenance_refs', 'memory_heads', 'memory_events',
+    'capture_scope_resolutions', 'capture_jobs', 'compartments', 'capture_work', 'provenance_refs', 'memory_heads', 'memory_events',
     'host_presentations', 'presentation_targets', 'pending_operations', 'host_operation_delivery', 'activation_batches',
     'projection_jobs', 'host_info_batches', 'source_appends', 'source_units', 'source_projection_jobs', 'search_documents',
     'search_projection_jobs', 'feedback_events', 'verification_runs', 'conflict_sets', 'conflict_members',
@@ -30,7 +30,7 @@ const identities: Record<string, readonly string[]> = {
   memory_discovery_grants: ['grant_id'], memory_discovery_projects: [], memory_discovery_targets: [],
   source_query_receipts: ['query_id'], memory_records: ['record_id'],
   memory_revisions: ['record_id', 'revision_id'], memory_applicability: [], capture_jobs: ['job_id'],
-  compartments: ['job_id'], capture_work: ['job_id'], provenance_refs: ['ref_id'], memory_heads: ['record_id'],
+  capture_scope_resolutions: ['job_id'], compartments: ['job_id'], capture_work: ['job_id'], provenance_refs: ['ref_id'], memory_heads: ['record_id'],
   memory_events: ['event_id', 'record_id'], host_presentations: ['presentation_id', 'operation_id', 'token'],
   presentation_targets: ['presentation_id', 'update_event_id'], pending_operations: ['operation_id'],
   host_operation_delivery: ['operation_id', 'summary_event_id'], activation_batches: ['batch_id'],
@@ -256,6 +256,7 @@ export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCar
       selectedRows.add(key); (selected.get(table) ?? selected.set(table, []).get(table)!).push(row); changed = true;
       for (const column of identities[table] ?? []) if (typeof row[column] === 'string') tokens.add(row[column] as string);
       for (const [column, value] of Object.entries(row)) {
+        if (['task_hash', 'authority_hash'].includes(column)) continue;
         if (typeof value === 'string' && (column.endsWith('_hash') || column === 'hash' || column === 'digest')) tokens.add(value);
       }
       // Follow original material owned by the removed memory, and output material
