@@ -2925,13 +2925,16 @@ export class ProbeStore {
     if (payload.lane !== 'normal-capture' || !authority.task || !payload.runId) return false;
     const run = this.#db.prepare('SELECT * FROM request_runs WHERE run_id=? AND redacted=0').get(payload.runId);
     if (!run || run.owner_kind !== 'session' || run.owner_id !== ref.binding.sessionId) return false;
-    const intent = this.#db.prepare('SELECT * FROM intent_events WHERE event_id=? AND session_id=?').get(run.intent_event_id!, ref.binding.sessionId);
-    if (!intent || intent.intent_id !== authority.task.intentId || intent.hash !== run.intent_hash) return false;
-    const snapshot = this.#readIntentSnapshot(intent, { ...ref.binding, projectId: authority.projectId });
-    if (!sameSourceAck(snapshot.goalInput, ref)) return false;
     const ledger = this.#readRequestLedger(this.#requestRun({ streamId: String(run.stream_id) }, String(run.run_id)));
-    return ledger.events.some(event => event.kind === 'agent/event@v1'
-      && JSON.parse(event.payload).event.kind === 'input' && sameSourceAck(JSON.parse(event.payload).event.source, ref));
+    if (!ledger.events.some(event => event.kind === 'agent/event@v1'
+      && JSON.parse(event.payload).event.kind === 'input' && sameSourceAck(JSON.parse(event.payload).event.source, ref))) return false;
+    return ledger.assemblies.some(assembly => {
+      if (!assembly.intent || !assembly.sources.some(source => sameSourceAck(source, ref))) return false;
+      const intent = this.#db.prepare('SELECT * FROM intent_events WHERE event_id=? AND session_id=?')
+        .get(assembly.intent.eventId, ref.binding.sessionId);
+      if (!intent || intent.intent_id !== authority.task!.intentId || intent.hash !== assembly.intent.hash) return false;
+      return sameSourceAck(this.#readIntentSnapshot(intent, { ...ref.binding, projectId: authority.projectId }).goalInput, ref);
+    });
   }
 
   #scopeResolution(jobId: string): CaptureScopeResolution | null {
@@ -3214,7 +3217,9 @@ export class ProbeStore {
           budget=excluded.budget,deadline=excluded.deadline`)
         .run(jobId, reason ? 'blocked' : job.stage === 'comparing' ? 'comparing' : job.record ? 'verifying' : 'proposing', reason,
           job.record?.recordId ?? null, previous?.expected_head_id ?? job.record?.headEventId ?? null,
-          token, holder?.id ?? null, until, generation, JSON.stringify(budget), deadline);
+          token, holder?.id ?? null, holder ? until : 0, generation,
+          holder || previous?.budget != null ? JSON.stringify(budget) : null,
+          holder || previous?.budget != null ? deadline : 0);
       return holder ? { jobId, activity: holder, token: token!, generation, expiresAt: until } : null;
     });
   }

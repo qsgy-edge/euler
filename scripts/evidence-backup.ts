@@ -200,7 +200,7 @@ for (const scenario of fixture.cases) {
     const snapshotDb = new DatabaseSync(snapshotPath, { readOnly: true });
     let attempts: Record<string, unknown>[], streams: Record<string, unknown>[], snapshotEpoch: number;
     try {
-      assert.equal(snapshotDb.prepare('PRAGMA user_version').get()!.user_version, 29);
+      assert.equal(snapshotDb.prepare('PRAGMA user_version').get()!.user_version, 30);
       assert.equal(snapshotDb.prepare('PRAGMA quick_check').get()!.quick_check, 'ok');
       assert.deepEqual(snapshotDb.prepare('PRAGMA foreign_key_check').all(), []);
       attempts = snapshotDb.prepare('SELECT * FROM request_attempts ORDER BY attempt_id').all();

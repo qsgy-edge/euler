@@ -1,15 +1,89 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { CaptureRun, DEFAULT_BUDGET } from '@euler/core';
+import { AgentRun, CaptureRun, DEFAULT_BUDGET } from '@euler/core';
+import { pumpAgent } from '../src/agent-pump.ts';
 import type { ModelReply } from '@euler/core';
 import { openMaintenanceStore } from '../src/backup.ts';
 import { readPurgeCarriers } from '../src/purge.ts';
 import { createSessionSandbox, createSandboxSession } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
+
+test('an ordinary first task resumes its complete capture range including the input preceding intent creation', async () => {
+  const sandbox = createSessionSandbox(randomUUID(), randomUUID());
+  let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const run = new AgentRun(probe.store, probe.activity, { binding: probe.binding, source: probe.archive },
+      { provider: 'synthetic', model: 'ordinary', route: 'synthetic', authNamespace: 'synthetic' },
+      { ...DEFAULT_BUDGET, contextLimit: 32000, maxTotalTokens: 128000 });
+    run.receive(randomUUID(), 'The synthetic task keeps original raw evidence.');
+    const status = await pumpAgent(run, { recoverInfo: () => true,
+      async *stream(request, _signal, send) {
+        probe.transport.send(request.payload, send(request.payload));
+        yield { kind: 'complete', reply: { text: 'The complete synthetic answer keeps original evidence.', calls: [], stop: 'end' } };
+      }, async execute() { throw new Error('unexpected-tool'); } });
+    assert.equal(status.terminal, 'completed');
+    const job = probe.store.queueCaptureBoundary(probe.activity, run.runId)!;
+    assert.equal(job.range[0]!.eventId, status.inputs[0]!.source.eventId);
+    const projectId = randomUUID();
+    probe.store.confirmSessionProject(probe.activity, probe.archive.append(randomUUID(), '/bind ' + JSON.stringify({ projectId, root: null })), projectId, null);
+    probe.close(); probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    const resumed = probe.store.resumeProjectCaptures(probe.activity, 'durable');
+    assert.equal(resumed.jobs.length, 1);
+    assert.equal(resumed.jobs[0]!.jobId, job.jobId);
+    assert.deepEqual(resumed.jobs[0]!.range, job.range);
+    assert.equal(resumed.jobs[0]!.scope.id, projectId);
+    assert.ok(probe.store.claimCaptureJob(probe.activity, job.jobId, DEFAULT_BUDGET, 30000));
+    probe.store.auditStore(probe.activity);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('two real workers converge on one resolution and activation of the same original candidate', async () => {
+  const sandbox = createSessionSandbox(randomUUID(), randomUUID());
+  let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const record = probe.store.rememberMemory(probe.activity,
+      { input: probe.archive.append(randomUUID(), '记住偏好：parallel scope continuation'), hostInfo: 'durable' }).record;
+    const projectId = randomUUID();
+    probe.store.confirmSessionProject(probe.activity, probe.archive.append(randomUUID(), '/bind ' + JSON.stringify({ projectId, root: null })), projectId, null);
+    probe.close();
+    const command = `import { openSandbox } from './apps/cli/src/sandbox.ts';
+      import { openProbe } from './apps/cli/src/probe.ts';
+      const p = openProbe(openSandbox(process.argv[1]), undefined, undefined, undefined, undefined, true);
+      try { console.log(JSON.stringify(p.store.resumeProjectCaptures(p.activity, 'durable'))); } finally { p.close(); }`;
+    const workers = await Promise.all([0, 1].map(() => promisify(execFile)(process.execPath,
+      ['--input-type=module', '-e', command, sandbox.root], { encoding: 'utf8' })));
+    assert.equal(workers.reduce((count, result) => count + JSON.parse(result.stdout).jobs.length, 0), 1);
+    probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    assert.deepEqual(probe.store.inspectMemory(probe.activity, record.recordId).history.map(event => event.kind),
+      ['capture', 'resolve-scope', 'verify', 'activate']);
+    assert.equal(probe.store.inspectMemory(probe.activity, record.recordId).record.revision, 2);
+    assert.deepEqual(probe.store.resumeProjectCaptures(probe.activity, 'durable'), { jobs: [], more: false });
+    probe.store.auditStore(probe.activity);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('waiting for project confirmation does not spend an unstarted capture execution budget', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: 1_800_000_000_000 });
+  const sandbox = createSessionSandbox(randomUUID(), randomUUID());
+  let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const job = probe.store.queueOwnerCapture(probe.activity, probe.archive.append(randomUUID(), '记住：scope waiting budget'));
+    assert.equal(probe.store.claimCaptureJob(probe.activity, job.jobId, DEFAULT_BUDGET, 30000), null);
+    assert.equal(probe.store.readCaptureJob(probe.activity, job.jobId).reason, 'scope-unresolved');
+    t.mock.timers.tick(DEFAULT_BUDGET.wallClockMs + 1);
+    const projectId = randomUUID();
+    probe.store.confirmSessionProject(probe.activity, probe.archive.append(randomUUID(), '/bind ' + JSON.stringify({ projectId, root: null })), projectId, null);
+    probe.close(); probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    probe.store.resumeProjectCaptures(probe.activity, 'durable');
+    assert.ok(probe.store.claimCaptureJob(probe.activity, job.jobId, DEFAULT_BUDGET, 30000),
+      JSON.stringify(probe.store.readCaptureJob(probe.activity, job.jobId)));
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
 
 test('resumeProjectCaptures resolves the original candidate without rewriting source or historical revision', () => {
   const sandbox = createSessionSandbox(randomUUID(), randomUUID());

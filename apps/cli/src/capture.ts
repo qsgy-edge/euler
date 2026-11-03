@@ -11,7 +11,7 @@ type Probe = ReturnType<typeof openProbe>;
 
 /** One explicitly configured test route, with independent role contexts and no ambient credential discovery. */
 export function createCaptureWorker(path?: string, onFailure?: (error: unknown) => void, recoverInfo?: () => boolean,
-  consumer: CaptureJob['consumer'] = 'memory') {
+  consumer: CaptureJob['consumer'] = 'memory', continueBatch?: () => void) {
   let configured: ReturnType<typeof configuredTransport> | null = null, setupError: unknown;
   if (path) {
     try { configured = configuredTransport(path); check(configured.captureCapability, 'capture-capability-required'); }
@@ -27,7 +27,14 @@ export function createCaptureWorker(path?: string, onFailure?: (error: unknown) 
       return jobs;
     };
     const defer = (reason: Parameters<Probe['store']['deferCaptureJobs']>[1]) => report(probe.store.deferCaptureJobs(probe.activity, reason, consumer));
-    if (!probe.store.listCaptureJobs(probe.activity, 1, true, consumer).length) return [];
+    let resumed: CaptureJob[] = [];
+    if (consumer === 'memory' && !foregroundActive && !signal?.aborted && !probe.store.captureDrainBlocked(probe.activity)) {
+      const continuation = probe.store.resumeProjectCaptures(probe.activity, recoverInfo?.() === true ? 'durable' : 'unavailable');
+      resumed = continuation.jobs;
+      if (resumed.length) { report(resumed); recoverInfo?.(); }
+      if (continuation.more) continueBatch?.();
+    }
+    if (!probe.store.listCaptureJobs(probe.activity, 1, true, consumer).length) return resumed;
     if (!path) return defer('capture-route-unavailable');
     if (setupError) { defer('capture-configuration-unavailable'); throw setupError; }
     if (consumer === 'memory' && foregroundActive) return defer('foreground-run-active');
@@ -64,8 +71,8 @@ export function createCaptureWorker(path?: string, onFailure?: (error: unknown) 
 }
 
 export function scheduleCaptures(probe: Probe, path: string | undefined, recoverInfo: () => boolean, consumer: CaptureJob['consumer'] = 'memory') {
-  const worker = createCaptureWorker(path, reportCaptureFailure, recoverInfo, consumer), abort = new AbortController();
   let pending = false, foreground = false, running: Promise<void> | undefined;
+  const worker = createCaptureWorker(path, reportCaptureFailure, recoverInfo, consumer, () => { pending = true; }), abort = new AbortController();
   const kick = (foregroundActive = false) => {
     if (abort.signal.aborted) return;
     pending = true; foreground = foregroundActive;
