@@ -49,7 +49,7 @@ Only the current task is covered. If you capture a shop decision, use `/task` to
 
 Untyped `记住：…` and ordinary semantic captures keep their original job identity and use the configured capture route for proposal, independent source verification and promotion. Objective facts still need authoritative evidence. Missing source/task evidence, changed heads, suppression and unavailable Info remain visible blocking reasons. No capture configuration means no background provider send; it does not prevent the deterministic owner lane from completing.
 
-Startup, `/bind`, ordinary cooperative boundaries and `/drain` resume bounded batches. Restart and repeated confirmation retain the same candidate, resolution and activation identities. `/drain` reports the actual queue, including unresolved or blocked work. A forgotten or purged item is not revived by confirmation or delayed work.
+Startup, `/bind`, ordinary cooperative boundaries and `/drain` resume bounded batches. Restart and repeated confirmation retain the same candidate, resolution and activation identities. `/drain` reports the actual queue, including unresolved or blocked work. A forgotten or purged item is not revived by confirmation or delayed work. Snapshot restore also fences original-statement fast-lane replay. If purge removes the current intent tail, older tasks remain historical rather than becoming current again; a new owner goal starts a fresh intent across the recorded purge boundary.
 
 ## Inputs, approval and diagnostics
 

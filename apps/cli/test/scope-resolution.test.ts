@@ -175,7 +175,7 @@ test('bounded continuation and unavailable Info are restart-safe and do not spin
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
-test('a bounded continuation does not read or validate payloads beyond its batch', () => {
+for (const fault of ['digest', 'project-field']) test(`a bounded continuation validates only its selected batch, damage=${fault}`, () => {
   const sandbox = createSessionSandbox(randomUUID(), randomUUID());
   let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
   try {
@@ -185,17 +185,18 @@ test('a bounded continuation does not read or validate payloads beyond its batch
     probe.store.confirmSessionProject(probe.activity, probe.archive.append(randomUUID(), '/bind ' + JSON.stringify({ projectId, root: null })), projectId, null);
     probe.close(); probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
     const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
-    const original = db.prepare('SELECT job_id,payload_hash FROM capture_jobs WHERE record_id=?').get(records[1]!.recordId)!;
+    const original = db.prepare('SELECT job_id,payload,payload_hash FROM capture_jobs WHERE record_id=?').get(records[1]!.recordId)!;
     try {
       db.exec('DROP TRIGGER immutable_capture_jobs_update');
       db.function('euler_store_writer', () => 1);
-      db.prepare("UPDATE capture_jobs SET payload_hash='damaged' WHERE job_id=?").run(original.job_id!);
+      if (fault === 'digest') db.prepare("UPDATE capture_jobs SET payload_hash='damaged' WHERE job_id=?").run(original.job_id!);
+      else db.prepare("UPDATE capture_jobs SET payload=json_set(payload,'$.source.binding.projectId',?) WHERE job_id=?").run(randomUUID(), original.job_id!);
       const first = probe.store.resumeProjectCaptures(probe.activity, 'durable', 1);
       assert.equal(first.jobs.length, 1); assert.equal(first.more, true);
       assert.equal(first.jobs[0]!.record!.recordId, records[0]!.recordId);
       assert.equal(first.jobs[0]!.record!.lifecycle, 'active');
       assert.throws(() => probe.store.resumeProjectCaptures(probe.activity, 'durable', 1), /capture-evidence-gap/);
-      db.prepare('UPDATE capture_jobs SET payload_hash=? WHERE job_id=?').run(original.payload_hash!, original.job_id!);
+      db.prepare('UPDATE capture_jobs SET payload=?,payload_hash=? WHERE job_id=?').run(original.payload!, original.payload_hash!, original.job_id!);
     } finally { db.close(); }
     assert.equal(probe.store.resumeProjectCaptures(probe.activity, 'durable', 1).jobs[0]!.record!.recordId, records[1]!.recordId);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
@@ -250,7 +251,8 @@ for (const typed of [false, true]) test(`resolved ${typed ? 'objective fact' : '
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
-for (const normalGoal of [false, true]) test(`purge of one resolved memory retains the shared binding and independent sibling, normal goal=${normalGoal}`, async () => {
+for (const variant of ['owner', 'normal', 'later-normal'] as const) test(`purge of one resolved memory retains the shared binding and independent sibling, variant=${variant}`, async () => {
+  const normalGoal = variant !== 'owner';
   const sandbox = createSessionSandbox(randomUUID(), randomUUID());
   let cli: ReturnType<typeof startCli> | undefined;
   try {
@@ -264,11 +266,18 @@ for (const normalGoal of [false, true]) test(`purge of one resolved memory retai
       let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
       const budget = { ...DEFAULT_BUDGET, contextLimit: 32000, maxTotalTokens: 256000, maxModelAttempts: 8 };
       const route = { provider: 'synthetic', model: 'purge-scope', route: 'synthetic', authNamespace: 'synthetic', capability: 'standard' };
-      let goal, normal;
+      let goal, normal, firstInput;
+      if (${variant === 'later-normal'}) {
+        const first = probe.archive.append(randomUUID(), 'first unrelated task');
+        let intent = probe.store.transitionIntent(probe.activity, null, first, { step: 'start', status: 'active' }, 'first unrelated task');
+        intent = probe.store.transitionIntent(probe.activity, intent.eventId, probe.archive.append(randomUUID(), 'first task done'), { step: 'done', status: 'completed' });
+        firstInput = probe.archive.append(randomUUID(), 'shared task authority');
+        probe.store.transitionIntent(probe.activity, intent.eventId, firstInput, { step: 'start', status: 'active' }, 'shared task authority');
+      }
       if (${normalGoal}) {
         const { capability, ...agentRoute } = route;
         const agent = new AgentRun(probe.store, probe.activity, { binding: probe.binding, source: probe.archive }, agentRoute, budget);
-        goal = agent.receive(randomUUID(), 'shared task authority');
+        goal = agent.receive(firstInput?.eventId ?? randomUUID(), 'shared task authority');
         await pumpAgent(agent, { recoverInfo: () => true, async *stream(request, signal, send) {
           probe.transport.send(request.payload, send(request.payload));
           yield { kind: 'complete', reply: { text: 'Completed synthetic task.', calls: [], stop: 'end' } };
@@ -330,6 +339,14 @@ for (const normalGoal of [false, true]) test(`purge of one resolved memory retai
       probe.store.confirmSessionProject(probe.activity, probe.archive.append(randomUUID(), '/bind ' + JSON.stringify({ projectId, root: null })), projectId, null);
       assert.deepEqual(probe.store.resumeProjectCaptures(probe.activity, 'durable'), { jobs: [], more: false });
       probe.store.auditStore(probe.activity);
+      if (variant === 'later-normal') {
+        assert.equal(probe.store.readIntent(probe.activity), null);
+        assert.equal(probe.store.recoverIntent(probe.activity), null);
+        const input = probe.archive.append(randomUUID(), 'new task after controlled purge');
+        const intent = probe.store.transitionIntent(probe.activity, null, input, { step: 'start', status: 'active' }, 'new task after controlled purge');
+        assert.equal(probe.store.readIntent(probe.activity)!.intentId, intent.intentId);
+        probe.store.auditStore(probe.activity);
+      }
       const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`, { readOnly: true });
       try {
         assert.equal(db.prepare('SELECT source_cut FROM session_project_bindings').get()!.source_cut, frozenCut);
@@ -367,6 +384,40 @@ test('same-project record expansion is exact-source authorized, without cross-se
     for (const ref of [source, unrelated]) assert.throws(() => probe.store.expandSource(probe.activity, { ref, offset: 0, limit: 4096 }), /source-scope-mismatch/);
     assert.throws(() => probe.store.rememberMemory(probe.activity, { input: { ...source, hash: '0'.repeat(64) }, hostInfo: 'durable' }), /source-scope-mismatch/);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('original fast-lane input replay cannot activate a candidate across snapshot ownership fences', async () => {
+  const sandbox = createSessionSandbox(randomUUID(), randomUUID());
+  try {
+    const seeded = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { randomUUID } from 'node:crypto';
+      import { openSandbox } from './apps/cli/src/sandbox.ts';
+      import { openProbe } from './apps/cli/src/probe.ts';
+      const sandbox = openSandbox(process.argv[1]);
+      let p = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+      const input = p.archive.append(randomUUID(), '记住偏好：snapshot replay waits for durable Info');
+      p.store.rememberMemory(p.activity, { input, hostInfo: 'durable' });
+      const projectId = randomUUID();
+      p.store.confirmSessionProject(p.activity, p.archive.append(randomUUID(), '/bind ' + JSON.stringify({ projectId, root: null })), projectId, null);
+      p.close(); p = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+      const record = p.store.resumeProjectCaptures(p.activity, 'unavailable').jobs[0].record;
+      p.close(); console.log(JSON.stringify({ input, record }));
+    `, sandbox.root], { encoding: 'utf8' });
+    assert.equal(seeded.status, 0, seeded.stderr);
+    const { input, record } = JSON.parse(seeded.stdout.trim());
+    assert.equal(record.verification, 'verified'); assert.equal(record.lifecycle, 'candidate');
+    const backup = startCli(['backup', '--sandbox', sandbox.root]);
+    assert.equal((await backup.exit).code, 0, JSON.stringify(backup.observations));
+    const snapshotId = (backup.observations.find(event => event.event === 'backup-result')!.snapshot as { id: string }).id;
+    const restore = startCli(['restore-snapshot', '--sandbox', sandbox.root, '--snapshot', snapshotId]);
+    assert.equal((await restore.exit).code, 0, JSON.stringify(restore.observations));
+    const p = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    try {
+      assert.throws(() => p.store.resumeProjectCaptures(p.activity, 'durable'), /recovered-stream-blocked/);
+      assert.throws(() => p.store.rememberMemory(p.activity, { input, hostInfo: 'durable' }), /recovered-stream-blocked/);
+      assert.deepEqual(p.store.inspectMemory(p.activity, record.recordId).record, record);
+    } finally { p.close(); }
+  } finally { rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
 test('owner backfill uses the original reservation task instead of the current replay task', () => {

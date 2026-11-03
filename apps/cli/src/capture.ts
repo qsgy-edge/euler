@@ -28,7 +28,8 @@ export function createCaptureWorker(path?: string, onFailure?: (error: unknown) 
     };
     const defer = (reason: Parameters<Probe['store']['deferCaptureJobs']>[1]) => report(probe.store.deferCaptureJobs(probe.activity, reason, consumer));
     let resumed: CaptureJob[] = [];
-    if (consumer === 'memory' && !foregroundActive && !signal?.aborted && !probe.store.captureDrainBlocked(probe.activity)) {
+    if (consumer === 'memory' && !foregroundActive && !signal?.aborted && !probe.store.captureDrainBlocked(probe.activity)
+      && probe.store.sessionProject(probe.activity)?.confirmation) {
       const continuation = probe.store.resumeProjectCaptures(probe.activity, recoverInfo?.() === true ? 'durable' : 'unavailable');
       resumed = continuation.jobs;
       if (resumed.length) { report(resumed); recoverInfo?.(); }

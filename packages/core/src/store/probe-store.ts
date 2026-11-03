@@ -372,7 +372,13 @@ CREATE TABLE intent_heads (
 ) STRICT;
 CREATE TRIGGER intent_sequence BEFORE INSERT ON intent_events
 WHEN NEW.version!=(SELECT COALESCE(MAX(version),0)+1 FROM intent_events WHERE session_id=NEW.session_id AND branch_id=NEW.branch_id)
-  OR NEW.expected_event_id IS NOT (SELECT event_id FROM intent_events WHERE session_id=NEW.session_id AND branch_id=NEW.branch_id ORDER BY version DESC LIMIT 1)
+  OR (NEW.expected_event_id IS NOT (SELECT event_id FROM intent_events WHERE session_id=NEW.session_id AND branch_id=NEW.branch_id ORDER BY version DESC LIMIT 1)
+    AND NOT (NEW.expected_event_id IS NULL
+      AND NOT EXISTS(SELECT 1 FROM intent_heads WHERE session_id=NEW.session_id AND branch_id=NEW.branch_id)
+      AND EXISTS(SELECT 1 FROM intent_tasks erased JOIN intent_tasks fresh ON fresh.task_id=NEW.intent_id
+        WHERE erased.session_id=NEW.session_id AND erased.content_state='purged' AND erased.task_ordinal<fresh.task_ordinal
+          AND erased.task_ordinal>=coalesce((SELECT t.task_ordinal FROM intent_events e JOIN intent_tasks t ON t.task_id=e.intent_id
+            WHERE e.session_id=NEW.session_id AND e.branch_id=NEW.branch_id ORDER BY e.version DESC LIMIT 1),0))))
 BEGIN SELECT RAISE(ABORT,'intent-sequence-conflict'); END;
 CREATE TRIGGER immutable_intent_update BEFORE UPDATE ON intent_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
 CREATE TRIGGER immutable_intent_delete BEFORE DELETE ON intent_events WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT, 'append-only'); END;
@@ -2512,9 +2518,10 @@ export class ProbeStore {
         WHERE h.session_id=? AND h.branch_id=?`).get(this.#binding.sessionId, this.#binding.branchId);
       if (!row) {
         const event = this.#db.prepare('SELECT 1 FROM intent_events WHERE session_id=? AND branch_id=? LIMIT 1').get(this.#binding.sessionId, this.#binding.branchId);
-        check(!event, 'intent-evidence-gap');
+        check(!event || this.#intentContentPurged(this.#binding), 'intent-evidence-gap');
         return null;
       }
+      check(!this.#intentContentPurged(this.#binding) && row.intent_id === this.#currentCaptureTask(this.#binding.sessionId), 'intent-evidence-gap');
       check(!this.#db.prepare('SELECT 1 FROM intent_events WHERE session_id=? AND branch_id=? AND version>?')
         .get(this.#binding.sessionId, this.#binding.branchId, row.version!), 'intent-evidence-gap');
       return this.#readIntentSnapshot(row);
@@ -2549,22 +2556,36 @@ export class ProbeStore {
     return { ...intent, hash: String(row.hash) };
   }
 
+  #intentContentPurged(binding: Binding): boolean {
+    return this.#db.prepare('SELECT content_state FROM intent_tasks WHERE session_id=? AND branch_id=? ORDER BY task_ordinal DESC LIMIT 1')
+      .get(binding.sessionId, binding.branchId)?.content_state === 'purged';
+  }
+
+  #purgedIntentGap(binding: Binding, before: string | null, after: string): boolean {
+    return !!this.#db.prepare(`SELECT 1 FROM intent_tasks erased JOIN intent_tasks next ON next.task_id=?
+      WHERE erased.session_id=? AND erased.branch_id=? AND erased.content_state='purged'
+        AND erased.task_ordinal>=coalesce((SELECT task_ordinal FROM intent_tasks WHERE task_id=?),0)
+        AND erased.task_ordinal<next.task_ordinal LIMIT 1`).get(after, binding.sessionId, binding.branchId, before);
+  }
+
   #replayIntent(binding: Binding): Intent | null {
     const rows = this.#db.prepare('SELECT * FROM intent_events WHERE session_id=? AND branch_id=? ORDER BY version')
       .all(binding.sessionId, binding.branchId);
     let latest: Intent | null = null;
-    for (const [index, row] of rows.entries()) {
-      check(row.version === index + 1 && row.expected_event_id === (latest?.eventId ?? null), 'intent-evidence-gap');
+    for (const row of rows) {
+      const reset = row.expected_event_id === null && this.#purgedIntentGap(binding, latest?.intentId ?? null, String(row.intent_id));
+      check((reset ? Number(row.version) > (latest?.version ?? 0) : row.version === (latest?.version ?? 0) + 1)
+        && (reset || row.expected_event_id === (latest?.eventId ?? null)), 'intent-evidence-gap');
       const next = this.#readIntentSnapshot(row, binding);
       const newTask = latest && next.intentId !== latest.intentId;
-      check(!latest || (JSON.stringify(next.constraints) === JSON.stringify(latest.constraints)
-        && (newTask ? latest.status === 'completed' && next.status === 'active'
+      check(!latest || (reset || JSON.stringify(next.constraints) === JSON.stringify(latest.constraints))
+        && (newTask ? (reset || latest.status === 'completed') && next.status === 'active'
           && JSON.stringify(next.goalInput) === JSON.stringify(next.input)
           && sha256(next.goal) === next.input.contentHash && this.#archiveRef(next.input).role === 'user'
-          : next.goal === latest.goal && JSON.stringify(next.goalInput) === JSON.stringify(latest.goalInput))), 'intent-evidence-gap');
+          : next.goal === latest.goal && JSON.stringify(next.goalInput) === JSON.stringify(latest.goalInput)), 'intent-evidence-gap');
       latest = next;
     }
-    return latest;
+    return this.#intentContentPurged(binding) ? null : latest;
   }
 
   recoverIntent(activity: Activity): Intent | null {
@@ -2605,7 +2626,8 @@ export class ProbeStore {
         && sha256(initialGoal) === input.contentHash && this.#archiveRef(input).role === 'user'), 'intent-needs-input');
       const snapshot: Omit<Intent, 'hash'> = {
         schema: 'intent@1', intentId: newTask ? randomUUID() : current?.intentId ?? randomUUID(), eventId: randomUUID(),
-        version: (current?.version ?? 0) + 1, binding: this.#binding,
+        version: Number(this.#db.prepare('SELECT coalesce(max(version),0)+1 AS version FROM intent_events WHERE session_id=? AND branch_id=?')
+          .get(this.#binding.sessionId, this.#binding.branchId)!.version), binding: this.#binding,
         goal: newTask ? initialGoal! : current?.goal ?? initialGoal!, constraints: current?.constraints ?? (this.#db.prepare('SELECT 1 FROM sessions WHERE session_id=? AND project_id IS NULL').get(this.#binding.sessionId)
           ? ['synthetic-only', 'explicitly-configured-transport-only'] : ['synthetic-only', 'local-counting-transport-only']),
         step: transition.step, status: transition.status, input, goalInput: newTask ? input : current?.goalInput ?? input,
@@ -3049,7 +3071,7 @@ export class ProbeStore {
         LEFT JOIN capture_work w ON w.job_id=j.job_id
         LEFT JOIN capture_scope_resolutions r ON r.job_id=j.job_id
         WHERE j.source_owner=? AND j.consumer='memory' AND j.task_id IS ? AND a.ordinal<=?
-          AND json_extract(j.payload,'$.source.binding.projectId') IS NULL AND coalesce(w.lease_until,0)<=?
+          AND coalesce(w.lease_until,0)<=?
           AND NOT EXISTS(SELECT 1 FROM store_recovered_owners recovered WHERE recovered.kind='job' AND recovered.owner_id=j.job_id)
           AND ((r.job_id IS NOT NULL AND w.reason='host-info-unavailable' AND ?=1)
             OR (r.job_id IS NULL AND (w.stage IS NULL OR w.stage IN ('pending','blocked'))
@@ -3689,7 +3711,7 @@ export class ProbeStore {
         ? { kind: 'session', id: this.#binding.sessionId, resolved: false }
         : localScope(this.#binding);
       this.#validateScope(scope);
-      const existing = this.#db.prepare("SELECT record_id,payload,payload_hash FROM capture_jobs WHERE source_owner=? AND source_event_id=? AND consumer='memory'")
+      const existing = this.#db.prepare("SELECT job_id,record_id,payload,payload_hash FROM capture_jobs WHERE source_owner=? AND source_event_id=? AND consumer='memory'")
         .get(input.binding.sessionId, input.eventId);
       let record: MemoryRecord;
       if (existing) {
@@ -3709,11 +3731,13 @@ export class ProbeStore {
         }
         const duplicate = this.#activeClaim(claimKey, statement, scope, null);
         if (duplicate) {
+          this.#assertStreamNotRecovered(activity.streamId);
           this.#corroborate(duplicate, range); // Ticket 08 §10: new evidence for the same claim only appends provenance.
           return this.#rememberResult('no_op', duplicate, range, 'claim-already-active');
         }
         const suppressed = this.#suppressed(claimKey, range, scope, []);
         if (suppressed) return this.#rememberResult('no_op', suppressed, range, 'memory-suppressed');
+        this.#assertStreamNotRecovered(activity.streamId);
         record = this.#withMemoryHash({ schema: 'memory-record@1', recordId: randomUUID(), revisionId: randomUUID(), revision: 1,
           claimKey, content: statement.content, contentHash: sha256(statement.content), type: statement.type,
           lifecycle: 'candidate', verification: 'unverified', scope, appliesTo: [], source: structuredClone(input),
@@ -3730,6 +3754,12 @@ export class ProbeStore {
       if (record.verification === 'unverified') {
         const prior = record.verificationRunId ? this.#verificationOf(record) : null;
         if (prior?.verifier === 'owner-fast-lane@1') return this.#rememberResult('blocked', record, range, prior.reason);
+      }
+      if (record.verification === 'verified' && request.hostInfo !== 'durable')
+        return this.#rememberResult('blocked', record, range, 'host-info-unavailable');
+      this.#assertStreamNotRecovered(activity.streamId);
+      check(!existing || !this.#requestRecoveryStatus('job', String(existing.job_id)).recovery, 'recovered-stream-blocked');
+      if (record.verification === 'unverified') {
         const ambiguous = this.#suppressionPeers(range, record.scope, record.appliesTo).length > 0;
         const reason = ambiguous ? 'suppression-identity-evidence-gap'
           : statement.type === 'fact' ? 'objective-fact-authority-required' : null;
@@ -6045,9 +6075,9 @@ export class ProbeStore {
   #suppressionPeers(sources: readonly SourceAck[], scope: MemoryScope, appliesTo: string[]): MemoryRecord[] {
     const rows = this.#db.prepare(`SELECT h.record_id,e.payload,e.payload_hash FROM memory_heads h
       JOIN memory_records r ON r.record_id=h.record_id JOIN memory_events e ON e.record_id=h.record_id
-      WHERE r.owner_id=? AND ((h.scope_kind=? AND h.scope_id=?) OR (?='project' AND h.scope_kind='session')) AND h.lifecycle='tombstoned'
+      WHERE r.owner_id=? AND h.scope_kind=? AND h.scope_id=? AND h.lifecycle='tombstoned'
         AND e.kind='forget' AND e.seq=(SELECT MAX(f.seq) FROM memory_events f WHERE f.record_id=h.record_id AND f.kind='forget')`)
-      .all(this.#binding.ownerId, scope.kind, scope.id, scope.kind);
+      .all(this.#binding.ownerId, scope.kind, scope.id);
     const peers: MemoryRecord[] = [];
     for (const row of rows) {
       check(sha256(String(row.payload)) === row.payload_hash, 'memory-evidence-gap');
@@ -6060,13 +6090,6 @@ export class ProbeStore {
         && JSON.stringify(suppression.scope) === JSON.stringify(before.scope)
         && JSON.stringify(suppression.appliesTo) === JSON.stringify(canonicalMemoryConditions(before.appliesTo))
         && suppression.sources.some(source => sameSourceAck(source, before.source)), 'memory-evidence-gap');
-      if (before.scope.kind !== scope.kind || before.scope.id !== scope.id) {
-        const relation = this.#db.prepare('SELECT job_id FROM capture_scope_resolutions WHERE session_id=? AND project_id=? LIMIT 1')
-          .get(before.source.binding.sessionId, scope.id);
-        if (!relation || !sources.some(ref => this.#resolvedSource(ref, scope.id))) continue;
-        const authority = this.#bindingAuthority(before.source.binding.sessionId);
-        if (!suppression.sources.some(ref => this.#coveredCaptureSource(ref, authority, String(relation.job_id)))) continue;
-      }
       // A CLI archive session is the logical source lineage; event IDs and byte ranges are versions within it.
       if (JSON.stringify(suppression.appliesTo) === JSON.stringify(canonicalMemoryConditions(appliesTo))
         && suppression.sources.some(source => sources.some(input => input.binding.ownerId === source.binding.ownerId
