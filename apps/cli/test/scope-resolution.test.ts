@@ -8,8 +8,7 @@ import test from 'node:test';
 import { AgentRun, CaptureRun, DEFAULT_BUDGET } from '@euler/core';
 import { pumpAgent } from '../src/agent-pump.ts';
 import type { ModelReply } from '@euler/core';
-import { openMaintenanceStore } from '../src/backup.ts';
-import { readPurgeCarriers } from '../src/purge.ts';
+import { startCli, sendCommand } from '../src/process-driver.ts';
 import { createSessionSandbox, createSandboxSession } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 
@@ -176,6 +175,32 @@ test('bounded continuation and unavailable Info are restart-safe and do not spin
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('a bounded continuation does not read or validate payloads beyond its batch', () => {
+  const sandbox = createSessionSandbox(randomUUID(), randomUUID());
+  let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const records = ['first bounded candidate', 'next bounded candidate'].map(content => probe.store.rememberMemory(probe.activity,
+      { input: probe.archive.append(randomUUID(), '记住偏好：' + content), hostInfo: 'durable' }).record);
+    const projectId = randomUUID();
+    probe.store.confirmSessionProject(probe.activity, probe.archive.append(randomUUID(), '/bind ' + JSON.stringify({ projectId, root: null })), projectId, null);
+    probe.close(); probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
+    const original = db.prepare('SELECT job_id,payload_hash FROM capture_jobs WHERE record_id=?').get(records[1]!.recordId)!;
+    try {
+      db.exec('DROP TRIGGER immutable_capture_jobs_update');
+      db.function('euler_store_writer', () => 1);
+      db.prepare("UPDATE capture_jobs SET payload_hash='damaged' WHERE job_id=?").run(original.job_id!);
+      const first = probe.store.resumeProjectCaptures(probe.activity, 'durable', 1);
+      assert.equal(first.jobs.length, 1); assert.equal(first.more, true);
+      assert.equal(first.jobs[0]!.record!.recordId, records[0]!.recordId);
+      assert.equal(first.jobs[0]!.record!.lifecycle, 'active');
+      assert.throws(() => probe.store.resumeProjectCaptures(probe.activity, 'durable', 1), /capture-evidence-gap/);
+      db.prepare('UPDATE capture_jobs SET payload_hash=? WHERE job_id=?').run(original.payload_hash!, original.job_id!);
+    } finally { db.close(); }
+    assert.equal(probe.store.resumeProjectCaptures(probe.activity, 'durable', 1).jobs[0]!.record!.recordId, records[1]!.recordId);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 for (const typed of [false, true]) test(`resolved ${typed ? 'objective fact' : 'untyped job'} uses independent capture verification with original null-project evidence`, () => {
   const sandbox = createSessionSandbox(randomUUID(), randomUUID());
   let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
@@ -209,6 +234,7 @@ for (const typed of [false, true]) test(`resolved ${typed ? 'objective fact' : '
       assert.equal(probe.store.isCaptureOutput(probe.activity, raw), true);
       run.finishModel(attempt.attemptId, reply);
       assert.equal(probe.store.isCaptureOutput(probe.activity, raw), true);
+      assert.equal(probe.store.isCaptureOutput(probe.activity, { ...raw, hash: '0'.repeat(64), contentHash: '0'.repeat(64) }), true);
     };
     if (!typed) deliver({ text: JSON.stringify({ type: 'insight', content: 'scope capture evidence' }), calls: [], stop: 'end' });
     deliver({ text: '', calls: [{ id: 'find', name: 'source.search', arguments: { query: 'capture evidence' } }], stop: 'tools' });
@@ -224,39 +250,102 @@ for (const typed of [false, true]) test(`resolved ${typed ? 'objective fact' : '
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
-test('purge of one resolved memory retains the shared binding and independent resolved sibling', () => {
+for (const normalGoal of [false, true]) test(`purge of one resolved memory retains the shared binding and independent sibling, normal goal=${normalGoal}`, async () => {
   const sandbox = createSessionSandbox(randomUUID(), randomUUID());
-  let store: ReturnType<typeof openMaintenanceStore> | undefined;
+  let cli: ReturnType<typeof startCli> | undefined;
   try {
     const seed = spawnSync(process.execPath, ['--input-type=module', '-e', `
       import { randomUUID } from 'node:crypto';
       import { openSandbox } from './apps/cli/src/sandbox.ts';
       import { openProbe } from './apps/cli/src/probe.ts';
+      import { AgentRun, CaptureRun, DEFAULT_BUDGET } from '@euler/core';
+      import { pumpAgent } from './apps/cli/src/agent-pump.ts';
       const sandbox = openSandbox(process.argv[1]);
       let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
-      const goal = probe.archive.append(randomUUID(), 'shared task authority');
-      probe.store.transitionIntent(probe.activity, null, goal, { step: 'start', status: 'active' }, 'shared task authority');
-      for (const text of ['purge selected', 'independent sibling']) probe.store.rememberMemory(probe.activity,
-        { input: probe.archive.append(randomUUID(), '记住偏好：' + text), hostInfo: 'durable' });
+      const budget = { ...DEFAULT_BUDGET, contextLimit: 32000, maxTotalTokens: 256000, maxModelAttempts: 8 };
+      const route = { provider: 'synthetic', model: 'purge-scope', route: 'synthetic', authNamespace: 'synthetic', capability: 'standard' };
+      let goal, normal;
+      if (${normalGoal}) {
+        const { capability, ...agentRoute } = route;
+        const agent = new AgentRun(probe.store, probe.activity, { binding: probe.binding, source: probe.archive }, agentRoute, budget);
+        goal = agent.receive(randomUUID(), 'shared task authority');
+        await pumpAgent(agent, { recoverInfo: () => true, async *stream(request, signal, send) {
+          probe.transport.send(request.payload, send(request.payload));
+          yield { kind: 'complete', reply: { text: 'Completed synthetic task.', calls: [], stop: 'end' } };
+        }, async execute() { throw new Error('unexpected'); } });
+        normal = probe.store.queueCaptureBoundary(probe.activity, agent.runId);
+      } else {
+        goal = probe.archive.append(randomUUID(), 'shared task authority');
+        probe.store.transitionIntent(probe.activity, null, goal, { step: 'start', status: 'active' }, 'shared task authority');
+        probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：purge selected'), hostInfo: 'durable' });
+      }
+      probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：independent sibling'), hostInfo: 'durable' });
       const projectId = randomUUID();
       probe.store.confirmSessionProject(probe.activity, probe.archive.append(randomUUID(), '/bind ' + JSON.stringify({ projectId, root: null })), projectId, null);
       probe.close(); probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
       const jobs = probe.store.resumeProjectCaptures(probe.activity, 'durable').jobs;
+      if (normal) {
+        const create = () => new CaptureRun(probe.store, probe.store.claimCaptureJob(probe.activity, normal.jobId, budget, 30000),
+          probe.archive, { proposer: [route], verifier: [route] });
+        let run = create();
+        const deliver = reply => {
+          let request = run.nextModel();
+          if (!request && run.status().stage === 'verifying') { run = create(); request = run.nextModel(); }
+          const attempt = run.startModel(request, request.payload);
+          if (!run.maySend(attempt.attemptId, request.payload)) throw new Error('not-authorized');
+          probe.transport.send(request.payload, attempt); run.finishModel(attempt.attemptId, reply);
+        };
+        deliver({ text: JSON.stringify({ type: 'insight', content: 'purge selected' }), calls: [], stop: 'end' });
+        deliver({ text: '', calls: [{ id: 's', name: 'source.search', arguments: { query: 'shared task authority' } }], stop: 'tools' });
+        deliver({ text: '', calls: [{ id: 'e', name: 'source.expand', arguments: { eventId: goal.eventId, offset: 0, limit: 4096 } }], stop: 'tools' });
+        deliver({ text: JSON.stringify({ result: 'pass', evidence: [goal] }), calls: [], stop: 'end' });
+        jobs[0] = probe.store.readCaptureJob(probe.activity, normal.jobId);
+        if (jobs[0].record.verification !== 'verified') throw new Error(JSON.stringify(jobs[0]));
+      }
       probe.store.auditStore(probe.activity); probe.close(); console.log(JSON.stringify(jobs));
     `, sandbox.root], { encoding: 'utf8' });
     assert.equal(seed.status, 0, seed.stderr);
     const jobs = JSON.parse(seed.stdout.trim());
-    store = openMaintenanceStore(sandbox);
-    const coordinator = randomUUID(); store.beginMaintenance(coordinator);
-    assert.equal(store.acquireMaintenance(coordinator).acquired, true);
-    const preview = store.previewPurge(coordinator, jobs[0].record.recordId, readPurgeCarriers(sandbox, store, coordinator));
-    assert.deepEqual(preview.manifest.records.map(record => record.recordId), [jobs[0].record.recordId]);
-    assert.equal(preview.manifest.database.some(row => row.table === 'session_project_bindings'), false);
-    assert.equal(preview.manifest.database.find(row => row.table === 'capture_scope_resolutions')!.count, 1);
-    store.acknowledgePurgePresentation(coordinator, preview.token, preview.digest);
-    assert.equal(store.commitPurge(coordinator, store.receivePurgeInput(coordinator, preview.phrase), preview.token,
-      readPurgeCarriers(sandbox, store, coordinator)).status, 'logical-commit');
-  } finally { store?.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+    const beforeDb = new DatabaseSync(`${sandbox.root}/probe.sqlite`, { readOnly: true });
+    const originalOrdinals = beforeDb.prepare('SELECT source_event_id,ordinal FROM source_appends').all();
+    const frozenCut = beforeDb.prepare('SELECT source_cut FROM session_project_bindings').get()!.source_cut;
+    beforeDb.close();
+    cli = startCli(['purge', '--sandbox', sandbox.root, '--record', jobs[0].record.recordId]);
+    const preview = await cli.waitFor('purge-preview');
+    const manifest = preview.manifest as { records: { recordId: string }[]; database: { table: string; count: number }[] };
+    assert.deepEqual(manifest.records.map(record => record.recordId), [jobs[0].record.recordId]);
+    assert.equal(manifest.database.some(row => row.table === 'session_project_bindings'), false);
+    assert.equal(manifest.database.find(row => row.table === 'capture_scope_resolutions')!.count, 1);
+    assert.equal((await sendCommand(cli, String(preview.phrase), 'purge-result')).status, 'logical-commit');
+    assert.equal((await sendCommand(cli, 'cleanup', 'purge-result')).status, 'controlled-complete');
+    assert.equal((await cli.exit).code, 0);
+    const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    try {
+      probe.store.auditStore(probe.activity);
+      assert.equal(probe.store.inspectMemory(probe.activity, jobs[1].record.recordId).record.lifecycle, 'active');
+      assert.throws(() => probe.store.inspectMemory(probe.activity, jobs[0].record.recordId), /memory-evidence-gap/);
+      probe.store.rebuildSearchProjection(probe.activity);
+      assert.equal(probe.store.searchMemories(probe.activity, { query: 'independent sibling' }).results.length, 1);
+      const projectId = probe.binding.projectId!;
+      probe.store.confirmSessionProject(probe.activity, probe.archive.append(randomUUID(), '/bind ' + JSON.stringify({ projectId, root: null })), projectId, null);
+      assert.deepEqual(probe.store.resumeProjectCaptures(probe.activity, 'durable'), { jobs: [], more: false });
+      probe.store.auditStore(probe.activity);
+      const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`, { readOnly: true });
+      try {
+        assert.equal(db.prepare('SELECT source_cut FROM session_project_bindings').get()!.source_cut, frozenCut);
+        const greatest = Math.max(...originalOrdinals.map(row => Number(row.ordinal)));
+        for (const row of db.prepare('SELECT source_event_id,ordinal FROM source_appends').all()) {
+          const original = originalOrdinals.find(original => original.source_event_id === row.source_event_id);
+          if (original) assert.equal(row.ordinal, original.ordinal);
+          else assert.ok(Number(row.ordinal) > greatest);
+        }
+      } finally { db.close(); }
+      if (normalGoal) assert.equal(readFileSync(`${sandbox.root}/session.jsonl`, 'utf8').includes('shared task authority'), false);
+    } finally { probe.close(); }
+  } finally {
+    if (cli && cli.child.exitCode === null && cli.child.signalCode === null) { cli.child.kill(); await cli.exit; }
+    rmSync(sandbox.root, { recursive: true, force: true });
+  }
 });
 
 test('same-project record expansion is exact-source authorized, without cross-session raw access', () => {
@@ -297,6 +386,22 @@ test('owner backfill uses the original reservation task instead of the current r
     const result = probe.store.resumeProjectCaptures(probe.activity, 'durable');
     assert.deepEqual(result.jobs.map(job => job.record!.recordId), [currentRecord.recordId]);
     assert.equal(probe.store.inspectMemory(probe.activity, oldRecord.recordId).record.scope.resolved, false);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('typed task ownership rejects nonexistent task references at the database boundary', () => {
+  const sandbox = createSessionSandbox(randomUUID(), randomUUID());
+  const probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const source = probe.archive.append(randomUUID(), 'typed source task');
+    const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
+    try {
+      db.function('euler_store_writer', () => 1);
+      db.exec('PRAGMA foreign_keys=ON');
+      assert.throws(() => db.prepare('UPDATE source_appends SET task_id=? WHERE source_event_id=?').run(randomUUID(), source.eventId), /append-only/);
+      db.exec('DROP TRIGGER immutable_source_appends_update');
+      assert.throws(() => db.prepare('UPDATE source_appends SET task_id=? WHERE source_event_id=?').run(randomUUID(), source.eventId), /FOREIGN KEY constraint failed/);
+    } finally { db.close(); }
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
@@ -349,12 +454,17 @@ test('a modified original head is visibly blocked rather than resolved or reacti
   try {
     const before = probe.store.rememberMemory(probe.activity, { input: probe.archive.append(randomUUID(), '记住偏好：original candidate'), hostInfo: 'durable' }).record;
     const changed = probe.store.correctMemory(probe.activity, before.recordId, before, probe.archive.append(randomUUID(), 'corrected candidate'), 'corrected candidate').record;
+    const reverification = probe.store.queueMemoryVerification(probe.activity, changed.recordId, changed);
     const projectId = randomUUID();
     probe.store.confirmSessionProject(probe.activity, probe.archive.append(randomUUID(), '/bind ' + JSON.stringify({ projectId, root: null })), projectId, null);
     probe.close(); probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
     assert.deepEqual(probe.store.resumeProjectCaptures(probe.activity, 'durable'), { jobs: [], more: false });
     assert.deepEqual(probe.store.inspectMemory(probe.activity, before.recordId).record, changed);
     assert.equal(probe.store.listCaptureJobs(probe.activity)[0]!.reason, 'later-memory-change');
+    const queued = probe.store.readCaptureJob(probe.activity, reverification.jobId);
+    assert.equal(queued.stage, 'blocked');
+    assert.equal(queued.reason, 'later-memory-change');
+    assert.equal(probe.store.claimCaptureJob(probe.activity, reverification.jobId, DEFAULT_BUDGET, 30000), null);
     assert.deepEqual(probe.store.resumeProjectCaptures(probe.activity, 'durable'), { jobs: [], more: false });
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });

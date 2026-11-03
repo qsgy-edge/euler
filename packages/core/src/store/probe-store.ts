@@ -109,7 +109,6 @@ export interface MemoryComparison {
 }
 type MemorySourceCheck = Map<string, 'checking' | 'checked'>;
 
-interface CaptureTask { intentId: string; eventId: string; hash: string }
 interface CaptureScopeResolution {
   schema: 'capture-scope-resolution@1'; jobId: string; sessionId: string; scope: MemoryScope;
   range: SourceAck[]; recordId: string | null; originalHeadId: string | null;
@@ -328,10 +327,25 @@ CREATE TABLE sessions (
   source_path TEXT NOT NULL UNIQUE, source_dev TEXT NOT NULL, source_ino TEXT NOT NULL,
   UNIQUE(session_id,branch_id), UNIQUE(session_id,branch_id,project_id)
 ) STRICT;
+CREATE TABLE intent_tasks (
+  task_ordinal INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL UNIQUE,
+  session_id TEXT NOT NULL, branch_id TEXT NOT NULL,
+  content_state TEXT NOT NULL DEFAULT 'intact' CHECK(content_state IN ('intact','purged')),
+  UNIQUE(session_id,task_id), UNIQUE(session_id,branch_id,task_id),
+  FOREIGN KEY(session_id,branch_id) REFERENCES sessions(session_id,branch_id)
+) STRICT;
+CREATE INDEX intent_tasks_current ON intent_tasks(session_id,task_ordinal DESC);
+CREATE TRIGGER immutable_intent_tasks_update BEFORE UPDATE ON intent_tasks
+WHEN euler_purge_writer()!=1 OR NEW.task_ordinal IS NOT OLD.task_ordinal OR NEW.task_id IS NOT OLD.task_id
+  OR NEW.session_id IS NOT OLD.session_id OR NEW.branch_id IS NOT OLD.branch_id
+  OR OLD.content_state!='intact' OR NEW.content_state!='purged'
+BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER immutable_intent_tasks_delete BEFORE DELETE ON intent_tasks BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TABLE session_project_bindings (
   session_id TEXT PRIMARY KEY REFERENCES sessions(session_id), project_id TEXT NOT NULL REFERENCES projects(project_id),
   confirmation TEXT NOT NULL, confirmation_hash TEXT NOT NULL, root_json TEXT,
-  task_json TEXT NOT NULL, source_cut INTEGER NOT NULL, authority_hash TEXT NOT NULL
+  task_id TEXT, source_cut INTEGER NOT NULL CHECK(source_cut>=0), authority_hash TEXT NOT NULL,
+  FOREIGN KEY(session_id,task_id) REFERENCES intent_tasks(session_id,task_id)
 ) STRICT;
 CREATE VIEW session_scopes AS SELECT s.session_id,s.branch_id,s.store_id,s.owner_id,s.host_id,
   coalesce(s.project_id,b.project_id) AS project_id,s.source_path,s.source_dev,s.source_ino
@@ -347,8 +361,10 @@ CREATE TABLE intent_events (
   transition_hash TEXT NOT NULL, snapshot TEXT NOT NULL, hash TEXT NOT NULL, request_json TEXT NOT NULL,
   UNIQUE(session_id, branch_id, version), UNIQUE(session_id, branch_id, input_event_id),
   UNIQUE(session_id,branch_id,event_id), FOREIGN KEY(session_id,branch_id) REFERENCES sessions(session_id,branch_id),
-  FOREIGN KEY(session_id,branch_id,expected_event_id) REFERENCES intent_events(session_id,branch_id,event_id)
+  FOREIGN KEY(session_id,branch_id,expected_event_id) REFERENCES intent_events(session_id,branch_id,event_id),
+  FOREIGN KEY(session_id,branch_id,intent_id) REFERENCES intent_tasks(session_id,branch_id,task_id)
 ) STRICT;
+CREATE INDEX intent_events_task ON intent_events(session_id,intent_id);
 CREATE TABLE intent_heads (
   session_id TEXT NOT NULL, branch_id TEXT NOT NULL,
   event_id TEXT NOT NULL REFERENCES intent_events(event_id), PRIMARY KEY(session_id, branch_id),
@@ -476,9 +492,14 @@ CREATE TABLE capture_jobs (
   job_id TEXT PRIMARY KEY, source_event_id TEXT NOT NULL, record_id TEXT UNIQUE REFERENCES memory_records(record_id),
   status TEXT NOT NULL CHECK(status IN ('pending','captured','complete')), payload TEXT NOT NULL, payload_hash TEXT NOT NULL, created_at TEXT NOT NULL,
   source_owner TEXT NOT NULL REFERENCES sessions(session_id), consumer TEXT NOT NULL DEFAULT 'memory' CHECK(consumer IN ('memory','historian')),
-  UNIQUE(source_owner,source_event_id,consumer), CHECK((status='pending')=(record_id IS NULL))
+  task_id TEXT, task_input_event_id TEXT,
+  UNIQUE(source_owner,source_event_id,consumer), CHECK((status='pending')=(record_id IS NULL)),
+  CHECK(task_input_event_id IS NULL OR task_id IS NOT NULL),
+  FOREIGN KEY(source_owner,task_id) REFERENCES intent_tasks(session_id,task_id),
+  FOREIGN KEY(source_owner,task_input_event_id) REFERENCES source_appends(source_owner,source_event_id)
 ) STRICT;
 CREATE INDEX capture_jobs_consumer ON capture_jobs(source_owner,consumer,json_extract(payload,'$.runId'));
+CREATE INDEX capture_jobs_task ON capture_jobs(source_owner,consumer,task_id);
 CREATE TABLE compartments (
   job_id TEXT PRIMARY KEY REFERENCES capture_jobs(job_id), source_json TEXT NOT NULL,
   attempt_id TEXT NOT NULL REFERENCES request_attempts(attempt_id), hash TEXT NOT NULL
@@ -487,8 +508,15 @@ CREATE TABLE capture_scope_resolutions (
   job_id TEXT PRIMARY KEY REFERENCES capture_jobs(job_id), session_id TEXT NOT NULL REFERENCES session_project_bindings(session_id),
   project_id TEXT NOT NULL REFERENCES projects(project_id), record_id TEXT REFERENCES memory_records(record_id),
   original_head_id TEXT REFERENCES memory_events(event_id), resolution_event_id TEXT REFERENCES memory_events(event_id) DEFERRABLE INITIALLY DEFERRED,
-  payload TEXT NOT NULL, payload_hash TEXT NOT NULL
+  payload TEXT NOT NULL, payload_hash TEXT NOT NULL, UNIQUE(job_id,session_id)
 ) STRICT;
+CREATE TABLE capture_scope_sources (
+  job_id TEXT NOT NULL, ordinal INTEGER NOT NULL CHECK(ordinal>=0), source_owner TEXT NOT NULL, source_event_id TEXT NOT NULL,
+  PRIMARY KEY(job_id,ordinal), UNIQUE(job_id,source_owner,source_event_id),
+  FOREIGN KEY(job_id,source_owner) REFERENCES capture_scope_resolutions(job_id,session_id),
+  FOREIGN KEY(source_owner,source_event_id) REFERENCES source_appends(source_owner,source_event_id)
+) STRICT;
+CREATE INDEX capture_scope_source_lookup ON capture_scope_sources(source_owner,source_event_id);
 CREATE TABLE capture_work (
   job_id TEXT PRIMARY KEY REFERENCES capture_jobs(job_id), stage TEXT NOT NULL CHECK(stage IN ('pending','proposing','verifying','comparing','complete','blocked','unknown')),
   reason TEXT, record_id TEXT REFERENCES memory_records(record_id), expected_head_id TEXT REFERENCES memory_events(event_id),
@@ -638,15 +666,17 @@ CREATE TABLE host_info_batches (
   CHECK((read_state='unread' AND read_at IS NULL) OR (read_state='read' AND read_at IS NOT NULL AND delivery='delivered'))
 ) STRICT;
 CREATE TABLE source_appends (
+  ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
   source_owner TEXT NOT NULL REFERENCES sessions(session_id), source_event_id TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('pending','durable')), payload TEXT NOT NULL, payload_hash TEXT NOT NULL,
-  task_json TEXT NOT NULL, task_hash TEXT NOT NULL,
-  PRIMARY KEY(source_owner,source_event_id)
+  task_id TEXT, task_hash TEXT NOT NULL,
+  UNIQUE(source_owner,source_event_id),
+  FOREIGN KEY(source_owner,task_id) REFERENCES intent_tasks(session_id,task_id)
 ) STRICT;
 CREATE UNIQUE INDEX one_source_append_pending ON source_appends(source_owner) WHERE status='pending';
 CREATE TRIGGER immutable_source_appends_update BEFORE UPDATE ON source_appends
 WHEN NEW.source_owner IS NOT OLD.source_owner OR NEW.source_event_id IS NOT OLD.source_event_id
-  OR NEW.task_json IS NOT OLD.task_json OR NEW.task_hash IS NOT OLD.task_hash
+  OR NEW.ordinal IS NOT OLD.ordinal OR NEW.task_id IS NOT OLD.task_id OR NEW.task_hash IS NOT OLD.task_hash
   OR OLD.status!='pending' OR NEW.status!='durable'
 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_source_appends_delete BEFORE DELETE ON source_appends WHEN euler_purge_writer()!=1
@@ -778,10 +808,10 @@ CREATE TRIGGER immutable_search_projection_jobs_update BEFORE UPDATE ON search_p
 CREATE TRIGGER immutable_search_projection_jobs_delete BEFORE DELETE ON search_projection_jobs WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE INDEX memory_heads_eligibility ON memory_heads(lifecycle, verification, scope_kind, scope_id, scope_resolved);
 PRAGMA user_version=30;
-` + ['capture_scope_resolutions','session_project_bindings','workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts','store_recovery_events','store_recovered_owners'].map(table => `
+` + ['capture_scope_sources','capture_scope_resolutions','session_project_bindings','workspaces','workspace_projects','memory_discovery_projects','memory_discovery_targets','presentation_targets','activation_batches','schema_meta','sessions','execution_streams','execution_events','memory_applicability','request_events','projects','project_resources','memory_scopes','conflict_sets','conflict_members','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','source_query_receipts','store_recovery_events','store_recovered_owners'].map(table => `
 CREATE TRIGGER immutable_${table}_update BEFORE UPDATE ON ${table} ${['request_events','execution_events','execution_streams','store_recovery_events'].includes(table) ? 'WHEN euler_purge_writer()!=1 ' : ''}BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER immutable_${table}_delete BEFORE DELETE ON ${table} WHEN euler_purge_writer()!=1 BEGIN SELECT RAISE(ABORT,'append-only'); END;
-`).join('') + ['capture_scope_resolutions','session_project_bindings','memory_heads','intent_heads','owner_fences','host_operation_delivery','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
+`).join('') + ['capture_scope_sources','intent_tasks','capture_scope_resolutions','session_project_bindings','memory_heads','intent_heads','owner_fences','host_operation_delivery','workspaces','workspace_projects','host_presentations','pending_operations','presentation_targets','activation_batches','schema_meta','sessions','intent_events','owner_activities','maintenance_residuals','execution_streams','execution_events','request_runs','request_events','request_assemblies','request_attempts','memory_records','memory_revisions','memory_events','memory_applicability','capture_jobs','provenance_refs',
   'verification_runs','verification_evidence','proposal_evidence','proposal_source_units','projection_jobs','feedback_events','search_projection_jobs','source_projection_jobs','conflict_sets','conflict_members','evolution_proposals','memory_discovery_grants','memory_discovery_targets','source_appends','source_units','source_query_receipts','host_info_batches','capture_work','compartments','store_snapshots','store_restores','store_recovery_events','store_recovered_owners'].map(table => `
 CREATE TRIGGER owned_${table}_insert BEFORE INSERT ON ${table}
 WHEN euler_store_writer()!=1 BEGIN SELECT RAISE(ABORT,'store-owned-identity'); END;
@@ -968,9 +998,8 @@ export class ProbeStore {
       this.#db.prepare('INSERT OR IGNORE INTO memory_scopes(kind,scope_id,resolved,owner_id,project_id,session_id) VALUES (?,?,?,?,?,?)')
         .run('project', projectId, 1, this.#binding.ownerId, projectId, null);
       const payload = JSON.stringify(confirmation), rootJson = root ? JSON.stringify(root) : null;
-      const intent = this.readIntent(activity);
-      const task = JSON.stringify(intent ? { intentId: intent.intentId, eventId: intent.eventId, hash: intent.hash } : null);
-      const cut = Number(this.#db.prepare('SELECT coalesce(max(rowid),0) AS cut FROM source_appends WHERE source_owner=?')
+      const task = this.#currentCaptureTask(this.#binding.sessionId);
+      const cut = Number(this.#db.prepare('SELECT coalesce(max(ordinal),0) AS cut FROM source_appends WHERE source_owner=?')
         .get(this.#binding.sessionId)!.cut);
       this.#db.prepare('INSERT INTO session_project_bindings VALUES (?,?,?,?,?,?,?,?)')
         .run(this.#binding.sessionId, projectId, payload, this.#confirmationHash(payload, rootJson), rootJson, task, cut,
@@ -1437,11 +1466,10 @@ export class ProbeStore {
         check(JSON.stringify(pending[0]) === payload, 'archive-append-pending');
         return structuredClone(input);
       }
-      const intent = this.readIntent(activity);
-      const task = JSON.stringify({ source_owner: input.binding.sessionId, source_event_id: input.eventId,
-        sourceHash: sha256(input.bytes.slice(0, -1)), task: intent ? { intentId: intent.intentId, eventId: intent.eventId, hash: intent.hash } : null });
-      this.#db.prepare("INSERT INTO source_appends VALUES (?,?,'pending',?,?,?,?)")
-        .run(input.binding.sessionId, input.eventId, payload, sha256(payload), task, sha256(task));
+      const task = this.#currentCaptureTask(input.binding.sessionId);
+      const taskHash = sha256(JSON.stringify([input.binding.sessionId, input.eventId, sha256(input.bytes.slice(0, -1)), task]));
+      this.#db.prepare("INSERT INTO source_appends VALUES (NULL,?,?,'pending',?,?,?,?)")
+        .run(input.binding.sessionId, input.eventId, payload, sha256(payload), task, taskHash);
       return structuredClone(input);
     });
   }
@@ -2584,6 +2612,8 @@ export class ProbeStore {
       };
       const bytes = JSON.stringify(snapshot);
       const hash = sha256(bytes);
+      if (!current || newTask) this.#db.prepare('INSERT INTO intent_tasks(task_id,session_id,branch_id) VALUES (?,?,?)')
+        .run(snapshot.intentId, this.#binding.sessionId, this.#binding.branchId);
       this.#db.prepare('INSERT INTO intent_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(snapshot.eventId, snapshot.intentId, snapshot.version, this.#binding.sessionId, this.#binding.branchId,
           input.eventId, expected, snapshot.status, input.hash, input.contentHash, input.locator, input.byteLength,
@@ -2675,8 +2705,19 @@ export class ProbeStore {
       const jobId = randomUUID();
       const payload = JSON.stringify({ schema: 'capture-job@1', source, range, scope, ownerId: this.#binding.ownerId,
         recordId: null, lane: 'normal-capture', boundary: attemptId ? 'react-complete' : 'task-complete', runId, reason: 'proposer-required' });
-      this.#db.prepare('INSERT INTO capture_jobs (job_id,source_event_id,record_id,status,payload,payload_hash,created_at,source_owner) VALUES (?,?,?,?,?,?,?,?)').run(jobId, source.eventId, null, 'pending',
-        payload, sha256(payload), new Date().toISOString(), source.binding.sessionId);
+      const task = this.#sourceCaptureTask(source)?.task;
+      const taskInput = task == null ? null : range.find(ref => {
+        const stamp = this.#sourceCaptureTask(ref);
+        return stamp !== null && stamp.task !== task && state.inputs.some(input => sameSourceAck(input.source, ref))
+          && ledger.assemblies.some(assembly => {
+            if (!assembly.intent || !assembly.sources.some(input => sameSourceAck(input, ref))) return false;
+            const intent = this.#db.prepare('SELECT * FROM intent_events WHERE event_id=? AND session_id=?')
+              .get(assembly.intent.eventId, source.binding.sessionId);
+            return intent?.intent_id === task && intent.hash === assembly.intent.hash
+              && sameSourceAck(this.#readIntentSnapshot(intent, this.#binding).goalInput, ref);
+          });
+      }) ?? null;
+      this.#insertCaptureJob(jobId, source, null, 'pending', payload, 'memory', taskInput);
       return this.#captureJob(jobId);
     });
   }
@@ -2734,8 +2775,7 @@ export class ProbeStore {
       const payload = JSON.stringify({ schema: 'capture-job@1', source, range, scope, ownerId: this.#binding.ownerId,
         recordId: null, lane: 'historian', runId, firstResponse, endResponse, rawHash: sha256(JSON.stringify(range)),
         boundary: state.terminal === 'completed' ? 'task-complete' : 'prefix-complete', reason: 'historian-required' });
-      this.#db.prepare('INSERT INTO capture_jobs VALUES (?,?,?,?,?,?,?,?,?)').run(jobId, source.eventId, null, 'pending',
-        payload, sha256(payload), new Date().toISOString(), source.binding.sessionId, 'historian');
+      this.#insertCaptureJob(jobId, source, null, 'pending', payload, 'historian');
       return this.#captureJob(jobId);
     });
   }
@@ -2874,8 +2914,7 @@ export class ProbeStore {
         .filter((ref, index, refs) => refs.findIndex(other => sameSourceAck(ref, other)) === index);
       const payload = JSON.stringify({ schema: 'capture-job@1', source, range, scope: record.scope,
         ownerId: this.#binding.ownerId, recordId, lane: 'reverification', expectedHead: record.headEventId, reason: 'reverification-required' });
-      this.#db.prepare('INSERT INTO capture_jobs (job_id,source_event_id,record_id,status,payload,payload_hash,created_at,source_owner) VALUES (?,?,?,?,?,?,?,?)').run(jobId, source.eventId, null, 'pending', payload,
-        sha256(payload), new Date().toISOString(), source.binding.sessionId);
+      this.#insertCaptureJob(jobId, source, null, 'pending', payload);
       return this.#captureJob(jobId);
     });
   }
@@ -2883,58 +2922,60 @@ export class ProbeStore {
   #bindingAuthority(sessionId: string) {
     const row = this.#db.prepare('SELECT * FROM session_project_bindings WHERE session_id=?').get(sessionId);
     check(row && sha256(JSON.stringify([sessionId, row.project_id, row.confirmation, row.root_json,
-      row.task_json, Number(row.source_cut)])) === row.authority_hash, 'scope-resolution-evidence-gap');
+      row.task_id, Number(row.source_cut)])) === row.authority_hash, 'scope-resolution-evidence-gap');
     check(this.#confirmationHash(String(row.confirmation), row.root_json === null ? null : String(row.root_json)) === row.confirmation_hash,
       'session-project-evidence-gap');
     const confirmation = JSON.parse(String(row.confirmation)) as SourceAck;
     this.#checkConfirmation(confirmation, String(row.project_id), row.root_json === null ? null : JSON.parse(String(row.root_json)), confirmation.binding);
-    const task = JSON.parse(String(row.task_json)) as CaptureTask | null;
+    const task = row.task_id as string | null;
     this.#checkCaptureTask(task, sessionId);
     return { row, task, projectId: String(row.project_id), cut: Number(row.source_cut) };
   }
 
-  #checkCaptureTask(task: CaptureTask | null, sessionId: string): void {
-    if (task === null) return;
-    const event = this.#db.prepare('SELECT * FROM intent_events WHERE event_id=? AND session_id=?').get(task.eventId, sessionId);
-    check(event && event.intent_id === task.intentId && event.hash === task.hash
-      && sha256(String(event.snapshot)) === task.hash, 'scope-task-evidence-gap');
+  #currentCaptureTask(sessionId: string): string | null {
+    const row = this.#db.prepare('SELECT task_id FROM intent_tasks WHERE session_id=? ORDER BY task_ordinal DESC LIMIT 1').get(sessionId);
+    return row ? String(row.task_id) : null;
   }
 
-  #sourceCaptureTask(ref: SourceAck): { task: CaptureTask | null; ordinal: number } | null {
-    const row = this.#db.prepare("SELECT rowid AS ordinal,* FROM source_appends WHERE source_owner=? AND source_event_id=? AND status='durable'")
+  #checkCaptureTask(task: string | null, sessionId: string): void {
+    if (task === null) return;
+    const row = this.#db.prepare('SELECT content_state FROM intent_tasks WHERE session_id=? AND task_id=?').get(sessionId, task);
+    check(row && (row.content_state === 'purged'
+      || this.#db.prepare('SELECT 1 FROM intent_events WHERE session_id=? AND intent_id=? LIMIT 1').get(sessionId, task)), 'scope-task-evidence-gap');
+  }
+
+  #sourceCaptureTask(ref: SourceAck): { task: string | null; ordinal: number } | null {
+    const row = this.#db.prepare("SELECT * FROM source_appends WHERE source_owner=? AND source_event_id=? AND status='durable'")
       .get(ref.binding.sessionId, ref.eventId);
     if (!row) return null;
-    check(sha256(String(row.task_json)) === row.task_hash && sha256(String(row.payload)) === row.payload_hash
-      && sameSourceAck(JSON.parse(String(row.payload)), ref), 'scope-task-evidence-gap');
-    const stamp = JSON.parse(String(row.task_json)) as { source_owner: string; source_event_id: string; sourceHash: string; task: CaptureTask | null };
-    check(stamp.source_owner === ref.binding.sessionId && stamp.source_event_id === ref.eventId && stamp.sourceHash === ref.hash,
-      'scope-task-evidence-gap');
-    this.#checkCaptureTask(stamp.task, ref.binding.sessionId);
-    return { task: stamp.task, ordinal: Number(row.ordinal) };
+    const task = row.task_id as string | null;
+    check(sha256(JSON.stringify([ref.binding.sessionId, ref.eventId, ref.hash, task])) === row.task_hash
+      && sha256(String(row.payload)) === row.payload_hash && sameSourceAck(JSON.parse(String(row.payload)), ref), 'scope-task-evidence-gap');
+    this.#checkCaptureTask(task, ref.binding.sessionId);
+    return { task, ordinal: Number(row.ordinal) };
   }
 
-  #coveredCaptureSource(ref: SourceAck, authority: { row: Record<string, unknown>; task: CaptureTask | null; projectId: string; cut: number }, jobId: string): boolean {
+  #insertCaptureJob(jobId: string, source: SourceAck, recordId: string | null, status: 'pending' | 'complete',
+    payload: string, consumer: CaptureJob['consumer'] = 'memory', taskInput: SourceAck | null = null): void {
+    const task = this.#sourceCaptureTask(source)?.task ?? null;
+    const bytes = JSON.stringify({ ...JSON.parse(payload), taskId: task, taskInput });
+    this.#db.prepare('INSERT INTO capture_jobs VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+      .run(jobId, source.eventId, recordId, status, bytes, sha256(bytes), new Date().toISOString(), source.binding.sessionId,
+        consumer, task, taskInput?.eventId ?? null);
+  }
+
+  #coveredCaptureSource(ref: SourceAck, authority: { row: Record<string, unknown>; task: string | null; projectId: string; cut: number }, jobId: string): boolean {
     const stamp = this.#sourceCaptureTask(ref);
     if (!stamp || ref.binding.sessionId !== authority.row.session_id || ref.binding.projectId !== null || stamp.ordinal > authority.cut) return false;
-    if ((stamp.task?.intentId ?? null) === (authority.task?.intentId ?? null)) return true;
-    // A run's first input necessarily predates creation of its intent. Only that
-    // trusted input/run chain can override the original stamp, never owner backfill.
-    const job = this.#db.prepare('SELECT payload,payload_hash FROM capture_jobs WHERE job_id=?').get(jobId);
+    if (stamp.task === authority.task) return true;
+    // The normal boundary freezes its verified first-input/intent relation before
+    // any later purge can remove the foreground ledger. Owner backfill has no such edge.
+    const job = this.#db.prepare('SELECT * FROM capture_jobs WHERE job_id=?').get(jobId);
     check(job && sha256(String(job.payload)) === job.payload_hash, 'capture-evidence-gap');
     const payload = JSON.parse(String(job.payload));
-    if (payload.lane !== 'normal-capture' || !authority.task || !payload.runId) return false;
-    const run = this.#db.prepare('SELECT * FROM request_runs WHERE run_id=? AND redacted=0').get(payload.runId);
-    if (!run || run.owner_kind !== 'session' || run.owner_id !== ref.binding.sessionId) return false;
-    const ledger = this.#readRequestLedger(this.#requestRun({ streamId: String(run.stream_id) }, String(run.run_id)));
-    if (!ledger.events.some(event => event.kind === 'agent/event@v1'
-      && JSON.parse(event.payload).event.kind === 'input' && sameSourceAck(JSON.parse(event.payload).event.source, ref))) return false;
-    return ledger.assemblies.some(assembly => {
-      if (!assembly.intent || !assembly.sources.some(source => sameSourceAck(source, ref))) return false;
-      const intent = this.#db.prepare('SELECT * FROM intent_events WHERE event_id=? AND session_id=?')
-        .get(assembly.intent.eventId, ref.binding.sessionId);
-      if (!intent || intent.intent_id !== authority.task!.intentId || intent.hash !== assembly.intent.hash) return false;
-      return sameSourceAck(this.#readIntentSnapshot(intent, { ...ref.binding, projectId: authority.projectId }).goalInput, ref);
-    });
+    return payload.lane === 'normal-capture' && job.task_id === authority.task && job.task_input_event_id === ref.eventId
+      && job.source_owner === ref.binding.sessionId && payload.taskId === job.task_id && payload.taskInput
+      && sameSourceAck(payload.taskInput, ref);
   }
 
   #scopeResolution(jobId: string): CaptureScopeResolution | null {
@@ -2951,6 +2992,9 @@ export class ProbeStore {
       && value.recordId === row.record_id && value.originalHeadId === row.original_head_id && value.eventId === row.resolution_event_id
       && JSON.stringify(value.range) === JSON.stringify(payload.range ?? [payload.source])
       && value.range.length > 0 && value.range.every(ref => this.#coveredCaptureSource(ref, authority, jobId)), 'scope-resolution-evidence-gap');
+    const sources = this.#db.prepare('SELECT * FROM capture_scope_sources WHERE job_id=? ORDER BY ordinal').all(jobId);
+    check(sources.length === value.range.length && sources.every((source, index) => source.ordinal === index
+      && source.source_owner === value.range[index]!.binding.sessionId && source.source_event_id === value.range[index]!.eventId), 'scope-resolution-evidence-gap');
     for (const ref of value.range) this.#archiveRef(ref);
     if (value.recordId !== null) {
       const event = this.#db.prepare("SELECT * FROM memory_events WHERE event_id=? AND record_id=? AND kind='resolve-scope'")
@@ -2970,11 +3014,10 @@ export class ProbeStore {
 
   #resolvedSource(ref: SourceAck, projectId: string): boolean {
     if (ref.binding.projectId !== null) return false;
-    for (const row of this.#db.prepare('SELECT job_id FROM capture_scope_resolutions WHERE session_id=? AND project_id=?')
-      .all(ref.binding.sessionId, projectId)) {
-      if (this.#scopeResolution(String(row.job_id))!.range.some(source => sameSourceAck(source, ref))) return true;
-    }
-    return false;
+    const row = this.#db.prepare(`SELECT s.job_id FROM capture_scope_sources s
+      JOIN capture_scope_resolutions r ON r.job_id=s.job_id
+      WHERE s.source_owner=? AND s.source_event_id=? AND r.project_id=? LIMIT 1`).get(ref.binding.sessionId, ref.eventId, projectId);
+    return !!row && this.#scopeResolution(String(row.job_id))!.range.some(source => sameSourceAck(source, ref));
   }
 
   #ownerSourceBinding(ref: SourceAck): boolean {
@@ -3001,25 +3044,31 @@ export class ProbeStore {
       this.#requestRecoveryGate(activity, null);
       check(!this.#db.prepare("SELECT 1 FROM request_runs WHERE stream_id=? AND state='authorized'").get(activity.streamId), 'project-binding-run-active');
       const authority = this.#bindingAuthority(this.#binding.sessionId);
-      const eligible = () => this.#db.prepare(`SELECT j.*,w.stage AS work_stage,w.reason AS work_reason,w.lease_until FROM capture_jobs j
-        LEFT JOIN capture_work w ON w.job_id=j.job_id WHERE j.source_owner=? AND j.consumer='memory'
-        AND NOT EXISTS(SELECT 1 FROM store_recovered_owners r WHERE r.kind='job' AND r.owner_id=j.job_id) ORDER BY j.rowid`)
-        .all(this.#binding.sessionId).filter(row => {
-          if (Number(row.lease_until ?? 0) > Date.now()) return false;
-          check(sha256(String(row.payload)) === row.payload_hash, 'capture-evidence-gap');
-          const payload = JSON.parse(String(row.payload));
-          if (this.#db.prepare('SELECT 1 FROM capture_scope_resolutions WHERE job_id=?').get(row.job_id!))
-            return row.work_reason === 'host-info-unavailable' && hostInfo === 'durable';
-          if (row.work_stage && !['pending','blocked'].includes(String(row.work_stage))) return false;
-          if (row.work_reason && !['scope-unresolved','memory-type-required','capture-route-unavailable','host-info-unavailable'].includes(String(row.work_reason))) return false;
-          return (payload.range ?? [payload.source]).every((ref: SourceAck) => this.#coveredCaptureSource(ref, authority, String(row.job_id)));
-        });
+      const eligible = this.#db.prepare(`SELECT j.job_id FROM capture_jobs j
+        JOIN source_appends a ON a.source_owner=j.source_owner AND a.source_event_id=j.source_event_id
+        LEFT JOIN capture_work w ON w.job_id=j.job_id
+        LEFT JOIN capture_scope_resolutions r ON r.job_id=j.job_id
+        WHERE j.source_owner=? AND j.consumer='memory' AND j.task_id IS ? AND a.ordinal<=?
+          AND json_extract(j.payload,'$.source.binding.projectId') IS NULL AND coalesce(w.lease_until,0)<=?
+          AND NOT EXISTS(SELECT 1 FROM store_recovered_owners recovered WHERE recovered.kind='job' AND recovered.owner_id=j.job_id)
+          AND ((r.job_id IS NOT NULL AND w.reason='host-info-unavailable' AND ?=1)
+            OR (r.job_id IS NULL AND (w.stage IS NULL OR w.stage IN ('pending','blocked'))
+              AND (w.reason IS NULL OR w.reason IN ('scope-unresolved','memory-type-required','capture-route-unavailable','host-info-unavailable'))))
+        ORDER BY j.rowid LIMIT ?`);
+      const parameters = [this.#binding.sessionId, authority.task, authority.cut, Date.now(), hostInfo === 'durable' ? 1 : 0] as const;
       const jobs: CaptureJob[] = [];
-      for (const row of eligible().slice(0, limit)) {
-        const jobId = String(row.job_id), payload = JSON.parse(String(row.payload));
+      for (const candidate of eligible.all(...parameters, limit)) {
+        const jobId = String(candidate.job_id), { row, payload } = this.#readCaptureJobMetadata(jobId, this.#binding);
+        if (!(payload.range ?? [payload.source]).every((ref: SourceAck) => this.#coveredCaptureSource(ref, authority, jobId))) {
+          this.#db.prepare(`INSERT INTO capture_work(job_id,stage,reason,lease_until,generation,deadline)
+            VALUES (?,'blocked','scope-confirmation-not-covered',0,1,0)
+            ON CONFLICT(job_id) DO UPDATE SET stage='blocked',reason='scope-confirmation-not-covered'`).run(jobId);
+          continue;
+        }
         let resolution = this.#scopeResolution(jobId);
         if (!resolution) {
-          const before = row.record_id === null ? null : this.#readMemoryUnsafe(String(row.record_id));
+          const recordId = row.record_id ?? payload.recordId;
+          const before = recordId == null ? null : this.#readMemoryUnsafe(String(recordId));
           if (before && (before.lifecycle !== 'candidate' || before.scope.resolved || before.scope.kind !== 'session'
             || before.headEventId !== this.#capturedSnapshot(before.recordId).headEventId)) {
             this.#db.prepare(`INSERT INTO capture_work(job_id,stage,reason,record_id,expected_head_id,lease_until,generation,deadline)
@@ -3036,6 +3085,8 @@ export class ProbeStore {
           const json = JSON.stringify(resolution);
           this.#db.prepare('INSERT INTO capture_scope_resolutions VALUES (?,?,?,?,?,?,?,?)')
             .run(jobId, resolution.sessionId, scope.id, resolution.recordId, resolution.originalHeadId, resolution.eventId, json, sha256(json));
+          for (const [index, source] of resolution.range.entries())
+            this.#db.prepare('INSERT INTO capture_scope_sources VALUES (?,?,?,?)').run(jobId, index, source.binding.sessionId, source.eventId);
           if (after && before) {
             this.#insertRevision(after, resolution.range.filter(ref => !sameSourceAck(ref, after.source)));
             this.#appendMemoryEvent(before, after, 'resolve-scope', before.source.eventId, { jobId, lane: payload.lane },
@@ -3059,7 +3110,7 @@ export class ProbeStore {
         }
         jobs.push(this.#captureJob(jobId));
       }
-      return { jobs, more: eligible().length > 0 };
+      return { jobs, more: eligible.get(...parameters, 1) !== undefined };
     });
   }
 
@@ -3088,6 +3139,10 @@ export class ProbeStore {
     const row = this.#db.prepare('SELECT * FROM capture_jobs WHERE job_id=?').get(jobId);
     check(row && sha256(String(row.payload)) === row.payload_hash, 'capture-evidence-gap');
     const payload = JSON.parse(String(row.payload));
+    check(payload.taskId === row.task_id && (payload.taskInput?.eventId ?? null) === row.task_input_event_id
+      && (!payload.taskInput || payload.lane === 'normal-capture' && payload.taskInput.binding.sessionId === row.source_owner
+        && payload.range.some((ref: SourceAck) => sameSourceAck(ref, payload.taskInput))), 'capture-evidence-gap');
+    this.#checkCaptureTask(row.task_id as string | null, String(row.source_owner));
     check(payload.schema === 'capture-job@1' && payload.source?.binding?.ownerId === binding.ownerId
       && (payload.source.binding.projectId === binding.projectId
         || payload.source.binding.projectId === null && payload.source.binding.sessionId === binding.sessionId
@@ -3298,7 +3353,7 @@ export class ProbeStore {
       .all(ref.eventId, ref.binding.ownerId, ref.binding.projectId);
     if (steps.length) return steps.some(row => {
       check(sha256(String(row.payload)) === row.hash, 'capture-evidence-gap');
-      return sameSourceAck(JSON.parse(String(row.payload)).source, ref);
+      return sameBinding(JSON.parse(String(row.payload)).source.binding, ref.binding);
     });
     // Before the step is recorded, a response uses its already-owned attempt identity.
     return !!this.#db.prepare(`SELECT 1 FROM request_attempts a
@@ -3574,8 +3629,7 @@ export class ProbeStore {
       // No guessed type, claim or verified memory: the normal lane owns extraction from this durable job.
       const payload = JSON.stringify({ schema: 'capture-job@1', source: input, range: [input], scope,
         ownerId: this.#binding.ownerId, recordId: null, lane: 'owner-untyped', reason: 'memory-type-required' });
-      this.#db.prepare('INSERT INTO capture_jobs (job_id,source_event_id,record_id,status,payload,payload_hash,created_at,source_owner) VALUES (?,?,?,?,?,?,?,?)')
-        .run(jobId, input.eventId, null, 'pending', payload, sha256(payload), new Date().toISOString(), input.binding.sessionId);
+      this.#insertCaptureJob(jobId, input, null, 'pending', payload);
       return { jobId, stage: 'pending', reason: 'memory-type-required' };
     });
   }
@@ -5885,9 +5939,7 @@ export class ProbeStore {
       .run(record.recordId, this.#binding.ownerId, record.claimKey, record.source.binding.sessionId, new Date().toISOString());
     this.#insertRevision(record, context);
     const capturePayload = JSON.stringify({ schema: 'capture-job@1', source: record.source, recordId: record.recordId, ...job });
-    if (!captureJobId) this.#db.prepare('INSERT INTO capture_jobs (job_id,source_event_id,record_id,status,payload,payload_hash,created_at,source_owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(randomUUID(), record.source.eventId, record.recordId, 'complete', capturePayload, sha256(capturePayload),
-        new Date().toISOString(), record.source.binding.sessionId);
+    if (!captureJobId) this.#insertCaptureJob(randomUUID(), record.source, record.recordId, 'complete', capturePayload);
     this.#appendMemoryEvent(null, record, 'capture', record.source.eventId, { automatic: true, ...job }, request);
   }
   #rememberResult(status: RememberResult['status'], record: MemoryRecord, range: SourceAck[], reason: string | null): RememberResult {
@@ -6535,6 +6587,8 @@ export class ProbeStore {
       this.#readCaptureJobMetadata(String(row.job_id), binding);
       if (this.#db.prepare('SELECT 1 FROM compartments WHERE job_id=?').get(row.job_id!)) this.#readCompartment(String(row.job_id), binding);
     }
+    for (const row of this.#db.prepare('SELECT session_id,task_id FROM intent_tasks').all())
+      this.#checkCaptureTask(row.task_id as string, String(row.session_id));
     for (const row of this.#db.prepare('SELECT job_id FROM capture_scope_resolutions').all()) this.#scopeResolution(String(row.job_id));
     for (const row of this.#db.prepare("SELECT payload FROM source_appends WHERE status='durable'").all()) this.#sourceCaptureTask(JSON.parse(String(row.payload)));
     for (const row of this.#db.prepare('SELECT job_id,run_id,comparison_event_id FROM capture_work').all()) {

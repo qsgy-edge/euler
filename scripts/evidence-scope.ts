@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
+import { scopeCaptureResponder } from '../apps/cli/test/support/scope-capture-http.ts';
 import { appendFileSync, cpSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { release } from 'node:os';
 import { join } from 'node:path';
@@ -161,24 +162,7 @@ try {
   await normalBefore.close();
   snapshot(normalRoot, 'normal-before');
   const requests: string[] = [];
-  const server = createServer(async (request, response) => {
-    let body = ''; for await (const chunk of request) body += chunk;
-    requests.push(body); writeFileSync(join(directory, `normal-http-${requests.length}.json`), body);
-    const { messages } = JSON.parse(body), tail = JSON.parse(messages.at(-1).content);
-    const results = messages.filter((message: { role: string }) => message.role === 'tool')
-      .map((message: { content: string }) => JSON.parse(JSON.parse(message.content).result));
-    const expanded = results.find((result: { ref?: unknown; text?: string }) => result.ref && typeof result.text === 'string');
-    const search = results.find((result: { results?: unknown[] }) => result.results);
-    const call = tail.intent.step === 'proposer' || expanded ? null : search
-      ? { name: 'source_expand', arguments: JSON.stringify({ eventId: search.results[0].ref.eventId, offset: 0, limit: 4096 }) }
-      : { name: 'source_search', arguments: JSON.stringify({ query: 'rawscope' }) };
-    const content = call ? null : tail.intent.step === 'proposer'
-      ? JSON.stringify({ type: 'decision', content: claim }) : JSON.stringify({ result: 'pass', evidence: [expanded.ref] });
-    response.setHeader('content-type', 'application/json');
-    response.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content,
-      ...(call ? { tool_calls: [{ id: 'scope-' + requests.length, type: 'function', function: call }] } : {}) },
-      finish_reason: call ? 'tool_calls' : 'stop' }] }));
-  });
+  const server = createServer(scopeCaptureResponder(claim, body => { requests.push(body); writeFileSync(join(directory, `normal-http-${requests.length}.json`), body); }));
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
     const config = join(directory, 'normal-route.json');

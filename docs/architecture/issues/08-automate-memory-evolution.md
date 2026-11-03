@@ -24,7 +24,7 @@ Blocked by: 01, 03, 05, 06
 
 4a. Session-local unresolved → project 是同一候选的归属确认：保留 `record_id`，追加新的 immutable revision 与 `resolve-scope` event；原 source binding/locator/hash、旧 revision/event/receipt 不变。新 revision 仍为 candidate + unverified，确认本身不代表验证通过。尚无 record 的 untyped/普通 capture 保留原 job identity，确定归属后才按原管线形成候选。
 
-确认复用可信项目绑定，冻结源 owner/session、当前 task identity 与覆盖的原始输入范围；没有 intent 的初始输入区段独立于后来的任务。只续办被该确认覆盖的工作，不把同 session 的旧任务、另一 project 或确认后追加的输入追溯纳入。Core 持久关联确认依据、精确 source identity/hash、原 head 与归属结果；current head、事件和后续工作同事务结算，变化的 head、冲突归属或来源缺口保持可观察阻塞。原始输入重放仍幂等，不创建副本，也不能绕开同源抑制。
+确认复用可信项目绑定，冻结源 owner/session、当前 task identity 与覆盖的原始输入范围；没有 intent 的初始输入区段独立于后来的任务。只续办被该确认覆盖的工作，不把同 session 的旧任务、另一 project 或确认后追加的输入追溯纳入。Core 持久关联确认依据、精确 source identity/hash、原 head 与归属结果；current head、事件和后续工作同事务结算，变化的 head、冲突归属或来源缺口保持可观察阻塞。原始输入重放仍幂等，不创建副本，也不能绕开同源抑制。任务成员关系以现有 `intent_id` 的无正文身份和类型化外键保存，与可清除的 goal/intent 正文分离；正文被清除须有持久标记，不能误当成初始无 intent 区段。覆盖边界使用清理/VACUUM 后不重排或复用的 append ordinal，普通任务首条输入的可信 run/intent 关系在入队时固定。逐源归属关系可独立清除、按 source identity 定位；删除某项原文不连带删除只共享任务身份的候选。
 
 续办沿用 cooperative capture 的有界批次、lease/generation 和恢复接点；明确 owner preference/decision 走确定性 fast lane，客观 fact 与普通语义候选走独立来源验证和晋升 gate。成功 activation 仍与固定 batch、search/Info outbox 原子提交。确认和逐项归属关系进入现有 backup/purge 闭包；共享确认不扩大独立候选的删除范围，清除后的迟到工作不得复活内容。此转移不提供 scope 编辑或已激活记忆搬迁。
 

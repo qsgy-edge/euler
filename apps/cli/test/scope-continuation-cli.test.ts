@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
+import { scopeCaptureResponder } from './support/scope-capture-http.ts';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -35,25 +36,7 @@ test('ordinary CLI resumes untyped capture through HTTP proposal and independent
   const sandbox = createSessionSandbox(randomUUID(), randomUUID()), directory = mkdtempSync(join(tmpdir(), 'euler-scope-http-'));
   const clients: ReturnType<typeof startCli>[] = [], requests: string[] = [];
   const claim = 'T55 rawscope verification keeps original evidence.';
-  const server = createServer(async (request, response) => {
-    let body = ''; for await (const chunk of request) body += chunk;
-    requests.push(body);
-    const { messages } = JSON.parse(body);
-    const tail = JSON.parse(messages.at(-1).content);
-    const results = messages.filter((message: { role: string }) => message.role === 'tool')
-      .map((message: { content: string }) => JSON.parse(JSON.parse(message.content).result));
-    const expanded = results.find((result: { ref?: SourceAck; text?: string }) => result.ref && typeof result.text === 'string');
-    const search = results.find((result: { results?: unknown[] }) => result.results);
-    const call = tail.intent.step === 'proposer' || expanded ? null : search
-      ? { name: 'source_expand', arguments: JSON.stringify({ eventId: search.results[0].ref.eventId, offset: 0, limit: 4096 }) }
-      : { name: 'source_search', arguments: JSON.stringify({ query: 'rawscope' }) };
-    const content = call ? null : tail.intent.step === 'proposer'
-      ? JSON.stringify({ type: 'decision', content: claim }) : JSON.stringify({ result: 'pass', evidence: [expanded.ref] });
-    response.setHeader('content-type', 'application/json');
-    response.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content,
-      ...(call ? { tool_calls: [{ id: 'scope-' + requests.length, type: 'function', function: call }] } : {}) },
-      finish_reason: call ? 'tool_calls' : 'stop' }] }));
-  });
+  const server = createServer(scopeCaptureResponder(claim, body => { requests.push(body); }));
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const start = (args: string[]) => {
     const cli = startCli(['session', '--sandbox', sandbox.root, ...args], 150000, undefined,
