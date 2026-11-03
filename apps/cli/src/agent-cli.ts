@@ -62,7 +62,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
       operation: { name: 'synthetic.read' as const, targets: [project.root.path] } } };
   };
   const startWorkers = () => ({
-    capture: scheduleCaptures(probe, options.captureConfig, () => owner.deliver()),
+    capture: scheduleCaptures(probe, options.captureConfig, () => { owner.drain(); return owner.log !== null && owner.deliver(); }),
     historian: options.historianConfig ? scheduleCaptures(probe, options.historianConfig, () => owner.deliver(), 'historian') : undefined,
   });
   let { capture, historian } = startWorkers();
@@ -250,7 +250,10 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
           owner = new OwnerMemoryHost(probe, openOwnerInfo(sandbox, probe), 'success', false);
           corrections.reopen(probe);
           owner.drain(); owner.deliver(); await corrections.recover();
-          if (live?.epoch === inputEpoch) ({ capture, historian } = startWorkers());
+          if (live?.epoch === inputEpoch) {
+            ({ capture, historian } = startWorkers());
+            capture.kick(); historian?.kick();
+          }
           emit('session-bound', state()); continue;
         }
         check(configured && route, 'explicit-route-model-auth-budget-required');

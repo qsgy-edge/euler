@@ -11,12 +11,12 @@ import { parseCorrectionCommand } from '../context/memory-correction.ts';
 
 // Implemented database carriers participating in logical purge.
 export const PURGE_DATABASE_INVENTORY = {
-  control: ['schema_meta', 'owner_fences', 'maintenance_residuals', 'owner_activities', 'sessions', 'projects',
+  control: ['intent_tasks', 'schema_meta', 'owner_fences', 'maintenance_residuals', 'owner_activities', 'sessions', 'projects',
     'project_resources', 'workspaces', 'workspace_projects', 'memory_scopes', 'source_projection_health',
     'store_recovery_events', 'store_recovered_owners', 'execution_streams', 'execution_events'],
   content: ['session_project_bindings', 'intent_events', 'intent_heads', 'memory_discovery_grants', 'memory_discovery_projects',
     'memory_discovery_targets', 'source_query_receipts', 'memory_records', 'memory_revisions', 'memory_applicability',
-    'capture_jobs', 'compartments', 'capture_work', 'provenance_refs', 'memory_heads', 'memory_events',
+    'capture_scope_sources', 'capture_scope_resolutions', 'capture_jobs', 'compartments', 'capture_work', 'provenance_refs', 'memory_heads', 'memory_events',
     'host_presentations', 'presentation_targets', 'pending_operations', 'host_operation_delivery', 'activation_batches',
     'projection_jobs', 'host_info_batches', 'source_appends', 'source_units', 'source_projection_jobs', 'search_documents',
     'search_projection_jobs', 'feedback_events', 'verification_runs', 'conflict_sets', 'conflict_members',
@@ -26,11 +26,11 @@ export const PURGE_DATABASE_INVENTORY = {
 } as const;
 
 const identities: Record<string, readonly string[]> = {
-  intent_events: ['event_id', 'intent_id'], intent_heads: [],
+  intent_events: ['event_id'], intent_heads: [],
   memory_discovery_grants: ['grant_id'], memory_discovery_projects: [], memory_discovery_targets: [],
   source_query_receipts: ['query_id'], memory_records: ['record_id'],
   memory_revisions: ['record_id', 'revision_id'], memory_applicability: [], capture_jobs: ['job_id'],
-  compartments: ['job_id'], capture_work: ['job_id'], provenance_refs: ['ref_id'], memory_heads: ['record_id'],
+  capture_scope_sources: ['job_id'], capture_scope_resolutions: ['job_id'], compartments: ['job_id'], capture_work: ['job_id'], provenance_refs: ['ref_id'], memory_heads: ['record_id'],
   memory_events: ['event_id', 'record_id'], host_presentations: ['presentation_id', 'operation_id', 'token'],
   presentation_targets: ['presentation_id', 'update_event_id'], pending_operations: ['operation_id'],
   host_operation_delivery: ['operation_id', 'summary_event_id'], activation_batches: ['batch_id'],
@@ -154,10 +154,10 @@ export function purgeValues(value: unknown, qualifiedSources = new Map<string, S
       for (const [key, child] of Object.entries(next)) {
         const object = next as Record<string, unknown>, sources = typeof child === 'string' ? qualifiedSources.get(child) : undefined;
         const source = !sources ? undefined : key === 'eventId' && object.schema === 'cli-source-ack@1'
-          ? resolveQualifiedSource(object, sources) : key === 'source_event_id'
+          ? resolveQualifiedSource(object, sources) : key === 'source_event_id' || key === 'task_input_event_id'
             ? sources.find(source => source.binding.sessionId === object.source_owner)
               ?? resolveQualifiedSource(object.source_json ?? object.payload, sources) : undefined;
-        if (sources && (key === 'source_event_id' || key === 'eventId' && object.schema === 'cli-source-ack@1'))
+        if (sources && (key === 'source_event_id' || key === 'task_input_event_id' || key === 'eventId' && object.schema === 'cli-source-ack@1'))
           check(source, 'purge-unqualified-source-reference');
         if (source) { pending.push(key, source.locator); continue; }
         pending.push(key, child);
@@ -220,6 +220,8 @@ export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCar
     sources.push(entry.source); allSources.set(entry.source.eventId, sources);
   }
   const qualifiedSources = new Map([...allSources].filter(([, sources]) => sources.length > 1));
+  for (const task of db.prepare('SELECT task_id FROM intent_tasks').all()) if (allSources.has(String(task.task_id)))
+    qualifiedSources.set(String(task.task_id), allSources.get(String(task.task_id))!);
   for (const [table, tableRows] of rows) for (const column of identities[table] ?? []) {
     // Job and attempt IDs deliberately name their archived output. Other object
     // kinds cannot acquire a source event merely by sharing its UUID.
@@ -249,13 +251,16 @@ export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCar
     for (const [table, tableRows] of rows) for (const row of tableRows) {
       const key = `${table}/${row._rowid}`;
       const matches = rowValues.get(row)!.filter(value => tokens.has(value));
-      if (selectedRows.has(key) || !matches.length) continue;
+      const removedAuthority = table === 'capture_scope_resolutions'
+        && (selected.get('session_project_bindings') ?? []).some(binding => binding.session_id === row.session_id);
+      if (selectedRows.has(key) || !matches.length && !removedAuthority) continue;
       // A frozen Info batch is a presentation container, not a dependency of its other memories.
       if (table === 'memory_events' && row.record_id !== null && matches.every(value => value === row.batch_id)) continue;
       if (table === 'memory_events' && row.record_id === null) continue;
       selectedRows.add(key); (selected.get(table) ?? selected.set(table, []).get(table)!).push(row); changed = true;
       for (const column of identities[table] ?? []) if (typeof row[column] === 'string') tokens.add(row[column] as string);
       for (const [column, value] of Object.entries(row)) {
+        if (['task_hash', 'authority_hash'].includes(column)) continue;
         if (typeof value === 'string' && (column.endsWith('_hash') || column === 'hash' || column === 'digest')) tokens.add(value);
       }
       // Follow original material owned by the removed memory, and output material
@@ -335,6 +340,8 @@ function safeOwnerReceipt(row: Row): boolean {
 /** Only called inside the Store's exclusive, approved privacy transaction. No filesystem writes. */
 export function applyLogicalPurge(db: DatabaseSync, plan: PurgePlan): void {
   db.exec('PRAGMA defer_foreign_keys=ON');
+  for (const row of plan.selected.get('intent_events') ?? [])
+    db.prepare("UPDATE intent_tasks SET content_state='purged' WHERE task_id=? AND content_state='intact'").run(row.intent_id!);
   for (const row of plan.detachBatches) {
     const payload = JSON.stringify({ ...JSON.parse(String(row.payload)), batchId: null, batchOrdinal: null });
     db.prepare('UPDATE memory_events SET batch_id=NULL,batch_ordinal=NULL,payload=?,payload_hash=? WHERE rowid=?')

@@ -67,7 +67,8 @@ function sourceAckShape(value: unknown): value is SourceAck {
   return Object.keys(ref).sort().join(',') === 'binding,byteLength,contentHash,eventId,hash,locator,schema,status'
     && ref.schema === 'cli-source-ack@1' && ref.status === 'durable' && !!ref.binding
     && Object.keys(ref.binding).sort().join(',') === 'branchId,hostId,ownerId,projectId,sessionId'
-    && Object.values(ref.binding).every(value => typeof value === 'string' && /^[0-9a-f-]{36}$/.test(value))
+    && Object.entries(ref.binding).every(([key, value]) => key === 'projectId' && value === null
+      || typeof value === 'string' && /^[0-9a-f-]{36}$/.test(value))
     && typeof ref.eventId === 'string' && /^[0-9a-f-]{36}$/.test(ref.eventId)
     && typeof ref.locator === 'string' && ref.locator.length <= 256
     && /^[a-f0-9]{64}$/.test(ref.hash) && /^[a-f0-9]{64}$/.test(ref.contentHash)

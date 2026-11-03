@@ -30,7 +30,7 @@ An unbound session has `projectId: null`. To confirm a new or existing logical p
 
 Use `"root":null` for a logical project without file access. The project UUID is chosen explicitly, not derived from cwd, Git, or the directory name. Binding is allowed at an idle boundary, persists the exact owner confirmation and root file identity, and enables that project's capabilities. A confirmed session cannot be reassigned to another project. Moving, removing or replacing its project directory does not invalidate the saved conversation or confirmation. `/status` retains the original binding and reports `projectRootError`; file capabilities and project guidance remain unavailable until that original directory identity is accessible again. Archive recovery and owner memory operations remain available.
 
-Before binding, questions and raw recovery are session-local. Project memory, project guidance and file capabilities are unavailable. Previously captured candidates retain their unresolved scope; candidate continuation belongs to #55.
+Before binding, questions and raw recovery are session-local. Project memory, project guidance and file capabilities are unavailable. `/bind` freezes the current task and its original input range, then schedules covered unresolved captures through the existing cooperative worker. Repeating the same binding preserves that original coverage; it does not claim later tasks.
 
 To start another unbound session in the same store, then choose an existing project:
 
@@ -40,6 +40,16 @@ node apps/cli/src/main.ts session --sandbox $store --session '<new sessionId>' -
 ```
 
 `session-create --sandbox` reuses the store's owner/host and generates a new session/branch identity. Use `--session` to reopen that session. The default session remains the one created with the store. `session-ready.binding` identifies the original archive; `session-ready.project` reports its confirmed project. Pre-binding source ACKs retain their original null project.
+
+## Pending captures after project confirmation
+
+An unbound session can accept `记住偏好：回答使用合成示例。`. It remains a session-local, unverified candidate until `/bind` confirms the project. The same record then gains a project-scoped revision and a `resolve-scope` event; the old revision, original source ACK and archive bytes remain unchanged. Deterministic owner preference/decision verification can finish without a model route. An already captured agreement to an assistant memory proposal continues from its frozen proposal/raw-owner-source pair; the owner does not need to agree again. Successful activation produces the usual durable Info and becomes available to `/memory` and later requests.
+
+Only the current task is covered. If you capture a shop decision, use `/task` to start a game task, and then bind the game project, the shop decision remains unresolved. Inputs captured before any intent belong to the initial session segment; beginning a task does not retroactively claim that segment. The binding is not a general scope editor.
+
+Untyped `记住：…` and ordinary semantic captures keep their original job identity and use the configured capture route for proposal, independent source verification and promotion. Objective facts still need authoritative evidence. Missing source/task evidence, changed heads, suppression and unavailable Info remain visible blocking reasons. No capture configuration means no background provider send; it does not prevent the deterministic owner lane from completing.
+
+Startup, `/bind`, ordinary cooperative boundaries and `/drain` resume bounded batches. Restart and repeated confirmation retain the same candidate, resolution and activation identities. `/drain` reports the actual queue, including unresolved or blocked work. A forgotten or purged item is not revived by confirmation or delayed work. Snapshot restore also fences original-statement fast-lane replay. If purge removes the current intent tail, older tasks remain historical rather than becoming current again; a new owner goal starts a fresh intent across the recorded purge boundary.
 
 ## Inputs, approval and diagnostics
 
@@ -129,7 +139,7 @@ The successor receives its own authorized budget, while the predecessor's attemp
 
 ## Storage and validation
 
-Disposable schema **29** stores immutable `session_project_bindings` in SQLite. `session_scopes` resolves the current project without rewriting `sessions`, historical source ACKs, intents or request ownership. Each new archive event records the project at append time. Existing demo identities and command entry points remain supported. Older disposable schemas must be rebuilt; the separate forward-migration test copy uses version 30.
+Disposable schema **30** stores immutable `session_project_bindings` and task-bound capture resolution evidence in SQLite. `intent_tasks` retains the existing opaque task ID separately from erasable intent content; source stamps and binding/job membership use typed foreign keys. `capture_scope_sources` indexes the exact authorized source edges. Source append ordinals are stable across purge and SQLite maintenance; cooperative resolution fetches at most 16 jobs plus one continuation probe. `session_scopes` resolves the current project without rewriting `sessions`, historical source ACKs, intents or request ownership. Each new archive event records the project at append time. The exact source relation authorizes the resolved memory and its verification, without granting unrelated session history to another project session. Existing demo identities and command entry points remain supported. Older disposable schemas must be rebuilt; the separate forward-migration test copy uses version 31.
 
 Binding confirmations, raw input and presentations use the existing archive and database carriers. The immutable confirmation checksum covers its archived ACK and frozen root descriptor; historical reads do not dereference the project directory. Snapshot integrity checks validate that saved confirmation, while creation and live resource use check the actual root identity. A missing project directory alone does not block backup; registered project-output carriers must still be present for a complete snapshot. Restore retains the existing recovered-stream block; purge uses the same source/Host/backup owners and preserves unrelated project confirmation. No additional content carrier is introduced.
 
@@ -137,6 +147,7 @@ Binding confirmations, raw input and presentations use the existing archive and 
 node --test --test-concurrency=1 apps/cli/test/interactive-session.test.ts apps/cli/test/interactive-recovery.test.ts
 npm run check
 npm run evidence:session
+npm run evidence:scope
 ```
 
-The Windows evidence command retains actual stdin/stdout, HTTP request bodies and counts, archive/SQLite copies, file output, implementation/fixture/environment identities and a receipt under `artifacts/t54-<timestamp>/`. Its requests use loopback and synthetic credentials. The copies preserve observed bytes; they are not relocatable runtime stores because their original file identities are intentionally retained in the manifest. External-provider semantic quality/X-14 remains T24 B3's evidence gap.
+The Windows evidence command retains actual stdin/stdout, HTTP request bodies and counts, archive/SQLite copies, file output, implementation/fixture/environment identities and a receipt under `artifacts/t54-<timestamp>/`. Its requests use loopback and synthetic credentials. The copies preserve observed bytes; they are not relocatable runtime stores because their original file identities are intentionally retained in the manifest. `evidence:scope` retains its actual commands, stdin/stdout, four controlled HTTP verification requests, pre/post-binding archive and SQLite copies, restart/forget/purge results and receipt under `artifacts/t55-<timestamp>/`. It checks initial/previous-task exclusion, wrong owner/project and unavailable-source negatives, immutable history, idempotent activation/Info and independent sibling survival. External-provider semantic quality/X-14 remains T24 B3's evidence gap.

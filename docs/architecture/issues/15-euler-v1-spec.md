@@ -126,6 +126,8 @@ scope 为 logical project、可选扁平 workspace、personal；每 project 最�
 
 原始事件先同步归档。完整 ReAct、明确 owner 决定/记住、compartment 或任务完成边界创建 capture job；“同意”与其指向的方案作为同一 source range。确定性事实由代码形成候选，语义内容由后台 Proposer 起草；主 Agent 只能给 hint。Harness 固定 source identity/hash、scope、owner、真实调用链，模型不能自报这些字段。秘密、临时任务/notes、原始日志与活动指令不包装成普通 memory。所有自动 capture 先固定为 `lifecycle=candidate + verification=unverified`；logical project 未确定时只进入当前 session 的 unresolved candidate queue，跨会话检索与 active 注入均为 0。只有 intent、真实 resource owner 或 manifest 确认 project 后，才进入对应 scope 的验证管线；scope、source 或 integrity 不足时保持 candidate/evidence-gap 并记录阻塞原因。
 
+项目后确认的续办按 [08 §4a](08-automate-memory-evolution.md) 保留候选 record identity，追加归属 revision/event，并冻结当前任务与精确来源的持久关系。无 intent 的初始区段与后续任务分别处理，确认不追溯认领旧任务；仍通过原验证与晋升 gate。续办、重启、backup/purge 共用现有 capture/owner 机制。
+
 Proposer/Historian 推荐标准级，Historian 还需长上下文和忠实压缩；Verifier 按风险选能力，低风险允许同模型隔离上下文，高影响/跨 scope/安全候选增加不同模型、真实工具/平台、held-out/canary 或人工。Provider/model 可配置，无型号白名单；低于所需能力只能停留 candidate/evidence-gap。模型能力、reasoning effort 与编排拓扑不等同。行为制品只保存版本化 inert proposal：target/type、expected change、owner/scope、evidence refs、risk 和建议的 evaluation contract；正文与完整 digest 不可原地改写，修订创建新 proposal 引用旧版，引用进入 purge 闭包。评估建议可描述 L0–L3、assertions、baseline/held-out 和成本限制，但它不是执行许可或已完成的结果。v1 不建 sealed plan、evaluation attempt/result 表族、不执行行为评估或自动发布；外部附带的 accepted/result 也不能激活行为。未来有评估/发布消费者时再定义执行、独立验收和迁移，memory 自身的 verification_runs 不受此收敛影响。
 
 完整分析报告和普通 handoff 是任务 source 产物；具体目标/验收明确的项目建议可作为待验证的 inert proposal 保存。按 [10 的任务产物契约](10-choose-storage-projections.md#analysis-handoff-artifacts) 保留正文版本、覆盖、来源与项目可见范围，提供有界发现及显式 Markdown 导出。它们不自动成为 verified memory 或 owner 已采纳决定；发布到项目仓库/Issue 及实施仍由当前授权和项目既有流程决定。

@@ -179,7 +179,7 @@ export class OwnerMemoryHost {
     const { store, activity } = this.probe;
     for (;;) {
       let pending: HostInfo[], more: boolean;
-      try { ({ pending, more } = store.registerHostInfo(activity)); }
+      try { this.log?.entries(); ({ pending, more } = store.registerHostInfo(activity)); }
       catch (error) {
         emit('info-error', { level: 'error', batchId: null, delivery: 'pending-redelivery', reason: (error as Error).message });
         return false;
@@ -455,7 +455,7 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
     const log = options.hostInfo === 'durable' ? openOwnerInfo(sandbox, probe) : null;
     host = new OwnerMemoryHost(probe, log, (OWNER_SCENARIOS as readonly string[]).includes(options.scenario)
       ? options.scenario as OwnerScenario : 'success', options.noActiveProject);
-    capture = scheduleCaptures(probe, options.captureConfig, () => { host.drain(); return host.deliver(); });
+    capture = scheduleCaptures(probe, options.captureConfig, () => { host.drain(); return host.log !== null && host.deliver(); });
     host.backfill();
     host.drain();
     host.deliver();
@@ -493,7 +493,7 @@ export async function runRememberSession(sandbox: Sandbox, options: RememberOpti
 /** Uses the same durable owner carrier after a background batch or during startup recovery. */
 export function deliverMemoryInfo(sandbox: Sandbox, probe: ReturnType<typeof openProbe>): boolean {
   const host = new OwnerMemoryHost(probe, openOwnerInfo(sandbox, probe), 'success', false);
-  host.drain(); return host.deliver();
+  host.drain(); return host.log !== null && host.deliver();
 }
 
 export function runInfoDelivery(sandbox: Sandbox): void {

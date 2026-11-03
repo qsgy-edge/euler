@@ -426,8 +426,8 @@ test('purge removes a bound-session memory and its backup without erasing the co
   } finally { reopened.command('/exit'); await reopened.exit; }
 });
 
-test('pre-binding cancelled correction delivery survives binding, restart and backup without promoting its candidate', async t => {
-  const session = await createSession(t), cli = startCli(['session', '--sandbox', session.root]);
+test('pre-binding cancelled correction delivery survives while its unchanged candidate continues after binding', async t => {
+  const session = await createSession(t), cli = startCli(['session', '--sandbox', session.root]), projectId = randomUUID();
   try {
     await cli.waitFor('session-ready');
     const candidate = await sendCommand(cli, '记住偏好：T54 unresolved correction source.', 'remember-result');
@@ -435,13 +435,13 @@ test('pre-binding cancelled correction delivery survives binding, restart and ba
     const preview = await sendCommand(cli, `correct ${candidate.recordId} "T54 proposed new text."`, 'memory-preview');
     const cancelled = await sendCommand(cli, `cancel ${preview.token}`, 'memory-result');
     assert.equal(cancelled.status, 'cancelled');
-    await sendCommand(cli, '/bind ' + JSON.stringify({ projectId: randomUUID(), root: null }), 'session-bound');
+    await sendCommand(cli, '/bind ' + JSON.stringify({ projectId, root: null }), 'session-bound');
     const at = cli.observations.length; cli.command(`replay ${preview.token}`);
     const replayed = await Promise.race(['memory-result', 'memory-delivery-error', 'session-command-rejected'].map(event => cli.waitFor(event, at)));
     assert.equal(replayed.status, 'cancelled', JSON.stringify(replayed));
     const inspected = await sendCommand(cli, `inspect ${candidate.recordId}`, 'memory-inspect');
-    assert.deepEqual((inspected.targets as { scope: unknown }[])[0]!.scope, { kind: 'session', id: session.binding.sessionId, resolved: false });
-    assert.deepEqual((await sendCommand(cli, '/memory T54', 'session-memory')).results, []);
+    assert.deepEqual((inspected.targets as { scope: unknown }[])[0]!.scope, { kind: 'project', id: projectId, resolved: true });
+    assert.equal(((await sendCommand(cli, '/memory T54', 'session-memory')).results as unknown[]).length, 1);
   } finally { cli.command('/exit'); await cli.exit; }
   const reopened = startCli(['session', '--sandbox', session.root]);
   try { await reopened.waitFor('session-ready'); assert.equal(reopened.observations.some(event => event.event === 'memory-delivery-error'), false); }
@@ -475,6 +475,47 @@ test('unbound and confirmed session identities participate in public backup and 
   } finally { reopened.command('/exit'); await reopened.exit; }
 });
 
+for (const snapshotBound of [false, true]) test(`snapshot recovery preserves ${snapshotBound ? 'resolved' : 'unresolved'} candidate identity and binding authority`, async t => {
+  const session = await createSession(t), projectId = randomUUID();
+  const bind = '/bind ' + JSON.stringify({ projectId, root: null });
+  let cli = startCli(['session', '--sandbox', session.root]);
+  await cli.waitFor('session-ready');
+  const candidate = await sendCommand(cli, '记住偏好：T55 snapshot original scope.', 'remember-result');
+  if (snapshotBound) await sendCommand(cli, bind, 'session-bound');
+  cli.command('/exit'); assert.equal((await cli.exit).code, 0);
+  const backup = startCli(['backup', '--sandbox', session.root]);
+  assert.equal((await backup.exit).code, 0, JSON.stringify(backup.observations));
+  const snapshotId = (backup.observations.find(event => event.event === 'backup-result')!.snapshot as { id: string }).id;
+  cli = startCli(['session', '--sandbox', session.root]);
+  await cli.waitFor('session-ready');
+  if (!snapshotBound) await sendCommand(cli, bind, 'session-bound');
+  const preview = await sendCommand(cli, `forget ${candidate.recordId}`, 'memory-preview');
+  assert.equal((await sendCommand(cli, `commit ${preview.token} forget`, 'memory-result')).status, 'committed');
+  cli.command('/exit'); assert.equal((await cli.exit).code, 0);
+  const restore = startCli(['restore-snapshot', '--sandbox', session.root, '--snapshot', snapshotId]);
+  assert.equal((await restore.exit).code, 0, JSON.stringify(restore.observations));
+  cli = startCli(['session', '--sandbox', session.root]);
+  try {
+    const ready = await cli.waitFor('session-ready');
+    assert.equal((ready.project as { projectId: string } | null)?.projectId ?? null, snapshotBound ? projectId : null);
+    const rejected = await sendCommand(cli, `inspect ${candidate.recordId}`, 'session-command-rejected');
+    assert.equal(rejected.reason, 'recovered-stream-blocked');
+    const page = await sendCommand(cli, '/memory snapshot', 'session-memory');
+    assert.equal((page.results as unknown[]).length, snapshotBound ? 1 : 0);
+    await sendCommand(cli, '/drain', 'session-drained');
+  } finally { cli.command('/exit'); await cli.exit; }
+  const probe = openProbe(openSandbox(session.root), undefined, undefined, undefined, undefined, true);
+  try {
+    const record = probe.store.inspectMemory(probe.activity, String(candidate.recordId)).record;
+    assert.equal(record.recordId, candidate.recordId);
+    assert.equal(record.revision, snapshotBound ? 2 : 1);
+    assert.equal(record.scope.resolved, snapshotBound);
+    assert.equal(record.source.binding.projectId, null);
+  } finally { probe.close(); }
+  const audited = startCli(['backup', '--sandbox', session.root]);
+  assert.equal((await audited.exit).code, 0, JSON.stringify(audited.observations));
+});
+
 test('an unbound session confirms an explicitly selected project and reopens without changing its source identity', async t => {
   const session = await createSession(t), projectId = randomUUID();
   const cli = startCli(['session', '--sandbox', session.root]);
@@ -485,12 +526,20 @@ test('an unbound session confirms an explicitly selected project and reopens wit
     const bound = await sendCommand(cli, '/bind ' + JSON.stringify({ projectId, root: null }), 'session-bound');
     assert.equal((bound.project as { projectId: string }).projectId, projectId);
     assert.deepEqual(bound.binding, session.binding);
+    const resumed = await sendCommand(cli, '/memory unbound', 'session-memory');
+    assert.equal((resumed.results as unknown[]).length, 1, JSON.stringify(resumed));
     const remembered = await sendCommand(cli, '记住偏好：T54 bound response should include examples.', 'remember-result');
     assert.equal(remembered.status, 'activated', JSON.stringify(cli.observations));
     const page = await sendCommand(cli, '/memory T54', 'session-memory');
-    assert.equal((page.results as unknown[]).length, 1);
+    assert.equal((page.results as unknown[]).length, 2);
+    const continued = await sendCommand(cli, `inspect ${unresolved.recordId}`, 'memory-inspect');
+    const target = (continued.targets as { recordId: string; revision: number; lifecycle: string; scope: { id: string } }[])[0]!;
+    assert.equal(target.recordId, unresolved.recordId);
+    assert.equal(target.revision, 2);
+    assert.equal(target.lifecycle, 'active');
+    assert.equal(target.scope.id, projectId);
     const info = await sendCommand(cli, '/info', 'info-list');
-    assert.equal((info.rows as unknown[]).length, 1);
+    assert.equal((info.rows as unknown[]).length, 2);
   } finally { cli.command('/exit'); cli.child.stdin.end(); assert.equal((await cli.exit).code, 0); }
   const reopened = startCli(['session', '--sandbox', session.root]);
   try {
