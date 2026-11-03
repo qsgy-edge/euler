@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { AgentRun, CaptureRun, DEFAULT_BUDGET } from '@euler/core';
+import { AgentRun, CaptureRun, DEFAULT_BUDGET, GuidanceSession } from '@euler/core';
 import { pumpAgent } from '../src/agent-pump.ts';
 import type { ModelReply } from '@euler/core';
 import { startCli, sendCommand } from '../src/process-driver.ts';
@@ -40,6 +40,36 @@ test('an ordinary first task resumes its complete capture range including the in
     probe.store.auditStore(probe.activity);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
+
+for (const stage of ['confirmation', 'continuation']) for (const guidanceOnly of [false, true]) {
+  test(`project ${stage} distinguishes guidance-only from a real active request: guidanceOnly=${guidanceOnly}`, () => {
+    const sandbox = createSessionSandbox(randomUUID(), randomUUID());
+    let probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+    try {
+      const record = probe.store.rememberMemory(probe.activity,
+        { input: probe.archive.append(randomUUID(), '记住偏好：guidance coexists with scope continuation'), hostInfo: 'durable' }).record;
+      const projectId = randomUUID();
+      const confirmation = probe.archive.append(randomUUID(), '/bind ' + JSON.stringify({ projectId, root: null }));
+      const bind = () => probe.store.confirmSessionProject(probe.activity, confirmation, projectId, null);
+      const reopen = () => { probe.close(); probe = openProbe(sandbox, undefined, undefined, undefined, undefined, true); };
+      if (stage === 'continuation') { bind(); reopen(); }
+      if (guidanceOnly) new GuidanceSession(probe.store, probe.activity, probe.archive,
+        { dataRoot: probe.activity.root, projects: [], sources: [], sharedSkills: null });
+      else probe.store.authorizeRequestRun(probe.activity, randomUUID(),
+        { budget: DEFAULT_BUDGET, intent: null, relatedRunId: null, acceptDuplicateRisk: false });
+      const action = stage === 'confirmation' ? bind : () => probe.store.resumeProjectCaptures(probe.activity, 'durable');
+      if (!guidanceOnly) {
+        assert.throws(action, /project-binding-run-active/);
+        assert.equal(probe.store.inspectMemory(probe.activity, record.recordId).record.scope.resolved, false);
+      } else {
+        action();
+        if (stage === 'confirmation') { reopen(); probe.store.resumeProjectCaptures(probe.activity, 'durable'); }
+        assert.equal(probe.store.inspectMemory(probe.activity, record.recordId).record.lifecycle, 'active');
+      }
+      probe.store.auditStore(probe.activity);
+    } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+  });
+}
 
 test('two real workers converge on one resolution and activation of the same original candidate', async () => {
   const sandbox = createSessionSandbox(randomUUID(), randomUUID());

@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { scopeCaptureResponder } from './support/scope-capture-http.ts';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -32,13 +32,14 @@ test('an existing Host detects a missing Info carrier before its first backgroun
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
-test('ordinary CLI continues an unbound raw owner agreement after binding without asking for agreement again', async () => {
+test('ordinary CLI continues an unbound raw owner agreement and stays live with project guidance', async () => {
   const sandbox = createSessionSandbox(randomUUID(), randomUUID()), directory = mkdtempSync(join(tmpdir(), 'euler-scope-agreement-'));
   const clients: ReturnType<typeof startCli>[] = [];
   let requests = 0;
+  const bodies: string[] = [];
   const server = createServer(async (request, response) => {
-    for await (const _chunk of request) { /* Consume the actual foreground request. */ }
-    requests++;
+    let body = ''; for await (const chunk of request) body += chunk;
+    bodies.push(body); requests++;
     response.setHeader('content-type', 'application/json');
     response.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: '建议记住偏好：T55 agreed examples stay concise.' }, finish_reason: 'stop' }] }));
   });
@@ -58,21 +59,26 @@ test('ordinary CLI continues an unbound raw owner agreement after binding withou
     const agreement = '  同意  ';
     const pending = await sendCommand(cli, agreement, 'remember-result');
     assert.equal(pending.reason, 'scope-unresolved');
-    const bind = '/bind ' + JSON.stringify({ projectId: randomUUID(), root: null });
+    writeFileSync(join(directory, 'AGENTS.md'), 'Synthetic project guidance for rawscope continuation.');
+    const bind = '/bind ' + JSON.stringify({ projectId: randomUUID(), root: realpathSync.native(directory) });
     await sendCommand(cli, bind, 'session-bound');
     await sendCommand(cli, '/drain', 'session-drained');
+    await sendCommand(cli, 'Answer using the synthetic project guidance.', 'session-result');
+    await sendCommand(cli, '/drain', 'session-drained');
+    assert.ok(bodies.at(-1)!.includes('Synthetic project guidance for rawscope continuation.'));
+    assert.deepEqual(cli.observations.filter(item => item.event === 'capture-error'), []);
     const page = await sendCommand(cli, '/memory concise', 'session-memory');
     assert.deepEqual((page.results as { unitId: string }[]).map(item => item.unitId), [pending.recordId], JSON.stringify({ page, errors: cli.observations.filter(item => item.event === 'capture-error') }));
     assert.equal((await sendCommand(cli, `source ${pending.recordId}`, 'memory-source')).text, agreement);
     assert.equal(((await sendCommand(cli, '/info', 'info-list')).rows as unknown[]).length, 1);
-    assert.equal(requests, 1);
+    assert.equal(requests, 2);
     cli.command('/exit'); assert.equal((await cli.exit).code, 0);
     const reopened = start([]); await reopened.waitFor('session-ready');
     await sendCommand(reopened, bind, 'session-bound');
     await sendCommand(reopened, '/drain', 'session-drained');
     assert.deepEqual(((await sendCommand(reopened, '/memory concise', 'session-memory')).results as { unitId: string }[]).map(item => item.unitId), [pending.recordId]);
     assert.equal(((await sendCommand(reopened, '/info', 'info-list')).rows as unknown[]).length, 1);
-    assert.equal(requests, 1);
+    assert.equal(requests, 2);
     reopened.command('/exit'); assert.equal((await reopened.exit).code, 0);
   } finally {
     for (const cli of clients) if (cli.child.exitCode === null && cli.child.signalCode === null) { cli.child.kill(); await cli.exit; }

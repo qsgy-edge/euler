@@ -979,6 +979,12 @@ export class ProbeStore {
     return command;
   }
 
+  #assertStreamModelIdle(activity: Activity): void {
+    for (const run of this.#db.prepare("SELECT run_id FROM request_runs WHERE stream_id=? AND state='authorized'").iterate(activity.streamId)) {
+      check(this.#guidanceOnly(String(run.run_id)), 'project-binding-run-active');
+    }
+  }
+
   confirmSessionProject(activity: Activity, confirmation: SourceAck, projectId: string, root: BoundFile | null): void {
     this.withActivity(activity, () => {
       const previous = this.#db.prepare('SELECT * FROM session_project_bindings WHERE session_id=?').get(this.#binding.sessionId);
@@ -997,7 +1003,7 @@ export class ProbeStore {
         sameFile(root.path, root.identity);
         check(lstatSync(root.path).isDirectory(), 'project-directory-required');
       }
-      check(!this.#db.prepare("SELECT 1 FROM request_runs WHERE stream_id=? AND state='authorized' LIMIT 1").get(activity.streamId), 'project-binding-run-active');
+      this.#assertStreamModelIdle(activity);
       const project = this.#db.prepare('SELECT owner_id FROM projects WHERE project_id=?').get(projectId);
       check(!project || project.owner_id === this.#binding.ownerId, 'store-binding-mismatch');
       this.#db.prepare('INSERT OR IGNORE INTO projects VALUES (?,?)').run(projectId, this.#binding.ownerId);
@@ -3064,7 +3070,7 @@ export class ProbeStore {
       if (this.#binding.projectId === null || !this.#db.prepare('SELECT 1 FROM session_project_bindings WHERE session_id=?').get(this.#binding.sessionId))
         return { jobs: [], more: false };
       this.#requestRecoveryGate(activity, null);
-      check(!this.#db.prepare("SELECT 1 FROM request_runs WHERE stream_id=? AND state='authorized'").get(activity.streamId), 'project-binding-run-active');
+      this.#assertStreamModelIdle(activity);
       const authority = this.#bindingAuthority(this.#binding.sessionId);
       const eligible = this.#db.prepare(`SELECT j.job_id FROM capture_jobs j
         JOIN source_appends a ON a.source_owner=j.source_owner AND a.source_event_id=j.source_event_id
