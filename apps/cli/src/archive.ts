@@ -85,6 +85,7 @@ export class CliArchive {
   readonly #gate: Gate;
   readonly #path: string;
   readonly #journal: ArchiveJournal | undefined;
+  #parsed: { bytes: Buffer; binding: string; events: { event: RawEvent; ack: SourceAck }[] } | undefined;
   constructor(sandbox: Sandbox, gate: Gate, journal?: ArchiveJournal) {
     this.#journal = journal;
     this.#sandbox = sandbox;
@@ -114,15 +115,17 @@ export class CliArchive {
   }
 
   #scan(bytes = this.#bytes()): { event: RawEvent; ack: SourceAck }[] {
+    const current = bindingOf(this.#sandbox), binding = JSON.stringify(current);
+    // Every read still opens the bound file and reads all bytes; only identical bytes reuse parsing.
+    if (this.#parsed?.binding === binding && this.#parsed.bytes.equals(bytes)) return this.#parsed.events;
     check(bytes.at(-1) === 10, 'archive-integrity: incomplete line');
     const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     const lines = text.slice(0, -1).split('\n');
     const header = JSON.parse(lines.shift()!);
-    const current = bindingOf(this.#sandbox);
     check(header.schema === 'cli-session@1' && sameBinding({ ...header.binding, projectId: current.projectId }, current)
       && (header.binding.projectId === null || header.binding.projectId === current.projectId), 'archive-binding-mismatch');
     const seen = new Set<string>();
-    return lines.filter(line => !/^ +$/.test(line)).map(line => {
+    const events = lines.filter(line => !/^ +$/.test(line)).map(line => {
       const event = JSON.parse(line) as RawEvent;
       uuid(event.eventId);
       check(event.schema === 'cli-input@1' && ['user', 'assistant', 'tool'].includes(event.role) && typeof event.text === 'string'
@@ -135,11 +138,13 @@ export class CliArchive {
       check(!seen.has(event.eventId), 'archive-integrity: duplicate identity');
       seen.add(event.eventId);
       return { event, ack: {
-        schema: 'cli-source-ack@1', status: 'durable', binding: { ...current, projectId },
+        schema: 'cli-source-ack@1' as const, status: 'durable' as const, binding: { ...current, projectId },
         eventId: event.eventId, locator: `cli-jsonl@1/${this.#sandbox.fixture.sessionId}/${event.eventId}`,
         hash: sha256(line), byteLength: Buffer.byteLength(line), contentHash: sha256(event.text),
       } };
     });
+    this.#parsed = { bytes, binding, events };
+    return events;
   }
 
   append(eventId: string, text: string | (() => string), role: RawEvent['role'] = 'user'): SourceAck {
@@ -161,7 +166,7 @@ export class CliArchive {
       check(!witness || previous?.ack.hash === witness.hash, 'archive-integrity: acknowledged bytes changed');
       if (previous) {
         check(previous.event.role === role && (typeof text === 'function' || previous.event.text === text), 'identity-conflict');
-        return previous.ack;
+        return structuredClone(previous.ack);
       }
       // Core's local result and budget mutation commit with this exact-byte reservation.
       const content = typeof text === 'function' ? text() : text;
@@ -208,7 +213,7 @@ export class CliArchive {
   #verifiedAck(eventId: string, hash: string): SourceAck {
     const recovered = this.#scan().find(item => item.event.eventId === eventId);
     check(recovered?.ack.hash === hash, 'archive-ack-failed');
-    return recovered.ack;
+    return structuredClone(recovered.ack);
   }
 
   #syncedAck(eventId: string, hash: string): SourceAck {
@@ -288,7 +293,7 @@ export class CliArchive {
     return this.#gate(() => {
       check(!this.#journal?.pending().length, 'archive-append-pending');
       return this.#scan().map(({ event, ack }) => ({ role: event.role, text: event.text,
-        ack: this.#journal?.acknowledged(event.eventId) ?? ack }));
+        ack: this.#journal?.acknowledged(event.eventId) ?? structuredClone(ack) }));
     });
   }
 }
