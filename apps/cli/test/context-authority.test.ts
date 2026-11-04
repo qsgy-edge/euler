@@ -6,14 +6,14 @@ import test from 'node:test';
 import { AgentRun, API_VERSION, DEFAULT_BUDGET } from '@euler/core';
 import type { AgentHost, SourceAck } from '@euler/core';
 import { pumpAgent } from '../src/agent-pump.ts';
-import { bindingOf, createSandbox, createSandboxSession } from '../src/sandbox.ts';
+import { bindingOf, createSandbox, createSandboxSession, createSessionSandbox } from '../src/sandbox.ts';
 import { openProbe } from '../src/probe.ts';
 import { approvedSourceUnit } from './support/source-publication.ts';
 
 const route = { provider: 'fake', model: 'authority', route: 'fixture', authNamespace: 'synthetic' };
 const budget = { ...DEFAULT_BUDGET, contextLimit: 24000, maxModelAttempts: 6, maxToolCalls: 6, maxTotalTokens: 200000 };
-function fixture(maxResults = 32) {
-  const sandbox = createSandbox();
+function fixture(maxResults = 32, initialProject: 'bound' | 'unbound' = 'bound') {
+  const sandbox = initialProject === 'bound' ? createSandbox() : createSessionSandbox(randomUUID(), randomUUID());
   const foreignBinding = { ...bindingOf(sandbox), projectId: randomUUID(), sessionId: randomUUID() };
   createSandboxSession(sandbox, foreignBinding);
   const foreign = openProbe(sandbox, budget, undefined, foreignBinding, undefined, true);
@@ -38,8 +38,9 @@ function fixture(maxResults = 32) {
     close() { closeProbe(); foreign.close(); rmSync(sandbox.root, { recursive: true, force: true }); } };
 }
 
-test('an approved search page survives later expansion exhausting the same grant budget', async () => {
-  const f = fixture(9);
+for (const initialProject of ['bound', 'unbound'] as const)
+test(`an approved search page survives later expansion exhausting the same grant budget (${initialProject})`, async () => {
+  const f = fixture(9, initialProject);
   try {
     for (let index = 1; index < 9; index++) {
       const text = `${f.text} Unit ${index}.`;
@@ -180,8 +181,9 @@ test(`archived cross-project tool and assistant copies retain their access depen
   } finally { reopened?.close(); f.close(); }
 });
 
-test('a cross-project memory stays reference-only while its exact revision is admitted and recorded', async () => {
-  const f = fixture();
+for (const initialProject of ['bound', 'unbound'] as const)
+test(`a cross-project memory stays reference-only while its exact revision is admitted and recorded (${initialProject})`, async () => {
+  const f = fixture(32, initialProject);
   try {
     const record = f.foreign.store.rememberMemory(f.foreign.activity, {
       input: f.foreign.archive.append(randomUUID(), '记住偏好：FOREIGN-T18-MEMORY uses npm'), hostInfo: 'durable' }).record;
