@@ -66,7 +66,7 @@ B1/B2 的完整回归采用与 `a23c0a2` 同 tree 的三平台 CI，本机对变
 | 能力 / X-card | 实际机制与运行证据 | 独立核验与结论 |
 |---|---|---|
 | 身份、CAS、事务、intent / X-01 | Core Store、T01/T02/T04 三平台；`session-create` / `session` / `/bind` | 实际 owner/session 身份、后绑定与重开已证实；不从 cwd/Git root 推断项目 |
-| 检索与任务级发现 / X-02 | scoped FTS/CJK、资格重验、累计 grant；context-authority/HTTP | 授权、撤销、目标环境和跨会话拒读通过；独立 held-out 仍缺，见 B4 |
+| 检索与任务级发现 / X-02 | scoped FTS/CJK、资格重验、累计 grant；context-authority/HTTP | 开发回归覆盖授权、撤销、目标环境和跨会话拒读；Windows 独立首测 3 个失败、24 个缺证，见 B4 |
 | search/proposal 投影 / X-03 | outbox、CAS、dirty/rebuild 与 CI projection tests | 已启用 search 子集通过；scope overview 未启用。#37 吞吐优化不单独阻塞本 gate |
 | 输入、完整 ReAct、来源、窗口 / X-04 | 普通 stdin、AgentRun/Orchestrator、archive、GuidanceSession/Historian | 输入原字节先 durable、同会话工具/记忆/换窗、取消/unknown 与重启通过；真实模型质量见 B3 |
 | scope、注入、guidance / X-05 通用 | Core 门禁、固定 schema、task-bound 确认、guidance 授权区分 | 常驻 guidance 不阻断合法续办，真实前台请求仍阻断；旧任务不被新绑定认领；MCP/Pi deferred |
@@ -100,7 +100,11 @@ T18 counting 归档只有 payload hash/长度，不据此宣称完整 wire bytes
 
 **归属：#7/#13–#19/#24。** 执行前需 owner 指定配置文件路径、credential 环境变量和总预算，不在聊天或 Issue 中贴密钥。不可用指标按原正确性/安全门禁保留 unavailable；不虚构数值或自动换路由。
 
-### B4 — 历史测试集版本可对齐，独立封存与释放缺证（evidence-gap）
+### B4 — Windows 独立首测 FAIL；未绑定授权缺陷已修复，独立验收仍开放
+
+**归属：#10 / X-02。** 新集在 `bce497a` 首测，27 个案例各执行一次：3 个 `fail`、24 个 `evidence-gap`、0 个完整通过。macOS/Linux 未运行该独立集。历史 T10 集的证据单独保留。
+
+#### 历史 T10 集：版本可对齐，保管记录缺证
 
 | 环节 | 元数据判定 |
 |---|---|
@@ -109,7 +113,32 @@ T18 counting 归档只有 payload hash/长度，不据此宣称完整 wire bytes
 | 独立释放 · 缺证 | 在所查 Git 历史、原始收据、[PR #35](https://github.com/qsgy-edge/euler/pull/35) 与 [#10 结案记录](https://github.com/qsgy-edge/euler/issues/10#issuecomment-5806109758) 中，未找到工作区外的保管者原件，能够把该摘要、封存时间及提交、被测实现、向独立评测者释放的时间及提交依次绑定。 |
 | 污染与替代 · 缺证 | 19 份实现侧收据均已写出五个案例的 `gold`、`passed` 字段；此处仅核对字段存在性。没有逐案提前访问、按题改码、降级或替代的登记可供对照。材料在实现侧可见已证实；具体人员是否提前看过、哪些案例受影响未证实，不能登记为零污染。 |
 
-**归属：#10；B4 保持开放。** 未找到同期的独立封存、释放及逐案污染记录。下一步仅向原保管者核对这些记录的元数据或可核验引用；不重跑旧集，不启用新集。本次未打开标准答案。开发集与任务级发现回归结论不变。
+历史集结论仍是 `evidence-gap`：未找到同期独立封存、释放及逐案污染记录。新集的保管记录只适用于新集。
+
+#### 独立新集：封存、首测与产品修复
+
+独立保管仓库 `../euler-t24-b4-verifier` 的提交顺序是：封存 `3facf7a` → 绑定实现 `177e2b0` → 释放给独立评测者 `8f2c598` → 固定首测原件 `33d4ec8` → 判定收据 `7d2e492`。被测实现为 `bce497a0baeba8990afcd2c80af5c1f101bc3d17`，tree `bc91e8f886091ed9daf626bc00c4c1920c718057`。公开收据 `7d2e492:public/receipt.json` 的 SHA-256 为 `91c81761cc399fa1970e82cd0399932a8b7d9c0529c05d7af1682edc4f9cbf1d`。
+
+- **首测已证实：** 48 个观测步骤中，36 个取得 Store 搜索页，12 个后续分页或展开步骤因前序未签发所需句柄而无法执行。逐条汇总 `cases[].observations[].assertions[]`：75 条通过、12 条失败、144 条缺证。12 条失败全部来自上述 3 个案例（9 条要求 cursor，3 条要求首次引用）。
+- **修复已证实：** 用独立于盲测题的开发数据走普通 CLI，在未绑定项目时复现 `/task` 成功、`/grant` 返回 `project-unbound`。[PR #60](https://github.com/qsgy-edge/euler/pull/60) 已合并为 `a860533`；[三平台开发 CI](https://github.com/qsgy-edge/euler/actions/runs/41799227983) 通过。同一任务现在可按 owner 授权搜索、翻页和展开指定项目；未授权项目、跨会话借用及撤销后读取仍被拒绝。新旧集均未重跑，修复后的独立表现未测。
+
+#### 24 个缺证案例：证据分布与下一项开发验证
+
+从公开收据的 `cases[]` 选出 `verdict` 为 `evidence-gap` 的记录，按 `reason_codes` 分组。以下四组互斥，合计 24 个；共 48 条断言通过、42 条缺证。**24 个都缺少自动装配观测**：Store 返回了什么，与最终模型请求选入了什么，是两个不同的观测点。
+
+| 案例数 | 收据中的缺口 | 用全新开发数据验证什么 |
+|---:|---|---|
+| 16 | 仅登记 `ASSEMBLY_NOT_OBSERVED` | **优先补这一项，四组共用。** 让普通 CLI 产生一份实际模型请求，对照候选及资格复核、冻结的选入/拒绝引用与原因、接收端请求中的 memory 字段及 token 成本。用一条可自动选入的本地记忆和一条仅供参考的跨项目记忆做正反对照；能从工具读回不计为自动选入。 |
+| 4 | 另有 `CANONICAL_TRANSITION_UNAVAILABLE` | 首测未能经受测接口建立所需的 4 次状态变化。用支持的操作生成新 revision 或状态，核对操作前后的权威记录、索引状态和查询结果；不能构造的变化单列。对未改变的数据查询，无法检验变化后的资格过滤。 |
+| 2 | 另有 `SINGLE_FALLBACK_UNSUPPORTED` | 中文单字在 2-gram 路径返回 `unsupported-query`。先验证明确不支持时的慢路径；若已有可用回退，再从同一开发数据快照比较单字召回和非单字排序。首测没有成对结果，不能据此采纳回退。 |
+| 2 | 另有 `GUIDANCE_ACTIVATION_NOT_INSTRUMENTED` | 首测只观察了 Store 读取结果，未记录 guidance 是否加载。给目标开发项目配置可识别的 guidance：先显式绑定该项目，确认能观测到加载；再用未绑定会话分别进行只读授权和仅模型自报范围的对照，核对加载记录与请求正文均未出现该项目的 guidance。 |
+
+**跨案例的观测限制（不另加案例数）：**
+
+- **排序和成本。** 首测可复算 24 条候选排序轨迹：各查询组内排序，再轮流选取未选候选。收据没有 BM25/RRF 数值、独立的查询分词器版本或自动装配的 token 成本；只观察到索引版本 `latin-cjk@3`。开发验证应记录实际排序规则、查询端版本和计量口径；若受测路径不计算某项分数，保留为与 [X-02 观测要求](https://github.com/qsgy-edge/euler/blob/a860533cf7673533ee6f951266cf088496c2ad49/docs/architecture/issues/12-build-evidence-experiment-matrix.md#L93-L98) 的差异，不把名次当分数，也不把字节数当 token。
+- **任务、环境与访问范围。** 首测的 Store 搜索使用显式 `query`，未观测到任务上下文组合查询，也未独立构造项目不可用和权限版本变化。开发数据应区分已授权、未授权、可披露不可用状态的项目，记录任务/授权版本、目标环境和实际读取范围；以真实 cursor/ref 检验任务切换、结束或撤销后的拒读。没有对应入口或宿主时标记缺证，不用 Windows 结果推算其他平台。
+
+这份清单依据公开判定元数据；没有打开标准答案、运行新旧盲测集或启用第三套题。开发验证用于定位缺口，不改写独立首测结论。
 
 ### B5 — 历史超时未结案；Windows prerequisite 取消实测通过
 
