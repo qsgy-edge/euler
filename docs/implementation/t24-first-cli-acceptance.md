@@ -1,6 +1,6 @@
 # T24：首次 CLI 验收 gate
 
-Issue：[#25](https://github.com/qsgy-edge/euler/issues/25)。验收日期：2026-11-03。
+Issue：[#25](https://github.com/qsgy-edge/euler/issues/25)。验收日期：2026-11-04。
 
 ## 结论
 
@@ -16,8 +16,9 @@ Issue：[#25](https://github.com/qsgy-edge/euler/issues/25)。验收日期：202
 
 | 对象 | 身份 |
 |---|---|
-| 实现基线 | `a23c0a28233b5780be7799bad00032d29c3d2d24` |
-| Git tree | `1d4b6fdc6d9de4f53966a83f26921baa64a5b76b` |
+| B5 取消取证基线 | `4d50e249017034bce1095a1d1325ae90d3da3fd6`，tree `74055fb4f17642dd88b9cf53e0b1c17ec0b887dc` |
+| B1/B2 组合复验基线 | `a23c0a28233b5780be7799bad00032d29c3d2d24` |
+| 组合复验 tree | `1d4b6fdc6d9de4f53966a83f26921baa64a5b76b` |
 | PR 最终 head | `a9daae15110927b9029a57086cd5c726efc3d2c9`，tree 与基线相同 |
 | CI checkout | `b34b2115f6b80972f943f98fcc184f1d01ed3a79`，tree 与基线相同 |
 | CI | [41630746615](https://github.com/qsgy-edge/euler/actions/runs/41630746615)，PR 三平台均成功 |
@@ -56,7 +57,7 @@ CI 执行原有 19 项 evidence 命令和全部 portable 测试；独立 `eviden
 - `schema-observation.json` / `observed-ddl.sql`：未批准冻结的 DDL 观测副本。
 - `verify-local.py`、`verify-combinations.py` 和相邻 PR 验收目录的 `verify-ci.py` / `verify-scope.py` 是本次临时取证脚本，不是新增产品入口或必跑检查；读取数据库前复制原件及 WAL，不修改证据。
 
-本轮没有重复本机全量 suite 或全部 22 项 evidence；完整回归与未变场景采用同 tree 的三平台 CI，本机对变化路径重跑上述 69 项检查和四项 evidence。没有外部 provider 调用、MC 访问或真实用户数据写入。
+B1/B2 的完整回归采用与 `a23c0a2` 同 tree 的三平台 CI，本机对变化路径重跑上述 69 项检查和四项 evidence。B5 的取证按下表分别使用原失败提交和 `4d50e24`，没有在后者重跑全部 B1/B2 组合。没有外部 provider 调用、MC 访问或真实用户数据写入。
 
 ## Capability × host × X-card
 
@@ -107,17 +108,22 @@ T18 counting 归档只有 payload hash/长度，不据此宣称完整 wire bytes
 
 **归属：#10。** 先恢复封存证据和污染记录；可重复开发验收与手动 held-out 分开，保存匹配基线及独立复算的原件。确需替代时登记理由，不追改旧 gold。
 
-### B5 — 历史失败与取消后代证据待结案（部分已证实）
+### B5 — 历史超时未结案；Windows prerequisite 取消实测通过
 
-- [T16 首次 Windows push](https://github.com/qsgy-edge/euler/actions/runs/39539111231/attempts/1) 的 T02 原始结果是 24 pass / 1 cancelled；停顿阶段未证实。
-- 旧 `artifacts/t20-v7-check.log:821-844` 的 owner receipt 故障用例在 180 秒达到 `ETIMEDOUT`；阶段复跑成功未解释原停顿。T18 已批准的观察预算对齐没有声称解决底层波动。
-- `docs/implementation/t15-owner-correction.md` 记录仅验证 prerequisite 直接子进程退出，完整后代退出仍无独立证据。
-- [#57](https://github.com/qsgy-edge/euler/issues/57) 已在原基线、fresh sandbox、禁用 compile cache 且无 profiler 的真实 `transport-conflict` worker 复现 30 秒限时。热点指向重复文件身份、archive scan 和 SQLite prepare；负载/缓存贡献未完成单变量归因。原预算串行通过不关闭该问题；owner 已将其从 #55 单独拆出。
+| 项目 | 判定 | 原始证据与边界 |
+|---|---|---|
+| T14 transport-conflict / [#57](https://github.com/qsgy-edge/euler/pull/59) | **已闭合** | PR #59 合并为 `4d50e24`，三平台检查通过。冻结 head `8d397e3` 的 worker 原件记录 23 个独立 attempt、exit 0，按起止时间差为 9.889 秒，原限时 30 秒；T14 的 15 项合成检查均通过。 |
+| T16 首次 Windows push 的 T02 / [attempt 1](https://github.com/qsgy-edge/euler/actions/runs/39539111231/attempts/1) | **超时已证实，内部阶段未知** | `47d5002` 的两文件 runner：24 pass / 1 cancelled，`crash-in-transaction` 测试在 15,002 ms 达到 15,000 ms 限时。失败测试没有留下 setup、writer checkpoint、kill 或 reconcile 的时标。同批独立 cross-project 测试耗时 14,860 ms，不能由此归因为宿主负载。 |
+| T20 owner receipt / `17d961e` | **已缩小阶段，内部原因未知** | 原 `t20-v7-check.log:578–580,821–844`：stdout、spawn 故障用例通过，receipt 用例在 180,043 ms 返回 `spawnSync ETIMEDOUT`。该轮遗留目录 `t12-1793019826519` 含故障 CLI 输出、raw SQLite 和两份错误记录；最后的 raw-validation 错误在目录命名时刻后约 0.86 秒写出。没有 `focused-test.txt`。源码在该错误后同步执行两个 owner 测试，再写此文件。由此可把停顿缩小至 raw-validation 已落盘、focused 输出尚未落盘之间；没有当次 worker/系统 trace 区分具体子测试、调度或 I/O。 |
+| T15 全 prerequisite 进程树 / Windows | **已测场景通过** | 实际 `remember → model inspect → stop`，未替换 `execFile`。在 CLI、Node test runner、test worker 和更深子进程同时存活时发送 stop。三轮均报告 cancelled、CLI exit 0、独立 loopback 接收 0；无终止策略的 Windows Job 分别累计 17/18/18 个进程，CLI 退出后 active=0，未调用清场终止。后两轮用内核退出时间核对，stop 时在场的 7 个后代分别全部先于 CLI 退出，最晚一个提前 8.818 / 8.575 ms。 |
+| 同一取消路径 / WSL2 Linux | **后代会短暂晚于 CLI 退出** | 两轮实际 stop 均零发送。stop 后 21 ms 的采样中 CLI 已以 0 退出，各有 1 个同一隔离 session、已重新挂接父级的进程仍在运行；62 ms 时均已自然退出。另一次未达到采样条件，未发送 stop，不计入这两轮。macOS 没有同类进程级取证；Linux/macOS 生产支持仍为 deferred。 |
 
-**归属：#57 及 #2/#7/#12/#15 的 runner/Host，T18/T20 提供既有原件。** 修复和基础测试交回对应票；不调大超时、改 skip 或用重跑成功替代结案。#38 已修复的 T15 轮询竞态不重新列为问题。
+**历史超时复跑。** 两个历史提交使用各自 lockfile、全新合成目录、空 Jiti cache、Node v24.18.0 和原限时，在 Windows 顺序运行；T16 保留原来的两个并行测试文件。普通/分阶段冷复跑中，T16 目标用例分别为 2.449 / 2.671 秒，第二轮依次观察到 setup、未提交 checkpoint、强杀与 reconcile。T20 的 receipt 目标用例分别为 33.555 / 43.955 秒，第二轮 nested focused runner 占 42.391 秒并返回 0。两次历史超时均未重现；复跑时长不用于解释原失败。T20 的目标重放没有模拟原全量 suite 的宿主负载。
+
+**原件与归属。** `D:/GithubRepositories/Agent/euler-t24-resume/artifacts/t24-b5-4d50e24/` 保留原失败样本、副本摘要、按提交隔离的冷复跑输出和逐阶段 trace、Windows Job 与 Linux /proc 样本。#25 登记的 GitHub 前置均已关闭。B5 在 Windows 首次切片仍留 #2/T02、#12/owner-evidence 两项历史内部原因；下次同路径出现超时时需要当次子进程阶段/退出证据。Linux 的退出顺序单列，不计为 Windows 失败。#38 已解决的 T15 轮询竞态不重新打开。
 
 ## 放行条件与支持范围
 
-B1/B2 的实施及本轮受影响组合证据已闭合。B3 授权真实路径、B4 独立检索证据、B5 失败/取消边界仍须闭合；修复后按实际影响更新组合证据。满足原 gate 后才冻结初始 DDL、版本、SHA-256 和实现 commit。
+B1/B2 的实施及受影响组合证据已闭合。B3 授权真实路径、B4 独立检索证据、B5 的两次 Windows 历史超时仍须闭合；修复后按实际影响更新组合证据。满足原 gate 后才冻结初始 DDL、版本、SHA-256 和实现 commit。
 
 有效结论为共享 Core 三平台 CI、Windows 合成普通 CLI、候选续办与本文列出的组合路径通过；首次完整 capability 仍 blocked。该结论不授权 MC 重建、真实数据迁移、owner 切换或 T27 canary。
