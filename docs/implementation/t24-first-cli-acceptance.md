@@ -100,13 +100,16 @@ T18 counting 归档只有 payload hash/长度，不据此宣称完整 wire bytes
 
 **归属：#7/#13–#19/#24。** 执行前需 owner 指定配置文件路径、credential 环境变量和总预算，不在聊天或 Issue 中贴密钥。不可用指标按原正确性/安全门禁保留 unavailable；不虚构数值或自动换路由。
 
-### B4 — 独立 held-out 收尾不完整（已证实缺字段，运行结论未证实）
+### B4 — 历史测试集版本可对齐，独立封存与释放缺证（evidence-gap）
 
-先前核对的 19 份历史 T10 receipt 没有 held-out owner、sealed/released commit、污染或替代案例记录，不能充当当前基线完整 held-out PASS。开发集、任务级发现与上述实际工具回归保持有效。
+| 环节 | 元数据判定 |
+|---|---|
+| 实际评测对象 · 已证实 | 主工作树 `artifacts/t10-*/summary.json` 的 19 份原件逐份 SHA-256 与 `euler-t24-acceptance/artifacts/t24/t10-receipt-metadata.json` 清单一致。全部记录 H01–H05，`corpusDigests.heldout` 均为 `caf4e7ecd16061e9c96b92592d871501ea457b5bf5dd0c9334f9adbe031adb42`，与 `3ac75f0:scripts/evidence-retrieval.ts:12` 固定的摘要一致。 |
+| 封存顺序 · 实现提交晚于已知评测 | 最早留存的 `t10-1790187988868/summary.json`（2026-09-23 18:26:28 UTC）及下一份 `t10-1790188670795/summary.json` 均记录 HEAD `56217fc`、Core 实现有未提交改动、held-out 文件在实现工作树中未跟踪。18:38:34 UTC，`3ac75f0` 才将实现与该文件一同提交；18:40:59 UTC 的 `t10-1790188859924/summary.json` 已是该提交的干净运行。`3ac75f0` 至验收基线 `79ace1e` 的文件 Git blob 均为 `47282fe7fa0fbfcc44e530f83e9954c5b0f942ed`。因此 `3ac75f0` 不能充当首次评测前的封存凭据，`56217fc` 也不能单独标识最早收据所测的实现。 |
+| 独立释放 · 缺证 | 在所查 Git 历史、原始收据、[PR #35](https://github.com/qsgy-edge/euler/pull/35) 与 [#10 结案记录](https://github.com/qsgy-edge/euler/issues/10#issuecomment-5806109758) 中，未找到工作区外的保管者原件，能够把该摘要、封存时间及提交、被测实现、向独立评测者释放的时间及提交依次绑定。 |
+| 污染与替代 · 缺证 | 19 份实现侧收据均已写出五个案例的 `gold`、`passed` 字段；此处仅核对字段存在性。没有逐案提前访问、按题改码、降级或替代的登记可供对照。材料在实现侧可见已证实；具体人员是否提前看过、哪些案例受影响未证实，不能登记为零污染。 |
 
-`docs/implementation/t10-memory-retrieval.md` 明确 Git 历史不能单独证明封存先于结果；现有 `scripts/evidence-retrieval.ts` 混合开发与 held-out 执行，本轮未打开 gold、未重跑或替换案例。
-
-**归属：#10。** 先恢复封存证据和污染记录；可重复开发验收与手动 held-out 分开，保存匹配基线及独立复算的原件。确需替代时登记理由，不追改旧 gold。
+**归属：#10；B4 保持开放。** 未找到同期的独立封存、释放及逐案污染记录。下一步仅向原保管者核对这些记录的元数据或可核验引用；不重跑旧集，不启用新集。本次未打开标准答案。开发集与任务级发现回归结论不变。
 
 ### B5 — 历史超时未结案；Windows prerequisite 取消实测通过
 
