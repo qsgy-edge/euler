@@ -1042,7 +1042,6 @@ export class ProbeStore {
     return this.withActivity(activity, () => {
       const intent = this.readIntent(activity);
       check(intent?.status === 'active' && !this.#discoveryTaskCompleted(intent.intentId), 'discovery-consent-required');
-      requireProject(this.#binding);
       const approval = this.#readDiscoveryApproval(consent, intent);
       check(JSON.stringify(approval.projectIds) === JSON.stringify(projectIds) && approval.maxResults === maxResults
         && approval.maxBytes === maxBytes && JSON.stringify(approval.targets) === JSON.stringify(targets), 'discovery-consent-required');
@@ -1168,11 +1167,12 @@ export class ProbeStore {
   #readDiscoveryGrant(row: Record<string, unknown>, intent: Intent): { projects: string[]; remaining: number; remainingBytes: number;
     remainingQueries: number; targets: Map<string, SearchTarget> } {
     const grantId = String(row.grant_id), binding = this.currentBinding(intent.binding.sessionId);
-    requireProject(binding);
     check(row.owner_id === binding.ownerId && row.session_id === binding.sessionId && row.intent_id === intent.intentId
       && sha256(String(row.consent)) === row.consent_hash, 'discovery-not-authorized');
     const consent = JSON.parse(String(row.consent)) as SourceAck;
-    const approval = this.#readDiscoveryApproval(consent, intent, binding);
+    // A later /bind leaves a grant's original session-local owner decision unbound.
+    const approval = this.#readDiscoveryApproval(consent, intent,
+      consent.binding?.projectId === null ? { ...binding, projectId: null } : binding);
     const projects = this.#db.prepare(`SELECT m.project_id FROM memory_discovery_projects m
       JOIN projects p ON p.project_id=m.project_id AND p.owner_id=? WHERE m.grant_id=? ORDER BY m.project_id`)
       .all(binding.ownerId, grantId).map(project => String(project.project_id));
@@ -4706,7 +4706,7 @@ export class ProbeStore {
         candidateCount: null, complete: false, reason: null };
       const unavailableCoverage = (reason: string): SearchPage['coverage'] =>
         ({ ...coverage, unavailableProjects: projects, reason });
-      if (this.#binding.projectId === null || !grant && request.noActiveProject) return { status: 'ready', results: [],
+      if (!grant && (this.#binding.projectId === null || request.noActiveProject)) return { status: 'ready', results: [],
         coverage: { ...coverage, allowedProjects: [], inspectedProjects: [], reason: 'no-active-project' },
         truncated: false, nextCursor: null };
       if (grant) {

@@ -5,9 +5,84 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { sha256, type SourceUnitInput } from '@euler/core';
-import { createSandbox, createSandboxSession, bindingOf, resourcesOf } from '../src/sandbox.ts';
+import { createSandbox, createSessionSandbox, createSandboxSession, bindingOf, resourcesOf } from '../src/sandbox.ts';
+import { startCli, sendCommand } from '../src/process-driver.ts';
 import { openProbe } from '../src/probe.ts';
 import { approvedSourceUnit, saveApprovedProposal } from './support/source-publication.ts';
+
+test('an unbound CLI grants task-scoped reads without binding an operation project', async t => {
+  const sandbox = createSessionSandbox(randomUUID(), randomUUID()), origin = bindingOf(sandbox);
+  t.after(() => rmSync(sandbox.root, { recursive: true, force: true }));
+  const query = 'ferruledev', allowed = randomUUID(), other = randomUUID();
+  const allowedSources = new Map<string, string>();
+  let outside = '';
+  for (const projectId of [allowed, other]) {
+    const binding = { ...origin, sessionId: randomUUID(), projectId };
+    createSandboxSession(sandbox, binding);
+    const p = openProbe(sandbox, undefined, undefined, binding, undefined, true);
+    try {
+      for (const part of projectId === allowed ? ['bearing', 'spindle'] : ['housing']) {
+        const text = `${query} ${part}`, ref = p.archive.append(randomUUID(), text);
+        const unit = p.store.publishSourceUnit(p.activity, approvedSourceUnit(p, { ref, projectId, kind: 'source', offset: 0, length: text.length }));
+        if (projectId === allowed) allowedSources.set(unit.unitId, text); else outside = unit.unitId;
+        const input = p.archive.append(randomUUID(), `记住决定：${text}`, 'user');
+        assert.equal(p.store.rememberMemory(p.activity, { input, hostInfo: 'durable' }).status, 'activated');
+      }
+      p.store.drainSourceProjection(p.activity); p.store.drainSearchProjection(p.activity);
+    } finally { p.close(); }
+  }
+  const cli = startCli(['session', '--sandbox', sandbox.root]);
+  let grantId: string;
+  try {
+    await cli.waitFor('session-ready');
+    await sendCommand(cli, '/task Compare the authorized drawings', 'session-task');
+    assert.deepEqual((await sendCommand(cli, `/memory ${query}`, 'session-memory')).results, []);
+    assert.deepEqual((await sendCommand(cli, `/source-search ${query}`, 'session-sources')).results, []);
+    const at = cli.observations.length;
+    cli.command('/grant ' + JSON.stringify({ projectIds: [allowed], targets: {}, maxResults: 32, maxBytes: 131072 }));
+    const grant = await Promise.race(['session-grant', 'session-command-rejected'].map(event => cli.waitFor(event, at)));
+    assert.equal(grant.event, 'session-grant', JSON.stringify(grant)); grantId = grant.grantId as string;
+    const status = await sendCommand(cli, '/status', 'session-status');
+    assert.equal(status.project, null); assert.equal(status.files, 'unavailable');
+    assert.equal((await sendCommand(cli, '/skills', 'session-command-rejected')).reason, 'guidance-project-unbound');
+  } finally { cli.command('/exit'); await cli.exit; }
+  const p = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const search = { query, grantId, limit: 1 };
+    const first = p.store.searchMemories(p.activity, search); assert.ok(first.nextCursor);
+    const last = p.store.searchMemories(p.activity, { ...search, cursor: first.nextCursor });
+    assert.equal(last.nextCursor, null);
+    assert.deepEqual([...first.results, ...last.results].map(hit => hit.projectId), [allowed, allowed]);
+    assert.notEqual(first.results[0]!.unitId, last.results[0]!.unitId);
+    const page = p.store.searchSources(p.activity, { ...search, queryId: randomUUID() }); assert.ok(page.nextCursor);
+    const next = p.store.searchSources(p.activity, { ...search, cursor: page.nextCursor, queryId: randomUUID() });
+    assert.equal(next.nextCursor, null);
+    assert.deepEqual(new Set([...page.results, ...next.results].map(hit => hit.unitId)), new Set(allowedSources.keys()));
+    const expand = { grantId, queryId: randomUUID(), unitId: page.results[0]!.unitId, offset: 0, limit: 100 };
+    assert.equal(p.store.expandSource(p.activity, expand).text, allowedSources.get(expand.unitId));
+    assert.throws(() => p.store.expandSource(p.activity, { ...expand, queryId: randomUUID(), unitId: outside }), /source-scope-mismatch/);
+    assert.equal(p.store.sessionProject(p.activity), null);
+  } finally { p.close(); }
+  const sibling = { ...origin, sessionId: randomUUID(), branchId: randomUUID() };
+  createSandboxSession(sandbox, sibling);
+  const fresh = openProbe(sandbox, undefined, undefined, sibling, undefined, true);
+  try {
+    assert.throws(() => fresh.store.searchMemories(fresh.activity, { grantId, query }), /discovery-not-authorized/);
+  } finally { fresh.close(); }
+  const nextCli = startCli(['session', '--sandbox', sandbox.root]);
+  try {
+    await nextCli.waitFor('session-ready');
+    await sendCommand(nextCli, '/bind ' + JSON.stringify({ projectId: other, root: null }), 'session-bound');
+  } finally { nextCli.command('/exit'); await nextCli.exit; }
+  const bound = openProbe(sandbox, undefined, undefined, undefined, undefined, true);
+  try {
+    const page = bound.store.searchMemories(bound.activity, { grantId, query });
+    assert.deepEqual(page.coverage.allowedProjects, [allowed]); assert.equal(page.results.length, 2);
+    bound.store.revokeMemoryDiscovery(bound.activity, grantId);
+    assert.throws(() => bound.store.searchMemories(bound.activity, { grantId, query }), /discovery-not-authorized/);
+    assert.throws(() => bound.store.expandSource(bound.activity, { grantId, queryId: randomUUID(), unitId: [...allowedSources.keys()][0]!, offset: 0, limit: 100 }), /discovery-not-authorized/);
+  } finally { bound.close(); }
+});
 
 test('an unknown cross-project source query can reconcile its stable identity without spending budget twice', () => {
   const sandbox = createSandbox();

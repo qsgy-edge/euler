@@ -30,7 +30,7 @@ An unbound session has `projectId: null`. To confirm a new or existing logical p
 
 Use `"root":null` for a logical project without file access. The project UUID is chosen explicitly, not derived from cwd, Git, or the directory name. Binding is allowed at an idle boundary, persists the exact owner confirmation and root file identity, and enables that project's capabilities. A confirmed session cannot be reassigned to another project. Moving, removing or replacing its project directory does not invalidate the saved conversation or confirmation. `/status` retains the original binding and reports `projectRootError`; file capabilities and project guidance remain unavailable until that original directory identity is accessible again. Archive recovery and owner memory operations remain available.
 
-Before binding, questions and raw recovery are session-local. Project memory, project guidance and file capabilities are unavailable. `/bind` freezes the current task and its original input range, then schedules covered unresolved captures through the existing cooperative worker. Repeating the same binding preserves that original coverage; it does not claim later tasks.
+Before binding, queries default to the session; project reads require the task grant described below. Project guidance and file capabilities remain unavailable. `/bind` freezes the current task and its original input range, then schedules covered unresolved captures through the existing cooperative worker. Repeating the same binding preserves that original coverage; it does not claim later tasks.
 
 To start another unbound session in the same store, then choose an existing project:
 
@@ -115,7 +115,7 @@ node apps/cli/src/main.ts session --sandbox $store --transport-config 'D:/synthe
 
 Background configurations use the existing capture route contract and `captureCapability`. Startup recovery and owner input schedule eligible queued work; memory capture waits for foreground boundaries. `/drain` waits for the configured workers and reports both queues; `/cancel` stops them. Prerequisite subprocess launches are recorded in the existing process/maintenance fence. No configured worker means no background provider send.
 
-Cross-project discovery still requires an active task and a structured owner grant:
+To search registered projects from an unbound session, start a task and grant it read access to the selected projects. No `/bind` is needed:
 
 ```text
 /task Compare the selected synthetic projects.
@@ -123,7 +123,7 @@ Cross-project discovery still requires an active task and a structured owner gra
 /revoke <grantId>
 ```
 
-The grant binds to the current intent and archived owner decision, leaves the primary operation project unchanged, and is not inherited by another session. Empty environment targets retain the existing “needs verification” meaning.
+Without a grant, an unbound session reads no project memories or published project sources. The grant allows search, pagination and source expansion only in the approved projects. It binds to the current intent and archived owner decision; it does not bind an operation project, enable files or guidance, or transfer to another session. A later `/bind` does not add the primary project to the grant. Empty environment targets retain the existing “needs verification” meaning.
 
 ## Unknown delivery and recovery
 
