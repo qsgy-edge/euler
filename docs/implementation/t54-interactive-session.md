@@ -76,6 +76,14 @@ The normal route and file tools coexist; no scenario switch is needed. Core sele
 
 `/skills [query]` lists the current project catalog. With an active intent, `/skill NAME` activates the qualified selection through `GuidanceSession`; it grants no file, shell, network or cross-project permission.
 
+### Publish a project rule
+
+In a Windows session bound to a project directory, enter `设为项目规则：维护通报末尾写「签收灯：青砚」。`. The CLI shows the root `AGENTS.md` path and the **complete proposed file** in `file-approval`. Type the displayed `approve <token>` or `reject <token>`. Only `project-rule-result.saved: true` means the write succeeded. This single-line owner command needs no model route. It appends without rewriting existing rules; the existing 4096-byte write limit applies to the whole proposed file. A logical project without a directory has no writable guidance file.
+
+New sessions bound to the same root load the rule as project guidance. `记住偏好：…` stores a memory instead. Free-form wording such as “以后都这样” stays in the conversation: the model can propose a file change, subject to the same live approval.
+
+Privacy purge of a related memory shows the affected rule ranges. The preview lists the memory IDs linked to the rule (`ruleMemoryIds`): exact eligible project memories for the owner command, or exact matches among the retrieved memories for a model proposal (all retrieved inputs if none matches verbatim). Reject a preview if the association is wrong. Identical wording by itself does not link independently published rules across projects. A publication receipt retains file identity and a rule hash without storing a second rule body. Cleanup blanks only those bytes in place, preserving other text, line endings and file identity. A durable start checkpoint permits interrupted erasure to resume within the approved ranges, after rechecking file identity and all untouched bytes. A missing, duplicated or ambiguous rule stops the preview with `project-rule-owner-review-required:<path>`; inspect the file and obtain a new preview. An ordinary forget does not edit the project file.
+
 ## Memory, source recovery and background work
 
 The entry point reuses `OwnerMemoryHost`, `CorrectionHost`, Core retrieval and durable Info:

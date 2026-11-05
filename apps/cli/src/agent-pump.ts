@@ -58,10 +58,12 @@ export async function pumpAgent(run: AgentRun, host: AgentPump): Promise<AgentSt
   const deadline = setTimeout(() => { try { run.stop('deadline'); } catch { /* pump observes the durable failure below */ } }, run.remainingMs());
   try {
     while (!run.status().terminal) {
-      const request = run.nextModel();
-      if (!request) break;
-      const { attempt, reply } = await receiveModel(run, request, host, run.signal);
-      run.finishModel(attempt.attemptId, reply);
+      if (!run.isProjectRule) {
+        const request = run.nextModel();
+        if (!request) break;
+        const { attempt, reply } = await receiveModel(run, request, host, run.signal);
+        run.finishModel(attempt.attemptId, reply);
+      }
       const execute = async (pending: ToolCall) => {
         if (run.status().terminal) return;
         if (pending.name === 'file.read' || pending.name === 'file.write') {
@@ -114,7 +116,8 @@ export async function pumpAgent(run: AgentRun, host: AgentPump): Promise<AgentSt
       const calls = run.pendingTools();
       if (run.toolBatchMode() === 'parallel-safe') await Promise.all(calls.map(execute));
       else for (const call of calls) await execute(call);
-      if (calls.length) await host.cooperate?.();
+      if (run.isProjectRule) run.finishProjectRule();
+      else if (calls.length) await host.cooperate?.();
     }
   } catch {
     if (!run.status().terminal) run.fail();

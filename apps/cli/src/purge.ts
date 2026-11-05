@@ -47,7 +47,9 @@ export function readPurgeCarriers(sandbox: Sandbox, store: ProbeStore, coordinat
     const file = { path: output.path, identity: output.identity };
     const existing = carriers.find(carrier => carrier.file.path === file.path);
     const captured = capture(file), content = readFileSync(file.path, 'utf8');
-    const entry = { id: output.callId, value: { ...output, content }, hash: captured.hash, content };
+    // Published lines are independent logical copies, even when their physical file is shared.
+    const entry = output.ruleHash ? { id: output.callId, value: { publicationId: output.callId, ruleHash: output.ruleHash, memoryRefs: output.memoryRefs ?? [] }, hash: output.ruleHash }
+      : { id: output.callId, value: { ...output, content }, hash: captured.hash, content };
     if (existing) {
       check(existing.role === 'project-output' && existing.hash === captured.hash
         && JSON.stringify(existing.output) === JSON.stringify({ root: output.root, parent: output.parent }), 'purge-project-output-evidence-gap');
@@ -111,10 +113,10 @@ export async function runPurge(sandbox: Sandbox, recordId?: string, scenario = '
           if (scenario === 'source-after-ack') killPoint('purge-source-checkpoint', 'after-ack', 10000);
           if (line === 'cleanup-source') { await emit('purge-source-result', result); return; }
           store.cleanupPurgeHost(coordinator, { info: new OwnerInfoLog(sandbox, action => action(), () => {}), receiver: new CountingTransport(sandbox) });
-          store.cleanupPurgeOutputs(coordinator, selection => {
+          store.cleanupPurgeOutputs(coordinator, (selection, started) => {
             check(selection.output, 'purge-project-owner-mismatch');
             const root = new WindowsFileRoot(selection.output.root);
-            try { return root.purge(selection); } finally { root.close(); }
+            try { return root.purge(selection, started); } finally { root.close(); }
           });
           store.cleanupPurgeBackups(coordinator);
           store.preparePurgeMaintenance(coordinator);

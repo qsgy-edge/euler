@@ -1,6 +1,6 @@
 import koffi from 'koffi';
 import { join, relative } from 'node:path';
-import { check, sha256 } from '@euler/core';
+import { check, inspectProjectRuleRanges, sha256 } from '@euler/core';
 import type { BoundFile, FileIdentity, FileTarget, FileReceipt, FileFailureReason, PurgeCarrierSelection } from '@euler/core';
 
 // Native calls live only in the Host. No model-controlled library, symbol or command.
@@ -58,12 +58,12 @@ function inspect(handle: bigint, directory: boolean): { identity: FileIdentity; 
   return { identity: { dev: String(value.volume), ino: String((BigInt(value.indexHigh) << 32n) | BigInt(value.indexLow)) },
     size: value.sizeHigh * 4294967296 + value.sizeLow };
 }
-function openAt(parent: bigint, name: string, { directory = false, write = false, create = false, remove = false }:
-  { directory?: boolean; write?: boolean; create?: boolean; remove?: boolean } = {}): bigint | null {
+function openAt(parent: bigint, name: string, { directory = false, write = false, create = false, remove = false, update = false }:
+  { directory?: boolean; write?: boolean; create?: boolean; remove?: boolean; update?: boolean } = {}): bigint | null {
   check(name.length > 0 && !/[\\/:\0]/.test(name) && name !== '.' && name !== '..', 'file-invalid-component');
   const a = native();
   const handle: (bigint | null)[] = [null];
-  const access = directory ? FILE_TRAVERSE | READ_CONTROL : remove ? 0x10000 | FILE_READ_DATA : write ? FILE_WRITE_DATA : FILE_READ_DATA;
+  const access = directory ? FILE_TRAVERSE | READ_CONTROL : remove ? 0x10000 | FILE_READ_DATA : update ? FILE_READ_DATA | FILE_WRITE_DATA : write ? FILE_WRITE_DATA : FILE_READ_DATA;
   const status = a.openAt(handle, SYNCHRONIZE | FILE_READ_ATTRIBUTES | access,
     { Length: a.attributeSize, RootDirectory: parent, ObjectName: { Length: name.length * 2, MaximumLength: name.length * 2, Buffer: name },
       Attributes: OBJ_CASE_INSENSITIVE, SecurityDescriptor: null, SecurityQualityOfService: null }, {}, null, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
@@ -197,8 +197,8 @@ export class WindowsFileRoot {
       };
     } catch (error) { close(); throw error; }
   }
-  /** Delete only the approved identity, through pinned root/parent/file handles. */
-  purge(selection: PurgeCarrierSelection): { removed: true } {
+  /** Erase approved rule ranges or delete the approved file through pinned handles. */
+  purge(selection: PurgeCarrierSelection, started = false): { removed: true } {
     check(this.#handle && selection.role === 'project-output' && selection.output
       && JSON.stringify(selection.output.root) === JSON.stringify(this.#root), 'purge-project-owner-mismatch');
     const parts = relative(this.#root.path, selection.file.path).split(/[\\/]/);
@@ -213,16 +213,27 @@ export class WindowsFileRoot {
       }
       check(join(this.#root.path, ...parts.slice(0, -1)) === selection.output.parent.path
         && JSON.stringify(inspect(parent, true).identity) === JSON.stringify(selection.output.parent.identity), 'file-parent-identity-changed');
-      const file = openAt(parent, parts.at(-1)!, { remove: true });
-      if (!file) return { removed: true };
+      const rules = parts.length === 1 && parts[0]!.toLowerCase() === 'agents.md';
+      check(rules === Boolean(selection.ruleCleanup), 'project-rule-owner-review-required');
+      const file = openAt(parent, parts.at(-1)!, rules ? { update: true } : { remove: true });
+      if (!file) { check(!rules, 'purge-project-output-changed'); return { removed: true }; }
       handles.push(file);
       const opened = inspect(file, false);
       check(JSON.stringify(opened.identity) === JSON.stringify(selection.file.identity), 'file-identity-changed');
       check(opened.size === selection.bytes, 'purge-project-output-changed');
       const bytes = Buffer.alloc(selection.bytes), done = [0];
-      check(native().read(file, bytes, bytes.length, done, null) && done[0] === bytes.length
-        && sha256(bytes) === selection.hash, 'purge-project-output-changed');
-      check(native().dispose(file, 4, Buffer.from([1]), 1), 'purge-project-delete-denied');
+      check(native().read(file, bytes, bytes.length, done, null) && done[0] === bytes.length, 'purge-project-output-changed');
+      if (selection.ruleCleanup) {
+        const after = inspectProjectRuleRanges(selection, bytes, started);
+        for (const { offset, bytes: length } of selection.ruleCleanup.ranges) {
+          check(native().seek(file, offset, null, 0) && native().write(file, after.subarray(offset, offset + length), length, done, null)
+            && done[0] === length, 'purge-project-rule-write-incomplete');
+        }
+        check(native().flush(file), 'purge-project-rule-write-incomplete');
+      } else {
+        check(sha256(bytes) === selection.hash, 'purge-project-output-changed');
+        check(native().dispose(file, 4, Buffer.from([1]), 1), 'purge-project-delete-denied');
+      }
       return { removed: true };
     } finally { for (const handle of handles.reverse()) native().close(handle); }
   }

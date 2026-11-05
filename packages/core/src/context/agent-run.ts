@@ -361,6 +361,7 @@ export class AgentRun {
       for (const prior of this.#store.sessionAgentRuns(this.#activity).reverse()) {
         if (prior.run.runId === this.runId) continue;
         const previous = this.#store.agentStatus(this.#activity, prior.run.runId);
+        if (previous.tools.some(t => t.attemptId === null)) continue;
         if (previous.terminal !== 'completed' || previous.discoveryGrantId || previous.inputs.every(input => input.state !== 'bound-to-assembly')) break;
         try { this.#store.assertConversationRun(this.#activity, prior.run.runId); }
         catch (error) {
@@ -427,7 +428,49 @@ export class AgentRun {
     this.#ready = request;
     return request;
   }
+  get isProjectRule(): boolean { return this.#route.route === 'owner-project-rule'; }
+
+  prepareProjectRule(line: string): void {
+    const matched = /^设为项目规则[：:]([^\r\n]*)$/u.exec(line);
+    const rule = matched?.[1]?.trim();
+    const binding = this.#host.guidance, files = this.#host.files;
+    check(this.isProjectRule && files && binding && !this.status().inputs.length, 'project-rule-unavailable');
+    check(rule && !/[\x00-\x1f\x7f]/u.test(rule), 'project-rule-text-required');
+    const path = join(files.root.path, 'AGENTS.md');
+    binding.targets = [{ projectId: requireProject(this.#host.binding), path }];
+    binding.operation = { name: 'synthetic.write', targets: [path] };
+    const source = this.receive(randomUUID(), line);
+    // Freeze the normal admission context, but never dispatch it to a provider.
+    const frozen = this.nextModel();
+    check(frozen, 'project-rule-context-unavailable');
+    this.#inflightGuidanceHash = this.#prepared.get(frozen)!.guidanceHash;
+    this.#ready = null;
+    const original = this.#rootRules();
+    check(original !== undefined, 'project-rule-guidance-unavailable');
+    check(!original.split(/\r?\n/u).includes(rule), 'project-rule-already-present');
+    const eol = original.includes('\r\n') ? '\r\n' : '\n';
+    const content = original + (original && !original.endsWith('\n') ? eol : '') + rule + eol;
+    const call = { id: randomUUID(), name: 'file.write', arguments: { path: 'AGENTS.md', content } };
+    parseFileCall(call);
+    this.#event({ kind: 'project-rule', source, callId: call.id, argumentsHash: sha256(JSON.stringify(call.arguments)) });
+    this.#calls.set(call.id, call);
+  }
+
+  #rootRules(): string | undefined {
+    const guidance = this.#host.guidance?.session.latest();
+    if (!this.#host.files || guidance?.status !== 'ready') return undefined;
+    const root = join(this.#host.files.root.path, 'AGENTS.md');
+    return guidance.snapshot.guidance.find(b => b.kind === 'agents' && b.scope.kind === 'project'
+      && b.scope.id === this.#host.binding.projectId && relative(root, b.locator) === '')?.text ?? '';
+  }
+
+  finishProjectRule(): void {
+    check(this.isProjectRule, 'project-rule-unavailable');
+    if (!this.status().terminal) this.#terminal(this.status().tools[0]?.result?.outcome === 'success' ? 'completed' : 'failed');
+  }
+
   startModel(request: ModelRequest, payload: string): RequestAttempt {
+    check(!this.isProjectRule, 'owner-command-no-provider');
     this.#store.assertDispatchBoundary();
     check(this.#active() && !this.#inflight, 'run-not-admissible');
     check(this.#prepared.get(request)?.digest === sha256(JSON.stringify(request)) && payload === request.payload, 'payload-mismatch');
@@ -589,6 +632,7 @@ export class AgentRun {
     const tool = this.status().tools.find(tool => tool.callId === callId);
     check(call && tool && !tool.started && !tool.result, 'file-not-admissible');
     this.#store.assertToolAdmission(this.#activity, this.runId);
+    if (this.isProjectRule) this.#checkGuidance(this.#inflightGuidanceHash);
     const parsed = parseFileCall(call);
     const guidance = this.#host.guidance;
     if (guidance?.selectFiles) {
@@ -617,12 +661,22 @@ export class AgentRun {
       && target.parent.path === join(capability.root.path, ...parts.slice(0, -1)), 'file-target-mismatch');
     const intent = this.#store.readIntent(this.#activity)!;
     const token = sourceEventId('file-presentation', this.runId, callId);
-    const presentation = { token, callId, path: target.path, existingIdentity: target.identity, content: String(call.arguments.content ?? '') };
+    const presentation: FilePresentation = { token, callId, path: target.path, existingIdentity: target.identity, content: String(call.arguments.content ?? '') };
+    const before = call.name === 'file.write' && relative(join(capability.root.path, 'AGENTS.md'), target.path) === '' ? this.#rootRules() : undefined;
+    const added = before !== undefined && presentation.content.startsWith(before)
+      ? /^(?:\r?\n)*([^\r\n]+)(?:\r?\n)?$/u.exec(presentation.content.slice(before.length))?.[1] : undefined;
+    const ruleHash = added && presentation.content.split(/\r?\n/u).includes(added) && !before!.split(/\r?\n/u).includes(added) ? sha256(added) : undefined;
+    if (ruleHash) {
+      const used = this.#store.requestStatus(this.#activity, this.runId).assemblies.at(-1)!.usedMemories;
+      const exact = used.filter(m => m.contentHash === ruleHash);
+      presentation.ruleMemoryIds = this.isProjectRule ? this.#store.localProjectRuleSources(this.#activity, ruleHash)
+        : [...new Set((exact.length ? exact : used).map(m => m.recordId))];
+    }
     const source = this.#appendOutput(token, JSON.stringify({ kind: 'file-presentation', ...presentation }), 'tool');
     this.#event({ kind: 'file-prepared', admission: { callId, presentationId: token, capabilityHash: sha256(JSON.stringify(capability)),
       intentEventId: intent.eventId, intentHash: intent.hash, epoch: this.#activity.epoch,
       operation: call.name as 'file.read' | 'file.write', rawPath: String(call.arguments.path), parts,
-      root: capability.root, target: structuredClone(target), cleanup: 'host-project-resource', source } });
+      root: capability.root, target: structuredClone(target), cleanup: 'host-project-resource', ...(ruleHash ? { ruleHash, ruleMemoryIds: presentation.ruleMemoryIds } : {}), source } });
     return call.name === 'file.write' ? presentation : null;
   }
   decideFile(presentation: FilePresentation, decision: FileDecision): void {
@@ -690,7 +744,7 @@ export class AgentRun {
     this.#store.withActivity(this.#activity, () => {
       this.#event({ kind: 'tool-result', result: { callId, executionState: tool.started ? 'started' : 'not_started',
         outcome: archivedOutcome, argumentsHash: tool.argumentsHash, errorClass: archivedErrorClass, source, ...(file ? { file: structuredClone(file) } : {}) } });
-      if (this.status().tools.filter(item => item.attemptId === tool.attemptId).every(item => item.result && item.result.outcome !== 'unknown')) {
+      if (tool.attemptId && this.status().tools.filter(item => item.attemptId === tool.attemptId).every(item => item.result && item.result.outcome !== 'unknown')) {
         this.#store.queueCaptureBoundary(this.#activity, this.runId, tool.attemptId);
       }
     });
@@ -702,10 +756,15 @@ export class AgentRun {
     catch (error) { this.#host.historian.onError(error); }
   }
   #terminal(terminal: RunTerminal): void {
+    const ownIntent = this.isProjectRule ? this.#store.readIntent(this.#activity) : null;
+    const closeIntent = ownIntent?.status === 'active' && ownIntent.goalInput.eventId === this.status().inputs[0]?.source.eventId;
+    const settled = closeIntent ? this.status().tools[0]?.result?.source
+      ?? this.#appendOutput(sourceEventId('project-rule-terminal', this.runId), JSON.stringify({ terminal }), 'tool') : null;
     this.#store.withActivity(this.#activity, () => {
       this.#event({ kind: 'terminal', terminal });
       this.#store.sealRequestRun(this.#activity, this.runId);
-      if (terminal === 'completed') this.#store.queueCaptureBoundary(this.#activity, this.runId);
+      if (settled) this.#store.transitionIntent(this.#activity, ownIntent!.eventId, settled, { status: 'completed', step: 'owner-project-rule-settled' });
+      if (terminal === 'completed' && !this.isProjectRule) this.#store.queueCaptureBoundary(this.#activity, this.runId);
     });
     if (terminal === 'completed') this.#queueHistorian();
   }
