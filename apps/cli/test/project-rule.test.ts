@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -9,7 +10,8 @@ import { once } from 'node:events';
 import { createServer } from 'node:http';
 import { AGENT_BUDGET } from '../src/agent-cli.ts';
 import { startCli, sendCommand } from '../src/process-driver.ts';
-import type { PurgeManifest } from '@euler/core';
+import { inspectProjectRuleRanges, sha256 } from '@euler/core';
+import type { PurgeCarrierSelection, PurgeManifest } from '@euler/core';
 
 const rule = '通报落款使用「签收灯：青砚」。', other = '日期必须使用 ISO 8601。';
 async function setup(t: TestContext) {
@@ -24,7 +26,7 @@ async function setup(t: TestContext) {
     rmSync(root, { recursive: true, force: true }); rmSync(sandbox, { recursive: true, force: true });
   });
   const start = (args: string[], env?: NodeJS.ProcessEnv) => {
-    const cli = startCli(args, 15000, undefined, env);
+    const cli = startCli(args, args.includes('--transport-config') ? 150000 : 15000, undefined, env);
     children.push(cli);
     return cli;
   };
@@ -42,6 +44,21 @@ async function modelRoute(t: TestContext, root: string, respond: (body: string) 
 }
 const localEnv = { ...process.env, EULER_RULE_TEST: 'local-fixture' };
 const done = { message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' };
+
+test('a started rule cleanup accepts partial erasure only within the frozen ranges', () => {
+  const prefix = 'Independent rule\r\n', bytes = Buffer.from(prefix + rule + '\r\n'), id = randomUUID();
+  const range = { offset: Buffer.byteLength(prefix), bytes: Buffer.byteLength(rule) };
+  const erased = Buffer.from(bytes); erased.fill(32, range.offset, range.offset + range.bytes);
+  const selection: PurgeCarrierSelection = { role: 'project-output', file: { path: '/project/AGENTS.md', identity: { dev: '1', ino: '2' } },
+    hash: sha256(bytes), bytes: bytes.length, entries: [{ id, hash: sha256(id + ':' + sha256(rule)) }],
+    ruleCleanup: { ranges: [range], afterHash: sha256(erased) } };
+  assert.deepEqual(inspectProjectRuleRanges(selection, bytes), erased);
+  const partial = Buffer.from(bytes); partial.fill(32, range.offset, range.offset + Math.floor(range.bytes / 2));
+  assert.throws(() => inspectProjectRuleRanges(selection, partial), /purge-project-output-changed/);
+  assert.deepEqual(inspectProjectRuleRanges(selection, partial, true), erased);
+  partial[0] = 120;
+  assert.throws(() => inspectProjectRuleRanges(selection, partial, true), /purge-project-output-changed/);
+});
 
 test('setting a rule neither grants a file root nor turns natural conversation into a write', async t => {
   const { cli, bind } = await setup(t);
@@ -101,6 +118,32 @@ test('owner rule preview, rejection, publication and selective privacy purge use
   assert.equal((await sendCommand(later, 'cleanup', 'purge-result')).status, 'controlled-complete');
   assert.equal((await later.exit).code, 0); assert.ok(readFileSync(file, 'utf8').endsWith('另一条手写规则。\n'));
   assert.ok(!readFileSync(file, 'utf8').includes(other));
+});
+
+for (const fault of ['before', 'partial', 'complete']) test(`interrupted rule erasure resumes after ${fault} write without changing unrelated bytes`, { skip: process.platform !== 'win32' }, async t => {
+  const { cli, start, sandbox, file, bind } = await setup(t);
+  writeFileSync(file, other + '\r\n'); await sendCommand(cli, bind, 'session-bound');
+  const mem = await sendCommand(cli, '记住偏好：' + rule, 'remember-result');
+  const offer = await sendCommand(cli, '设为项目规则：' + rule, 'file-approval');
+  assert.equal((await sendCommand(cli, String(offer.command), 'project-rule-result')).saved, true);
+  cli.command('/exit'); assert.equal((await cli.exit).code, 0);
+  const before = readFileSync(file);
+  const worker = (fault: string) => {
+    const child = spawnSync(process.execPath, ['apps/cli/test/support/project-rule-purge-worker.ts', sandbox, String(mem.recordId), fault], { encoding: 'utf8' });
+    assert.equal(child.status, 0, child.stderr); return child.stdout;
+  };
+  worker(fault);
+  assert.deepEqual(readFileSync(file).subarray(0, Buffer.byteLength(other + '\r\n')), before.subarray(0, Buffer.byteLength(other + '\r\n')));
+  if (fault === 'partial') {
+    const partial = readFileSync(file), changed = Buffer.from(partial); changed[0] = 120; writeFileSync(file, changed);
+    assert.equal(JSON.parse(worker('acquire')).acquired, false, 'unrelated bytes cannot change after the checkpoint');
+    assert.deepEqual(readFileSync(file), changed); writeFileSync(file, partial);
+  }
+  assert.equal(JSON.parse(worker('acquire')).acquired, true, 'interrupted rule bytes must not permanently block maintenance');
+  const resume = start(['purge', '--sandbox', sandbox]); await resume.waitFor('purge-result');
+  assert.equal((await sendCommand(resume, 'cleanup', 'purge-result')).status, 'controlled-complete');
+  assert.equal((await resume.exit).code, 0);
+  assert.equal(readFileSync(file, 'utf8'), other + '\r\n' + ' '.repeat(Buffer.byteLength(rule)) + '\r\n');
 });
 
 test('an ordinary model-proposed addition retains the unrelated pre-existing AGENTS bytes through purge', { skip: process.platform !== 'win32' }, async t => {

@@ -75,7 +75,7 @@ export interface PurgeContinuation {
   schema: 'purge-continuation@1'; operationId: string; phase: 'external-cleanup' | 'sqlite-maintenance';
   carriers: PurgeCarrierSelection[]; backups: SnapshotCleanupManifest[];
   inventory: PurgeManifest['inventory']['carriers']; sources: BoundSource[];
-  sourceCleanup?: PurgeLineWork[]; hostCleanup?: PurgeLineWork[]; backupCleanup?: number[]; outputCleanup?: number[];
+  sourceCleanup?: PurgeLineWork[]; hostCleanup?: PurgeLineWork[]; backupCleanup?: number[]; outputCleanup?: number[]; outputStarted?: number[];
 }
 interface PurgeLineWork { index: number; plan: PurgeLinePlan; ack: PurgeLineAck | null }
 export interface PurgeLinePlan { ranges: { offset: number; bytes: number }[]; afterHash: string }
@@ -103,8 +103,8 @@ export function inspectPurgeLines(selection: PurgeCarrierSelection, plan: PurgeL
   check(sha256(result) === plan.afterHash, 'purge-source-carrier-changed');
   return result;
 }
-/** A completed range can survive a crash before its output acknowledgement. */
-export function inspectProjectRuleRanges(selection: PurgeCarrierSelection, bytes: Uint8Array): Buffer {
+/** After the durable start checkpoint, resume only the frozen ranges; all other bytes still match. */
+export function inspectProjectRuleRanges(selection: PurgeCarrierSelection, bytes: Uint8Array, started = false): Buffer {
   const plan = selection.ruleCleanup;
   check(selection.role === 'project-output' && plan && bytes.length === selection.bytes
     && plan.ranges.length > 0 && plan.ranges.length === selection.entries.length, 'purge-project-rule-range-mismatch');
@@ -114,7 +114,7 @@ export function inspectProjectRuleRanges(selection: PurgeCarrierSelection, bytes
       && offset + length <= after.length && (!offset || after[offset - 1] === 10)
       && (offset + length === after.length || [10, 13].includes(after[offset + length]!)), 'purge-project-rule-range-mismatch');
     const entry = selection.entries[i]!, line = after.subarray(offset, offset + length);
-    check(line.every(b => b === 32) || sha256(entry.id + ':' + sha256(line)) === entry.hash, 'purge-project-output-changed');
+    check(started || line.every(b => b === 32) || sha256(entry.id + ':' + sha256(line)) === entry.hash, 'purge-project-output-changed');
     line.fill(32);
   }
   check(sha256(after) === plan.afterHash, 'purge-project-output-changed');

@@ -113,10 +113,10 @@ export async function runPurge(sandbox: Sandbox, recordId?: string, scenario = '
           if (scenario === 'source-after-ack') killPoint('purge-source-checkpoint', 'after-ack', 10000);
           if (line === 'cleanup-source') { await emit('purge-source-result', result); return; }
           store.cleanupPurgeHost(coordinator, { info: new OwnerInfoLog(sandbox, action => action(), () => {}), receiver: new CountingTransport(sandbox) });
-          store.cleanupPurgeOutputs(coordinator, selection => {
+          store.cleanupPurgeOutputs(coordinator, (selection, started) => {
             check(selection.output, 'purge-project-owner-mismatch');
             const root = new WindowsFileRoot(selection.output.root);
-            try { return root.purge(selection); } finally { root.close(); }
+            try { return root.purge(selection, started); } finally { root.close(); }
           });
           store.cleanupPurgeBackups(coordinator);
           store.preparePurgeMaintenance(coordinator);

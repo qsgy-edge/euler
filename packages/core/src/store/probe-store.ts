@@ -7366,6 +7366,9 @@ export class ProbeStore {
     check(new Set(continuation.outputCleanup).size === (continuation.outputCleanup?.length ?? 0)
       && (continuation.outputCleanup ?? []).every(index => Number.isSafeInteger(index)
         && continuation.carriers[index]?.role === 'project-output'), 'purge-continuation-evidence-gap');
+    check(new Set(continuation.outputStarted).size === (continuation.outputStarted?.length ?? 0)
+      && (continuation.outputStarted ?? []).every(index => Number.isSafeInteger(index)
+        && continuation.carriers[index]?.role === 'project-output' && continuation.carriers[index]?.ruleCleanup), 'purge-continuation-evidence-gap');
     return continuation;
   }
 
@@ -7587,7 +7590,7 @@ export class ProbeStore {
     });
   }
 
-  cleanupPurgeOutputs(coordinator: string, owner: (selection: PurgeCarrierSelection) => { removed: true }) {
+  cleanupPurgeOutputs(coordinator: string, owner: (selection: PurgeCarrierSelection, started: boolean) => { removed: true }) {
     return this.#purgeStep(coordinator, 'output', () => {
       check(this.acquireMaintenance(coordinator).acquired && this.#assertCoordinator(coordinator).state === 'cleaning',
         'maintenance-residuals-or-participants');
@@ -7597,10 +7600,19 @@ export class ProbeStore {
         check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
         if (!this.#purgeOutputClean(selection)) {
           check(!continuation.outputCleanup?.includes(index), 'purge-output-postcondition-failed');
+          const started = continuation.outputStarted?.includes(index) ?? false;
           const bytes = snapshotBytes(selection.file);
-          if (selection.ruleCleanup) inspectProjectRuleRanges(selection, bytes);
-          else check(bytes.length === selection.bytes && sha256(bytes) === selection.hash, 'purge-project-output-changed');
-          check(owner(structuredClone(selection)).removed, 'purge-output-postcondition-failed');
+          if (selection.ruleCleanup) {
+            inspectProjectRuleRanges(selection, bytes, started);
+            if (!started) this.#transaction(() => {
+              check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
+              const current = snapshotBytes(selection.file);
+              check(current.length === selection.bytes && sha256(current) === selection.hash, 'purge-project-output-changed');
+              continuation.outputStarted ??= []; continuation.outputStarted.push(index);
+              this.#savePurgeContinuation(continuation);
+            });
+          } else check(bytes.length === selection.bytes && sha256(bytes) === selection.hash, 'purge-project-output-changed');
+          check(owner(structuredClone(selection), started).removed, 'purge-output-postcondition-failed');
         }
         this.#transaction(() => {
           check(this.#assertCoordinator(coordinator).state === 'cleaning', 'maintenance-not-exclusive');
@@ -7912,7 +7924,7 @@ export class ProbeStore {
         if (work) {
           inspectPurgeLines(purge!.carriers[index]!, work.plan, bytes);
           if (work.ack) check(sha256(bytes) === work.ack.hash, 'purge-source-postcondition-failed');
-        } else if (selection?.ruleCleanup) inspectProjectRuleRanges(selection, bytes);
+        } else if (selection?.ruleCleanup) inspectProjectRuleRanges(selection, bytes, purge!.outputStarted?.includes(index));
         else check(bytes.length === carrier.bytes && sha256(bytes) === carrier.hash, 'purge-carrier-stale');
         entries.push({ path: carrier.role === 'project-output' ? carrier.file.path : basename(carrier.file.path), state: 'expected', observedAt,
           dev: carrier.file.identity.dev, ino: carrier.file.identity.ino, reason: 'purge-continuation-carrier' });

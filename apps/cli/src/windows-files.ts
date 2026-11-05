@@ -198,7 +198,7 @@ export class WindowsFileRoot {
     } catch (error) { close(); throw error; }
   }
   /** Erase approved rule ranges or delete the approved file through pinned handles. */
-  purge(selection: PurgeCarrierSelection): { removed: true } {
+  purge(selection: PurgeCarrierSelection, started = false): { removed: true } {
     check(this.#handle && selection.role === 'project-output' && selection.output
       && JSON.stringify(selection.output.root) === JSON.stringify(this.#root), 'purge-project-owner-mismatch');
     const parts = relative(this.#root.path, selection.file.path).split(/[\\/]/);
@@ -224,7 +224,7 @@ export class WindowsFileRoot {
       const bytes = Buffer.alloc(selection.bytes), done = [0];
       check(native().read(file, bytes, bytes.length, done, null) && done[0] === bytes.length, 'purge-project-output-changed');
       if (selection.ruleCleanup) {
-        const after = inspectProjectRuleRanges(selection, bytes);
+        const after = inspectProjectRuleRanges(selection, bytes, started);
         for (const { offset, bytes: length } of selection.ruleCleanup.ranges) {
           check(native().seek(file, offset, null, 0) && native().write(file, after.subarray(offset, offset + length), length, done, null)
             && done[0] === length, 'purge-project-rule-write-incomplete');
