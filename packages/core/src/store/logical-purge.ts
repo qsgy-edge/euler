@@ -14,7 +14,7 @@ export const PURGE_DATABASE_INVENTORY = {
   control: ['intent_tasks', 'schema_meta', 'owner_fences', 'maintenance_residuals', 'owner_activities', 'sessions', 'projects',
     'project_resources', 'workspaces', 'workspace_projects', 'memory_scopes', 'source_projection_health',
     'store_recovery_events', 'store_recovered_owners', 'execution_streams', 'execution_events'],
-  content: ['session_project_bindings', 'intent_events', 'intent_heads', 'memory_discovery_grants', 'memory_discovery_projects',
+  content: ['project_rule_publications', 'session_project_bindings', 'intent_events', 'intent_heads', 'memory_discovery_grants', 'memory_discovery_projects',
     'memory_discovery_targets', 'source_query_receipts', 'memory_records', 'memory_revisions', 'memory_applicability',
     'capture_scope_sources', 'capture_scope_resolutions', 'capture_jobs', 'compartments', 'capture_work', 'provenance_refs', 'memory_heads', 'memory_events',
     'host_presentations', 'presentation_targets', 'pending_operations', 'host_operation_delivery', 'activation_batches',
@@ -26,7 +26,7 @@ export const PURGE_DATABASE_INVENTORY = {
 } as const;
 
 const identities: Record<string, readonly string[]> = {
-  intent_events: ['event_id'], intent_heads: [],
+  project_rule_publications: ['publication_id'], intent_events: ['event_id'], intent_heads: [],
   memory_discovery_grants: ['grant_id'], memory_discovery_projects: [], memory_discovery_targets: [],
   source_query_receipts: ['query_id'], memory_records: ['record_id'],
   memory_revisions: ['record_id', 'revision_id'], memory_applicability: [], capture_jobs: ['job_id'],
@@ -52,6 +52,7 @@ export interface PurgeCarrier {
 export interface PurgeCarrierSelection {
   role: PurgeCarrier['role']; file: BoundFile; hash: string; bytes: number; entries: { id: string; hash: string }[];
   output?: Pick<ControlledFile, 'root' | 'parent'>;
+  ruleCleanup?: PurgeLinePlan;
 }
 export interface PurgeManifest {
   schema: 'purge-manifest@1'; recordId: string; records: MemoryRecord[];
@@ -102,6 +103,23 @@ export function inspectPurgeLines(selection: PurgeCarrierSelection, plan: PurgeL
   check(sha256(result) === plan.afterHash, 'purge-source-carrier-changed');
   return result;
 }
+/** A completed range can survive a crash before its output acknowledgement. */
+export function inspectProjectRuleRanges(selection: PurgeCarrierSelection, bytes: Uint8Array): Buffer {
+  const plan = selection.ruleCleanup;
+  check(selection.role === 'project-output' && plan && bytes.length === selection.bytes
+    && plan.ranges.length > 0 && plan.ranges.length === selection.entries.length, 'purge-project-rule-range-mismatch');
+  const after = Buffer.from(bytes);
+  for (const [i, { offset, bytes: length }] of plan.ranges.entries()) {
+    check(Number.isSafeInteger(offset) && Number.isSafeInteger(length) && offset >= 0 && length > 0
+      && offset + length <= after.length && (!offset || after[offset - 1] === 10)
+      && (offset + length === after.length || [10, 13].includes(after[offset + length]!)), 'purge-project-rule-range-mismatch');
+    const entry = selection.entries[i]!, line = after.subarray(offset, offset + length);
+    check(line.every(b => b === 32) || sha256(entry.id + ':' + sha256(line)) === entry.hash, 'purge-project-output-changed');
+    line.fill(32);
+  }
+  check(sha256(after) === plan.afterHash, 'purge-project-output-changed');
+  return after;
+}
 export interface PurgePresentation {
   operationId: string; token: string; nonce: string; phrase: string; manifest: PurgeManifest; digest: string;
 }
@@ -142,6 +160,8 @@ export function purgeValues(value: unknown, qualifiedSources = new Map<string, S
         try { pending.push(JSON.parse(next)); }
         catch { /* Free text may start with a bracket; canonical JSON columns are checked by the planner. */ }
       } else {
+        const rule = /^设为项目规则[：:]([^\r\n]+)$/u.exec(next)?.[1]?.trim();
+        if (rule) values.add('published-rule:' + sha256(rule));
         const command = parseCorrectionCommand(next);
         if (command) pending.push(command);
         const purge = /^purge ([a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/u.exec(next);
@@ -151,6 +171,13 @@ export function purgeValues(value: unknown, qualifiedSources = new Map<string, S
       }
     } else if (next && typeof next === 'object' && !seen.has(next)) {
       seen.add(next);
+      const objectValue = next as Record<string, unknown>;
+      const rulesText = objectValue.kind === 'agents' && objectValue.scope && typeof objectValue.text === 'string' ? objectValue.text
+        : objectValue.kind === 'file-presentation' && typeof objectValue.path === 'string' && /(?:^|[\\/])agents\.md$/iu.test(objectValue.path) ? objectValue.content
+        : (objectValue.name === 'file.write' || objectValue.name === 'file_write') && typeof objectValue.arguments === 'object'
+          && /(?:^|[\\/])agents\.md$/iu.test(String((objectValue.arguments as Record<string, unknown>)?.path))
+          ? (objectValue.arguments as Record<string, unknown>).content : null;
+      if (typeof rulesText === 'string') for (const line of rulesText.split(/\r?\n/u)) if (line.trim()) values.add('published-rule:' + sha256(line));
       for (const [key, child] of Object.entries(next)) {
         const object = next as Record<string, unknown>, sources = typeof child === 'string' ? qualifiedSources.get(child) : undefined;
         const source = !sources ? undefined : key === 'eventId' && object.schema === 'cli-source-ack@1'
@@ -203,7 +230,7 @@ function assertPurgeSchema(db: DatabaseSync, ddl: string, tables: string[]): voi
     'purge-unregistered-database-reference');
 }
 
-export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCarrier[], backups: SnapshotCleanupManifest[], ddl: string, sources: BoundSource[]): PurgePlan {
+export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCarrier[], backups: SnapshotCleanupManifest[], ddl: string, sources: BoundSource[], ruleLines: ReadonlyMap<string, string> = new Map()): PurgePlan {
   const tables = db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
     .all().map(row => String(row.name));
   const known = Object.values(PURGE_DATABASE_INVENTORY).flat() as string[];
@@ -283,6 +310,8 @@ export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCar
       selectedEntries.add(key); changed = true;
       if (!entry.source || !qualifiedSources.has(entry.id)) tokens.add(entry.id);
       tokens.add(entry.hash);
+      const ruleLine = carrier.role === 'project-output' && ruleLines.get(entry.id);
+      if (ruleLine) tokens.add('published-rule:' + ruleLine);
       if (entry.source) for (const value of sourceValues(entry.source, qualifiedSources)) tokens.add(value);
     }
   }

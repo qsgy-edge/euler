@@ -12,7 +12,7 @@ export interface ToolResult {
   outcome: 'success' | 'failure' | 'cancelled' | 'timeout' | 'unavailable' | 'unknown';
   argumentsHash: string; errorClass: string | null; source: SourceAck; file?: FileReceipt;
 }
-export interface ToolFact { callId: string; name: string; argumentsHash: string; attemptId: string; started: boolean; result: ToolResult | null }
+export interface ToolFact { callId: string; name: string; argumentsHash: string; attemptId: string | null; started: boolean; result: ToolResult | null }
 export type AgentEvent =
   | { kind: 'opened'; route: ModelRoute; files?: FileCapability; discoveryGrantId?: string; guidanceRunId?: string }
   | { kind: 'source-access'; sourceEventId: string; binding: Binding; discoveryGrantId: string }
@@ -24,6 +24,7 @@ export type AgentEvent =
   | { kind: 'admitted'; eventIds: string[] }
   | { kind: 'bound'; assemblyId: string; eventIds: string[] }
   | { kind: 'response'; attemptId: string; source: SourceAck; calls: { callId: string; name: string; argumentsHash: string }[] }
+  | { kind: 'project-rule'; source: SourceAck; callId: string; argumentsHash: string }
   | { kind: 'file-prepared'; admission: FileAdmission }
   | { kind: 'file-approved'; callId: string; presentationId: string; source: SourceAck }
   | ({ kind: 'file-reconciled'; callId: string; source: SourceAck } & ({ receipt: FileReceipt; failureReason?: never } | { failureReason: FileFailureReason; receipt?: never }))
@@ -99,6 +100,13 @@ export function replayAgent(events: AgentEvent[], attempts: number): AgentStatus
           state.tools.push({ ...call, attemptId: event.attemptId, started: false, result: null });
         }
         break;
+      case 'project-rule': {
+        check(events[0]?.kind === 'opened' && events[0].route.route === 'owner-project-rule' && !state.tools.length
+          && state.inputs.length === 1 && state.inputs[0]!.state === 'bound-to-assembly'
+          && state.inputs[0]!.source.hash === event.source.hash, 'project-rule-input-required');
+        state.tools.push({ callId: event.callId, name: 'file.write', argumentsHash: event.argumentsHash, attemptId: null, started: false, result: null });
+        break;
+      }
       case 'file-prepared': {
         const tool = state.tools.find(tool => tool.callId === event.admission.callId);
         check(tool && !tool.started && !tool.result && tool.name === event.admission.operation

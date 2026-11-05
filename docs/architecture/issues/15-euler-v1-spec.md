@@ -292,6 +292,8 @@ Batch identity 与完整有序 event manifest 稳定，每次新卡有独立 pre
 
 Continuation、fence/activity、intent、Info/outbox 的敏感关联全部进清除闭包；在删 locator 前获取并排空整个 store 的维护 fence，只留随机 store identity/epoch/无内容进度，重启继续关闭。外部完成后删敏感 continuation、再做 SQLite 维护，完成 receipt 与开放 fence 最后同事务提交，旧 activity/缓存/token 不因重新开放复活。Continuation 不保存正文，仅在未完成期间保护必要 locator/ack，不用于检索或模型输入，也不是完成后保留例外。外部 owner 全部完成后，先事务删除其敏感字段/反向引用，只留无内容 operation 进度，再完成 main/WAL/free-page 维护及复核，最后追加 content-free controlled-complete。删 continuation 本身产生的旧页也须清理；中途崩溃凭无内容进度重做末段维护，不恢复 locator。受影响备份/bundle 不发布或恢复旧内容；缺清除进度或 store integrity 时保持 blocked，不从清除前快照复活目标。逻辑提交、incomplete 和最终结果是不同追加事实，不回写旧 receipt。
 
+Owner 确认发布到已绑定项目根 AGENTS.md 的持续规则由项目管理，普通记忆或 forget 不改该文件。隐私 purge 的预览和批准范围只包括能归属于目标记忆的已发布规则；保留同文件的独立规则。规则位置、来源关系或文件身份不能核实时停止，不得以整文件删除代替。
+
 Purge 前已签 owner operation receipt 仅在原本已是不可反查假名 subjectRef/revision、无正文/locator/原 hash 时保留且不改写；否则删整行及对应展示。清除完成后的其他保留物仅 content-free envelope/seq/attempt 状态与不可反查 purge marker，受影响 stream 明示不可完整复算。旧 preview/detail 只能 redacted，外部 remote/备份列为不可控残留；不声称 SSD/文件系统取证级擦除。
 
 清除结果由维护 Host 持久呈现；不为补模型摘要向已退出 session 重投已清除目标。新 runtime 读取 completion/fence 与当前合格来源建立新 window，旧 source 已清除则报缺，必要状态无敏感内容。普通 correction/forget/restore/rollback 的两面投递义务不变，见 14。

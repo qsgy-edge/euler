@@ -8,7 +8,7 @@ Issue：[#25](https://github.com/qsgy-edge/euler/issues/25)。验收日期：202
 
 普通 CLI 输入、显式项目绑定及待定候选自动续办已由 [#54 / PR #56](https://github.com/qsgy-edge/euler/pull/56)、[#55 / PR #58](https://github.com/qsgy-edge/euler/pull/58) 交付，并在合并基线上通过受影响组合复验。共享 Core 三平台回归、Windows 实际 CLI/文件操作、候选验证、恢复与清理证据符合下述限定场景。真实 provider 与部分独立证据尚未齐备。
 
-当前 `schema 30` 只用于 disposable 数据库，forward-migration 测试副本为 `31`。没有生成初始 migration，也没有在本票补写产品、基础测试或 CI。
+本报告被测基线的 `schema 30` 只用于 disposable 数据库，其 forward-migration 测试副本为 `31`。没有生成初始 migration，也没有在本票补写产品、基础测试或 CI。
 
 判定依据是 [I01/I03/I05/I08](../architecture/issues/15-euler-v1-spec.md)、[08 §4a](../architecture/issues/08-automate-memory-evolution.md)、[X-card](../architecture/issues/12-build-evidence-experiment-matrix.md) 和 [D8 / Physical contract](../architecture/issues/13-select-target-v1-migration.md)。#25 是验收票；缺功能与基础验证交回所属实施票。
 

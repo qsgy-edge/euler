@@ -33,6 +33,7 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
   let run: AgentRun | undefined, pumping: Promise<void> | undefined, windowRequested = false;
   let owner = new OwnerMemoryHost(probe, openOwnerInfo(sandbox, probe), 'success', probe.binding.projectId === null);
   const corrections = new CorrectionHost(probe, { recoverInfo: () => owner.deliver() });
+  let ruleRun: AgentRun | undefined;
   let inputEpoch = 0, pendingBindings = 0;
   const liveInputs: ({ input: ReturnType<CorrectionHost['receive']>; epoch: number; bindsProject: boolean; fileToken?: string; error?: unknown })[] = [];
   let project = probe.store.sessionProject(probe.activity);
@@ -68,13 +69,13 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
   let { capture, historian } = startWorkers();
   let pendingApproval: { token: string; presented: boolean; decide(decision: FileDecision): void } | undefined;
   const setup = new AbortController();
-  const stop = () => { inputEpoch++; setup.abort(); run?.cancel(); void capture.close(); void historian?.close(); };
+  const stop = () => { inputEpoch++; setup.abort(); ruleRun?.cancel(); run?.cancel(); void capture.close(); void historian?.close(); };
   process.on('SIGINT', stop);
   let lines: ReturnType<typeof createInterface> | undefined, inputClosed = false;
   const state = () => ({ binding: options.binding ?? bindingOf(sandbox), project: probe.store.sessionProject(probe.activity), route,
     intent: probe.store.readIntent(probe.activity), discoveryGrantId: discoveryGrantId ?? null,
     files: fileCapability() ? 'windows-handles' : 'unavailable', projectRootError: projectRootError(),
-    runId: run?.runId ?? null, status: run?.status() ?? null, networkCount: configured?.transport.count ?? 0,
+    runId: (ruleRun ?? run)?.runId ?? null, status: (ruleRun ?? run)?.status() ?? null, networkCount: configured?.transport.count ?? 0,
     runs: probe.store.sessionAgentRuns(probe.activity).map(ledger => ({ runId: ledger.run.runId, sealed: ledger.sealed,
       relatedRunId: ledger.run.relatedRunId, terminal: probe.store.agentStatus(probe.activity, ledger.run.runId).terminal, attempts: ledger.attempts })) });
   const rejected = (error: unknown): void => { emit('session-command-rejected', { reason: (error as Error).message, sends: configured?.transport.count ?? 0 }); };
@@ -152,6 +153,22 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
         if (/^(approve|reject) [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(line)) {
           check(pendingApproval && live?.fileToken === pendingApproval.token && line === `${line.split(' ')[0]} ${pendingApproval.token}`, 'file-approval-stale');
           pendingApproval.decide(line.startsWith('approve ') ? 'approved' : 'rejected'); continue;
+        }
+        check(!ruleRun, 'project-rule-pending');
+        if (/^设为项目规则[：:]/u.test(line)) {
+          check(!pumping, 'foreground-run-active');
+          check(project?.root, 'project-rule-root-required');
+          const files = fileCapability(); check(files, 'project-rule-file-unavailable');
+          const active = new AgentRun(probe.store, probe.activity, { binding: probe.binding, source: probe.archive,
+            files, ...guidanceHost() }, { provider: 'owner', model: 'none', route: 'owner-project-rule', authNamespace: 'local' }, AGENT_BUDGET);
+          try { active.prepareProjectRule(line); } catch (error) { active.fail(); throw error; }
+          ruleRun = active;
+          pumping = pumpAgent(active, host).then(status => {
+            const tool = status.tools[0]?.result;
+            emit('project-rule-result', { runId: active.runId, terminal: status.terminal, saved: tool?.outcome === 'success',
+              reason: tool && tool.outcome !== 'success' ? JSON.parse(probe.archive.read(tool.source).text).modelResult : null });
+          }).catch(rejected).finally(() => { ruleRun = undefined; pumping = undefined; });
+          continue;
         }
         if (line === '/drain') {
           check(!pumping, 'foreground-run-active'); await capture.flush(); await historian?.flush();

@@ -93,7 +93,7 @@ try {
   await after.close();
   snapshot(root, 'after');
   database(root, db => {
-    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 30);
+    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version, 31);
     assert.equal(db.prepare('PRAGMA integrity_check').get()!.integrity_check, 'ok');
     assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(), []);
     for (const row of original.revisions) assert.deepEqual(db.prepare('SELECT * FROM memory_revisions WHERE revision_id=?').get(row.revision_id!), row);
