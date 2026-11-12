@@ -22,34 +22,34 @@
 |---|---|---|---|
 | 普通自动装配 | 24 个独立缺证案例均缺自动装配观测 | 新验收改看 R2/R7 的触发→返回→冻结送达；旧 `ASSEMBLY_NOT_OBSERVED` 保留原判，注明旧规格身份 | 普通 CLI、实际请求、tool archive、assembly/attempt 逐项对齐；不只检查 Store 页 |
 | 投影滞后与新激活记录 | pinned delta／current-head 与下一次可读性 | 取消自主送入 prompt，保留按需读取新 head 或明确 dirty／不可用 | `search-projection`、`owner-memory`、`agent-run` 现有测试入口；必要时用新开发数据查缺口 |
-| canonical 状态变化 | 4 个案例另缺 transition 可达性 | 保留 | 从公开操作建立新 revision／状态，核对 before/after、投影、搜索和发送前资格；不可构造的状态仍缺证 |
-| 中文单字 fallback | 2 个案例 `unsupported-query`，没有成对回退证据 | 保留，不借策略变更采纳分词或 fallback | 同一开发快照核对支持／不支持行为及候选质量；有实证缺陷后再决定实现 |
-| guidance 正负向 | 2 个案例未观测加载；PR #61 有正向开发证据 | 保留 | 已绑定项目、未绑定仅只读 grant、仅模型自报范围三种对照；读取加载记录与实际请求 |
+| canonical 状态变化 | 4 个独立案例另缺 transition 可达性 | 保留 | 新开发探针已记录 activation/revision/forget/restore/rejected/conflict、dirty→drain、旧快照拒用与重启，共 15 项断言；不映射未知独立案例，冻结请求送达仍分别核对 |
+| 中文单字 fallback | 2 个独立案例 `unsupported-query`，没有回退质量证据 | 保留，不借策略变更采纳分词或 fallback | 同一开发 head 已核对「松」不支持／「松林」命中；慢路径与独立配对质量仍缺 |
+| guidance 正负向 | 2 个独立案例未观测加载 | 保留独立首测判定 | 开发侧已补显式绑定、未绑定只读 grant、仅模型自报三种实际请求对照；复用 #25 的 4/4 场景和 7 次 loopback 原件 |
 | scope、权限、目标环境 | 未授权泄漏、跨项目 reference-only、撤销／任务结束／切换 | 保留 | 授权版本、实际覆盖、target 环境、cursor/ref；旧句柄不能延续失效授权 |
 | 排序／query tokenizer | 规格 BM25/RRF 与实际组内命中数／轮询次序有差异；独立计量缺证 | 保留为独立规格／实现差异，不在按需策略中顺带合法化 | 记录实际算法和版本、每 lane 查询与顺序；不把名次当分数 |
 | 预算与成本 | 逐候选 token／选择原因未齐 | 保留实际检索与送达路径的对应要求；无查询时不造候选排除记录 | 区分 token、UTF-8 bytes、provider usage 和 unknown；定义计量后才能宣称满足原要求 |
 | 独立证据保管 | 旧集污染／封存记录缺口；新集首测 3 fail / 24 gap | 保留 | 开发实验与独立首测分别归档；不读取 gold、不重跑新旧 held-out、不另启第三套题 |
 
-本计划列出现有测试入口用于后续定向核对，不声称本轮重新执行了这些测试。文档调整本身仅做静态验证。
+原始身份、结果和范围见 [gate 的开发补证](t24-first-cli-acceptance.md#已确认策略基线的开发补证)。既有 27 项边界案例复用三平台 CI；新开发探针不替代独立验收。
 
 ## 来源接口的定向核对
 
-两次旧 `source.expand` 拒绝已有调用链证据：一次把 memory recordId 作为 published unitId，一次把另会话 eventId 交给当前 archive 查询。[实验索引](t24-retrieval-experiment-index.md) 记录具体原件和代码入口。后续依次检查：
+两次旧 `source.expand` 拒绝已有调用链证据：一次把 memory recordId 作为 published unitId，一次把另会话 eventId 交给当前 archive 查询。[实验索引](t24-retrieval-experiment-index.md) 记录具体原件和代码入口。当前核对结果：
 
-1. 返回对象能否清楚区分 memory record、当前会话 event 和已发布 source unit；工具说明是否给出合法的继续路径。
-2. `source.search(scope=project)` 找 published unit 后的展开是否按实际授权和 immutable source 返回。已通过的离线样例可复用；权限与来源失效负例仍按现有测试覆盖。
-3. Core 的 recordId 展开重载与模型工具仅有 eventId/unitId 的差异，是否形成真实用户需求的不可达路径。先核对工具契约和调用方，再决定修正说明或扩接口，不能将门禁拒绝直接改为放行。
+1. `memory.search` 的 unitId 为 recordId；模型 source 工具的 unitId 查已发布单元，eventId 查当前会话。两类 ID 的含义须在修复中明确，保留既有错误路由的拒绝。
+2. 已发布来源的 project search→unit expand 已有开发正例，可复用；权限与来源失效负例仍按现有测试覆盖。
+3. 未发布的同项目跨会话来源已通过最小 AgentRun 开发对照确认不可达：记忆命中，项目来源为空，三个参数路径拒绝，Core recordId 恢复原文成功。实际三个冻结请求均无原文，未发生 07 §14 保留的定向恢复。差异交 #11/T11 与 #8/T08；修复须沿既有资格、授权、hash、预算和发送前重验边界，不能将拒绝一律改为放行。
 
 ## 后续执行顺序
 
 | 顺序 | 工作 | 完成条件 |
 |---|---|---|
-| 1 | 发布已确认的规格与对应验收口径 | 本地正式条款已同步；发布后固定 commit，受影响票引用该基线，再开始实现差异修复 |
-| 2 | B4 的确定性开发核对 | 权限／状态／来源／query／计量逐项有证据或具体差异；修复归原能力 owner，T24 不隐含补功能 |
+| 1 | 已发布规格与对应验收口径 | PR #62 合并基线 fb51c16；#25/#26/#28 引用已同步 |
+| 2 | B4 的确定性开发核对与差异移交 | guidance 边界、canonical 状态和单字对照已补开发证据；来源可达性、排序及计量差异归原 owner 修复，慢路径与独立复验继续保留 |
 | 3 | B5 取证准备与新证据分析 | 原 probe 能保留拒绝时 observations/residuals 及现场；出现新失败时按具体参与者／残留追因；通过复跑不代替根因结案 |
 | 4 | B3 剩余真实路径的有界方案 | 优先项目规则遵守、两条验证管线、纠正／遗忘、长会话／交接、Historian 与 X-14；冻结输入、指标、请求上限后取得新预算 |
 | 5 | T24 组合与独立验收 | 按正式规格补齐所属证据，保留历史身份和判定；满足 gate 后才冻结初始 schema |
 
 B5 的两次历史 Windows 超时与 database restore 拒绝仍开放。新增三次 restore 定向诊断均通过且 acquired=true，未捕获拒绝原因；下一次实验应有新的可验证假设或更完整取证条件。
 
-本轮真实模型额度已经用完，剩余为 0。现有证据整理、规格审阅和确定性开发核对不依赖新增模型请求。GitHub 正文／评论尚未同步，正式条款已在本地同步，发布后按实际授权更新受影响票的规格基线。
+既有真实模型额度已用完，剩余为 0。规格与前一组 guidance/source-ID 开发证据已同步 GitHub；canonical／单字与未发布来源的新原件见上述 gate 补证。新真实模型请求须先准备有界方案并取得新预算。

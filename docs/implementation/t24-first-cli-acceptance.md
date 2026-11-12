@@ -154,6 +154,19 @@ T18 counting 归档只有 payload hash/长度，不据此宣称完整 wire bytes
 
 B3 的模型探索与 PR #61 的项目规则 guidance 已分别提供有限证据。普通记忆按需交付策略及未来验收口径已确认；旧独立首测仍按当时自动装配规格保留身份和结果，取消的旧交付要求不改标 PASS。当前须补的是按需路径的完整资格、查询、送达和计量证据。PR #61 证明了绑定项目根后的 guidance 正向加载，未补齐独立集的未绑定授权／模型自报范围等负向观测。上述开发证据不改写独立首测原判，其他缺证仍按下表登记。
 
+#### 已确认策略基线的开发补证
+
+规格基线为 [PR #62](https://github.com/qsgy-edge/euler/pull/62) 合并 `fb51c16fd9262d084ebd377bc3a3eafdf73305e3`。下列原件均为 Windows 合成开发证据；独立首测的案例、身份和判定保持不变。
+
+- **guidance 与来源 ID 边界：** [#25 补证记录](https://github.com/qsgy-edge/euler/issues/25#issuecomment-6816058947) 已登记 4/4 场景、7 次 loopback HTTP。显式绑定加载项目 guidance；未绑定仅任务只读 grant 可查询 reference-only 记忆／项目来源，未加载 guidance；模型自报项目范围未建立授权或泄露种子正文。原件为 `artifacts/t24-b4-boundary-probe/run-2026-11-12T05-59-39-496Z-e97b0ebb/`。同基线 PR CI 的既有 27 项边界案例三平台各 27/27，直接复用该证据。
+- **canonical 状态与投影：** `artifacts/t24-b4-canonical-probe/run-2026-11-12T06-25-02.568Z-dea1bb7f/` 通过 15 项开发断言，保留 20 步观测、操作结果、查询页、恢复对照及文件摘要。公开 Store API 覆盖 candidate→verified→active、revision、forget→restore、block→rejected、conflict；投影滞后明确返回 dirty，drain 后读取当前 head，旧 revision／已忘记／冲突快照拒用，重启后 head 不变。此组未发送模型请求，不能替代冻结请求送达和独立集四个未知 transition 的验收。首轮探针误将稳定 `claimKey` 中的旧文本判为旧事实；依据既有身份契约，修正为检查当前 `record.content` 并核对 claimKey 不变，原失败目录保留。
+- **中文单字成对观测：** 上述同一 head 的「松」查询返回 `unsupported-query`，「松林」命中。确认现有单字路径不支持；慢路径及独立配对质量仍缺证，未据此选择 fallback 算法。
+- **未发布原文不可达：** `artifacts/t24-source-reachability/run-2026-11-12T06-23-31-064Z-0aa46445/` 用两个同项目会话与一条未发布来源复现：`memory.search` 命中、项目来源搜索为空；模型把 memory ID 作为 unitId、跨会话 eventId、recordId 参数展开，分别得到 `source-scope-mismatch`、`source-evidence-gap`、`invalid-source-request`。同环境 Core `expandSource(recordId)` 精确恢复原文。三个受控 AgentRun 请求的 hash／bytes 与 attempt 对齐，原文 marker 均未进入请求；该路径也未发生定向预取。此组为内存中的受控 transport，无 HTTP 或外部 provider 请求。归属 #11/T11 与 #8/T08，须补实现后再验收，工具说明调整不足以关闭该差异。
+
+当前排序实现仍是 FTS 命中后按 query-group 命中数排序，再对 lane 轮询去重（`ProbeStore.searchMemories`）；未计算规格要求的 BM25／可复算排名融合分。索引保存 `latin-cjk@3`，逐查询返回没有 query/index tokenizer 版本；查询预算按 UTF-8 bytes，assembly 使用 `utf8-bytes-upper-bound@1` 整包估算，缺逐候选 token／成本。分别交 #10/T10 与 context/ledger owner 核对，不能把现有 rank 或字节数标为相应指标。
+
+原文不可达原件经另一只读核验者复算：3 份请求与 JSON／SQLite 的 attempt 和 assembly 一致，35 个 ledger payload 摘要、10 个 source ACK 与两份 archive 一致，SQLite quick_check/FK 正常；canonical 探针的 30 个原件文件摘要及字节数全部匹配。这组补证没有读取或重跑 held-out、启用第三套题或调用外部 provider。B4 继续开放，初始 schema 未冻结。
+
 #### 24 个缺证案例：证据分布与开发验证
 
 从公开收据的 `cases[]` 选出 `verdict` 为 `evidence-gap` 的记录，按 `reason_codes` 分组。以下四组互斥，合计 24 个；共 48 条断言通过、42 条缺证。**24 个在原规格下都缺少自动装配观测**。该历史结论保留；后续按需口径仍分别观察 Store 返回内容与实际模型请求选入内容，不能由策略确认补写历史收据。
