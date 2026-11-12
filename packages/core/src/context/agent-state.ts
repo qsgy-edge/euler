@@ -15,7 +15,7 @@ export interface ToolResult {
 export interface ToolFact { callId: string; name: string; argumentsHash: string; attemptId: string | null; started: boolean; result: ToolResult | null }
 export type AgentEvent =
   | { kind: 'opened'; route: ModelRoute; files?: FileCapability; discoveryGrantId?: string; guidanceRunId?: string }
-  | { kind: 'source-access'; sourceEventId: string; binding: Binding; discoveryGrantId: string }
+  | { kind: 'source-access'; sourceEventId: string; binding: Binding; discoveryGrantId: string | null; sourceGrantIds?: string[] }
   | { kind: 'window-opened'; windowId: string; previousWindowId: string | null; firstResponse: number; reason: 'initial' | 'pressure' | 'explicit'; recovery: SourceAck[];
       compartments?: { jobId: string; source: SourceAck }[]; compartmentGaps?: { jobId: string; reason: string }[] }
   | ({ kind: 'cache-epoch-opened' } & RequestContext)
@@ -64,7 +64,8 @@ export function replayAgent(events: AgentEvent[], attempts: number): AgentStatus
         check(index === 0, 'agent-evidence-gap'); state.discoveryGrantId = event.discoveryGrantId ?? null;
         state.guidanceRunId = event.guidanceRunId ?? null; break;
       case 'source-access':
-        check(event.discoveryGrantId === state.discoveryGrantId, 'source-access-mismatch'); break;
+        check(event.discoveryGrantId === state.discoveryGrantId
+          && (event.discoveryGrantId !== null || Boolean(event.sourceGrantIds?.length)), 'source-access-mismatch'); break;
       case 'window-opened':
         check(!state.windows.some(window => window.windowId === event.windowId)
           && event.previousWindowId === (state.windows.at(-1)?.windowId ?? null)
