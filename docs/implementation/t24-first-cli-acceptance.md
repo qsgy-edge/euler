@@ -128,17 +128,17 @@ T18 counting 归档只有 payload hash/长度，不据此宣称完整 wire bytes
 
 G1 项目规则对照在 `248e5db` 另获最多 4 次请求额度。沿用 `mistral-vibe / deepseek-v4-1-flash-1017`、`high` 和单次输出上限 1024 tokens，两个会话各用一次请求后正常完成，共 **2/4** 次。绑定会话的请求含规则，回答严格符合两行格式和固定签收灯。未绑定只读会话的请求无该规则，回答添加了输入未提供的巡检范围和归档细节。两臂还有文件能力差异，无法从本组单独估计 guidance 的作用。[G1 原件索引](t24-retrieval-experiment-index.md#g1-项目规则对照)
 
-G4 用冻结中文样例完成三次普通 CLI loopback，模拟检索、精确原文展开和逐字引用，实际请求及原文标识均已核对。[G4 原件索引](t24-retrieval-experiment-index.md#g4-未发布原文离线演练)
+G4 用冻结中文样例完成三次普通 CLI loopback，核对检索、精确原文展开和逐字引用。真实 G4 原额度 **3/3**，第一次直连连接超时，之后经现有本机代理的两次请求均 HTTP 200。真实模型检索命中，第二次冻结请求送达跨会话原文及 locator／contentHash。模型继续调用工具，额度用完时尚未给出最终引文。[G4 原件索引](t24-retrieval-experiment-index.md#g4-未发布原文恢复) · [代理补测记录](https://github.com/qsgy-edge/euler/issues/25#issuecomment-6822273815)
 
-**仍缺：** 两条完整验证管线、真实模型恢复并引用同项目未发布原文、纠正／遗忘、长会话／跨项目交接、Historian 忠实度、规则遵守的重复及对照证据，以及 X-14 缓存／成本／延迟配对。接近实际长度的合成 source 吞吐与 deadline 结算也需有界 workload 证据。
+**仍缺：** 两条完整验证管线、真实模型准确引用已送达的同项目未发布原文、纠正／遗忘、长会话／跨项目交接、Historian 忠实度、规则遵守的重复及对照证据，以及 X-14 缓存／成本／延迟配对。接近实际长度的合成 source 吞吐与 deadline 结算也需有界 workload 证据。
 
 当前非流式 transport 的 TTFT 为 `unsupported`；未给价格表则费用 `unknown`，没有 cache on/off、冷重置或明确服务端指标时不推断命中。普通记忆采用按需检索、持续约束由明确发布的项目规则提供，已按 [R1–R8 决策](../architecture/memory-retrieval-policy-proposal.md) 同步正式规格。后续验收按 [清单](t24-retrieval-acceptance-plan.md) 核对触发、实际返回和冻结送达；设计确认不代替完整实现及独立验收。
 
 **归属：#7/#13–#19/#24。** 已有测试配置和凭据环境绑定，后续真实请求需另批总预算；不自动换供应商、模型或接口，不在文档或 Issue 中公开密钥。
 
-### B4 — Windows 独立首测 FAIL；未绑定授权缺陷已修复，独立验收仍开放
+### B4 — Windows 独立复验已执行，独立验收仍缺证
 
-**归属：#10 / X-02。** 新集在 `bce497a` 首测，27 个案例各执行一次：3 个 `fail`、24 个 `evidence-gap`、0 个完整通过。macOS/Linux 未运行该独立集。历史 T10 集的证据单独保留。
+**归属 #10 / X-02。** 27 案在 `bce497a` 首测为 3 个 `fail`、24 个 `evidence-gap`，同一封存集在 `49f8702` 独立复验为 0 个 `fail`、27 个 `evidence-gap`。两次均无完整通过，分别留存。macOS/Linux 未运行该独立集。历史 T10 集证据另列。
 
 #### 历史 T10 集：版本可对齐，保管记录缺证
 
@@ -156,7 +156,15 @@ G4 用冻结中文样例完成三次普通 CLI loopback，模拟检索、精确�
 独立保管仓库 `../euler-t24-b4-verifier` 的提交顺序是：封存 `3facf7a` → 绑定实现 `177e2b0` → 释放给独立评测者 `8f2c598` → 固定首测原件 `33d4ec8` → 判定收据 `7d2e492`。被测实现为 `bce497a0baeba8990afcd2c80af5c1f101bc3d17`，tree `bc91e8f886091ed9daf626bc00c4c1920c718057`。公开收据 `7d2e492:public/receipt.json` 的 SHA-256 为 `91c81761cc399fa1970e82cd0399932a8b7d9c0529c05d7af1682edc4f9cbf1d`。
 
 - **首测已证实：** 48 个观测步骤中，36 个取得 Store 搜索页，12 个后续分页或展开步骤因前序未签发所需句柄而无法执行。逐条汇总 `cases[].observations[].assertions[]`：75 条通过、12 条失败、144 条缺证。12 条失败全部来自上述 3 个案例（9 条要求 cursor，3 条要求首次引用）。
-- **修复已证实：** 用独立于盲测题的开发数据走普通 CLI，在未绑定项目时复现 `/task` 成功、`/grant` 返回 `project-unbound`。[PR #60](https://github.com/qsgy-edge/euler/pull/60) 已合并为 `a860533`；[三平台开发 CI](https://github.com/qsgy-edge/euler/actions/runs/41799227983) 通过。同一任务现在可按 owner 授权搜索、翻页和展开指定项目；未授权项目、跨会话借用及撤销后读取仍被拒绝。新旧集均未重跑，修复后的独立表现未测。
+- **修复已证实。** 用独立于盲测题的开发数据走普通 CLI，在未绑定项目时复现 `/task` 成功、`/grant` 返回 `project-unbound`。[PR #60](https://github.com/qsgy-edge/euler/pull/60) 已合并为 `a860533`，[三平台开发 CI](https://github.com/qsgy-edge/euler/actions/runs/41799227983) 通过。同一任务现在可按 owner 授权搜索、翻页和展开指定项目。未授权项目、跨会话借用及撤销后读取仍被拒绝。修复后的独立结果见复验收据。
+
+#### 同一封存集的 Windows 独立复验
+
+经独立保管交接 `b75e04e`、当前实现绑定 `72a7fb7`、单次新释放 `fe5516c`，未接触 gold 的评测者在 `49f8702`（tree `bca0fc156257439af827b5974a1fb3a8b4796e81`）各执行原 27 案一次，48 步均有记录，外部模型请求为 0。保管者独立复算 400 个原件摘要，原件先冻结于 `6ac606c`。公开收据 `cb26575:public/retest-20261112-a63ae149/receipt.json` 的 SHA-256 为 `36bd02092876f35d4b51c2d20e50d0c81b63f71a575bf0b02f2ee7c0c76c223a`。[#25 独立复验记录](https://github.com/qsgy-edge/euler/issues/25#issuecomment-6823703509)
+
+- **本次已证实。** 原首测 9 条游标签发、3 条首次引用签发及本次 6 条失效句柄拒绝均通过。封存断言为 133 通过、0 失败、98 缺证。复算 48 个排序页和 173 个 BM25 lane 分值，语料未产生可复算的 RRF 候选分。初判的 15 条范围误报按原件区分 intent／consent 控制读取与项目内容读取后离线更正，原评分保留，未重跑案例。
+- **装配与送达。** 将封存 `token_budget=4096` 映射到 AgentRun 保守 UTF-8 整包估算时，首包发出 0/27。另用默认整包预算得到 27/27 本机 Counting 首包未带普通记忆。Store 结果已核对，实际冻结 `memory.search` 送达仍缺独立观测。179 个实际逐候选 token 为 `unsupported`，费用为 `unknown`。
+- **仍缺。** 三个正向展开步骤只到旧 ref-only 入口，当前 `recordId` 恢复仍需独立观察。项目级单字慢路径，以及部分 canonical、grant target、项目可用性和 guidance 状态仍缺。保留旧 T10 集历史缺证及 27 案首测判定。
 
 #### 普通请求装配的开发观测
 
@@ -171,6 +179,7 @@ B3 的模型探索与 PR #61 的项目规则 guidance 已分别提供有限证�
 - **guidance 与来源 ID 边界：** [#25 补证记录](https://github.com/qsgy-edge/euler/issues/25#issuecomment-6816058947) 已登记 4/4 场景、7 次 loopback HTTP。显式绑定加载项目 guidance；未绑定仅任务只读 grant 可查询 reference-only 记忆／项目来源，未加载 guidance；模型自报项目范围未建立授权或泄露种子正文。原件为 `artifacts/t24-b4-boundary-probe/run-2026-11-12T05-59-39-496Z-e97b0ebb/`。同基线 PR CI 的既有 27 项边界案例三平台各 27/27，直接复用该证据。
 - **canonical 状态与投影：** `artifacts/t24-b4-canonical-probe/run-2026-11-12T06-25-02.568Z-dea1bb7f/` 通过 15 项开发断言，保留 20 步观测、操作结果、查询页、恢复对照及文件摘要。公开 Store API 覆盖 candidate→verified→active、revision、forget→restore、block→rejected、conflict；投影滞后明确返回 dirty，drain 后读取当前 head，旧 revision／已忘记／冲突快照拒用，重启后 head 不变。此组未发送模型请求，不能替代冻结请求送达和独立集四个未知 transition 的验收。首轮探针误将稳定 `claimKey` 中的旧文本判为旧事实；依据既有身份契约，修正为检查当前 `record.content` 并核对 claimKey 不变，原失败目录保留。
 - **中文单字成对观测：** 上述同一 head 的「松」查询返回 `unsupported-query`，「松林」命中。确认现有单字路径不支持；慢路径及独立配对质量仍缺证，未据此选择 fallback 算法。
+- **单字慢路径的范围。** `artifacts/t24-b4-b5-next/single-han-d5a56ee1/` 的三次普通 CLI loopback 核对本会话单字字面搜索及精确展开。项目记忆和项目来源单字均返回 `unsupported-query`，跨会话 `eventId` 拒绝。改用双字后命中项目记忆并送达原文。项目级单字发现仍缺慢路径。
 - **未发布原文不可达的旧基线：** `artifacts/t24-source-reachability/run-2026-11-12T06-23-31-064Z-0aa46445/` 用两个同项目会话与一条未发布来源复现。`memory.search` 命中，项目来源搜索为空。模型把 memory ID 作为 unitId、跨会话 eventId、recordId 参数展开，分别得到 `source-scope-mismatch`、`source-evidence-gap`、`invalid-source-request`。同环境 Core `expandSource(recordId)` 精确恢复原文。三个受控 AgentRun 请求的 hash／bytes 与 attempt 对齐，原文 marker 均未进入请求。此组使用内存 transport。
 
 旧排序按 FTS 命中组数及 lane 轮询，缺少 BM25／RRF、逐查询 tokenizer 版本及逐候选计量。来源恢复与排序／计量的实施差异已由 [#63](https://github.com/qsgy-edge/euler/issues/63)、[#64](https://github.com/qsgy-edge/euler/issues/64) 交付。当前按合格 lexical 候选计算 BM25，多 lane 用 RRF，并区分检索返回和实际送达。账本记录 query/index tokenizer 版本、候选选择原因和 UTF-8 bytes 预算计量。实际 token 仍为 `unsupported`，费用为 `unknown`。
@@ -183,7 +192,13 @@ B3 的模型探索与 PR #61 的项目规则 guidance 已分别提供有限证�
 
 普通 Windows CLI 连续三次 loopback HTTP 200，覆盖首请求无种子记忆、BM25 顺序、同项目跨会话精确原文预取及 `source.expand(recordId)` 分页。完整 ReAct 回合保留原文，排序审计 metadata 留在账本。只读复核匹配全部 34 个原件摘要、三份 wire 请求与响应及 29 个 ledger event 摘要。原件为 `artifacts/t24-retrieval-closure-evidence/run-2026-11-12T08-04-37-963Z-5aee9774/`。这是开发组合证据，B4 独立首测判定仍保留。
 
-#### 24 个缺证案例：证据分布与开发验证
+#### 查询页与整包预算对照
+
+`49f8702` 的公开合成 fixture 对照保存在 `artifacts/t24-b4-b5-next/envelope-59dc9941/`。Store 查询页 `byteBudget=4096` 返回 1 条记忆。相同问题在普通 CLI 的整包 `contextLimit=4096` 时以 `needs-input` 停止，未组装可发送请求或创建 attempt。`contextLimit=32000` 时发送 3 次 loopback，首包 5625 bytes，加上输出预留 1024 和安全余量 256 后占 6905 个估算单位。该路径实际送达 `memory.search`、自动原文及显式 `source.expand(recordId)`，RRF 由两个 lane 复算，wire 与 attempt、assembly 的摘要及字节数一致。实际逐候选 token／费用仍为 `unsupported`／`unknown`。该开发对照单列，独立复验的 4096 结果保留。
+
+后续独立复验按 X-02 在释放前分别固定查询页、候选计量和整包预算。4096 保留为紧预算观察，普通 CLI 冻结送达采用已声明支持且预先冻结的整包配置。既有 0/27 及逐候选计量缺证继续保留。[复验清单](t24-retrieval-acceptance-plan.md#b4策略相关项与独立保留项)
+
+#### 首测 24 个缺证案例的证据分布
 
 从公开收据的 `cases[]` 选出 `verdict` 为 `evidence-gap` 的记录，按 `reason_codes` 分组。以下四组互斥，合计 24 个；共 48 条断言通过、42 条缺证。**24 个在原规格下都缺少自动装配观测**。该历史结论保留；后续按需口径仍分别观察 Store 返回内容与实际模型请求选入内容，不能由策略确认补写历史收据。
 
@@ -199,7 +214,7 @@ B3 的模型探索与 PR #61 的项目规则 guidance 已分别提供有限证�
 - **排序和成本。** 旧独立首测可复算 24 条轮询排序轨迹，收据只有索引版本 `latin-cjk@3`，缺 BM25/RRF 分数、查询分词器版本和逐候选 token 成本。PR #65 已提供排序分数、两端版本和 UTF-8 bytes 计量。独立排序与送达复验，以及 [X-02](https://github.com/qsgy-edge/euler/blob/a860533cf7673533ee6f951266cf088496c2ad49/docs/architecture/issues/12-build-evidence-experiment-matrix.md#L93-L98) 要求的逐候选实际 token 计量仍缺。
 - **任务、环境与访问范围。** 首测的 Store 搜索使用显式 `query`，未观测到任务上下文组合查询，也未独立构造项目不可用和权限版本变化。开发数据应区分已授权、未授权、可披露不可用状态的项目，记录任务/授权版本、目标环境和实际读取范围；以真实 cursor/ref 检验任务切换、结束或撤销后的拒读。没有对应入口或宿主时标记缺证，不用 Windows 结果推算其他平台。
 
-这份清单依据公开判定元数据；没有打开标准答案、运行新旧盲测集或启用第三套题。开发验证用于定位缺口，不改写独立首测结论。
+这份历史分布依据首测公开判定元数据。开发核对与独立复验分列，均保留原首测身份和结论。
 
 ### B5 — 历史超时与备份门禁拒绝未结案；Windows prerequisite 取消实测通过
 
@@ -220,6 +235,8 @@ B3 的模型探索与 PR #61 的项目规则 guidance 已分别提供有限证�
 **原件与归属。** `D:/GithubRepositories/Agent/euler-t24-resume/artifacts/t24-b5-4d50e24/` 保留两次历史超时样本、按原提交隔离的冷复跑和逐阶段 trace、Windows Job 与 Linux /proc 样本。PR #61 的原失败与最终成功日志分别保留于上述 `project-rule-resume-check-ab369825/`、`project-rule-final-check-494b0afa/`；后者的 `maintenance-capture.mjs` 是仅供取证的诊断探针，不是产品或必跑检查。首次维护门禁 observations/residuals 未留存，仍需原现场或同路径再次失败的判定证据。
 
 PR #61 最终 head `c3a6993`（tree `dea7613`）的 database restore 单用例有三次带诊断定向运行，均为 1 pass / 0 fail，门禁均 `acquired: true`。[B5 定向取证索引](t24-retrieval-experiment-index.md#b5本轮独立取证) 保留原件和观测字段。PR #65、PR #67 的本机全量各记录两次 `acquired: true`，各轮的参与者／残留观测数依次为 2／8、4／9。PR #65 原件在 `artifacts/t24-full-2f2ecb9259df420599dd5cb7c8a2834f/`，PR #67 原件见上节。原门禁拒绝仍缺现场判定。
+
+`artifacts/t24-b4-b5-next/restore-gate-ce9211cb/` 在 `49f8702` 的合成库用实际 CLI 对照了存活参与者和未知文件两类门禁拒绝。两次拒绝均无恢复操作，archive／receiver 摘要未变。清除测试阻塞后恢复完成，fence 回到 `open`。原 PR #61 拒绝仍缺当时的判定原件。
 
 #25 登记的 GitHub 前置均已关闭。B5 仍留 #2/T02、#12/owner-evidence 两次历史超时内部原因，以及 #20/T20 备份恢复维护门禁拒绝。Linux 的退出顺序单列，不计为 Windows 失败。规则擦除中断恢复 P1 和 #38 的 T15 轮询竞态已有独立修复证据，不重新打开，也不用于关闭其他未解释失败。
 

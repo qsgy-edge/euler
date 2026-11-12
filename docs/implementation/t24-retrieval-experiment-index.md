@@ -68,9 +68,13 @@ A 为原系统策略；B 只增加“当已有项目约定、决定或偏好可�
 
 两臂的文件 capability 和 `file.read/write` 工具集也有差异，无法单独归因到 guidance。真实原件为 `artifacts/t24-b3-next-plan/run-real-2026-11-12T08-28-10-611Z-68aece7a/`。只读复核匹配 5 份脚本／计划摘要、2 个槽位以及请求的 6570／4108 bytes 和响应的 1010／3370 bytes。离线演练 `run-offline-2026-11-12T08-20-28-736Z-f0c39a7f` 的 3 次 loopback 单列。
 
-## G4 未发布原文离线演练
+## G4 未发布原文恢复
 
-在 PR #65 合并 `c9e4e7b` 的 Windows 普通 CLI 上，用冻结的 G4 中文输入完成三次 Mistral 格式 loopback。旧会话存原文及简写记忆，发布来源数为 0。新会话绑定同项目后依次检索、用 `recordId` 显式展开、给出逐字引文和实际 locator／contentHash。首请求无原文，检索返回的记忆正文无完整引文，最终冻结请求带 108 bytes 原文。只读复核匹配 4 份脚本／计划摘要、6 份 wire 摘要，三次请求的 6008／9985／13179 bytes 与 JSON、SQLite 的 attempt 和 assembly 一致。原件在 `artifacts/t24-b3-g4-preflight/run-2026-11-12T09-18-03-242Z-bbe54633/`，真实 provider 请求数为 0。模型是否会主动检索并准确引用仍待真实 G4。
+在 PR #65 合并 `c9e4e7b` 的 Windows 普通 CLI 上，用冻结的 G4 中文输入完成三次 Mistral 格式 loopback。旧会话存原文及简写记忆，发布来源数为 0。新会话绑定同项目后依次检索、用 `recordId` 显式展开、给出逐字引文和实际 locator／contentHash。首请求无原文，检索返回的记忆正文无完整引文，最终冻结请求带 108 bytes 原文。只读复核匹配 4 份脚本／计划摘要、6 份 wire 摘要，三次请求的 6008／9985／13179 bytes 与 JSON、SQLite 的 attempt 和 assembly 一致。离线原件在 `artifacts/t24-b3-g4-preflight/run-2026-11-12T09-18-03-242Z-bbe54633/`。
+
+真实 G4 在 `49f8702` 用完原额度 3/3。首次直连在 21.662 秒返回 `ETIMEDOUT`，没有 HTTP 响应，账本为 `unknown-sent`。原件在 `artifacts/t24-b3-g4-real/run-real-2026-11-12T10-07-29-367Z-e1a2d033/`。[直连结果](https://github.com/qsgy-edge/euler/issues/25#issuecomment-6820744994)
+
+经授权改走本机现有代理后，剩余两次均 HTTP 200、`received`。模型 `memory.search` 命中，第二次冻结请求自动送达 108 bytes 原文及实际 locator／contentHash。跨会话 `eventId` 展开失败，`recordId` 调用在工具额度用尽后取消。run 停在 `budget-exhausted`，逐字引用及回答中的来源标识仍缺证。原件在 `artifacts/t24-b3-g4-proxy/run-real-2026-11-12T11-22-29-303Z-b2ec6c3a/`。[代理补测](https://github.com/qsgy-edge/euler/issues/25#issuecomment-6822273815)
 
 ## B5：本轮独立取证
 
@@ -78,4 +82,4 @@ A 为原系统策略；B 只增加“当已有项目约定、决定或偏好可�
 
 三份 `attempt-N/test.log` 均为 1 pass / 0 fail / 0 cancelled；三份 `maintenance.jsonl` 均为 `acquired: true`、`participantCount: 2`、`residualCount: 8`。参与者／残留数是 probe 的观测字段，acquired=true 的运行没有提供原失败的拒绝判定。没有找回首次被清理的 sandbox，本轮不关闭 B5。
 
-所有记录均为开发／取证证据。未读取 held-out 标准答案、未重跑独立集、未启用第三套题；B3/B4/B5 仍按现行 gate 保持开放。
+本索引记录开发实验和 B5 取证。B4 的独立首测与单次复验见 [T24 gate](t24-first-cli-acceptance.md#同一封存集的-windows-独立复验)。B3–B5 仍开放。
