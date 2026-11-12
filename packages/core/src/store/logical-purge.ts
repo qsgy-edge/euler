@@ -288,6 +288,10 @@ export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCar
       for (const column of identities[table] ?? []) if (typeof row[column] === 'string') tokens.add(row[column] as string);
       for (const [column, value] of Object.entries(row)) {
         if (['task_hash', 'authority_hash'].includes(column)) continue;
+        // Erase shared request digests with the selected row. Follow explicit run
+        // identities and actual data references to determine the deletion scope.
+        if ((PURGE_DATABASE_INVENTORY.ledger as readonly string[]).includes(table)
+          && ['policy_hash', 'intent_hash', 'payload_hash'].includes(column)) continue;
         if (typeof value === 'string' && (column.endsWith('_hash') || column === 'hash' || column === 'digest')) tokens.add(value);
       }
       // Follow original material owned by the removed memory, and output material
@@ -313,6 +317,22 @@ export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCar
       const ruleLine = carrier.role === 'project-output' && ruleLines.get(entry.id);
       if (ruleLine) tokens.add('published-rule:' + ruleLine);
       if (entry.source) for (const value of sourceValues(entry.source, qualifiedSources)) tokens.add(value);
+    }
+  }
+  // Older counting receivers can lack attempt and run identities. Match those
+  // receipts only when the frozen request actually depended on erased input.
+  const erasedInputDigests = new Set<string>();
+  for (const row of selected.get('request_assemblies') ?? []) {
+    if (typeof row.payload_hash === 'string'
+      && purgeValues([row.sources, row.used_memories], qualifiedSources).some(value => tokens.has(value)))
+      erasedInputDigests.add(row.payload_hash);
+  }
+  for (const [ci, carrier] of carriers.entries()) {
+    if (carrier.role !== 'receiver') continue;
+    for (const [ei, entry] of carrier.entries.entries()) {
+      const record = (entry.value as { record?: { attemptId: string | null; runId: string | null; payloadHash: string } }).record;
+      if (record?.attemptId === null && record.runId === null && erasedInputDigests.has(record.payloadHash))
+        selectedEntries.add(`${ci}/${ei}`);
     }
   }
   const removedSources = new Set(carriers.flatMap((carrier, ci) => carrier.entries

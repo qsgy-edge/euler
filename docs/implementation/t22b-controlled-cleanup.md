@@ -40,6 +40,10 @@ Multiple writes to one project path contribute all their dependencies before the
 
 The logical transaction preserves genuinely content-free execution sequence and outcome facts. An attempt ID that also addresses an erased archive event is replaced consistently in its retained execution/request envelopes. Removed job identities are detached. Shared session ownership and authorization needed by unaffected requests remain valid; affected runs stay sealed/redacted, and their streams remain explicitly not fully replayable. Old activities fail the epoch gate.
 
+An affected run is selected through its own identities or actual dependencies on the target. Its policy, intent, and request payload digests are erased with its ledger fields. These shared context digests do not extend deletion to independent runs. A digest belonging to the target material can still select matching copies, and a run that actually used the target remains in scope through its frozen memory and source references.
+
+A counting receiver entry without attempt and run identities can be selected by the exact payload digest of a frozen request that used erased input. This match selects the receiver entry alone.
+
 ## Durable phases and final gate
 
 1. **Logical commit.** The original database transaction removes the closure, appends the immutable logical receipt, persists the approved cleanup continuation and changes the fence to `cleaning`. No external owner deletes before this transaction commits.
