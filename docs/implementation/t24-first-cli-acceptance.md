@@ -8,7 +8,7 @@ Issue：[#25](https://github.com/qsgy-edge/euler/issues/25)。证据核对日期
 
 普通 CLI 输入、显式项目绑定及待定候选自动续办已由 [#54 / PR #56](https://github.com/qsgy-edge/euler/pull/56)、[#55 / PR #58](https://github.com/qsgy-edge/euler/pull/58) 交付，并在合并基线上通过受影响组合复验。共享 Core 三平台回归、Windows 实际 CLI/文件操作、候选验证、恢复与清理证据符合下述限定场景。真实 provider 与部分独立证据尚未齐备。
 
-当前产品基线为 [PR #67](https://github.com/qsgy-edge/euler/pull/67) 合并 `a04b494a8fdff3824f8da83313e7b101843d2c49`，含 [PR #65](https://github.com/qsgy-edge/euler/pull/65) 的来源恢复及检索交付。Disposable schema 为 **31**，独立 forward-migration 测试副本为 **32**。B1/B2 组合原件仍绑定原基线的 schema 30／副本 31。初始生产 DDL、migration 和 SHA-256 均未冻结。
+清理范围的开发证据绑定 [PR #67](https://github.com/qsgy-edge/euler/pull/67) 合并 `a04b494a8fdff3824f8da83313e7b101843d2c49`，包含 [PR #65](https://github.com/qsgy-edge/euler/pull/65) 的来源恢复及检索交付。现行项目级单字入口见 [T10](t10-memory-retrieval.md#explicit-single-han-search)。Disposable schema 为 **31**，独立 forward-migration 测试副本为 **32**。B1/B2 组合原件仍绑定原基线的 schema 30／副本 31。初始生产 DDL、migration 和 SHA-256 均未冻结。
 
 判定依据是 [I01/I03/I05/I08](../architecture/issues/15-euler-v1-spec.md)、[08 §4a](../architecture/issues/08-automate-memory-evolution.md)、[X-card](../architecture/issues/12-build-evidence-experiment-matrix.md) 和 [D8 / Physical contract](../architecture/issues/13-select-target-v1-migration.md)。#25 是验收票；缺功能与基础验证交回所属实施票。
 
@@ -164,7 +164,7 @@ G4 用冻结中文样例完成三次普通 CLI loopback，核对检索、精确�
 
 - **本次已证实。** 原首测 9 条游标签发、3 条首次引用签发及本次 6 条失效句柄拒绝均通过。封存断言为 133 通过、0 失败、98 缺证。复算 48 个排序页和 173 个 BM25 lane 分值，语料未产生可复算的 RRF 候选分。初判的 15 条范围误报按原件区分 intent／consent 控制读取与项目内容读取后离线更正，原评分保留，未重跑案例。
 - **装配与送达。** 将封存 `token_budget=4096` 映射到 AgentRun 保守 UTF-8 整包估算时，首包发出 0/27。另用默认整包预算得到 27/27 本机 Counting 首包未带普通记忆。Store 结果已核对，实际冻结 `memory.search` 送达仍缺独立观测。179 个实际逐候选 token 为 `unsupported`，费用为 `unknown`。
-- **仍缺。** 三个正向展开步骤只到旧 ref-only 入口，当前 `recordId` 恢复仍需独立观察。项目级单字慢路径，以及部分 canonical、grant target、项目可用性和 guidance 状态仍缺。保留旧 T10 集历史缺证及 27 案首测判定。
+- **仍缺。** 三个正向展开步骤只到旧 ref-only 入口，当前 `recordId` 恢复和项目级单字慢路径仍需独立观察。部分 canonical、grant target、项目可用性和 guidance 状态仍缺。保留旧 T10 集历史缺证及 27 案首测判定。
 
 #### 普通请求装配的开发观测
 
@@ -179,7 +179,7 @@ B3 的模型探索与 PR #61 的项目规则 guidance 已分别提供有限证�
 - **guidance 与来源 ID 边界：** [#25 补证记录](https://github.com/qsgy-edge/euler/issues/25#issuecomment-6816058947) 已登记 4/4 场景、7 次 loopback HTTP。显式绑定加载项目 guidance；未绑定仅任务只读 grant 可查询 reference-only 记忆／项目来源，未加载 guidance；模型自报项目范围未建立授权或泄露种子正文。原件为 `artifacts/t24-b4-boundary-probe/run-2026-11-12T05-59-39-496Z-e97b0ebb/`。同基线 PR CI 的既有 27 项边界案例三平台各 27/27，直接复用该证据。
 - **canonical 状态与投影：** `artifacts/t24-b4-canonical-probe/run-2026-11-12T06-25-02.568Z-dea1bb7f/` 通过 15 项开发断言，保留 20 步观测、操作结果、查询页、恢复对照及文件摘要。公开 Store API 覆盖 candidate→verified→active、revision、forget→restore、block→rejected、conflict；投影滞后明确返回 dirty，drain 后读取当前 head，旧 revision／已忘记／冲突快照拒用，重启后 head 不变。此组未发送模型请求，不能替代冻结请求送达和独立集四个未知 transition 的验收。首轮探针误将稳定 `claimKey` 中的旧文本判为旧事实；依据既有身份契约，修正为检查当前 `record.content` 并核对 claimKey 不变，原失败目录保留。
 - **中文单字成对观测：** 上述同一 head 的「松」查询返回 `unsupported-query`，「松林」命中。确认现有单字路径不支持；慢路径及独立配对质量仍缺证，未据此选择 fallback 算法。
-- **单字慢路径的范围。** `artifacts/t24-b4-b5-next/single-han-d5a56ee1/` 的三次普通 CLI loopback 核对本会话单字字面搜索及精确展开。项目记忆和项目来源单字均返回 `unsupported-query`，跨会话 `eventId` 拒绝。改用双字后命中项目记忆并送达原文。项目级单字发现仍缺慢路径。
+- **单字慢路径的范围。** `artifacts/t24-b4-b5-next/single-han-d5a56ee1/` 的三次普通 CLI loopback 核对本会话单字字面搜索及精确展开。该快照的项目记忆和项目来源单字均返回 `unsupported-query`，跨会话 `eventId` 拒绝。改用双字后命中项目记忆并送达原文。现行 CLI 提供显式项目级单字慢路径。适用案例仍待独立复验。[T10 单字入口](t10-memory-retrieval.md#explicit-single-han-search)
 - **未发布原文不可达的旧基线：** `artifacts/t24-source-reachability/run-2026-11-12T06-23-31-064Z-0aa46445/` 用两个同项目会话与一条未发布来源复现。`memory.search` 命中，项目来源搜索为空。模型把 memory ID 作为 unitId、跨会话 eventId、recordId 参数展开，分别得到 `source-scope-mismatch`、`source-evidence-gap`、`invalid-source-request`。同环境 Core `expandSource(recordId)` 精确恢复原文。三个受控 AgentRun 请求的 hash／bytes 与 attempt 对齐，原文 marker 均未进入请求。此组使用内存 transport。
 
 旧排序按 FTS 命中组数及 lane 轮询，缺少 BM25／RRF、逐查询 tokenizer 版本及逐候选计量。来源恢复与排序／计量的实施差异已由 [#63](https://github.com/qsgy-edge/euler/issues/63)、[#64](https://github.com/qsgy-edge/euler/issues/64) 交付。当前按合格 lexical 候选计算 BM25，多 lane 用 RRF，并区分检索返回和实际送达。账本记录 query/index tokenizer 版本、候选选择原因和 UTF-8 bytes 预算计量。实际 token 仍为 `unsupported`，费用为 `unknown`。

@@ -128,7 +128,7 @@ test('missing FTS posting reports a dirty projection instead of an empty answer'
   const db = new DatabaseSync(`${sandbox.root}/probe.sqlite`);
   try {
     const source = probe.archive.append(randomUUID(), 'posting evidence');
-    const captured = probe.store.captureMemory(probe.activity, source, 'Atlas posting', {
+    const captured = probe.store.captureMemory(probe.activity, source, 'Atlas 榆桥 posting', {
       type: 'fact', scope: { kind: 'project', id: sandbox.fixture.projectId, resolved: true }, appliesTo: [],
     }).record;
     const verified = probe.store.verifyMemory(probe.activity, captured.recordId, captured, 'pass', [source]).record;
@@ -139,6 +139,12 @@ test('missing FTS posting reports a dirty projection instead of an empty answer'
     const missing = probe.store.searchMemories(probe.activity, { query: 'Atlas' });
     assert.equal(missing.status, 'dirty');
     assert.deepEqual(missing.results, []);
+    const literal = { query: '榆', mode: 'single-han' as const };
+    assert.deepEqual(probe.store.searchMemories(probe.activity, literal).results.map(hit => hit.unitId), [captured.recordId]);
+    db.prepare("UPDATE search_documents SET content='different projection text' WHERE record_id=?").run(captured.recordId);
+    const mismatched = probe.store.searchMemories(probe.activity, literal);
+    assert.equal(mismatched.status, 'dirty');
+    assert.equal(mismatched.coverage.reason, 'index-lag');
     probe.store.rebuildSearchProjection(probe.activity);
     assert.equal(probe.store.searchMemories(probe.activity, { query: 'Atlas' }).results[0]?.unitId, captured.recordId);
   } finally { db.close(); probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }

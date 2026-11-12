@@ -40,6 +40,60 @@ test('D02: a CJK substring reaches its current canonical memory', () => {
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('explicit single-Han memory search pages through authorized cross-session matches', () => {
+  const sandbox = createSandbox(), writer = openProbe(sandbox);
+  try {
+    const inputs = ['记住决定：榆桥检查先核对原件', '记住决定：备用标签为榆', '记住决定：代号〇号'];
+    const records = inputs.map(text => writer.store.rememberMemory(writer.activity,
+      { input: writer.archive.append(randomUUID(), text, 'user'), hostInfo: 'durable' }).record!);
+    writer.store.drainSearchProjection(writer.activity);
+    const binding = { ...bindingOf(sandbox), sessionId: randomUUID(), branchId: randomUUID() };
+    createSandboxSession(sandbox, binding);
+    const reader = openProbe(sandbox, undefined, undefined, binding);
+    try {
+      const search = { query: '榆', limit: 1 };
+      assert.equal(reader.store.searchMemories(reader.activity, search).coverage.reason, 'unsupported-query');
+      const literal = { ...search, mode: 'single-han' as const };
+      const first = reader.store.searchMemories(reader.activity, literal);
+      assert.equal(first.status, 'ready');
+      assert.deepEqual(first.results.map(hit => hit.unitId), [records[0]!.recordId]);
+      assert.equal(first.retrieval?.queryTokenizer, 'single-han-literal@1');
+      assert.equal(first.retrieval?.bm25, null);
+      assert.equal(first.retrieval?.candidates[0]?.scoreKind, 'literal-order');
+      assert.ok(first.nextCursor);
+      const second = reader.store.searchMemories(reader.activity, { ...literal, cursor: first.nextCursor });
+      assert.deepEqual(second.results.map(hit => hit.unitId), [records[1]!.recordId]);
+      assert.equal(second.nextCursor, null);
+      assert.equal(reader.store.retrieveMemorySource(reader.activity,
+        { recordId: second.results[0]!.unitId, offset: 0, limit: 256 }).text, inputs[1]);
+      assert.deepEqual(reader.store.searchMemories(reader.activity, { ...literal, query: '〇' }).results.map(hit => hit.unitId),
+        [records[2]!.recordId]);
+      assert.throws(() => reader.store.searchMemories(reader.activity, { ...literal, query: '榆桥' }), /invalid-single-han-query/);
+    } finally { reader.close(); }
+  } finally { writer.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
+test('single-Han search stops at its scoped scan limit even when only one record matches', () => {
+  const sandbox = createSandbox(), probe = openProbe(sandbox);
+  try {
+    for (let index = 0; index <= 256; index++) {
+      const input = probe.archive.append(randomUUID(), index === 256 ? '记住决定：唯一榆桥记录' : `记住决定：无关条目 ${index}`, 'user');
+      assert.equal(probe.store.rememberMemory(probe.activity, { input, hostInfo: 'durable' }).status, 'activated');
+    }
+    while (probe.store.drainSearchProjection(probe.activity, 128).length) { /* drain the fixture */ }
+    const page = probe.store.searchMemories(probe.activity, { query: '榆', mode: 'single-han' });
+    assert.equal(page.status, 'unavailable');
+    assert.equal(page.coverage.reason, 'single-han-scan-limit');
+    assert.deepEqual(page.coverage.inspectedProjects, []);
+    assert.deepEqual(page.results, []);
+    assert.equal(page.truncated, true);
+    assert.equal(page.nextCursor, null);
+    const normal = probe.store.searchMemories(probe.activity, { query: '榆桥' });
+    assert.equal(normal.results.length, 1);
+    assert.equal(normal.retrieval?.candidates[0]?.scoreKind, 'bm25');
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('D01/D03/D04/D05: frozen exact, boundary, synonym and single-Han judgments', () => {
   for (const entry of corpus.cases.filter(item => item.id !== 'D02')) {
     const sandbox = createSandbox();

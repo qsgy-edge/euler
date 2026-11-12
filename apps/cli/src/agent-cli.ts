@@ -229,11 +229,14 @@ export async function runInteractiveSession(sandbox: Sandbox, options: { binding
         if (owner.handle(line.startsWith('/') ? line.slice(1) : line, true)) {
           capture.kick(Boolean(pumping)); historian?.kick(Boolean(pumping)); continue;
         }
-        if (line.startsWith('/memory ')) {
-          emit('session-memory', probe.store.searchMemories(probe.activity, { query: line.slice(8), ...(discoveryGrantId ? { grantId: discoveryGrantId } : {}) })); continue;
+        if (line.startsWith('/memory ') || line.startsWith('/memory-han ')) {
+          emit('session-memory', probe.store.searchMemories(probe.activity, { query: line.slice(line.indexOf(' ') + 1),
+            ...(line.startsWith('/memory-han ') ? { mode: 'single-han' } : {}), ...(discoveryGrantId ? { grantId: discoveryGrantId } : {}) })); continue;
         }
-        if (line.startsWith('/source-search ')) {
-          emit('session-sources', probe.store.searchSources(probe.activity, { query: line.slice(15), ...(discoveryGrantId ? { grantId: discoveryGrantId, queryId: randomUUID() } : {}) })); continue;
+        if (line.startsWith('/source-search ') || line.startsWith('/source-search-han ')) {
+          emit('session-sources', probe.store.searchSources(probe.activity, { query: line.slice(line.indexOf(' ') + 1),
+            ...(line.startsWith('/source-search-han ') ? { mode: 'single-han' } : {}),
+            ...(discoveryGrantId ? { grantId: discoveryGrantId, queryId: randomUUID() } : {}) })); continue;
         }
         if (line.startsWith('/expand ')) {
           const request = JSON.parse(line.slice(8));

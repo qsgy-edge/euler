@@ -2,18 +2,22 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { rmSync } from 'node:fs';
+import { rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { join } from 'node:path';
 import test from 'node:test';
-import { AgentRun, sha256 } from '@euler/core';
+import { AgentRun, sha256, type RequestStatus } from '@euler/core';
 import type { Model } from '@earendil-works/pi-ai';
-import { bindingOf, createSandbox } from '../src/sandbox.ts';
+import { bindingOf, createSandbox, createSandboxSession, createSessionSandbox } from '../src/sandbox.ts';
+import { AGENT_BUDGET } from '../src/agent-cli.ts';
 import { openMaintenanceStore } from '../src/backup.ts';
 import { openProbe } from '../src/probe.ts';
+import { sendCommand, startCli } from '../src/process-driver.ts';
 import { readPurgeCarriers } from '../src/purge.ts';
 import { HttpModelTransport } from '../src/model-transport.ts';
 import { pumpAgent } from '../src/agent-pump.ts';
 import { retrievalBudget, retrievalFixture as fixture } from './support/retrieval-fixture.ts';
+import { approvedSourceUnit } from './support/source-publication.ts';
 
 test('retrieval receipts stay outside model data while actual frozen delivery gets a bound selection', () => {
   const f = fixture();
@@ -106,6 +110,135 @@ test('actual HTTP tool bytes match retrieval delivery while audit metadata stays
   } finally {
     server.closeAllConnections(); server.close(); await once(server, 'close');
     probe.close(); rmSync(sandbox.root, { recursive: true, force: true });
+  }
+});
+
+test('ordinary CLI delivers single-Han memory and published sources within the current grant', async t => {
+  const sandbox = createSessionSandbox(randomUUID(), randomUUID());
+  t.after(() => rmSync(sandbox.root, { recursive: true, force: true }));
+  const allowed = randomUUID(), other = randomUUID();
+  const seed = (projectId: string, memories: string[], sources: string[]) => {
+    const binding = { ...bindingOf(sandbox), projectId, sessionId: randomUUID(), branchId: randomUUID() };
+    createSandboxSession(sandbox, binding);
+    const probe = openProbe(sandbox, undefined, undefined, binding, undefined, true);
+    try {
+      const recordIds = memories.map(text => {
+        const input = probe.archive.append(randomUUID(), `记住决定：${text}`, 'user');
+        return probe.store.rememberMemory(probe.activity, { input, hostInfo: 'durable' }).record!.recordId;
+      });
+      const ref = probe.archive.append(randomUUID(), `${sources.join('\n')}\n榆树-UNPUBLISHED-TAIL`, 'assistant');
+      let offset = 0;
+      const unitIds = sources.map(text => {
+        const length = Array.from(text).length;
+        const unit = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref, projectId, kind: 'source', offset, length }));
+        offset += length + 1;
+        return unit.unitId;
+      });
+      probe.store.drainSearchProjection(probe.activity);
+      probe.store.drainSourceProjection(probe.activity);
+      return { recordIds, unitIds };
+    } finally { probe.close(); }
+  };
+  const firstMemory = '河岸标识为榆';
+  const granted = seed(allowed, [firstMemory, `备用榆 ${'x'.repeat(2000)}`, `后备榆 ${'y'.repeat(2000)}`],
+    Array.from({ length: 9 }, (_, index) => `榆桥材料 ${index}`));
+  const excluded = seed(other, ['榆桥-EXCLUDED-PROJECT'], ['榆桥-EXCLUDED-PROJECT']);
+  const args = { query: '榆', mode: 'single-han' }, sourceArgs = { ...args, scope: 'project' };
+  const call = (id: string, name: string, fields: object) => ({ id, type: 'function', function: { name, arguments: JSON.stringify(fields) } });
+  const bodies: string[] = [];
+  const toolResult = (body: string, id: string) => {
+    const { messages } = JSON.parse(body);
+    const message = messages.find((item: { tool_call_id?: string }) => item.tool_call_id === id);
+    const envelope = message ? JSON.parse(message.content) : { outcome: 'missing', result: '{}' };
+    return { outcome: envelope.outcome as string, raw: envelope.result as string, value: JSON.parse(envelope.result) };
+  };
+  let sourceCursor: string | undefined;
+  const server = createServer(async (request, response) => {
+    let body = ''; for await (const chunk of request) body += chunk;
+    bodies.push(body);
+    let toolCalls: ReturnType<typeof call>[] = [];
+    if (bodies.length === 1) {
+      toolCalls = [call('literal-memory', 'memory_search', args), call('literal-source', 'source_search', sourceArgs)];
+    } else if (bodies.length === 2) {
+      const memoryCursor = toolResult(body, 'literal-memory').value.nextCursor;
+      sourceCursor = toolResult(body, 'literal-source').value.nextCursor;
+      toolCalls = [call('memory-next', 'memory_search', { ...args, cursor: memoryCursor }),
+        call('source-next', 'source_search', { ...sourceArgs, cursor: sourceCursor })];
+    } else if (bodies.length === 4) {
+      toolCalls = [call('stale-cursor', 'source_search', { ...sourceArgs, cursor: sourceCursor }),
+        call('stale-source', 'source_expand', { unitId: granted.unitIds[0], offset: 0, limit: 40 }),
+        call('stale-memory', 'source_expand', { recordId: granted.recordIds[0], offset: 0, limit: 40 })];
+    }
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: toolCalls.length ? null : 'Checked.',
+      ...(toolCalls.length ? { tool_calls: toolCalls } : {}) }, finish_reason: toolCalls.length ? 'tool_calls' : 'stop' }] }));
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  let cli: ReturnType<typeof startCli> | undefined;
+  try {
+    const address = server.address(); assert.ok(address && typeof address !== 'string');
+    const path = join(sandbox.root, 'literal-route.json');
+    writeFileSync(path, JSON.stringify({ provider: 'fixture', model: 'literal-loopback', baseUrl: `http://127.0.0.1:${address.port}/v1`,
+      authNamespace: 'synthetic', credentialEnv: 'EULER_LITERAL_TEST_KEY', contextWindow: 32000, maxTokens: 1024,
+      authorization: 'synthetic-test-only', budget: AGENT_BUDGET }));
+    cli = startCli(['session', '--sandbox', sandbox.root, '--transport-config', path], 150000, undefined,
+      { ...process.env, EULER_LITERAL_TEST_KEY: 'synthetic-literal-header' });
+    await cli.waitFor('session-ready');
+    await sendCommand(cli, '/task Check the authorized riverbank label', 'session-task');
+    const grant = await sendCommand(cli, '/grant ' + JSON.stringify({ projectIds: [allowed], targets: {}, maxResults: 32, maxBytes: 131072 }), 'session-grant');
+    const result = await sendCommand(cli, 'Find the previously recorded riverbank label and published source.', 'session-result');
+    assert.equal(result.terminal, 'completed');
+    assert.equal(bodies.length, 3);
+    assert.doesNotMatch(bodies[0]!, /河岸标识为榆/);
+    const { tools } = JSON.parse(bodies[0]!);
+    for (const name of ['memory_search', 'source_search']) {
+      const tool = tools.find((item: { function: { name: string } }) => item.function.name === name);
+      assert.deepEqual(tool.function.parameters.properties.mode.enum, ['single-han']);
+    }
+    const memory = toolResult(bodies[1]!, 'literal-memory'), source = toolResult(bodies[1]!, 'literal-source');
+    const memoryNext = toolResult(bodies[2]!, 'memory-next'), sourceNext = toolResult(bodies[2]!, 'source-next');
+    for (const page of [memory, source]) assert.equal(page.outcome, 'success', page.raw);
+    assert.ok(memory.value.nextCursor, `memory first page returned ${memory.value.results.length} results without a cursor`);
+    assert.ok(sourceCursor, `source first page returned ${source.value.results.length} results without a cursor`);
+    for (const page of [memoryNext, sourceNext]) assert.equal(page.outcome, 'success', page.raw);
+    assert.equal(memoryNext.value.nextCursor, null);
+    assert.equal(sourceNext.value.nextCursor, null);
+    const ids = (results: unknown) => (results as { unitId: string }[]).map(hit => hit.unitId);
+    assert.deepEqual(ids(memory.value.results), granted.recordIds.slice(0, 2));
+    assert.deepEqual(ids(memoryNext.value.results), granted.recordIds.slice(2));
+    assert.equal(memory.value.results[0].exposureMode, 'reference_only');
+    assert.deepEqual(ids(source.value.results), granted.unitIds.slice(0, 8));
+    assert.deepEqual(ids(sourceNext.value.results), granted.unitIds.slice(8));
+    const tail = JSON.parse(JSON.parse(bodies[1]!).messages.findLast((message: { role: string }) => message.role === 'user').content);
+    const [recovery] = tail.sourceRecovery.items;
+    assert.equal(recovery.recordId, granted.recordIds[0]);
+    assert.equal(recovery.excerpt.text, `记住决定：${firstMemory}`);
+    assert.equal(recovery.excerpt.excerptHash, sha256(recovery.excerpt.text));
+    const ledger = result.ledger as RequestStatus;
+    assert.deepEqual(ledger.attempts.map(attempt => attempt.payloadHash), bodies.map(sha256));
+    for (const [index, page] of [memory, memoryNext].entries()) {
+      const delivery = ledger.assemblies[index + 1]!.selection.find(item => item.retrieval?.callId === ['literal-memory', 'memory-next'][index])!.retrieval!;
+      assert.equal(delivery.resultHash, sha256(page.raw));
+      assert.deepEqual(delivery.returned.map(hit => hit.recordId), ids(page.value.results));
+    }
+    assert.deepEqual(ids((await sendCommand(cli, '/memory-han 榆', 'session-memory')).results), granted.recordIds.slice(0, 2));
+    assert.deepEqual(ids((await sendCommand(cli, '/source-search-han 榆', 'session-sources')).results), granted.unitIds);
+    await sendCommand(cli, '/revoke ' + grant.grantId, 'session-grant-revoked');
+    assert.deepEqual((await sendCommand(cli, '/memory-han 榆', 'session-memory')).results, []);
+    assert.deepEqual((await sendCommand(cli, '/source-search-han 榆', 'session-sources')).results, []);
+    const denied = await sendCommand(cli, 'Check whether a prior lookup can continue after revocation.', 'session-result');
+    assert.equal(denied.terminal, 'completed');
+    assert.equal(bodies.length, 5);
+    for (const id of ['stale-cursor', 'stale-source', 'stale-memory']) assert.equal(toolResult(bodies[4]!, id).outcome, 'failure');
+    for (const body of bodies) {
+      assert.doesNotMatch(body, /EXCLUDED-PROJECT|UNPUBLISHED-TAIL/);
+      for (const id of [...excluded.recordIds, ...excluded.unitIds]) assert.ok(!body.includes(id));
+    }
+    for (const body of bodies.slice(3)) assert.ok(!body.includes(firstMemory));
+  } finally {
+    try {
+      if (cli) { cli.command('/exit'); cli.child.stdin.end(); await cli.exit; }
+    } finally { server.closeAllConnections(); server.close(); await once(server, 'close'); }
   }
 });
 

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { API_VERSION, check, requireProject, sha256, sourceEventId, validateBudget } from '../contracts.ts';
 import type { Binding, HostAdapter, ProbeBudget, SourceAck, SourceExcerpt } from '../contracts.ts';
-import type { Activity, ProbeStore } from '../store/probe-store.ts';
+import type { Activity, ProbeStore, SearchRequest } from '../store/probe-store.ts';
 import type { RequestAttempt, RequestRecovery, RequestAssemblyInput, RequestStatus } from '../store/request-ledger.ts';
 import type { MemoryRetrievalReceipt, MemorySearchTrace } from '../store/memory-retrieval.ts';
 import { coreToolSchemas, controlledToolSchema } from './tool-schemas.ts';
@@ -211,13 +211,17 @@ export class AgentRun {
           });
         }
       } else {
-        check(Object.keys(args).every(key => ['query', 'cursor', ...(call.name === 'source.search' ? ['scope'] : [])].includes(key))
+        const projectSearch = call.name === 'memory.search' || call.name === 'source.search' && args.scope === 'project';
+        const mode = args.mode;
+        check(Object.keys(args).every(key => ['query', 'cursor', ...(call.name === 'source.search' ? ['scope'] : []),
+          ...(projectSearch ? ['mode'] : [])].includes(key)) && (mode === undefined || mode === 'single-han')
           && typeof args.query === 'string' && (args.cursor === undefined || typeof args.cursor === 'string'), 'invalid-search-request');
         const query = args.query, cursor = args.cursor as string | undefined;
+        const search = { query, byteBudget, limit: 8, ...(cursor ? { cursor } : {}), ...(mode ? { mode } : {}) } satisfies SearchRequest;
         if (call.name === 'source.search') {
           check(args.scope === undefined || ['session', 'project'].includes(String(args.scope)), 'invalid-source-scope');
           if (args.scope === 'project') {
-            const request = { query, byteBudget, limit: 8, ...(cursor ? { cursor } : {}), ...(grant ? { grantId: grant, queryId: randomUUID() } : {}) };
+            const request = { ...search, ...(grant ? { grantId: grant, queryId: randomUUID() } : {}) };
             const page = this.#store.searchSources(this.#activity, request);
             result = page;
             if (grant && page.results.length) this.#retrievalChecks.set(callId, () => this.#store.assertSourceSearchResult(this.#activity, request, page));
@@ -229,8 +233,7 @@ export class AgentRun {
             for (const grantId of this.#store.sourceGrantDependencies(this.#activity, page.results.map(hit => hit.ref), grant)) this.#sourceGrantIds.add(grantId);
           }
         } else if (call.name === 'memory.search') {
-          const page = this.#store.searchMemories(this.#activity, { query, byteBudget, limit: 8,
-            ...(cursor ? { cursor } : {}), ...(grant ? { grantId: grant } : {}) });
+          const page = this.#store.searchMemories(this.#activity, { ...search, ...(grant ? { grantId: grant } : {}) });
           const { retrieval: trace, ...modelPage } = page;
           retrieval = trace;
           const records = [...new Map(page.results.filter(hit => hit.kind === 'memory')
