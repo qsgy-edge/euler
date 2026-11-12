@@ -154,7 +154,7 @@ retrieved、injected、source revalidated、task outcome、owner feedback 与 ca
 
 ### I07. Retrieval 与可重建投影
 
-正常自动检索先硬过滤 logical scope、active project set、applies-to、lifecycle/verification、时间有效性及 integrity，再按当前请求/intent 检索、简单可复算融合与 claim/environment/time 去重，在预算内覆盖任务子项。不用可信度/相似度/时效总分抵消资格失败，不为固定 top-k 注入弱命中。
+普通记忆由主 Agent 的 memory.search 或显式 Host 查询按需读取，普通请求首轮不自主召回。实际查询先硬过滤 logical scope、active project set、applies-to、lifecycle/verification、时间有效性及 integrity，再按调用者提供的 query 检索、简单可复算融合与 claim/environment/time 去重，在预算内覆盖任务子项。Harness 不在每轮自动拼接请求与 intent；主 Agent 可按任务改写 query。不用可信度/相似度/时效总分抵消资格失败，不为固定 top-k 注入弱命中。
 
 显式跨项目分析按 [09 的只读发现契约](09-assemble-context-safely.md#cross-project-discovery) 建立绑定当前 intent/task 的获准读取集合，任务内复用，结束/换任务/撤销后失效。该集合不扩大操作/guidance 的 `active_project_set`，不授予发布、写入或跨 scope 晋升。适用条件按被分析项目及目标环境判断；环境未知的有界参考须标待核验，不成为当前项目事实。结果保留项目、环境、版本/时间及来源，说明实际覆盖、未覆盖/不可用和截断，不能将少量命中冒充全历史分析。
 
@@ -164,17 +164,17 @@ Memory 与 owner 明确发布的有界 session/source/repo units 分 lane；不�
 
 跨会话的 `scope_overview` 是可选的有界 baseline，不替代 canonical retrieval。只有用户要求项目全貌/规划、当前请求需要跨主题关系，或 retrieval 暴露 evidence-gap 时才读取适用 overview；它必须带 input generation、source/memory refs digest 和 content hash。overview 过期、冲突、purge、cursor gap 或 verifier 未完成时只返回状态标记或触发局部 review/source recovery，不把旧摘要当事实注入。
 
-新 verified head 可由 pinned delta 或有界 canonical scan 补暂时索引延迟。超 backlog、hash 失配或索引损坏时标 dirty/rebuilding/failed，停止使用旧投影并重建，不回滚 canonical truth，不伪装成最新结果。
+新 verified head 不自动作为 pinned delta 进入下一请求；下一次实际检索通过有界 canonical scan 或既有投影一致性处理补暂时索引延迟，保留 read-after-write 可用性。超 backlog、hash 失配或索引损坏时标 dirty/rebuilding/failed，停止使用旧投影并重建，不回滚 canonical truth，不用旧结果或假空结果伪装成当前完整查询。
 
 ### I08. Context admission 与有界恢复
 
-唯一、确定性的 Context Orchestrator 拥有最终 prompt 与预算；其他职责只提供候选。Control Plane 自持 07 §4 的最小 versioned active intent，载体为同库分域的 `intent_events`/`intent_heads`，公开 API 为 `readIntent`、`transitionIntent(expected_event_id, input_ref, proposed_transition)` 与 `recoverIntent`。最小 snapshot 至少含 intent/session/branch identity、current event/version、目标与硬约束、经 owner/resource gate 确认的 scope、当前步骤、active/paused/completed/needs-input 状态，以及有界正文和 input locator/hash。Pi/CLI 经同一 API 读取，不依赖外部 todo/task/wayfinder 是否安装。外部状态仅作输入/投影，不新建通用任务系统，不从摘要反推目标。新任务先 durable 原输入；目标/约束/权限扩大需真实授权，模型步骤变更经 Alignment Gate。每个 transition 绑定 input identity 与 expected event，同事务追加事件/移动 head，重放幂等、冲突 stale、unknown 先查；未明确换任务保留原目标，分支不倒拨同一版本。缺失/损坏/来源被清除时 needs-input/unavailable，相关行动暂停；外部 todo 离线不抹掉有效本地 intent。Assembly 冻结 intent event/hash，dispatch 重验版本和状态，变化则重组；后台用已批准 job goal/scope，不借无关前台 intent。普通快路径先归档，获取缓存 intent、预生成 compartment/tail 和有 deadline 的本地检索，再只调用一次主 LLM；失败的可选后台工作不增加 router/RAG Agent。
+唯一、确定性的 Context Orchestrator 拥有最终 prompt 与预算；其他职责只提供候选。Control Plane 自持 07 §4 的最小 versioned active intent，载体为同库分域的 `intent_events`/`intent_heads`，公开 API 为 `readIntent`、`transitionIntent(expected_event_id, input_ref, proposed_transition)` 与 `recoverIntent`。最小 snapshot 至少含 intent/session/branch identity、current event/version、目标与硬约束、经 owner/resource gate 确认的 scope、当前步骤、active/paused/completed/needs-input 状态，以及有界正文和 input locator/hash。Pi/CLI 经同一 API 读取，不依赖外部 todo/task/wayfinder 是否安装。外部状态仅作输入/投影，不新建通用任务系统，不从摘要反推目标。新任务先 durable 原输入；目标/约束/权限扩大需真实授权，模型步骤变更经 Alignment Gate。每个 transition 绑定 input identity 与 expected event，同事务追加事件/移动 head，重放幂等、冲突 stale、unknown 先查；未明确换任务保留原目标，分支不倒拨同一版本。缺失/损坏/来源被清除时 needs-input/unavailable，相关行动暂停；外部 todo 离线不抹掉有效本地 intent。Assembly 冻结 intent event/hash，dispatch 重验版本和状态，变化则重组；后台用已批准 job goal/scope，不借无关前台 intent。普通快路径先归档，获取缓存 intent 和预生成 compartment/tail，再确定性装配；首请求不自主召回普通记忆。无需工具且无传输／协议故障的正常回答恰一次主调用；明确依赖当前上下文之外的历史时，主 Agent 通过授权检索／恢复能力沿有界 ReAct 完成，缺证时说明缺口。信息完整时可直接回答，历史依赖有歧义的泛化写作不因隐藏约定缺失单独判失败；不以任务长度或固定实体名单建立路由。失败的可选后台工作不增加 router/RAG Agent，Source 的既定定向恢复保留。
 
 每次调用强制 `mandatory + selected + output_reserve + safety_margin <= context_limit`。活动 policy、当前用户输入、最小 intent、需要的核心工具契约、完整最近 ReAct 边界与输出预算为硬保留项。不得按消息条数拆 tool pair；mandatory 自身超窗则明确拒发或拆任务。
 
 运行时协议进一步区分输入和消费状态：用户输入先完成 source append/durable ack，再进入 `received`；被当前 run 接受并绑定 active intent 后为 `admitted-to-loop`；被选入冻结 model assembly 后为 `bound-to-assembly`。`bound-to-assembly` 只表示该输入被纳入一次模型请求的冻结材料，不证明模型理解或 provider 已成功接收；实际发送及结果由 attempt ledger 记录。默认普通输入是 `steer`，在完整 ReAct 工具批次结束后消费；`follow-up`、外层 `queue` 和 `cancel` 是不同生命周期。普通 steer 不取消当前批次；明确 cancel、权限/scope/safety invalidation 或 fence 失效必须在下一次 admission 前阻止旧 assembly。
 
-这不代替累计运行预算：每个前台 run 在首次 attempt 前固定可配置的 model-attempt/tool-call 上限、累计 token 或成本上限、wall-clock deadline 和工具超时；source recovery/重试计入同一 run，换窗不重置。达到限制或用户取消后停止新增调用，返回可见原因；已发请求按 ledger 结算，迟到结果不得自动执行工具或提交 memory。参数先有合成测试初值，再用 workload 校准；缺必需预算不启动，不为调参增加通用调度系统。恢复继续须新授权和新 run，不抹掉旧用量或 unknown。
+这不代替累计运行预算：每个前台 run 在首次 attempt 前固定可配置的 model-attempt/tool-call 上限、累计 token 或成本上限、wall-clock deadline 和工具超时；source recovery/重试计入同一 run，换窗不重置。达到限制或用户取消后停止新增调用，返回可见原因；因预算耗尽停止的运行记为预算受限；其中已检索但尚无最终答案的运行分别保留触发与送达观测，取消、输出截断、传输／协议失败另列；已发请求按 ledger 结算，迟到结果不得自动执行工具或提交 memory。参数先有合成测试初值，再用 workload 校准；缺必需预算不启动，不为调参增加通用调度系统。恢复继续须新授权和新 run，不抹掉旧用量或 unknown。
 
 原文可恢复是卸载前置。按弱相关/近重复/可重建、非 pinned memory/source、已准备 compartment 的完整边界、已归档单条的分页/分块逐级降级；未归档成功、当前行动马上需要精确值或 hash 失败的内容不得卸载。Source Recovery 仅按明确原话/版本/证据需求、精确 provenance，或主 Agent 判断证据不足进入慢路径；返回带 immutable locator/hash 的有界非指令 excerpt。失败显式 evidence-gap，不能拿摘要冒充原文。
 
@@ -192,7 +192,7 @@ Pi 的既有边界内候选见 13 的 `Pi P0 public-API probe boundary`：live r
 
 ### I10. Prompt/cache 与最终 transport
 
-Prompt 四区为 provider-stable P0 policy/tool、epoch-frozen P1 baseline/compartment/pinned memory、按序追加的 P2 完整轨迹、P3 当前输入及有界 retrieval/intent/status。物理位置不改变权威。P0/P1 在同一 epoch 字节稳定，动态 tail 在完整 ReAct turn 内冻结，后续用户轮可替换短尾；不回写旧工具结果。
+Prompt 四区为 provider-stable P0 policy/tool/guidance、epoch-frozen P1 baseline/compartment 及已按需取得后合法保留的有界 memory、按序追加的 P2 完整轨迹、P3 当前输入及实际 retrieval/intent/status。新激活记录、后台 top-k 或跨会话普通记忆不自行进入 P1/P3；新会话不因记录 active 重新 pin。已有工具结果和 compartment 按窗口、预算及状态重验规则保留，不要求每轮重查。物理位置不改变权威。P0/P1 在同一 epoch 字节稳定，动态 tail 在完整 ReAct turn 内冻结，后续用户轮可替换短尾；不回写旧工具结果。
 
 P3-only、正常 P2 append、相同 payload retry、cache miss/TTL 到期及尚未选入 baseline 的 compartment 不自动换 epoch。P0/P1、已选 compartment/pinned memory、活动指令/tool schema、估计器/strategy 或缓存 namespace 变化需要新 epoch；provider/route/model/auth namespace 变化默认新 epoch。fresh window 仅在字节及 namespace 完全一致且 provider contract 允许时沿用 epoch。安全/权限/scope/policy/已确认 supersession 立即使旧 epoch 对后续 dispatch 失效；先 durable invalidation，再新 assembly，失败禁发。
 
@@ -202,7 +202,7 @@ P0 输入接点亦按 13 的公开 API 边界：在原 Pi regular 界面冻结�
 
 ### I11. Execution ledger 与恢复
 
-execution ledger 为 Host-owned 独立 append-only stream，与 memory 同库不同 domain；stream 固定 `owner_kind=session|job|maintenance|migration`、owner ID、已验证 scope 和授权来源。前台归 session，后台模型调用归实际 durable job，无子 job 的维护/迁移请求归该 run；originating session 仅关联，不是无 session 时伪造的 owner。每次 attempt 恰属一 stream，进程接管不改 owner 或重发 unknown。普通 job 只回收可重建 payload，被引用的最小 job owner/scope 行及账本仍保留，来源 session purge 清除跨 stream 引用/授权并阻断依赖 job，不误删无关 owner；整条 owning stream 的显式 purge 按 10 §11 结算必要无内容状态，不能由账本消失推断可重发。surface history 是投影，receipt 为 log-only，不进入模型上下文。assembly receipt 记录 intent/project/policy/selection/ref/hash/order/token/reason、P0-P3 预算与降级；每个真实 transport attempt 有 started/finished、最终 route/model/payload、TTFT/usage/cache/finish/error/cancel。
+execution ledger 为 Host-owned 独立 append-only stream，与 memory 同库不同 domain；stream 固定 `owner_kind=session|job|maintenance|migration`、owner ID、已验证 scope 和授权来源。前台归 session，后台模型调用归实际 durable job，无子 job 的维护/迁移请求归该 run；originating session 仅关联，不是无 session 时伪造的 owner。每次 attempt 恰属一 stream，进程接管不改 owner 或重发 unknown。普通 job 只回收可重建 payload，被引用的最小 job owner/scope 行及账本仍保留，来源 session purge 清除跨 stream 引用/授权并阻断依赖 job，不误删无关 owner；整条 owning stream 的显式 purge 按 10 §11 结算必要无内容状态，不能由账本消失推断可重发。surface history 是投影，receipt 为 log-only，不进入模型上下文。assembly receipt 记录 intent/project/policy/实际 selection/ref/hash/order/token/reason、P0-P3 预算与降级；工具归档与请求账本分别证明检索触发、实际返回和真实送达。无查询时不虚构候选排除原因或推断全库为空；作为工具结果送达也计入实际 selection，token／成本缺证不由字节、名次或整包 usage 代替；每个真实 transport attempt 有 started/finished、最终 route/model/payload、TTFT/usage/cache/finish/error/cancel。
 
 Tool call 的执行事实使用 provider/host-neutral 的 Core 结果信封，至少区分 `executionState=not_started|started|unknown` 与 `outcome=success|failure|cancelled|timeout|unavailable|unknown`，并保留 call identity、参数摘要/hash、错误分类和 receipt 引用。模型看到的是有界 `modelResult` 投影，不是执行事实本身。`not_started` 只表示 Core 有可靠证据表明工具未开始；已启动但没有可靠结束证据必须是 `started + unknown`。普通参数/业务错误只影响当前调用并形成错误结果；已准入的其他调用继续，executor 不自动重试。未启动调用的取消结果只用于维持 tool-call/result 配对；不能以取消文本证明已启动的副作用未发生。
 
@@ -330,7 +330,7 @@ Windows-first；共享 Core/portable/可自动化 OS 用 Windows/macOS/Linux CI 
 
 测试边界沿用 owner 已批准的 Ticket 12 和 D8.2，不另建测试框架：共享 Core 的公开操作/结果边界、HostAdapter 的真实输入与呈现边界、最终 transport 的 payload/dispatch 边界。Store 事务、约束和崩溃恢复是外部可观察契约，必须用实际 SQLite 和重启核验；私有 helper 的自测不能代替这些边界。
 
-优先测试输入产生的 canonical 状态、明确终态、真正输出给消费者的正文、不可变 receipt、实际网络/文件副作用及恢复结果；不以函数调用次数或类布局作为需求。唯一快路径主 LLM 调用数、dispatch=0 等是已定外部行为，仍作为明确断言。
+优先测试输入产生的 canonical 状态、明确终态、真正输出给消费者的正文、不可变 receipt、实际网络/文件副作用及恢复结果；不以函数调用次数或类布局作为需求。无需工具且无传输／协议故障的正常回答恰一次主调用、dispatch=0 等是已定外部行为，仍作为明确断言。
 
 课程 fixture/原型和固定源码反例只用于发现遗漏，不证明目标行为。当前 Ticket 12 的相应能力子项及失败影响是验收依据：首次切片不能跳过其启用路径的 case，后续未启用能力标 deferred 而非 PASS，也不作为首次隐含前置。正常成功、失败后恢复与拒绝路径都要验证；原型/旧评审不证明本次修订或 runtime。
 
@@ -341,7 +341,7 @@ Windows-first；共享 Core/portable/可自动化 OS 用 Windows/macOS/Linux CI 
 | X-01 | P1 | 首次路径的 app-id/数据根、schema/FK/CAS/seq/head/intent、pending、Info/outbox、stream owner/fence 与 inert proposal 完整 digest；不预建可选 artifact 或行为评估表，portable/Host 分列。 |
 | X-02 | P2 | eligibility、FTS/CJK、current 去重、任务级只读发现/目标环境/覆盖说明与本地冻结需求语料/held-out；历史 60 用例取得后追加，不是开跑硬前置，不伪称复用。 |
 | X-03 | P1 | 实际 search worker 的乱序/重复/崩溃/lease、FTS 损坏重建与双向完整性；overview 后续子项验 SQLite body/refs/cursor 原子性、历史证据与新版本重建。 |
-| X-04 | P2，P3 接线复验 | bootstrap、硬上下文及累计 run 预算、取消、四级降级、完整 ReAct、source ack/recovery、单主调用快路径和失败后正常继续；补充验证 `received → admitted-to-loop → bound-to-assembly`、默认 steer 的完整批次边界、follow-up/queue/cancel 分流、局部工具错误隔离和严格终态；fake provider/受控工具仅用于状态机反馈回路，仍须在合成数据上用真实 provider 完成接线证据。 |
+| X-04 | P2，P3 接线复验 | bootstrap、硬上下文及累计 run 预算、取消、四级降级、完整 ReAct、source ack/recovery、无需工具且无传输／协议故障时恰一次主调用、有界工具循环和失败后正常继续；补充验证 `received → admitted-to-loop → bound-to-assembly`、默认 steer 的完整批次边界、follow-up/queue/cancel 分流、局部工具错误隔离和严格终态；fake provider/受控工具仅用于状态机反馈回路，仍须在合成数据上用真实 provider 完成接线证据。 |
 | X-05 | P2，P3 补齐 | 按 12 通用组验 project/scope、本地 AGENTS/Skill/provider metadata 与 Core gate；MCP 和 Pi loading 分别为后续追加组。共享隔离失败与能力专属失败分开处理，未启用能力不阻塞首次 CLI。 |
 | X-06 | P1，P3 接线复验 | 两道 barrier、started 与撤销的并发线性化、payload/网络计数、unknown-sent 对账/封存与 recovery gap；有正常发送及继续路径，stub 不替代真实接线；补充验证 Core 结果信封、未启动/已启动/unknown 区分、普通错误的兄弟调用继续、`executionMode` 批次顺序、权威事件 durable-before-terminal-presentation 和迟到结果不触发新调用；自研 CLI 须验证同一响应中已出现完整 tool call、但响应尚未结束时，工具执行次数为 0；完整响应结束并 durable 归档后，通过 gate 的调用正常执行。 |
 | X-07 | P2 | capture/独立取源、08 状态转换表、时间/冲突/回滚/抑制/Info、retrieved/injected 和 inert proposal 无行为权限；含任务报告/项目提案的保存、导出与 source 发现，普通 handoff 不强制转 proposal；scope review/backfill 是后续子项，无行为 evaluation runner。 |

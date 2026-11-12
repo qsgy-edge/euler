@@ -2,7 +2,7 @@
 
 > 用途：供在 Claude 上构建记忆系统时参考。本文整理完整目标设计，不按当前实现进度裁剪，也不是一份实现状态清单。
 >
-> 依据：Euler 正式规格及其领域、权威、记忆、上下文、演化和存储契约；整理日期 2026-10-05，来源检查点 `1e516658f15c91bdb78b6e074828c4f8d2661033`。
+> 依据：Euler 正式规格及其领域、权威、记忆、上下文、演化和存储契约；当前普通记忆策略见 [已确认决策](memory-retrieval-policy-proposal.md)，核对日期 2026-11-12；具体约束以同版本的 `issues/07`、`09`、`10`、`12`、`13`、`15` 为准。
 >
 > 本文是可独立阅读的架构说明，不替代 Euler 原规格，不代表 Claude 已具备这些能力，也不授予读取、写入或发布权限。具体 Claude 接入方式需要按实际宿主能力另行确定。
 
@@ -325,7 +325,7 @@ pass | block | evidence-gap
 ### 8.1 正常检索流程
 
 ```text
-当前请求 + active intent
+主 Agent memory.search / 显式 Host query
   → 获准 logical scope / 目标环境
   → lifecycle、verification、有效期、source integrity 硬过滤
   → 本地 lexical/FTS 召回，按 owner kind / 任务子项分 lane
@@ -335,7 +335,7 @@ pass | block | evidence-gap
   → 返回有来源的结果或明确降级状态
 ```
 
-相关性不能抵消资格失败。不能用“很像当前问题”放行越权、过期、冲突或未验证内容。
+普通请求首轮不自主召回或装入普通记忆；主 Agent 判断当前上下文是否充分，明确需要历史时按任务改写 query。信息完整可直接答，模糊写作的隐藏约定缺失不单独判漏掉必要检索。持续约束经明确发布的项目 guidance 提供。相关性不能抵消资格失败，越权、过期、冲突或未验证内容仍须过滤。
 
 不设必须填满的 top-k。没有强相关合格内容时可以返回空。
 
@@ -392,12 +392,12 @@ Orchestrator 是确定性本地代码，独占最终内容选择和 token 预算
 
 ```text
 同步归档输入
-  → 并行取得缓存 intent、预生成 compartment/recent tail、本地检索
+  → 并行取得缓存 intent、预生成 compartment/recent tail
   → 确定性装配与 admission
   → 一次主 Agent 模型调用
 ```
 
-后续工具循环仍可继续调用模型；“一次”指普通首轮不额外插入分类或检索决策 LLM。
+无需工具且无传输／协议故障的正常回答恰一次主调用；需要检索或其他工具时走同一 run 的有界 ReAct，所有往返计入累计预算，不额外插入分类／检索决策 LLM。普通记忆不在首轮预取，明确原文／版本／证据或精确 provenance 的既定定向 Source Recovery 继续保留。
 
 候选提取、压缩生成、验证、索引、overview 和 Wiki 维护不进入普通响应关键路径。
 
@@ -442,11 +442,11 @@ mandatory + selected + output_reserve + safety_margin <= context_limit
 | 区域 | 内容 | 稳定性 |
 |---|---|---|
 | P0 | 活动 policy、固定顺序的工具 schema、合格 guidance | Provider-stable prefix |
-| P1 | Session baseline、已提交 compartment、少量 pinned verified memory | 同一 cache epoch 字节冻结 |
+| P1 | Session baseline、已提交 compartment、已按需取得后合法保留的有界 verified memory | 同一 cache epoch 字节冻结 |
 | P2 | 完整、按时间追加的 user/assistant/tool 轨迹 | 追加，不回写旧事件 |
-| P3 | 当前用户输入、本轮 memory/source 数据、短 intent/runtime status | 当前完整 ReAct turn 内冻结 |
+| P3 | 当前用户输入、实际检索／恢复取得的有界 memory/source 数据、短 intent/runtime status | 当前完整 ReAct turn 内冻结 |
 
-P0/P1 确定性序列化，在同一 cache epoch 内保持字节冻结。下一用户轮可以替换上一轮的短 retrieval tail，不为更新动态信息改写长前缀。
+P0/P1 确定性序列化，在同一 cache epoch 内保持字节冻结。新激活或跨会话普通记忆不自行进入 baseline；已有工具结果、合法 compartment 按资格与预算保留。下一用户轮可以替换上一轮的短 retrieval tail，不为更新动态信息改写长前缀。
 
 Window、cache epoch、assembly 和 attempt 是不同身份。安全/权限/scope/policy/已确认 supersession 立即使旧上下文对后续发送失效；缓存优化不能推迟撤销。
 
@@ -490,7 +490,7 @@ Canonical 变更在同一事务追加 projection job，不同步等待 FTS 或�
 
 Worker 处理时重新读 current head，按 revision/hash/事件身份条件幂等更新。乱序旧 job 不得覆盖新 head；崩溃后可以至少一次处理，不能至少一次激活同一 mutation。
 
-用 watermark 和双向完整性核验发现丢行、错行及 FTS posting 损坏。小延迟可由 pinned delta/有界 canonical scan 补；无法安全补齐时明确 dirty，并重建，不回滚正确的 canonical memory。
+用 watermark 和双向完整性核验发现丢行、错行及 FTS posting 损坏。新激活内容不自动以 pinned delta 送入下一请求；实际检索的小延迟可由有界 canonical scan 或既有一致性处理补；无法安全补齐时明确 dirty，并重建，不回滚正确的 canonical memory。
 
 ### 11.3 Cooperative worker，而非常驻服务
 
@@ -527,7 +527,7 @@ Lease 到期只表示可接管执行权，不证明未知操作从未发生。�
 
 它是有界派生投影，逐条引用 canonical revision/head 或 immutable source，并携带覆盖水位、generation、hash 和状态。旧 overview 只作定位，不作为生成新事实的证据。
 
-当前请求仍先走 canonical retrieval；需要项目全貌、跨主题关系或局部证据补缺时才读取适用 overview。输入资格、权限、source、membership 或覆盖发生变化时失效；fresh 标志本身不足以证明可注入。
+实际需要检索时先走 canonical retrieval；需要项目全貌、跨主题关系或局部证据补缺时才读取适用 overview。输入资格、权限、source、membership 或覆盖发生变化时失效；fresh 标志本身不足以证明可注入。
 
 增量 review 复用 worker，读取新增事件及受影响有限邻域，不每轮扫描全部 archive。跨 scope 汇总须有实际 membership/derived-from 和授权，不把所有项目合成全局池。
 
