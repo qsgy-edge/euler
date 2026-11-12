@@ -614,9 +614,10 @@ test('a consistent index-body and FTS rewrite cannot hide a canonical source hit
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);
   try {
-    const ref = probe.archive.append(randomUUID(), 'Atlas canonical handoff');
+    const text = 'Atlas 榆桥 canonical handoff';
+    const ref = probe.archive.append(randomUUID(), text);
     const unit = probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref,
-      projectId: sandbox.fixture.projectId, kind: 'handoff', offset: 0, length: Array.from('Atlas canonical handoff').length }));
+      projectId: sandbox.fixture.projectId, kind: 'handoff', offset: 0, length: Array.from(text).length }));
     probe.store.drainSourceProjection(probe.activity);
     const db = new DatabaseSync(resourcesOf(sandbox).store.path);
     try {
@@ -626,6 +627,8 @@ test('a consistent index-body and FTS rewrite cannot hide a canonical source hit
     const page = probe.store.searchSources(probe.activity, { query: 'Atlas' });
     assert.equal(page.status, 'dirty');
     assert.deepEqual(page.results, []);
+    const literal = { query: '榆', mode: 'single-han' as const };
+    assert.equal(probe.store.searchSources(probe.activity, literal).status, 'dirty');
     const newer = probe.archive.append(randomUUID(), 'Atlas fresh handoff');
     probe.store.publishSourceUnit(probe.activity, approvedSourceUnit(probe, { ref: newer,
       projectId: sandbox.fixture.projectId, kind: 'handoff', offset: 0, length: Array.from('Atlas fresh handoff').length }));
@@ -633,6 +636,7 @@ test('a consistent index-body and FTS rewrite cannot hide a canonical source hit
     assert.equal(probe.store.searchSources(probe.activity, { query: 'Atlas' }).status, 'dirty');
     probe.store.rebuildSourceProjection(probe.activity);
     assert.equal(probe.store.searchSources(probe.activity, { query: 'Atlas' }).results.length, 2);
+    assert.deepEqual(probe.store.searchSources(probe.activity, literal).results.map(hit => hit.unitId), [unit.unitId]);
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 

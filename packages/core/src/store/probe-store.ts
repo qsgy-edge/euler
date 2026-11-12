@@ -4660,33 +4660,35 @@ export class ProbeStore {
       if (pending) return finalize(unavailable('index-lag', 'dirty'));
       if (this.#db.prepare(`SELECT 1 FROM source_projection_health WHERE project_id IN (${ids}) AND dirty=1 LIMIT 1`)
         .get(...projects)) return finalize(unavailable('index-damaged', 'dirty'));
-      const missing = this.#db.prepare(`SELECT 1 FROM source_units s LEFT JOIN search_documents d ON d.unit_id=s.unit_id
-        WHERE s.owner_id=? AND s.project_id IN (${ids}) AND (d.unit_id IS NULL OR d.owner_kind!='session'
-          OR d.owner_id!=s.source_owner OR d.project_id!=s.project_id OR d.scope_kind!='project'
-          OR d.scope_id!=s.project_id OR d.revision_id!=s.unit_id OR d.record_id!=s.unit_id
-          OR d.content_hash!=s.content_hash
-          OR d.source_seq!=s.version OR d.projection_generation!=s.version OR d.tokenizer_version!='latin-cjk@3') LIMIT 1`)
-        .get(this.#binding.ownerId, ...projects);
-      const extra = this.#db.prepare(`SELECT 1 FROM search_documents d LEFT JOIN source_units s ON s.unit_id=d.unit_id
-        WHERE d.owner_kind='session' AND d.project_id IN (${ids})
-          AND (s.unit_id IS NULL OR s.owner_id!=? OR s.project_id!=d.project_id) LIMIT 1`)
-        .get(...projects, this.#binding.ownerId);
-      const missingProposal = this.#db.prepare(`SELECT 1 FROM evolution_proposals p
-        LEFT JOIN search_documents d ON d.unit_id=p.proposal_id
-        WHERE p.owner=? AND p.scope_kind='project' AND p.scope_id IN (${ids})
-          AND (d.unit_id IS NULL OR d.owner_kind!='proposal' OR d.owner_id!=p.proposal_id
-            OR d.project_id!=p.scope_id OR d.scope_id!=p.scope_id OR d.revision_id!=p.proposal_id
-            OR d.content_hash!=p.payload_hash OR d.source_seq!=p.version OR d.projection_generation!=p.version
-            OR d.tokenizer_version!='latin-cjk@3') LIMIT 1`)
-        .get(this.#binding.ownerId, ...projects);
-      const extraProposal = this.#db.prepare(`SELECT 1 FROM search_documents d
-        LEFT JOIN evolution_proposals p ON p.proposal_id=d.unit_id
-        WHERE d.owner_kind='proposal' AND d.project_id IN (${ids})
-          AND (p.proposal_id IS NULL OR p.owner!=? OR p.scope_id!=d.project_id) LIMIT 1`)
-        .get(...projects, this.#binding.ownerId);
-      if (missing || extra || missingProposal || extraProposal) return finalize(unavailable('index-lag', 'dirty'));
-      try { this.#db.exec("INSERT INTO search_fts(search_fts,rank) VALUES ('integrity-check',1)"); }
-      catch { return finalize(unavailable('fts-integrity-gap', 'dirty')); }
+      if (!literal) {
+        const missing = this.#db.prepare(`SELECT 1 FROM source_units s LEFT JOIN search_documents d ON d.unit_id=s.unit_id
+          WHERE s.owner_id=? AND s.project_id IN (${ids}) AND (d.unit_id IS NULL OR d.owner_kind!='session'
+            OR d.owner_id!=s.source_owner OR d.project_id!=s.project_id OR d.scope_kind!='project'
+            OR d.scope_id!=s.project_id OR d.revision_id!=s.unit_id OR d.record_id!=s.unit_id
+            OR d.content_hash!=s.content_hash
+            OR d.source_seq!=s.version OR d.projection_generation!=s.version OR d.tokenizer_version!='latin-cjk@3') LIMIT 1`)
+          .get(this.#binding.ownerId, ...projects);
+        const extra = this.#db.prepare(`SELECT 1 FROM search_documents d LEFT JOIN source_units s ON s.unit_id=d.unit_id
+          WHERE d.owner_kind='session' AND d.project_id IN (${ids})
+            AND (s.unit_id IS NULL OR s.owner_id!=? OR s.project_id!=d.project_id) LIMIT 1`)
+          .get(...projects, this.#binding.ownerId);
+        const missingProposal = this.#db.prepare(`SELECT 1 FROM evolution_proposals p
+          LEFT JOIN search_documents d ON d.unit_id=p.proposal_id
+          WHERE p.owner=? AND p.scope_kind='project' AND p.scope_id IN (${ids})
+            AND (d.unit_id IS NULL OR d.owner_kind!='proposal' OR d.owner_id!=p.proposal_id
+              OR d.project_id!=p.scope_id OR d.scope_id!=p.scope_id OR d.revision_id!=p.proposal_id
+              OR d.content_hash!=p.payload_hash OR d.source_seq!=p.version OR d.projection_generation!=p.version
+              OR d.tokenizer_version!='latin-cjk@3') LIMIT 1`)
+          .get(this.#binding.ownerId, ...projects);
+        const extraProposal = this.#db.prepare(`SELECT 1 FROM search_documents d
+          LEFT JOIN evolution_proposals p ON p.proposal_id=d.unit_id
+          WHERE d.owner_kind='proposal' AND d.project_id IN (${ids})
+            AND (p.proposal_id IS NULL OR p.owner!=? OR p.scope_id!=d.project_id) LIMIT 1`)
+          .get(...projects, this.#binding.ownerId);
+        if (missing || extra || missingProposal || extraProposal) return finalize(unavailable('index-lag', 'dirty'));
+        try { this.#db.exec("INSERT INTO search_fts(search_fts,rank) VALUES ('integrity-check',1)"); }
+        catch { return finalize(unavailable('fts-integrity-gap', 'dirty')); }
+      }
       const terms = literal ? [literal] : searchTerms(request.query);
       if (!terms.length) return finalize({ status: 'ready', results: [], coverage: { ...coverage, reason: 'unsupported-query' }, truncated: false, nextCursor: null });
       if (terms.length > 16) return finalize(unavailable('query-term-limit'));
@@ -4695,13 +4697,25 @@ export class ProbeStore {
       const visible = `d.owner_kind IN ('session','proposal') AND d.project_id IN (${ids})`;
       let rows: Record<string, unknown>[];
       try {
-        rows = literal ? this.#db.prepare(`SELECT d.* FROM search_documents d WHERE ${visible}
-          ORDER BY d.rowid LIMIT ${SEARCH_CANDIDATE_LIMIT + 1}`).all(...projects)
+        rows = literal ? this.#db.prepare(`WITH scoped(unit_id,project_id,owner_id,content_hash,version,owner_kind) AS MATERIALIZED (
+          SELECT unit_id,project_id,source_owner,content_hash,version,'session' FROM source_units
+            WHERE owner_id=? AND project_id IN (${ids})
+          UNION ALL SELECT proposal_id,scope_id,proposal_id,payload_hash,version,'proposal' FROM evolution_proposals
+            WHERE owner=? AND scope_kind='project' AND scope_id IN (${ids})
+          LIMIT ${SEARCH_CANDIDATE_LIMIT + 1}
+        ) SELECT d.* FROM scoped s LEFT JOIN search_documents d ON d.unit_id=s.unit_id
+          AND d.project_id=s.project_id AND d.owner_id=s.owner_id AND d.owner_kind=s.owner_kind
+          AND d.scope_kind='project' AND d.scope_id=s.project_id AND d.record_id=s.unit_id AND d.revision_id=s.unit_id
+          AND d.content_hash=s.content_hash AND d.source_seq=s.version AND d.projection_generation=s.version
+          AND d.tokenizer_version='latin-cjk@3' ORDER BY d.rowid`).all(this.#binding.ownerId, ...projects, this.#binding.ownerId, ...projects)
           : this.#db.prepare(`SELECT d.* FROM search_fts JOIN search_documents d ON d.rowid=search_fts.rowid
             WHERE search_fts MATCH ? AND ${visible} ORDER BY d.rowid LIMIT ${SEARCH_CANDIDATE_LIMIT + 1}`).all(match, ...projects);
       } catch { return finalize(unavailable('index-unavailable')); }
       if (rows.length > SEARCH_CANDIDATE_LIMIT) return finalize(unavailable(literal ? 'single-han-scan-limit' : 'candidate-limit'));
-      if (literal) rows = rows.filter(row => String(row.content).includes(literal));
+      if (literal) {
+        if (rows.some(row => row.unit_id === null)) return finalize(unavailable('index-lag', 'dirty'));
+        rows = rows.filter(row => String(row.content).includes(literal));
+      }
       const candidates: SourceSearchHit[] = [];
       for (const row of rows) {
         try {
@@ -4801,37 +4815,36 @@ export class ProbeStore {
           WHERE grant_id=? AND state='active' AND used_queries<max_queries`).run(request.grantId!);
         check(charged.changes === 1, 'discovery-budget-stale');
       }
-      const scopeSql = this.#searchScopeSql('h', projects);
+      const ids = projects.map(() => '?').join(',');
       const scopeArgs = this.#searchScopeArgs(projects);
-      const sourceSql = grant ? ` AND (CASE WHEN h.scope_kind='project' THEN h.scope_id ELSE v.source_project_id END) IN (${projects.map(() => '?').join(',')})` : '';
-      const projectedSourceSql = grant ? ` AND d.project_id IN (${projects.map(() => '?').join(',')})` : '';
-      const missing = this.#db.prepare(`SELECT 1 FROM memory_heads h JOIN memory_records r ON r.record_id=h.record_id
+      const sourceSql = grant ? ` AND (CASE WHEN h.scope_kind='project' THEN h.scope_id ELSE v.source_project_id END) IN (${ids})` : '';
+      const projectedSourceSql = grant ? ` AND d.project_id IN (${ids})` : '';
+      const canonical = `JOIN memory_records r ON r.record_id=h.record_id
         JOIN memory_revisions v ON v.revision_id=h.revision_id
-        LEFT JOIN search_documents d ON d.record_id=h.record_id AND d.owner_kind='memory'
-        WHERE r.owner_id=? AND ${scopeSql}${sourceSql} AND h.lifecycle='active' AND h.scope_resolved=1
-          AND h.verification IN ('verified','stale','conflicted')
-          AND (d.unit_id IS NULL OR d.owner_id!=r.owner_id OR d.project_id!=(CASE WHEN h.scope_kind='project' THEN h.scope_id ELSE v.source_project_id END)
+        LEFT JOIN search_documents d ON d.record_id=h.record_id AND d.owner_kind='memory'`;
+      const active = "h.lifecycle='active' AND h.scope_resolved=1 AND h.verification IN ('verified','stale','conflicted')";
+      const indexLag = `d.unit_id IS NULL OR d.unit_id!=h.record_id OR d.owner_id!=r.owner_id
+            OR d.project_id!=(CASE WHEN h.scope_kind='project' THEN h.scope_id ELSE v.source_project_id END)
             OR d.scope_kind!=h.scope_kind OR d.scope_id!=h.scope_id OR d.content_hash!=v.content_hash
             OR d.tokenizer_version!='latin-cjk@3' OR d.source_seq!=v.revision
             OR d.exposure_mode!=CASE WHEN h.verification='verified' AND h.conflict_set_id IS NULL THEN 'normal' ELSE 'status_only' END
-            OR d.revision_id!=h.revision_id OR d.lifecycle!=h.lifecycle OR d.verification!=h.verification)
-        LIMIT 1`).get(this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
-      const extra = this.#db.prepare(`SELECT 1 FROM search_documents d
-        LEFT JOIN memory_heads h ON h.record_id=d.record_id
-        LEFT JOIN memory_records r ON r.record_id=d.record_id
-        LEFT JOIN memory_revisions v ON v.revision_id=h.revision_id
-        WHERE d.owner_kind='memory' AND d.owner_id=? AND ${this.#searchScopeSql('d', projects)}${projectedSourceSql}
-          AND (h.record_id IS NULL OR r.record_id IS NULL OR v.revision_id IS NULL
-            OR r.owner_id!=d.owner_id OR d.unit_id!=d.record_id OR d.project_id!=(CASE WHEN h.scope_kind='project' THEN h.scope_id ELSE v.source_project_id END)
-            OR d.scope_kind!=h.scope_kind OR d.scope_id!=h.scope_id OR d.content_hash!=v.content_hash
-            OR d.tokenizer_version!='latin-cjk@3' OR d.source_seq!=v.revision
-            OR d.exposure_mode!=CASE WHEN h.verification='verified' AND h.conflict_set_id IS NULL THEN 'normal' ELSE 'status_only' END
-            OR h.lifecycle!='active' OR h.scope_resolved!=1 OR d.revision_id!=h.revision_id
-            OR d.lifecycle!=h.lifecycle OR d.verification!=h.verification) LIMIT 1`)
-        .get(this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
-      if (missing || extra) return { status: 'dirty', results: [], coverage: unavailableCoverage('index-lag'), truncated: true, nextCursor: null };
-      try { this.#db.exec("INSERT INTO search_fts(search_fts,rank) VALUES ('integrity-check',1)"); }
-      catch { return { status: 'dirty', results: [], coverage: unavailableCoverage('fts-integrity-gap'), truncated: true, nextCursor: null }; }
+            OR d.revision_id!=h.revision_id OR d.lifecycle!=h.lifecycle OR d.verification!=h.verification`;
+      if (!literal) {
+        const missing = this.#db.prepare(`SELECT 1 FROM memory_heads h ${canonical}
+          WHERE r.owner_id=? AND ${this.#searchScopeSql('h', projects)}${sourceSql} AND ${active}
+            AND (${indexLag}) LIMIT 1`).get(this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
+        const extra = this.#db.prepare(`SELECT 1 FROM search_documents d
+          LEFT JOIN memory_heads h ON h.record_id=d.record_id
+          LEFT JOIN memory_records r ON r.record_id=d.record_id
+          LEFT JOIN memory_revisions v ON v.revision_id=h.revision_id
+          WHERE d.owner_kind='memory' AND d.owner_id=? AND ${this.#searchScopeSql('d', projects)}${projectedSourceSql}
+            AND (h.record_id IS NULL OR r.record_id IS NULL OR v.revision_id IS NULL OR h.lifecycle!='active'
+              OR h.scope_resolved!=1 OR ${indexLag}) LIMIT 1`)
+          .get(this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
+        if (missing || extra) return { status: 'dirty', results: [], coverage: unavailableCoverage('index-lag'), truncated: true, nextCursor: null };
+        try { this.#db.exec("INSERT INTO search_fts(search_fts,rank) VALUES ('integrity-check',1)"); }
+        catch { return { status: 'dirty', results: [], coverage: unavailableCoverage('fts-integrity-gap'), truncated: true, nextCursor: null }; }
+      }
       if (!terms.length) return { status: 'ready', results: [], coverage: { ...coverage, reason: 'unsupported-query' }, truncated: false, nextCursor: null };
       if (terms.length > 16) return { status: 'unavailable', results: [],
         coverage: unavailableCoverage('query-term-limit'), truncated: true, nextCursor: null };
@@ -4842,17 +4855,33 @@ export class ProbeStore {
       const visibleArgs = [this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : [])];
       let rows: Record<string, unknown>[];
       try {
-        rows = literal ? this.#db.prepare(`WITH visible AS MATERIALIZED (
-          SELECT d.*, r.rowid AS record_order FROM search_documents d JOIN memory_records r ON r.record_id=d.record_id
-          WHERE ${visible} LIMIT ${SEARCH_CANDIDATE_LIMIT + 1}
-        ) SELECT * FROM visible ORDER BY record_order`).all(...visibleArgs) : this.#db.prepare(`SELECT d.* FROM search_fts
+        rows = literal ? this.#db.prepare(`WITH scopes(kind,id) AS (
+          SELECT 'project', project_id FROM projects WHERE project_id IN (${ids})
+          UNION ALL SELECT 'personal', ?
+          UNION ALL SELECT DISTINCT 'workspace', workspace_id FROM workspace_projects WHERE project_id IN (${ids})
+        ), scoped AS MATERIALIZED (
+          SELECT d.*, r.rowid AS record_order, v.content AS canonical_content, (${indexLag}) AS index_lag
+          FROM scopes CROSS JOIN memory_heads h INDEXED BY memory_heads_eligibility ${canonical}
+          WHERE h.scope_kind=scopes.kind AND h.scope_id=scopes.id AND ${active} AND r.owner_id=?${sourceSql}
+          LIMIT ${SEARCH_CANDIDATE_LIMIT + 1}
+        ) SELECT * FROM scoped ORDER BY record_order`).all(...projects, this.#binding.ownerId, ...projects,
+          this.#binding.ownerId, ...(grant ? projects : [])) : this.#db.prepare(`SELECT d.* FROM search_fts
           JOIN search_documents d ON d.rowid=search_fts.rowid
           JOIN memory_records r ON r.record_id=d.record_id
           WHERE search_fts MATCH ? AND ${visible} ORDER BY r.rowid LIMIT ${SEARCH_CANDIDATE_LIMIT + 1}`).all(match, ...visibleArgs);
       } catch { return { status: 'unavailable', results: [], coverage: unavailableCoverage('index-unavailable'), truncated: true, nextCursor: null }; }
       if (rows.length > SEARCH_CANDIDATE_LIMIT) return { status: 'unavailable', results: [],
         coverage: unavailableCoverage(literal ? 'single-han-scan-limit' : 'candidate-limit'), truncated: true, nextCursor: null };
-      if (literal) rows = rows.filter(row => String(row.content).includes(literal));
+      if (literal) {
+        for (const row of rows) {
+          const content = String(row.canonical_content);
+          if (row.index_lag || row.content_hash !== sha256(content)
+            || row.content !== `${normalizeSearchText(content)} ${cjkBigrams(content)}`.trim()) {
+            return { status: 'dirty', results: [], coverage: unavailableCoverage('index-lag'), truncated: true, nextCursor: null };
+          }
+        }
+        rows = rows.filter(row => String(row.content).includes(literal));
+      }
       const candidates: SearchResult[] = [];
       const lanes = groups.map(() => [] as SearchResult[]);
       const claimKeys = new Map<SearchResult, string>();
@@ -4878,7 +4907,7 @@ export class ProbeStore {
         const words = normalizeSearchText(record.content).split(' ');
         const matchingGroups = groups.flatMap((group, index) =>
           words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text) ? [index] : []);
-        if (!numericContextMatches(queryGroups, words) || matchingGroups.length === 0) continue;
+        if (matchingGroups.length === 0 || !literal && !numericContextMatches(queryGroups, words)) continue;
         const projectId = this.#memoryProject(record);
         const targetProjects = record.scope.kind === 'project' ? [record.scope.id]
           : record.scope.kind === 'personal' ? projects

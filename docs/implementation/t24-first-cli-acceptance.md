@@ -8,7 +8,7 @@ Issue：[#25](https://github.com/qsgy-edge/euler/issues/25)。证据核对日期
 
 普通 CLI 输入、显式项目绑定及待定候选自动续办已由 [#54 / PR #56](https://github.com/qsgy-edge/euler/pull/56)、[#55 / PR #58](https://github.com/qsgy-edge/euler/pull/58) 交付，并在合并基线上通过受影响组合复验。共享 Core 三平台回归、Windows 实际 CLI/文件操作、候选验证、恢复与清理证据符合下述限定场景。真实 provider 与部分独立证据尚未齐备。
 
-当前产品基线为 [PR #67](https://github.com/qsgy-edge/euler/pull/67) 合并 `a04b494a8fdff3824f8da83313e7b101843d2c49`，含 [PR #65](https://github.com/qsgy-edge/euler/pull/65) 的来源恢复及检索交付。Disposable schema 为 **31**，独立 forward-migration 测试副本为 **32**。B1/B2 组合原件仍绑定原基线的 schema 30／副本 31。初始生产 DDL、migration 和 SHA-256 均未冻结。
+清理范围的开发证据绑定 [PR #67](https://github.com/qsgy-edge/euler/pull/67) 合并 `a04b494a8fdff3824f8da83313e7b101843d2c49`，包含 [PR #65](https://github.com/qsgy-edge/euler/pull/65) 的来源恢复及检索交付。现行项目级单字入口见 [T10](t10-memory-retrieval.md#explicit-single-han-search)。Disposable schema 为 **31**，独立 forward-migration 测试副本为 **32**。B1/B2 组合原件仍绑定原基线的 schema 30／副本 31。初始生产 DDL、migration 和 SHA-256 均未冻结。
 
 判定依据是 [I01/I03/I05/I08](../architecture/issues/15-euler-v1-spec.md)、[08 §4a](../architecture/issues/08-automate-memory-evolution.md)、[X-card](../architecture/issues/12-build-evidence-experiment-matrix.md) 和 [D8 / Physical contract](../architecture/issues/13-select-target-v1-migration.md)。#25 是验收票；缺功能与基础验证交回所属实施票。
 
@@ -164,7 +164,7 @@ G4 用冻结中文样例完成三次普通 CLI loopback，核对检索、精确�
 
 - **本次已证实。** 原首测 9 条游标签发、3 条首次引用签发及本次 6 条失效句柄拒绝均通过。封存断言为 133 通过、0 失败、98 缺证。复算 48 个排序页和 173 个 BM25 lane 分值，语料未产生可复算的 RRF 候选分。初判的 15 条范围误报按原件区分 intent／consent 控制读取与项目内容读取后离线更正，原评分保留，未重跑案例。
 - **装配与送达。** 将封存 `token_budget=4096` 映射到 AgentRun 保守 UTF-8 整包估算时，首包发出 0/27。另用默认整包预算得到 27/27 本机 Counting 首包未带普通记忆。Store 结果已核对，实际冻结 `memory.search` 送达仍缺独立观测。179 个实际逐候选 token 为 `unsupported`，费用为 `unknown`。
-- **仍缺。** 三个正向展开步骤只到旧 ref-only 入口，当前 `recordId` 恢复仍需独立观察。项目级单字慢路径，以及部分 canonical、grant target、项目可用性和 guidance 状态仍缺。保留旧 T10 集历史缺证及 27 案首测判定。
+- **仍缺。** 三个正向展开步骤只到旧 ref-only 入口，当前 `recordId` 恢复和项目级单字慢路径仍需独立观察。部分 canonical、grant target、项目可用性和 guidance 状态仍缺。保留旧 T10 集历史缺证及 27 案首测判定。
 
 #### 普通请求装配的开发观测
 

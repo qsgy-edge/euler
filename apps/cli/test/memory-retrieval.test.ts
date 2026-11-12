@@ -43,7 +43,7 @@ test('D02: a CJK substring reaches its current canonical memory', () => {
 test('explicit single-Han memory search pages through authorized cross-session matches', () => {
   const sandbox = createSandbox(), writer = openProbe(sandbox);
   try {
-    const inputs = ['记住决定：榆桥检查先核对原件', '记住决定：备用标签为榆'];
+    const inputs = ['记住决定：榆桥检查先核对原件', '记住决定：备用标签为榆', '记住决定：代号〇号'];
     const records = inputs.map(text => writer.store.rememberMemory(writer.activity,
       { input: writer.archive.append(randomUUID(), text, 'user'), hostInfo: 'durable' }).record!);
     writer.store.drainSearchProjection(writer.activity);
@@ -66,6 +66,8 @@ test('explicit single-Han memory search pages through authorized cross-session m
       assert.equal(second.nextCursor, null);
       assert.equal(reader.store.retrieveMemorySource(reader.activity,
         { recordId: second.results[0]!.unitId, offset: 0, limit: 256 }).text, inputs[1]);
+      assert.deepEqual(reader.store.searchMemories(reader.activity, { ...literal, query: '〇' }).results.map(hit => hit.unitId),
+        [records[2]!.recordId]);
       assert.throws(() => reader.store.searchMemories(reader.activity, { ...literal, query: '榆桥' }), /invalid-single-han-query/);
     } finally { reader.close(); }
   } finally { writer.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
