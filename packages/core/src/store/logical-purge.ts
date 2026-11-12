@@ -319,12 +319,12 @@ export function planPurge(db: DatabaseSync, recordId: string, carriers: PurgeCar
       if (entry.source) for (const value of sourceValues(entry.source, qualifiedSources)) tokens.add(value);
     }
   }
-  // Older counting receivers can lack attempt and run identities. Match those
+  // Counting receipts can omit attempt and run identities. Match those
   // receipts only when the frozen request actually depended on erased input.
   const erasedInputDigests = new Set<string>();
   for (const row of selected.get('request_assemblies') ?? []) {
     if (typeof row.payload_hash === 'string'
-      && purgeValues([row.sources, row.used_memories], qualifiedSources).some(value => tokens.has(value)))
+      && purgeValues([row.sources, row.used_memories, row.intent_event_id], qualifiedSources).some(value => tokens.has(value)))
       erasedInputDigests.add(row.payload_hash);
   }
   for (const [ci, carrier] of carriers.entries()) {

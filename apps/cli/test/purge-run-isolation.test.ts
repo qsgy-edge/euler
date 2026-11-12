@@ -5,7 +5,7 @@ import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { AgentRun, DEFAULT_BUDGET, requireProject } from '@euler/core';
+import { AgentRun, API_VERSION, DEFAULT_BUDGET, ProbeSession, requireProject } from '@euler/core';
 import type { MemoryRecord, PurgeManifest, SourceAck } from '@euler/core';
 import { openMaintenanceStore } from '../src/backup.ts';
 import { openProbe } from '../src/probe.ts';
@@ -98,7 +98,33 @@ function seed(root: string, scenario: Scenario) {
   } finally { probe.close(); }
 }
 
-function seedInProcess(root: string, scenario: Scenario): ReturnType<typeof seed> {
+function seedIntentInput(root: string) {
+  const sandbox = openSandbox(root), binding = bindingOf(sandbox);
+  const probe = openProbe(sandbox, budget, undefined, undefined, undefined, true);
+  try {
+    const goalText = 'Review the archived synthetic intent goal.';
+    const goal = probe.archive.append(randomUUID(), goalText);
+    probe.store.transitionIntent(probe.activity, null, goal, { status: 'active', step: 'analysis' }, goalText);
+    const { record } = probe.store.captureMemory(probe.activity, goal, 'The decision recorded by the task goal.',
+      { type: 'fact', scope: { kind: 'project', id: requireProject(binding), resolved: true }, appliesTo: [] });
+    const session = new ProbeSession(probe.store, probe.activity, { version: API_VERSION, binding, source: probe.archive,
+      transport: { kind: probe.transport.kind, send: payload => probe.transport.send(payload) } }, budget);
+    try {
+      probe.transport.send('Unrelated receiver observation.');
+      const turn = session.prepare(randomUUID(), 'An unrelated follow-up message.');
+      assert.equal(JSON.parse(turn.payload).intent.goal, goalText);
+      const [assembly] = probe.store.requestStatus(probe.activity, session.runId).assemblies;
+      assert.deepEqual(assembly!.sources, [turn.input]);
+      assert.deepEqual(assembly!.usedMemories, []);
+      assert.equal(session.dispatch(turn).outcome, 'received');
+    } finally { session.close(); }
+    return record.recordId;
+  } finally { probe.close(); }
+}
+
+function seedInProcess(root: string, scenario: 'intent-input'): ReturnType<typeof seedIntentInput>;
+function seedInProcess(root: string, scenario: Scenario): ReturnType<typeof seed>;
+function seedInProcess(root: string, scenario: Scenario | 'intent-input') {
   const result = spawnSync(process.execPath, [fileURLToPath(import.meta.url), 'seed-purge-run-isolation', root, scenario],
     { encoding: 'utf8', windowsHide: true, timeout: 30000 });
   assert.equal(result.status, 0, result.stdout + result.stderr);
@@ -115,8 +141,9 @@ function filesContaining(root: string, marker: string): string[] {
 
 if (process.argv[2] === 'seed-purge-run-isolation') {
   const scenario = process.argv[4];
-  assert.ok(scenario === 'independent' || scenario === 'derived' || scenario === 'identical-input');
-  console.log(JSON.stringify(seed(process.argv[3]!, scenario)));
+  assert.ok(scenario === 'independent' || scenario === 'derived' || scenario === 'identical-input' || scenario === 'intent-input');
+  const root = process.argv[3]!;
+  console.log(JSON.stringify(scenario === 'intent-input' ? seedIntentInput(root) : seed(root, scenario)));
 } else {
   const cases = {
     independent: 'purge preview preserves independent canonical B and its source under the same task grant',
@@ -153,6 +180,26 @@ if (process.argv[2] === 'seed-purge-run-isolation') {
         finally { store.close(); }
       }
     } finally { rmSync(sandbox.root, { recursive: true, force: true }); }
+  });
+
+  test('purge preview selects an unbound receiver receipt for an erased intent goal', async () => {
+    const sandbox = createSandbox();
+    let purge: ReturnType<typeof startCli> | undefined;
+    try {
+      const recordId = seedInProcess(sandbox.root, 'intent-input');
+      purge = startCli(['purge', '--sandbox', sandbox.root, '--record', recordId]);
+      const preview = await purge.waitFor('purge-preview');
+      const manifest = preview.manifest as PurgeManifest;
+      assert.deepEqual(manifest.records.map(record => record.recordId), [recordId]);
+      assert.ok(manifest.database.some(item => item.table === 'request_assemblies'));
+      assert.deepEqual(manifest.carriers.find(item => item.role === 'receiver')?.entries.map(entry => entry.id), ['1']);
+      assert.equal((await sendCommand(purge, 'cancel', 'purge-cancelled')).status, 'cancelled');
+      assert.equal((await purge.exit).code, 0, purge.stderr());
+    } finally {
+      if (purge && purge.child.exitCode === null && purge.child.signalCode === null) purge.child.kill();
+      if (purge) await purge.exit;
+      rmSync(sandbox.root, { recursive: true, force: true });
+    }
   });
 
   test('approved cleanup removes A and its derived output while B and the shared task grant survive reopening', async () => {
