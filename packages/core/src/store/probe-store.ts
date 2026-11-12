@@ -22,8 +22,9 @@ import type { ControlledFile } from '../context/file-contract.ts';
 import { check, localProjects, localScope, requireProject, sameBinding, sha256, sourceEventId, uuid, validateBudget } from '../contracts.ts';
 import type { Binding, ProbeBudget, SourceAck, SourceExcerpt } from '../contracts.ts';
 import { REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, assemblyIdentityHash, chargedRequestTokens, deriveAssemblyState, freezeRequestPayload } from './request-ledger.ts';
-import { MEMORY_QUERY_TOKENIZER, MEMORY_INDEX_TOKENIZER, MEMORY_RANKING_VERSION, assertMemoryRetrievalReceipt, measureRetrievalResult, memoryDelivery, rankMemoryCandidates, retrievalResultHash } from './memory-retrieval.ts';
-import type { MemorySearchTrace } from './memory-retrieval.ts';
+import { MEMORY_QUERY_TOKENIZER, MEMORY_INDEX_TOKENIZER, MEMORY_RANKING_VERSION, SINGLE_HAN_QUERY_TOKENIZER, SINGLE_HAN_RANKING_VERSION,
+  assertMemoryRetrievalReceipt, measureRetrievalResult, memoryDelivery, rankMemoryCandidates, retrievalResultHash } from './memory-retrieval.ts';
+import type { MemoryRank, MemorySearchTrace } from './memory-retrieval.ts';
 import type { RequestAssembly, RequestAssemblyInput, RequestAssemblyState, AssemblyMemoryUse, RequestAttempt, RequestEvent, RequestEventKind, RequestRun, RequestStatus, RequestReconciliation } from './request-ledger.ts';
 
 export interface FileIdentity { dev: string; ino: string }
@@ -175,7 +176,8 @@ function sameSourceAck(left: SourceAck | undefined, right: SourceAck | undefined
     && left.locator === right.locator && left.hash === right.hash
     && left.byteLength === right.byteLength && left.contentHash === right.contentHash;
 }
-export interface SourceSearchRequest { query: string; limit?: number; byteBudget?: number; cursor?: string; grantId?: string; queryId?: string }
+export interface SourceSearchRequest { query: string; limit?: number; byteBudget?: number; cursor?: string; grantId?: string;
+  queryId?: string; mode?: 'single-han' }
 export interface SourceSearchHit { unitId: string; locator: string; kind: SourceUnitInput['kind'] | 'proposal'; projectId: string;
   sourceProjectId: string | null; version: number; contentHash: string; range: { offset: number; end: number; total: number };
   status: 'available' | 'inert'; preview: string }
@@ -187,7 +189,7 @@ export interface SourceUnitExcerpt { unitId: string; locator: string; kind: Sour
   projectId: string; sourceProjectId: string | null; sourceOwnerId: string; sourceSessionId: string;
   contentHash: string; text: string; offset: number; end: number; total: number; truncated: boolean; excerptHash: string }
 export interface SearchRequest { query: string; limit?: number; byteBudget?: number; cursor?: string; grantId?: string;
-  noActiveProject?: true; target?: SearchTarget }
+  noActiveProject?: true; target?: SearchTarget; mode?: 'single-han' }
 export type SearchResult = { kind: 'memory'; unitId: string; record: MemoryRecord; exposureMode: 'normal' | 'reference_only'; rank: number;
   projectId: string; targetProjectId: string; target: SearchTarget; applicability: 'applicable' | 'needs-verification' }
   | { kind: 'status'; unitId: string; claimRef: string; verification: MemoryVerification;
@@ -4546,7 +4548,7 @@ export class ProbeStore {
 
   #sourceSearchHash(request: SourceSearchRequest): string {
     return sha256(JSON.stringify({ sessionId: this.#binding.sessionId, grantId: request.grantId,
-      query: request.query, limit: request.limit ?? 10, byteBudget: request.byteBudget ?? 8192, cursor: request.cursor ?? null }));
+      query: request.query, limit: request.limit ?? 10, byteBudget: request.byteBudget ?? 8192, cursor: request.cursor ?? null, mode: request.mode }));
   }
 
   #sourceQueryDigest(row: Record<string, unknown>): string {
@@ -4601,8 +4603,9 @@ export class ProbeStore {
 
   searchSources(activity: Activity, request: SourceSearchRequest): SourceSearchPage {
     return this.withActivity(activity, () => {
-      check(request && Object.keys(request).every(key => ['query','limit','byteBudget','cursor','grantId','queryId'].includes(key))
+      check(request && Object.keys(request).every(key => ['query','limit','byteBudget','cursor','grantId','queryId','mode'].includes(key))
         && typeof request.query === 'string' && Buffer.byteLength(request.query) <= 4096, 'invalid-source-search');
+      const literal = singleHanLiteral(request.query, request.mode);
       const limit = request.limit ?? 10, byteBudget = request.byteBudget ?? 8192;
       check(Number.isSafeInteger(limit) && limit > 0 && limit <= 32
         && Number.isSafeInteger(byteBudget) && byteBudget > 0 && byteBudget <= 65536, 'invalid-source-search');
@@ -4684,18 +4687,21 @@ export class ProbeStore {
       if (missing || extra || missingProposal || extraProposal) return finalize(unavailable('index-lag', 'dirty'));
       try { this.#db.exec("INSERT INTO search_fts(search_fts,rank) VALUES ('integrity-check',1)"); }
       catch { return finalize(unavailable('fts-integrity-gap', 'dirty')); }
-      const terms = searchTerms(request.query);
+      const terms = literal ? [literal] : searchTerms(request.query);
       if (!terms.length) return finalize({ status: 'ready', results: [], coverage: { ...coverage, reason: 'unsupported-query' }, truncated: false, nextCursor: null });
       if (terms.length > 16) return finalize(unavailable('query-term-limit'));
       if (grant && (!grant.remaining || !grant.remainingBytes)) return finalize(unavailable('task-budget-exhausted'));
       const match = terms.map(term => `"${term.replaceAll('"', '""')}"`).join(' OR ');
+      const visible = `d.owner_kind IN ('session','proposal') AND d.project_id IN (${ids})`;
       let rows: Record<string, unknown>[];
       try {
-        rows = this.#db.prepare(`SELECT d.* FROM search_fts JOIN search_documents d ON d.rowid=search_fts.rowid
-          WHERE search_fts MATCH ? AND d.owner_kind IN ('session','proposal') AND d.project_id IN (${ids})
-          ORDER BY d.rowid LIMIT 257`).all(match, ...projects);
+        rows = literal ? this.#db.prepare(`SELECT d.* FROM search_documents d WHERE ${visible}
+          ORDER BY d.rowid LIMIT ${SEARCH_CANDIDATE_LIMIT + 1}`).all(...projects)
+          : this.#db.prepare(`SELECT d.* FROM search_fts JOIN search_documents d ON d.rowid=search_fts.rowid
+            WHERE search_fts MATCH ? AND ${visible} ORDER BY d.rowid LIMIT ${SEARCH_CANDIDATE_LIMIT + 1}`).all(match, ...projects);
       } catch { return finalize(unavailable('index-unavailable')); }
-      if (rows.length > 256) return finalize(unavailable('candidate-limit'));
+      if (rows.length > SEARCH_CANDIDATE_LIMIT) return finalize(unavailable(literal ? 'single-han-scan-limit' : 'candidate-limit'));
+      if (literal) rows = rows.filter(row => String(row.content).includes(literal));
       const candidates: SourceSearchHit[] = [];
       for (const row of rows) {
         try {
@@ -4733,7 +4739,8 @@ export class ProbeStore {
       coverage.inspectedProjects = projects;
       coverage.candidateCount = candidates.length;
       const fingerprint = sha256(JSON.stringify(candidates.map(hit => [hit.unitId, hit.contentHash])));
-      const scope = sha256(JSON.stringify([this.#binding.sessionId, request.grantId ?? null, request.query, projects]));
+      const scope = sha256(JSON.stringify([this.#binding.sessionId, request.grantId ?? null, request.query, projects,
+        ...(request.mode ? [request.mode] : [])]));
       let offset = 0;
       if (request.cursor !== undefined) {
         check(typeof request.cursor === 'string' && request.cursor.length <= 2048, 'invalid-source-cursor');
@@ -4765,7 +4772,7 @@ export class ProbeStore {
   searchMemories(activity: Activity, request: SearchRequest): SearchPage {
     return this.withActivity(activity, () => {
       check(request && typeof request === 'object' && Object.keys(request).every(key =>
-        ['query','limit','byteBudget','cursor','grantId','target','noActiveProject'].includes(key)), 'invalid-search-request');
+        ['query','limit','byteBudget','cursor','grantId','target','noActiveProject','mode'].includes(key)), 'invalid-search-request');
       check(request.noActiveProject === undefined || request.noActiveProject === true, 'invalid-search-request');
       const limit = request.limit ?? 10;
       const byteBudget = request.byteBudget ?? 8192;
@@ -4773,8 +4780,9 @@ export class ProbeStore {
       check(Number.isSafeInteger(byteBudget) && byteBudget > 0 && byteBudget <= 65536, 'invalid-search-budget');
       check(typeof request.query === 'string' && Buffer.byteLength(request.query) <= 4096, 'invalid-search-query');
       check(request.target === undefined || validSearchTarget(request.target), 'invalid-search-target');
-      const terms = searchTerms(request.query);
-      const queryGroups = searchGroups(request.query);
+      const literal = singleHanLiteral(request.query, request.mode);
+      const terms = literal ? [literal] : searchTerms(request.query);
+      const queryGroups = literal ? [{ kind: 'han' as const, text: literal }] : searchGroups(request.query);
       const groups = [...new Map(queryGroups.map(group => [`${group.kind}:${group.text}`, group])).values()];
       const grant = request.grantId ? this.#discoveryProjects(activity, request.grantId) : null;
       check(!grant || request.target === undefined, 'invalid-search-target');
@@ -4830,17 +4838,21 @@ export class ProbeStore {
       if (grant && (grant.remaining === 0 || grant.remainingBytes === 0)) return { status: 'unavailable', results: [],
         coverage: unavailableCoverage('task-budget-exhausted'), truncated: true, nextCursor: null };
       const match = terms.map(term => `"${term.replaceAll('"', '""')}"`).join(' OR ');
+      const visible = `d.owner_kind='memory' AND d.owner_id=? AND ${this.#searchScopeSql('d', projects)}${projectedSourceSql}`;
+      const visibleArgs = [this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : [])];
       let rows: Record<string, unknown>[];
       try {
-        rows = this.#db.prepare(`SELECT d.* FROM search_fts
+        rows = literal ? this.#db.prepare(`WITH visible AS MATERIALIZED (
+          SELECT d.*, r.rowid AS record_order FROM search_documents d JOIN memory_records r ON r.record_id=d.record_id
+          WHERE ${visible} LIMIT ${SEARCH_CANDIDATE_LIMIT + 1}
+        ) SELECT * FROM visible ORDER BY record_order`).all(...visibleArgs) : this.#db.prepare(`SELECT d.* FROM search_fts
           JOIN search_documents d ON d.rowid=search_fts.rowid
           JOIN memory_records r ON r.record_id=d.record_id
-          WHERE search_fts MATCH ? AND d.owner_kind='memory' AND d.owner_id=? AND ${this.#searchScopeSql('d', projects)}${projectedSourceSql}
-          ORDER BY r.rowid LIMIT 257`).all(
-          match, this.#binding.ownerId, ...scopeArgs, ...(grant ? projects : []));
+          WHERE search_fts MATCH ? AND ${visible} ORDER BY r.rowid LIMIT ${SEARCH_CANDIDATE_LIMIT + 1}`).all(match, ...visibleArgs);
       } catch { return { status: 'unavailable', results: [], coverage: unavailableCoverage('index-unavailable'), truncated: true, nextCursor: null }; }
-      if (rows.length > 256) return { status: 'unavailable', results: [],
-        coverage: unavailableCoverage('candidate-limit'), truncated: true, nextCursor: null };
+      if (rows.length > SEARCH_CANDIDATE_LIMIT) return { status: 'unavailable', results: [],
+        coverage: unavailableCoverage(literal ? 'single-han-scan-limit' : 'candidate-limit'), truncated: true, nextCursor: null };
+      if (literal) rows = rows.filter(row => String(row.content).includes(literal));
       const candidates: SearchResult[] = [];
       const lanes = groups.map(() => [] as SearchResult[]);
       const claimKeys = new Map<SearchResult, string>();
@@ -4894,7 +4906,7 @@ export class ProbeStore {
               projectId, targetProjectId, target, exposureMode: 'status_only', rank: null });
           } else candidates.push({ kind: 'memory', unitId: record.recordId, record, projectId, targetProjectId, target,
             applicability, exposureMode: applicability === 'needs-verification' ? 'reference_only' : 'normal', rank: 0 });
-          if (candidates.length > 256) return { status: 'unavailable', results: [],
+          if (candidates.length > SEARCH_CANDIDATE_LIMIT) return { status: 'unavailable', results: [],
             coverage: unavailableCoverage('candidate-limit'), truncated: true, nextCursor: null };
           const hit = candidates[candidates.length - 1]!;
           claimKeys.set(hit, key);
@@ -4906,7 +4918,10 @@ export class ProbeStore {
         .map(hit => [hit.record.recordId, { recordId: hit.record.recordId,
           revisionId: hit.record.revisionId, headEventId: hit.record.headEventId, contentHash: hit.record.contentHash,
           text: `${normalizeSearchText(hit.record.content)} ${cjkBigrams(hit.record.content)}`.trim() }])).values()];
-      const ranked = rankMemoryCandidates(documents, groups.map((group, index) => ({
+      const ranked = literal ? {
+        ranks: new Map<string, MemoryRank>(documents.map(({ recordId }, ordinal) => [recordId, { score: ordinal, ordinal, lanes: [] }])),
+        sqliteVersion: String(this.#db.prepare('SELECT sqlite_version() AS version').get()!.version), fusion: false,
+      } : rankMemoryCandidates(documents, groups.map((group, index) => ({
         match: searchTerms(group.text).map(term => `"${term.replaceAll('"', '""')}"`).join(' OR '),
         recordIds: lanes[index]!.filter(hit => hit.kind === 'memory').map(hit => hit.record.recordId),
       })));
@@ -4931,10 +4946,12 @@ export class ProbeStore {
       candidates.splice(0, candidates.length, ...distinct);
       coverage.inspectedProjects = projects;
       coverage.candidateCount = candidates.length;
-      const fingerprint = sha256(JSON.stringify({ corpusHash, rankingVersion: MEMORY_RANKING_VERSION,
-        queryTokenizer: MEMORY_QUERY_TOKENIZER, indexTokenizer: MEMORY_INDEX_TOKENIZER,
+      const rankingVersion = literal ? SINGLE_HAN_RANKING_VERSION : MEMORY_RANKING_VERSION;
+      const queryTokenizer = literal ? SINGLE_HAN_QUERY_TOKENIZER : MEMORY_QUERY_TOKENIZER;
+      const fingerprint = sha256(JSON.stringify({ corpusHash, rankingVersion, queryTokenizer, indexTokenizer: MEMORY_INDEX_TOKENIZER,
         candidates: candidates.map(hit => [hit.unitId, hit.projectId, hit.targetProjectId, candidateRecords.get(hit)!.headEventId, hit.rank]) }));
-      const cursorScope = sha256(JSON.stringify([this.#binding.sessionId, request.grantId ?? null, request.query, request.target ?? null, projects]));
+      const cursorScope = sha256(JSON.stringify([this.#binding.sessionId, request.grantId ?? null, request.query, request.target ?? null, projects,
+        ...(request.mode ? [request.mode] : [])]));
       let offset = 0;
       if (request.cursor !== undefined) {
         check(typeof request.cursor === 'string' && request.cursor.length <= 2048, 'invalid-search-cursor');
@@ -4963,17 +4980,18 @@ export class ProbeStore {
       }
       for (const hit of candidates) if (!decisions.has(hit)) decisions.set(hit,
         results.length >= Math.min(limit, remaining) ? 'page-result-limit' : 'page-byte-budget');
+      const scoreKind = literal ? 'literal-order' : ranked.fusion ? 'rrf' : 'bm25';
       const retrieval: MemorySearchTrace = { schema: 'memory-retrieval@1', queryHash: sha256(request.query),
-        queryTokenizer: MEMORY_QUERY_TOKENIZER, indexTokenizer: MEMORY_INDEX_TOKENIZER, sqliteVersion: ranked.sqliteVersion,
-        rankingVersion: MEMORY_RANKING_VERSION, bm25: { k1: 1.2, b: 0.75 }, fusion: ranked.fusion ? { method: 'rrf', k: 60 } : null,
+        queryTokenizer, indexTokenizer: MEMORY_INDEX_TOKENIZER, sqliteVersion: ranked.sqliteVersion,
+        rankingVersion, bm25: literal ? null : { k1: 1.2, b: 0.75 }, fusion: ranked.fusion ? { method: 'rrf', k: 60 } : null,
         corpus: { kind: 'eligible-lexical-candidates', count: documents.length, hash: corpusHash },
-        lanes: groups.map((group, ordinal) => ({ ordinal, queryHash: sha256(group.text), termHashes: searchTerms(group.text).map(sha256) })),
+        lanes: groups.map((group, ordinal) => ({ ordinal, queryHash: sha256(group.text), termHashes: (literal ? terms : searchTerms(group.text)).map(sha256) })),
         candidates: rankedCandidates.map((hit, ordinal) => {
           const record = candidateRecords.get(hit)!, returnedOrdinal = results.indexOf(hit);
           return { recordId: record.recordId, revisionId: record.revisionId, headEventId: record.headEventId,
             hash: record.hash, contentHash: record.contentHash, targetProjectId: hit.targetProjectId, kind: hit.kind,
             ordinal, corpusOrdinal: hit.kind === 'memory' ? documents.findIndex(document => document.recordId === hit.record.recordId) : null,
-            resultHash: retrievalResultHash(hit), scoreKind: hit.kind === 'status' ? 'not-applicable' : ranked.fusion ? 'rrf' : 'bm25',
+            resultHash: retrievalResultHash(hit), scoreKind: hit.kind === 'status' ? 'not-applicable' : scoreKind,
             score: hit.kind === 'memory' && ranked.fusion ? -hit.rank : hit.rank,
             lanes: hit.kind === 'memory' ? ranks.get(hit.record.recordId)!.lanes : [],
             decision: decisions.get(hit)!, returnedOrdinal: returnedOrdinal < 0 ? null : returnedOrdinal, measurement: measureRetrievalResult(hit) };
@@ -8235,6 +8253,16 @@ function searchRuns(value: string): { text: string; kind: 'han' | 'latin' }[] {
     previousKind = kind;
   }
   return runs;
+}
+
+const SEARCH_CANDIDATE_LIMIT = 256;
+
+function singleHanLiteral(query: string, mode: SearchRequest['mode']): string | undefined {
+  if (mode === undefined) return undefined;
+  check(mode === 'single-han', 'invalid-search-mode');
+  const literal = query.trim().normalize('NFKC');
+  check(/^\p{Script=Han}$/u.test(literal), 'invalid-single-han-query');
+  return literal;
 }
 
 function searchGroups(value: string): { text: string; kind: 'han' | 'latin' }[] {

@@ -23,7 +23,7 @@
 | 普通自动装配 | 24 个独立缺证案例均缺自动装配观测 | 新验收改看 R2/R7 的触发→返回→冻结送达；旧 `ASSEMBLY_NOT_OBSERVED` 保留原判，注明旧规格身份 | 普通 CLI、实际请求、tool archive、assembly/attempt 逐项对齐；不只检查 Store 页 |
 | 投影滞后与新激活记录 | pinned delta／current-head 与下一次可读性 | 取消自主送入 prompt，保留按需读取新 head 或明确 dirty／不可用 | `search-projection`、`owner-memory`、`agent-run` 现有测试入口；必要时用新开发数据查缺口 |
 | canonical 状态变化 | 4 个独立案例另缺 transition 可达性 | 保留 | 新开发探针已记录 activation/revision/forget/restore/rejected/conflict、dirty→drain、旧快照拒用与重启，共 15 项断言；不映射未知独立案例，冻结请求送达仍分别核对 |
-| 中文单字 fallback | 2 个独立查询 `unsupported-query` | 继续按 X-02 的全单字召回、非单字零排序回归判定 | 本会话字面原文慢路径已在普通 CLI 验证。项目级单字发现仍缺对应慢路径与独立配对 |
+| 中文单字 fallback | 2 个独立查询 `unsupported-query` | 默认 FTS 仍明确不支持，项目级单字可使用显式有界慢路径 | 普通 CLI 已验证记忆和已发布来源的字面查询、权限及实际送达。全单字召回、非单字排序仍按 X-02 独立配对判定。[T10 单字入口](t10-memory-retrieval.md#explicit-single-han-search) |
 | guidance 正负向 | 2 个独立案例未观测加载 | 保留独立首测判定 | 开发侧已补显式绑定、未绑定只读 grant、仅模型自报三种实际请求对照；复用 #25 的 4/4 场景和 7 次 loopback 原件 |
 | scope、权限、目标环境 | 未授权泄漏、跨项目 reference-only、撤销／任务结束／切换 | 保留 | 独立复验的 9 条游标、3 条首次引用、6 条失效句柄拒绝通过。已有 grant 的 target 变化与项目不可用仍缺 |
 | 排序／query tokenizer | 旧实现按组内命中数与轮询 | PR #65 已交付合格候选集 BM25、多 lane RRF 及 tokenizer 版本 | 独立复验复算 173 个 BM25 lane 分值。RRF 仍为开发路径证据 |
@@ -47,7 +47,7 @@
 | 顺序 | 工作 | 完成条件 |
 |---|---|---|
 | 1 | 规格与对应验收口径 | R1–R8 基线为 PR #62 合并的 `fb51c16`。X-02 后续复验使用本清单中的分项预算口径 |
-| 2 | B4 独立复验的缺证补齐 | 查询页、紧预算和受支持整包的开发对照已完成。下次独立释放前冻结配置、适用断言与真实 tool delivery／`recordId` 入口，并补齐项目级单字、计量和状态观察 |
+| 2 | B4 独立复验的缺证补齐 | 查询页、紧预算、受支持整包和项目级单字慢路径已有开发对照。下次独立释放前冻结配置、适用断言、单字入口与实际 tool delivery／`recordId` 恢复，并补齐独立计量和状态观察 |
 | 3 | B5 取证准备与新证据分析 | 原 probe 能保留拒绝时 observations/residuals 及现场；出现新失败时按具体参与者／残留追因；通过复跑不代替根因结案 |
 | 4 | B3 剩余真实路径的有界方案 | G1 完成规则正负对照，各用一次真实请求。两条验证管线、纠正／遗忘、长会话／交接、Historian 与 X-14 分组冻结输入、指标及请求上限后取得对应预算 |
 | 5 | T24 组合与独立验收 | 按正式规格补齐所属证据，保留历史身份和判定；满足 gate 后才冻结初始 schema |

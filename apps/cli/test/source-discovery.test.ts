@@ -138,6 +138,32 @@ test('replaying a changed source-query result returns a gap, not new bytes under
   } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
 });
 
+test('explicit single-Han project search pages through published ranges only', () => {
+  const sandbox = createSandbox(), probe = openProbe(sandbox);
+  try {
+    const text = '榆桥记录\n备注为榆\n未发布的榆树原文';
+    const ref = probe.archive.append(randomUUID(), text);
+    const projectId = sandbox.fixture.projectId;
+    const units = [0, 5].map(offset => probe.store.publishSourceUnit(probe.activity,
+      approvedSourceUnit(probe, { ref, projectId, kind: 'source', offset, length: 4 })));
+    const search = { query: '榆', limit: 1, mode: 'single-han' as const };
+    assert.equal(probe.store.searchSources(probe.activity, search).status, 'dirty');
+    probe.store.drainSourceProjection(probe.activity);
+    assert.equal(probe.store.searchSources(probe.activity, { query: '榆' }).coverage.reason, 'unsupported-query');
+    const first = probe.store.searchSources(probe.activity, search);
+    assert.deepEqual(first.results.map(hit => hit.unitId), [units[0]!.unitId]);
+    assert.ok(first.nextCursor);
+    const next = probe.store.searchSources(probe.activity, { ...search, cursor: first.nextCursor });
+    assert.deepEqual(next.results.map(hit => hit.unitId), [units[1]!.unitId]);
+    assert.equal(next.nextCursor, null);
+    assert.equal(probe.store.expandSource(probe.activity, { unitId: units[1]!.unitId, offset: 0, limit: 4 }).text, '备注为榆');
+    const tiny = probe.store.searchSources(probe.activity, { ...search, byteBudget: 1 });
+    assert.equal(tiny.coverage.reason, 'result-over-budget');
+    assert.deepEqual(tiny.results, []);
+    assert.equal(tiny.nextCursor, null);
+  } finally { probe.close(); rmSync(sandbox.root, { recursive: true, force: true }); }
+});
+
 test('an owner-published source chunk is discoverable only after indexing and expands to exact bytes', () => {
   const sandbox = createSandbox();
   const probe = openProbe(sandbox);

@@ -5,21 +5,24 @@ export interface MemoryRank { score: number; ordinal: number; lanes: { ordinal: 
 export const MEMORY_QUERY_TOKENIZER = 'latin-cjk-query@1';
 export const MEMORY_INDEX_TOKENIZER = 'unicode61+latin-cjk@3';
 export const MEMORY_RANKING_VERSION = 'eligible-fts5-bm25-rrf@1';
+export const SINGLE_HAN_QUERY_TOKENIZER = 'single-han-literal@1';
+export const SINGLE_HAN_RANKING_VERSION = 'eligible-literal-order@1';
 export interface RetrievalMeasurement {
   basis: 'utf8-json-search-result@1'; byteLength: number; budgetUnits: number;
   budgetEstimator: 'utf8-bytes-upper-bound@1'; modelTokenizer: 'unavailable';
   tokens: 'unsupported'; cost: 'unknown'; currency: 'unknown';
 }
 export interface MemorySearchTrace {
-  schema: 'memory-retrieval@1'; queryHash: string; queryTokenizer: typeof MEMORY_QUERY_TOKENIZER;
-  indexTokenizer: typeof MEMORY_INDEX_TOKENIZER; sqliteVersion: string; rankingVersion: typeof MEMORY_RANKING_VERSION;
-  bm25: { k1: 1.2; b: 0.75 }; fusion: { method: 'rrf'; k: 60 } | null;
+  schema: 'memory-retrieval@1'; queryHash: string; queryTokenizer: typeof MEMORY_QUERY_TOKENIZER | typeof SINGLE_HAN_QUERY_TOKENIZER;
+  indexTokenizer: typeof MEMORY_INDEX_TOKENIZER; sqliteVersion: string;
+  rankingVersion: typeof MEMORY_RANKING_VERSION | typeof SINGLE_HAN_RANKING_VERSION;
+  bm25: { k1: 1.2; b: 0.75 } | null; fusion: { method: 'rrf'; k: 60 } | null;
   corpus: { kind: 'eligible-lexical-candidates'; count: number; hash: string };
   lanes: { ordinal: number; queryHash: string; termHashes: string[] }[];
   candidates: {
     recordId: string; revisionId: string; headEventId: string; hash: string; contentHash: string;
     targetProjectId: string; kind: 'memory' | 'status'; ordinal: number; corpusOrdinal: number | null; resultHash: string;
-    scoreKind: 'bm25' | 'rrf' | 'not-applicable'; score: number | null; lanes: MemoryRank['lanes'];
+    scoreKind: 'bm25' | 'rrf' | 'literal-order' | 'not-applicable'; score: number | null; lanes: MemoryRank['lanes'];
     decision: 'returned' | 'duplicate' | 'previous-page' | 'candidate-over-byte-budget' | 'page-result-limit' | 'page-byte-budget';
     returnedOrdinal: number | null; measurement: RetrievalMeasurement;
   }[];
