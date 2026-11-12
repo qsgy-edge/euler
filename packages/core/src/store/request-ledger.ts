@@ -2,6 +2,7 @@ import { CORE_TOOLS, sha256 } from '../contracts.ts';
 import type { ProbeBudget, SourceAck } from '../contracts.ts';
 import type { AttemptOwnership, ExecutionStream } from './probe-store.ts';
 import type { SnapshotRecoveryReceipt } from './snapshot-recovery.ts';
+import type { MemoryDelivery } from './memory-retrieval.ts';
 
 // T06 / I11 / Ticket 09 §13-16: durable, recoverable request ledger facts.
 // The ledger stores only references, hashes, budgets and states — never request
@@ -55,7 +56,7 @@ export interface RequestAssemblyInput {
   sources: SourceAck[]; usedMemories?: AssemblyMemoryUse[]; claimHeadEventId?: string; intent: { eventId: string; hash: string } | null;
   payload: string; payloadHash: string; byteLength: number; estimatedTokens: number;
   budget: ProbeBudget; zones: { p0: number; p1: number; p2: number; p3: number };
-  selection: { ordinal: number; hash: string; reason: 'mandatory-source' }[];
+  selection: { ordinal: number; hash: string; reason: 'mandatory-source'; retrieval?: MemoryDelivery }[];
   degradation: 'none' | 'compact' | 'selected' | 'window';
 }
 export interface RequestAssembly extends Omit<RequestAssemblyInput, 'payload' | 'usedMemories'> {

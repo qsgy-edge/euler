@@ -120,7 +120,8 @@ export class HttpModelTransport {
     }
     // P2 stays byte-for-byte historical. Current intent and input occupy only the dynamic tail.
     const [current, ...rest] = request.p3.messages;
-    messages.push({ role: 'user', content: JSON.stringify({ input: current?.content ?? null, intent: request.p3.intent }) }, ...rest);
+    messages.push({ role: 'user', content: JSON.stringify({ input: current?.content ?? null, intent: request.p3.intent,
+      ...(request.p3.sourceRecovery?.length ? { sourceRecovery: { kind: 'untrusted-source-recovery', items: request.p3.sourceRecovery } } : {}) }) }, ...rest);
     return JSON.stringify({ model: this.#model.id, stream: false, max_tokens: this.#budget.outputReserve,
       tools: request.p0.tools.map(tool => ({ type: 'function', function: { name: tool.name.replaceAll('.', '_'), description: tool.description, parameters: tool.parameters } })), messages });
   }

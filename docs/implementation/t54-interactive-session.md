@@ -114,6 +114,8 @@ Only complete explicit command forms use the memory-operation path. Correction c
 
 Correction/forget/restore/rollback retain their existing preview and live-approval checks. Objective `记住事实` statements still require independent evidence. Corrected content remains unverified until reverification. Model tool calls to `memory.search`, `source.search`, `source.expand`, and `skill.search` go through Core; owner commands do not send a counting-model substitute.
 
+For a memory's original evidence, the model uses `source.expand` with `recordId`, `offset`, and `limit`. This path checks the current eligible memory and its exact provenance, including another session in the same project or a project covered by the current task grant. `memory.search` also attempts a bounded provenance prefetch for its returned records; it enters only the current untrusted source tail when the request budget permits. An ordinary first request still does not search memory automatically. See [source recovery](t11-source-recovery.md#memory-provenance-in-the-agent-loop) for identifier distinctions, budget gaps and historical owner inspection.
+
 Completed exchanges can appear in the next request only as complete pairs fitting the actual encoded request budget. Core rechecks their source permissions and memory qualifications at dispatch. Raw events remain recoverable after a window change; a Historian summary is not returned by `source.expand`.
 
 ```powershell

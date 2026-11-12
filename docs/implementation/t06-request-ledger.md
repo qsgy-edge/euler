@@ -8,6 +8,8 @@ This slice implements GitHub issue #6 for the disposable CLI and local counting 
 
 Assembly commit precedes started commit; transport runs after both. A missing started fact means `not-dispatched`. Started without finished remains `unknown-sent`, including when the receiver actually received the request but the sender died before committing its receipt.
 
+For actual `memory.search` calls, Core records the bounded retrieval trace in the existing tool-result event and binds its returned model-data hash. Selected tool sources carry a `memory-delivery@1` reference/measurement block in their existing assembly `selection` item; that block participates in identity and admission validation. No query produces no retrieval trace, and a query stopped before its next assembly produces no delivery selection. Candidate UTF-8 JSON bytes and conservative budget units remain separate from unsupported model-token counts and unknown per-candidate costs. The trace and selection metadata never enter model data. See [retrieval receipts](t10-memory-retrieval.md#retrieval-and-delivery-receipts) for the query/corpus versions and persistence boundary.
+
 Admission checks the intent, source references, epoch, authorized request budget and request identity in the started transaction. A second connection may revoke after that transaction; the sender rechecks observable cancellation before calling transport. A revoke before admission leaves no attempt; a revoke after admission but before sending records `cancelled-before-send`. A source removed during transport prevents a late result from settling the attempt.
 
 ## Recovery

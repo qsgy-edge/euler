@@ -2,6 +2,7 @@ import type { RequestContext, RequestStatus } from '../store/request-ledger.ts';
 import type { Binding, SourceAck } from '../contracts.ts';
 import { check } from '../contracts.ts';
 import type { FileAdmission, FileReceipt, FileCapability, FileFailureReason } from './file-contract.ts';
+import type { MemoryRetrievalReceipt } from '../store/memory-retrieval.ts';
 
 export type RunTerminal = 'completed' | 'needs-input' | 'cancelled' | 'budget-exhausted' | 'deadline' | 'failed' | 'blocked-unknown';
 export interface ModelRoute { provider: string; model: string; route: string; authNamespace: string }
@@ -10,12 +11,12 @@ export interface ToolCall { id: string; name: string; arguments: Record<string, 
 export interface ToolResult {
   callId: string; executionState: 'not_started' | 'started' | 'unknown';
   outcome: 'success' | 'failure' | 'cancelled' | 'timeout' | 'unavailable' | 'unknown';
-  argumentsHash: string; errorClass: string | null; source: SourceAck; file?: FileReceipt;
+  argumentsHash: string; errorClass: string | null; source: SourceAck; file?: FileReceipt; retrieval?: MemoryRetrievalReceipt;
 }
 export interface ToolFact { callId: string; name: string; argumentsHash: string; attemptId: string | null; started: boolean; result: ToolResult | null }
 export type AgentEvent =
   | { kind: 'opened'; route: ModelRoute; files?: FileCapability; discoveryGrantId?: string; guidanceRunId?: string }
-  | { kind: 'source-access'; sourceEventId: string; binding: Binding; discoveryGrantId: string }
+  | { kind: 'source-access'; sourceEventId: string; binding: Binding; discoveryGrantId: string | null; sourceGrantIds?: string[] }
   | { kind: 'window-opened'; windowId: string; previousWindowId: string | null; firstResponse: number; reason: 'initial' | 'pressure' | 'explicit'; recovery: SourceAck[];
       compartments?: { jobId: string; source: SourceAck }[]; compartmentGaps?: { jobId: string; reason: string }[] }
   | ({ kind: 'cache-epoch-opened' } & RequestContext)
@@ -64,7 +65,8 @@ export function replayAgent(events: AgentEvent[], attempts: number): AgentStatus
         check(index === 0, 'agent-evidence-gap'); state.discoveryGrantId = event.discoveryGrantId ?? null;
         state.guidanceRunId = event.guidanceRunId ?? null; break;
       case 'source-access':
-        check(event.discoveryGrantId === state.discoveryGrantId, 'source-access-mismatch'); break;
+        check(event.discoveryGrantId === state.discoveryGrantId
+          && (event.discoveryGrantId !== null || Boolean(event.sourceGrantIds?.length)), 'source-access-mismatch'); break;
       case 'window-opened':
         check(!state.windows.some(window => window.windowId === event.windowId)
           && event.previousWindowId === (state.windows.at(-1)?.windowId ?? null)
