@@ -67,7 +67,7 @@ B1/B2 的完整回归采用与 `a23c0a2` 同 tree 的三平台 CI，本机对变
 - **选择性清理已证实：** 连续发布两条规则后，`purge` 一条仅擦除关联规则字节，保留其他文本、换行和文件身份；另一条仍可在新会话加载并单独清除。规则归属或位置不明时停止，普通 `forget` 不改文件。模型经本机固定响应提出改写版规则的文件批准与来源关联也已覆盖。
 - **中断恢复已证实：** 规则擦除前、部分擦除、全部擦除但未记完成三个边界可在重启后续做原批准范围；范围外变更仍被拒绝。Greptile 原 P1 已复现修复，规则／受控输出定向 11/11 通过；与 B5 的备份恢复门禁拒绝分开登记。
 - **验证身份：** 本机最终 `npm run check` 为 1016 tests、**1015 pass / 0 fail / 1 skip**，typecheck/build 成功，退出码 0。原日志为 `../euler-t24-project-rule/artifacts/project-rule-final-check-494b0afa/check.log:1082–1089`。[push CI](https://github.com/qsgy-edge/euler/actions/runs/41970434357) 与 [PR CI](https://github.com/qsgy-edge/euler/actions/runs/41970442854) 的 Windows/macOS/Ubuntu **6/6 成功**；Greptile 复审 5/5、无新增问题，原线程已解决。
-- **边界：** macOS/Linux 原生文件 Host 仍为 unavailable，三平台 CI 不替代 Windows 实际文件证据。本 PR 的外部模型请求为 0，真实模型是否遵守已加载规则尚未验证；项目规则 guidance 不替代普通记忆自动装配或 B4 独立验收。
+- **边界：** macOS/Linux 原生文件 Host 仍为 unavailable，三平台 CI 不替代 Windows 实际文件证据。本 PR 的外部模型请求为 0，真实模型是否遵守已加载规则尚未验证；项目规则 guidance 的交付与普通记忆按需检索、B4 独立验收分列；本 PR 的原证据身份不变。
 
 ## Capability × host × X-card
 
@@ -79,7 +79,7 @@ B1/B2 的完整回归采用与 `a23c0a2` 同 tree 的三平台 CI，本机对变
 | 检索与任务级发现 / X-02 | scoped FTS/CJK、资格重验、累计 grant；context-authority/HTTP | 开发回归覆盖授权、撤销、目标环境和跨会话拒读；Windows 独立首测 3 个失败、24 个缺证，见 B4 |
 | search/proposal 投影 / X-03 | outbox、CAS、dirty/rebuild 与 CI projection tests | 已启用 search 子集通过；scope overview 未启用。#37 吞吐优化不单独阻塞本 gate |
 | 输入、完整 ReAct、来源、窗口 / X-04 | 普通 stdin、AgentRun/Orchestrator、archive、GuidanceSession/Historian | 输入原字节先 durable、同会话工具/记忆/换窗、取消/unknown 与重启通过；真实模型质量见 B3 |
-| scope、注入、guidance / X-05 通用 | Core 门禁、固定 schema、task-bound 确认、guidance 授权区分；PR #61 项目规则发布 | 常驻 guidance 不阻断合法续办，真实前台请求仍阻断；旧任务不被新绑定认领；批准规则可在新会话加载，普通记忆自动注入仍未定案；MCP/Pi deferred |
+| scope、注入、guidance / X-05 通用 | Core 门禁、固定 schema、task-bound 确认、guidance 授权区分；PR #61 项目规则发布 | 常驻 guidance 不阻断合法续办，真实前台请求仍阻断；旧任务不被新绑定认领；批准规则可在新会话加载，普通记忆按需交付策略已确认，完整实现／独立证据仍待核对；MCP/Pi deferred |
 | dispatch/unknown / X-06 | assembly/started 事务、独立 attempt、无隐藏 retry | 本机 HTTP/ledger、迟到响应与显式新预算续办通过；真实 provider 断流/重试见 B3 |
 | owner/普通验证、conflict/feedback / X-07 | fast lane、独立 source Verifier、scope continuation、晋升事务 | 同 recordId 追加归属 revision/event，原证据不变，两管线实际 CLI 通过；语义质量与长源吞吐仍缺 |
 | inspect/correct/forget/restore/rollback / X-09 | snapshot/CAS、不可变 receipt、suppression、长期摘要 | 混合操作重启、有界下一请求、scope 续办后的 forget/清除通过；开放复述真实模型验证见 B3 |
@@ -104,7 +104,7 @@ T18 counting 归档只有 payload hash/长度，不据此宣称完整 wire bytes
 
 ### B3 — 有限真实模型探索已完成，完整验收未齐
 
-在 `13f2015` 开发基线上，已按 owner 批准使用 `goodlucky / gpt-6.1-terra` 与 `gpt-6.1-sol`，经 Euler 的 Chat Completions 路由发送合成数据。累计 **18/18 次**真实请求；现有额度耗尽，未新增外部请求。该实验配置不包含生产授权。
+在 `13f2015` 开发基线上，已按 owner 批准使用 `goodlucky / gpt-6.1-terra` 与 `gpt-6.1-sol`，经 Euler 的 Chat Completions 路由发送合成数据。该原轮次累计 **18/18 次**真实请求，额度已耗尽；随后单独批准的轮次见下文，两轮分列。该实验配置不包含生产授权。
 
 原件根目录为 `artifacts/t24-b3-memory-pair-13f2015/`；下表给出相对路径。逐轮 `identity.json`、`wire.jsonl` 和会话归档可核对 18 条发送及 18 条 `transport` 收讫记录，均为 HTTP 200；按 attempt 计数，重复请求 hash 不合并。结果限于固定开发题与实际网关路由，不作模型总体能力或服务端内部设置的判断。
 
@@ -112,13 +112,17 @@ T18 counting 归档只有 payload hash/长度，不据此宣称完整 wire bytes
 |---|---:|---|---|
 | Terra：不预取／固定规则预取 | 7 | 三题按原判定口径为 1/3、2/3；翻译题附引导语的自动误判已按既定标准核正。不预取组未主动搜索；预取组有一题搜索后答对，另一题虽收到正确约定仍漏用，无法分离预取和搜索的贡献。 | `real-306/audit.json` |
 | Terra：原工具描述／实验描述 | 4 | 每对首个请求只差 `memory.search` 描述；维护通报两组均未搜索且漏落款，排序题均正确且未搜索。实验描述未进入官方文案。 | `tool-description/real-341/audit.json` |
-| Terra：未指定档位／请求 high | 2 | 两组均漏搜；网关分别报告 12、18 个 reasoning tokens。实发包只差 `reasoning_effort: "high"`，网关未回显实际采用档位，不能写成“默认关闭思考”或“已证实 high 生效”。 | `tool-description/effort-high/real-362/audit.json` |
+| Terra：未指定档位／请求 high | 2 | 两组均未调用检索且未写出隐藏落款；网关分别报告 12、18 个 reasoning tokens。实发包只差 `reasoning_effort: "high"`，网关未回显实际采用档位，不能写成“默认关闭思考”或“已证实 high 生效”。 | `tool-description/effort-high/real-362/audit.json` |
 | Sol：仅换模型／独立送达检查 | 3 | 普通维护通报仍未搜索、漏落款。显式要求检索的独立诊断中，Sol 从工具描述准确取出随机查询词，原生调用后又返回仅在搜索结果中的回执码；证明该路由上工具描述与结果能送达，不等于普通写作必查约定。 | `tool-description/sol-tools/real-376/audit.json` |
 | Sol：明确询问缺失项目事实 | 2 | 保持原系统提示和工具描述，Sol 自主先用 `source.search`，再用 `memory.search` 命中唯一正确记忆；额度到此用完，结果未再发回模型，**最终作答未验证**。 | `tool-description/sol-recall/real-407/audit.json` |
 
+2026-11-12 在 `8a90e54` 基线上新增的独立批准额度也已使用 **18/18 次**：goodlucky 两次 HTTP 503，mistral-vibe / deepseek-v4-1-flash-1017 一次直连超时、十五次 HTTP 200。后者包含三组系统指导配对、历史依赖／完整给格式对照及同题复测；[实验索引](t24-retrieval-experiment-index.md) 保存分组、原件位置、身份与核对口径。
+
+明确要求沿用历史格式的简单写作，在两个新会话中均首轮检索并于第二请求正确完成；完整给出格式的一次观察无检索且答对。原模糊维护通报题 A/B 均未检索，未观察到新增指导改善；该题的历史依赖未明确，隐藏落款缺失不足以单独判必要检索失败。两次历史样本都使用 B 指导且新增了可用历史来源，未测出指导的独立贡献或通用稳定性。旧明确落款题的来源展开拒绝、新 fixture 的离线展开成功和真实搜索结果使用分别登记，不合写成完整原文恢复通过。
+
 **仍缺：** 完整两条验证管线、长会话／交接、纠正意图、Historian 忠实度、真实模型遵守已加载项目规则的效果，以及 X-14 缓存／成本／延迟配对。接近实际长度的合成 source 吞吐与 deadline 结算也需有界 workload 证据；有限普通回答和工具往返不关闭这些组合验收。
 
-当前非流式 transport 的 TTFT 为 `unsupported`；未给价格表则费用 `unknown`，没有 cache on/off、冷重置或明确服务端指标时不推断命中。普通记忆采用按需搜索还是自动注入尚未定案，未修改对应规格或 B4 验收要求。
+当前非流式 transport 的 TTFT 为 `unsupported`；未给价格表则费用 `unknown`，没有 cache on/off、冷重置或明确服务端指标时不推断命中。普通记忆采用按需检索、持续约束由明确发布的项目规则提供，已按 [R1–R8 决策](../architecture/memory-retrieval-policy-proposal.md) 同步正式规格。后续验收按 [清单](t24-retrieval-acceptance-plan.md) 核对触发、实际返回和冻结送达；设计确认不代替完整实现及独立验收。
 
 **归属：#7/#13–#19/#24。** 已有测试配置和凭据环境绑定，后续真实请求需另批总预算；不自动换供应商、模型或接口，不在文档或 Issue 中公开密钥。
 
@@ -148,15 +152,15 @@ T18 counting 归档只有 payload hash/长度，不据此宣称完整 wire bytes
 
 `13f2015` 的全新开发数据对照已记录于 `artifacts/t24-b4-dev-assembly-13f2015/run-A9GBUm/reconciliation.json`：3 份本机 HTTP 请求的 SHA-256 和字节数均对齐 SQLite 冻结装配与发送记录。本项目候选为 `normal`，获准查阅的其他项目候选为 `reference_only`；两组首个请求均没有记忆正文，`usedMemories` 为空。显式 `memory.search` 后，两条只作为 `role=tool` 结果出现，使用账本记为 `retrieved-memory`。该路径没有逐候选的自动选入／排除原因或逐记忆实际 token 成本，整包 UTF-8 字节上界另列。
 
-B3 的模型探索与 PR #61 的项目规则 guidance 已分别提供有限证据；普通记忆自动注入的产品策略与验收口径尚未定案。PR #61 证明了绑定项目根后的 guidance 正向加载，未补齐独立集的未绑定授权／模型自报范围等负向观测。上述开发证据不改写独立首测原判，其他缺证仍按下表登记。
+B3 的模型探索与 PR #61 的项目规则 guidance 已分别提供有限证据。普通记忆按需交付策略及未来验收口径已确认；旧独立首测仍按当时自动装配规格保留身份和结果，取消的旧交付要求不改标 PASS。当前须补的是按需路径的完整资格、查询、送达和计量证据。PR #61 证明了绑定项目根后的 guidance 正向加载，未补齐独立集的未绑定授权／模型自报范围等负向观测。上述开发证据不改写独立首测原判，其他缺证仍按下表登记。
 
 #### 24 个缺证案例：证据分布与开发验证
 
-从公开收据的 `cases[]` 选出 `verdict` 为 `evidence-gap` 的记录，按 `reason_codes` 分组。以下四组互斥，合计 24 个；共 48 条断言通过、42 条缺证。**24 个都缺少自动装配观测**：Store 返回了什么，与最终模型请求选入了什么，是两个不同的观测点。
+从公开收据的 `cases[]` 选出 `verdict` 为 `evidence-gap` 的记录，按 `reason_codes` 分组。以下四组互斥，合计 24 个；共 48 条断言通过、42 条缺证。**24 个在原规格下都缺少自动装配观测**。该历史结论保留；后续按需口径仍分别观察 Store 返回内容与实际模型请求选入内容，不能由策略确认补写历史收据。
 
 | 案例数 | 收据中的缺口 | 用全新开发数据验证什么 |
 |---:|---|---|
-| 16 | 仅登记 `ASSEMBLY_NOT_OBSERVED` | 开发对照已观察首个普通请求没有自动选入本地 `normal` 记忆，见上节。四组仍共缺逐候选资格复核、冻结的自动选入／排除引用与原因及实际 token 成本；对应产品策略未定案。工具读回和项目规则 guidance 分列，均不计为普通记忆自动选入。 |
+| 16 | 仅登记 `ASSEMBLY_NOT_OBSERVED` | 开发对照已观察首个普通请求没有自动选入本地 `normal` 记忆，见上节。原首测按当时规格登记缺少逐候选资格复核、自动选入／排除引用与原因及 token 成本；此判定保留。后续改验实际检索后的资格、返回／送达引用、原因与成本；无查询不造排除账。工具读回和项目规则 guidance 仍分列，不改称原有自动选入已通过。 |
 | 4 | 另有 `CANONICAL_TRANSITION_UNAVAILABLE` | 首测未能经受测接口建立所需的 4 次状态变化。用支持的操作生成新 revision 或状态，核对操作前后的权威记录、索引状态和查询结果；不能构造的变化单列。对未改变的数据查询，无法检验变化后的资格过滤。 |
 | 2 | 另有 `SINGLE_FALLBACK_UNSUPPORTED` | 中文单字在 2-gram 路径返回 `unsupported-query`。先验证明确不支持时的慢路径；若已有可用回退，再从同一开发数据快照比较单字召回和非单字排序。首测没有成对结果，不能据此采纳回退。 |
 | 2 | 另有 `GUIDANCE_ACTIVATION_NOT_INSTRUMENTED` | 首测只观察了 Store 读取结果，未记录 guidance 是否加载。给目标开发项目配置可识别的 guidance：先显式绑定该项目，确认能观测到加载；再用未绑定会话分别进行只读授权和仅模型自报范围的对照，核对加载记录与请求正文均未出现该项目的 guidance。 |
@@ -184,10 +188,12 @@ B3 的模型探索与 PR #61 的项目规则 guidance 已分别提供有限证�
 
 **原件与归属。** `D:/GithubRepositories/Agent/euler-t24-resume/artifacts/t24-b5-4d50e24/` 保留两次历史超时样本、按原提交隔离的冷复跑和逐阶段 trace、Windows Job 与 Linux /proc 样本。PR #61 的原失败与最终成功日志分别保留于上述 `project-rule-resume-check-ab369825/`、`project-rule-final-check-494b0afa/`；后者的 `maintenance-capture.mjs` 是仅供取证的诊断探针，不是产品或必跑检查。首次维护门禁 observations/residuals 未留存，仍需原现场或同路径再次失败的判定证据。
 
+本轮另在 PR #61 最终 head `c3a6993`（tree `dea7613`）对 database restore 单用例做三次带诊断定向运行，均为 1 pass / 0 fail，门禁均 `acquired: true`。这三次与上表旧复跑分列，未提供拒绝现场；[索引中的 B5 记录](t24-retrieval-experiment-index.md#b5本轮独立取证) 指向原件与具体观测字段。
+
 #25 登记的 GitHub 前置均已关闭。B5 仍留 #2/T02、#12/owner-evidence 两次历史超时内部原因，以及 #20/T20 备份恢复维护门禁拒绝。Linux 的退出顺序单列，不计为 Windows 失败。规则擦除中断恢复 P1 和 #38 的 T15 轮询竞态已有独立修复证据，不重新打开，也不用于关闭其他未解释失败。
 
 ## 放行条件与支持范围
 
-B1/B2 的实施及受影响组合证据已闭合，PR #61 项目规则能力已交付。B3 完整真实路径、B4 独立检索证据、B5 的两次 Windows 历史超时和备份维护门禁拒绝仍须闭合；修复后按实际影响更新组合证据。满足原 gate 后才冻结初始 DDL、版本、SHA-256 和实现 commit。
+B1/B2 的实施及受影响组合证据已闭合，PR #61 项目规则能力已交付。B3 完整真实路径、B4 独立检索证据、B5 的两次 Windows 历史超时和备份维护门禁拒绝仍须闭合；修复后按实际影响更新组合证据。满足当前已确认规格的完整 gate 并保留历史判定后，才冻结初始 DDL、版本、SHA-256 和实现 commit。
 
 有效结论为共享 Core 三平台 CI、Windows 合成普通 CLI、候选续办与本文列出的组合路径通过；首次完整 capability 仍 blocked。该结论不授权 MC 重建、真实数据迁移、owner 切换或 T27 canary。

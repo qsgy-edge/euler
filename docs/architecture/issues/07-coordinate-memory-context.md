@@ -20,8 +20,8 @@ Blocked by: 02, 04, 05, 06
 ## Decisions — Round 1
 
 1. Context Orchestrator 是 Harness 内唯一拥有最终 prompt 与 token 预算的逻辑角色，本身是确定性本地代码而非额外 LLM。Session Virtualizer、Memory Retriever、Intent Provider 与 Source Recovery 只是职责模块，可在同一进程实现，只向 Orchestrator 提供候选；MC 仍工作时由其 adapter 占用唯一 context hook。
-2. 快路径先追加原始事件，再并行取得缓存的 intent snapshot、预生成 compartment/recent tail 与有 deadline 的本地 memory top-k，随后确定性组装并只调用一次主 Agent LLM。Compartment 生成、candidate 提取、embedding/index 更新、未来可选的 Wiki 重建和 stale/conflict 检查都移出响应关键路径；Source Recovery 只在需要原始证据时进入慢路径。
-3. 不用纯代码或额外 router LLM 判断“任务复杂度”。代码只处理原话/版本/行号/证据、安全边界、stale/conflict、项目切换等确定性预取信号；每个实质性请求可并行做廉价本地检索；主 Agent LLM 在正常调用中判断语义信息是否足够，不足时通过 memory/source/session/read/git 工具升级。路由依据是证据充分性，不是任务表面复杂度。
+2. 快路径先追加原始事件，取得缓存的 intent snapshot 与预生成 compartment/recent tail，再确定性组装。普通请求的首个模型调用前不自主召回或装入普通记忆；持续约束由明确发布且适用的项目 guidance 提供。无需工具且无传输／协议故障的正常回答恰一次主 Agent LLM 调用；依赖检索或其他工具的任务走同一有界 ReAct 循环。Compartment 生成、candidate 提取、embedding/index 更新、未来可选的 Wiki 重建和 stale/conflict 后台检查移出响应关键路径；Source Recovery 保留 §14 的定向触发。
+3. 不用纯代码或额外 router LLM 判断“任务复杂度”。主 Agent 在正常调用中判断当前输入与已有有效上下文是否充分；明确依赖尚未提供的历史信息时，使用授权范围内的 memory/source/session/read/git 工具，结果不足或不可用时说明缺口。信息完整时允许直接回答；历史依赖有歧义的泛化写作不因未带入隐藏约定就单独判失败。代码继续处理原话/版本/行号/证据、安全边界、stale/conflict、项目切换等既定确定性信号，不以任务长度、固定实体名单或所有写作均搜索替代证据充分性判断。
 
 ## Decisions — Intent continuity boundary
 
@@ -47,15 +47,15 @@ Blocked by: 02, 04, 05, 06
 
 ## Decisions — KV-cache-aware prompt layout
 
-8. 最终 prompt 的物理布局按四个缓存区域组织，而不是只按语义相关度重排：`P0 provider-stable prefix` 放 system/developer policy 与固定集合、固定顺序的核心 tool schemas；`P1 epoch-frozen baseline` 放冻结的 session baseline、已提交 compartments 与少量 session-pinned verified memory；`P2 cache-hot trajectory` 放按时间追加的完整 user/assistant/tool ReAct 轨迹；`P3 current-turn tail` 依次放当前用户输入、本轮检索到且明确标为 data 的 memory/source excerpts，以及短小的 active intent/runtime status。物理位置不改变权威：memory、archive 与远端返回即使靠近输出也不能取得 instruction 权限。
+8. 最终 prompt 的物理布局按四个缓存区域组织：`P0 provider-stable prefix` 放 system/developer policy、独立适用 guidance 与固定集合、固定顺序的核心 tool schemas；`P1 epoch-frozen baseline` 放冻结的 session baseline、已提交 compartments，以及按需取得后因会话连续性合法保留的有界 verified memory；`P2 cache-hot trajectory` 放按时间追加的完整 user/assistant/tool ReAct 轨迹；`P3 current-turn tail` 放当前用户输入、实际检索／恢复后明确标为 data 的有界 excerpts，以及 active intent/runtime status。新激活记录、后台 top-k 或跨会话普通记忆不自行进入 P1/P3；新会话不因记录 active 而重新 pin。已有工具结果和合法 compartment 按窗口、预算与状态重验规则保留，不要求每轮重查。物理位置不改变权威，memory/archive/远端返回不取得 instruction 权限。
 9. P0/P1 必须内容寻址、确定性序列化并在一个 cache epoch 内保持字节级冻结；Euler 的 cache epoch 是逻辑失效代际，provider adapter 负责标准消息角色、显式 cache boundary 与 provider-specific session/lineage key，provider continuation/window handle 若存在只作可选 opaque metadata。Intent/status 仅在发生变化时追加 delta，不回写旧消息；本轮 retrieval envelope 在完整 ReAct turn 内冻结，工具调用与结果继续追加。下一用户轮可替换或移除上一轮的动态 retrieval tail，允许只重算短后缀，禁止为更新动态信息改写长前缀。
 10. 正常 compaction/materialization 只在完整 ReAct/任务边界批量开启新 cache epoch；可结合 provider cache TTL、可回收 token 与预估重算成本择机执行，但不得把缓存延迟、安全规则、权限撤销、已确认 supersession 或 emergency 混为同一种触发。安全、权限、scope、policy 或已确认 supersession 等 emergency 必须立即使旧 epoch 对后续 dispatch 失效，并在下一次发送前持久化新的 invalidation/lifecycle event；运行时记录 `cached_tokens`、`cache_read/cache_creation`、TTFT、epoch rebuild 次数与压缩收益；具体阈值必须由目标 provider/模型实测，不采信书稿或项目自述中的效果数字。
 
 ## Decisions — Hybrid retrieval and Agentic RAG
 
-11. Memory Retriever 保持为本地、确定性、可单独测试的 retrieval primitive：先按 logical project/workspace/personal、`applies_to`、lifecycle 与 verification 做硬过滤，v1 再对当前请求 + active intent 执行 FTS/BM25 lexical 召回与分 lane 的简单融合、claim 去重和 token-budget admission。Dense semantic 是有可复现漏召回并实验胜出后的扩展，不是 v1 必做项；scope 更窄、类型固定或时间更新都不构成万能排序优先级。
+11. Memory Retriever 保持为本地、确定性、可单独测试的 retrieval primitive：主 Agent 的 `memory.search` 或显式 Host 查询提供 query，先按 logical project/workspace/personal、`applies_to`、lifecycle 与 verification 做硬过滤，再执行 v1 FTS/BM25 lexical 召回、分 lane 简单融合、claim 去重和 token-budget admission。主 Agent 可按任务改写查询；Harness 不在每个普通请求前自动拼接用户输入与 active intent 召回。Dense semantic 仍需可复现漏召回与实验胜出；scope 更窄、类型固定或时间更新均不构成万能排序优先级。
 12. 快路径不调用额外 LLM，也不为凑固定 `top-k` 注入弱相关内容；`candidate/stale/conflicted` 默认不得作为事实进入正常 prompt，只有显式研究/核验流程才能带状态标签返回。最小 v1 可先落 metadata filter + FTS/BM25，在出现可复现的语义漏召回后接入向量检索；接口从一开始允许融合多路候选，但不预设向量数据库、固定融合公式或 LLM reranker。
-13. Agentic RAG 属主 Agent 的按需慢路径，不是另建 RAG Agent：首轮无强相关命中、证据冲突/过期、多跳关系、跨 scope、需要原话/版本/出处，或主 Agent 在正常调用中判断证据不足时，才通过 `memory.search`、provenance traversal、`source.expand` 等工具改写查询并迭代检索。这样智能体化能力复用现有主 Agent ReAct 循环，同时维持单一 Orchestrator、一次普通快路径调用和可审计的检索底座。证据不足本身不授权全局查询；跨项目只读范围必须由 09 的显式任务授权建立，并在任务内复用、结束或撤销后失效。报告/提案属于按需读取的任务产物，其归档与交接按 10，不由 Retriever 自动转成 durable memory。
+13. Agentic RAG 属主 Agent 的按需工具路径：当前上下文缺少历史信息、已有查询无强相关命中、证据冲突/过期、多跳关系、跨 scope 或需要原话/版本/出处时，通过 `memory.search`、provenance traversal、`source.expand` 等工具改写查询并迭代检索。它复用现有 ReAct、单一 Orchestrator 和可审计检索底座，不另建 RAG Agent；工具和后续模型往返计入同一 run 预算。证据不足不授权全局查询，跨项目只读范围仍由 09 的显式任务授权建立、任务内复用、结束或撤销后失效。报告/提案按 10 归档交接，不由 Retriever 自动转成 durable memory。
 
 ## Decisions — Source Recovery
 
