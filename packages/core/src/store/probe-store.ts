@@ -6,7 +6,7 @@ import { assertHistorianReply, compartmentBody, isCompartmentEvidenceGap } from 
 import type { Compartment, CompartmentBody, HistorianBounds } from '../context/historian.ts';
 import type { ExportSelection } from '../context/analysis-artifacts.ts';
 import { replayAgent, responseInputIds } from '../context/agent-state.ts';
-import type { AgentEvent, AgentStatus } from '../context/agent-state.ts';
+import type { AgentEvent, AgentStatus, ToolResult } from '../context/agent-state.ts';
 import { isUntypedRemember, parseMemoryProposal, parseOwnerAgreement, parseOwnerStatement } from '../context/owner-memory.ts';
 import type { OwnerMemoryStatement } from '../context/owner-memory.ts';
 import { randomUUID } from 'node:crypto';
@@ -22,6 +22,8 @@ import type { ControlledFile } from '../context/file-contract.ts';
 import { check, localProjects, localScope, requireProject, sameBinding, sha256, sourceEventId, uuid, validateBudget } from '../contracts.ts';
 import type { Binding, ProbeBudget, SourceAck, SourceExcerpt } from '../contracts.ts';
 import { REQUEST_ENCODING, REQUEST_HASH_ALGORITHM, assemblyIdentityHash, chargedRequestTokens, deriveAssemblyState, freezeRequestPayload } from './request-ledger.ts';
+import { MEMORY_QUERY_TOKENIZER, MEMORY_INDEX_TOKENIZER, MEMORY_RANKING_VERSION, assertMemoryRetrievalReceipt, measureRetrievalResult, memoryDelivery, rankMemoryCandidates, retrievalResultHash } from './memory-retrieval.ts';
+import type { MemorySearchTrace } from './memory-retrieval.ts';
 import type { RequestAssembly, RequestAssemblyInput, RequestAssemblyState, AssemblyMemoryUse, RequestAttempt, RequestEvent, RequestEventKind, RequestRun, RequestStatus, RequestReconciliation } from './request-ledger.ts';
 
 export interface FileIdentity { dev: string; ino: string }
@@ -190,11 +192,11 @@ export type SearchResult = { kind: 'memory'; unitId: string; record: MemoryRecor
   projectId: string; targetProjectId: string; target: SearchTarget; applicability: 'applicable' | 'needs-verification' }
   | { kind: 'status'; unitId: string; claimRef: string; verification: MemoryVerification;
     reason: 'stale' | 'conflicted' | 'expired' | 'not-yet-valid'; conflictSetId: string | null;
-    projectId: string; targetProjectId: string; target: SearchTarget; exposureMode: 'status_only'; rank: number };
+    projectId: string; targetProjectId: string; target: SearchTarget; exposureMode: 'status_only'; rank: null };
 export interface SearchPage { status: 'ready' | 'dirty' | 'unavailable'; results: SearchResult[];
   coverage: { allowedProjects: string[]; inspectedProjects: string[]; unavailableProjects: string[];
     candidateCount: number | null; complete: false; reason: string | null };
-  truncated: boolean; nextCursor: string | null }
+  truncated: boolean; nextCursor: string | null; retrieval?: MemorySearchTrace }
 export interface SearchProjectionReceipt { jobId: string; eventId: string; status: 'done' | 'failed'; generation: number; reason: string | null }
 export interface ConflictOperation { status: 'committed' | 'no_op'; left: MemoryOperation; right: MemoryOperation; conflictSetId: string | null }
 export interface EvolutionProposalInput {
@@ -1885,6 +1887,40 @@ export class ProbeStore {
     });
   }
 
+  #validateMemoryRetrieval(agent: AgentStatus, result: ToolResult): void {
+    const tool = agent.tools.find(item => item.callId === result.callId);
+    const response = agent.responses.find(item => item.attemptId === tool?.attemptId);
+    check(tool?.name === 'memory.search' && response && result.retrieval, 'retrieval-receipt-mismatch');
+    const reply = JSON.parse(this.#archiveRef(response.source).text) as { calls: { id: string; arguments: Record<string, unknown> }[] };
+    const call = reply.calls.find(item => item.id === result.callId);
+    check(call && sha256(JSON.stringify(call.arguments)) === tool.argumentsHash && typeof call.arguments.query === 'string', 'retrieval-receipt-mismatch');
+    const raw = JSON.parse(this.#archiveRef(result.source).text) as { callId: string; outcome: string; modelResult: string };
+    check(raw.callId === result.callId && raw.outcome === result.outcome, 'retrieval-receipt-mismatch');
+    assertMemoryRetrievalReceipt(result.retrieval, raw.modelResult, call.arguments.query, result.outcome === 'success');
+  }
+
+  agentSourceSelections(activity: Activity, runId: string, sources: SourceAck[]): RequestAssemblyInput['selection'] {
+    return this.withActivity(activity, () => {
+      const selection: RequestAssemblyInput['selection'] = sources.map((source, ordinal) => ({ ordinal, hash: source.hash, reason: 'mandatory-source' }));
+      const usedRuns = this.#db.prepare(`SELECT DISTINCT r.run_id FROM request_events e JOIN request_runs r ON r.run_id=e.run_id
+        JOIN execution_streams s ON s.stream_id=r.stream_id WHERE s.owner_kind='session' AND s.owner_id=? AND r.redacted=0
+        AND e.kind='agent/event@v1' AND json_extract(e.payload,'$.event.kind')='tool-result'
+        AND json_extract(e.payload,'$.event.result.source.eventId') IN (SELECT value FROM json_each(?)) ORDER BY r.rowid`)
+        .all(this.#binding.sessionId, JSON.stringify(sources.map(ref => ref.eventId)));
+      for (const id of new Set([runId, ...usedRuns.map(row => String(row.run_id))])) {
+        const agent = this.agentStatus(activity, id);
+        for (const tool of agent.tools) {
+          if (!tool.result?.retrieval) continue;
+          const ordinal = sources.findIndex(source => sameSourceAck(source, tool.result!.source));
+          if (ordinal < 0) continue;
+          this.#validateMemoryRetrieval(agent, tool.result);
+          selection[ordinal]!.retrieval = memoryDelivery(tool.callId, tool.result.retrieval);
+        }
+      }
+      return selection;
+    });
+  }
+
   appendRequestAssembly(activity: Activity, input: RequestAssemblyInput): RequestAssembly {
     return this.withActivity(activity, () => {
       const run = this.#requestRun(activity, input.runId);
@@ -2065,7 +2101,7 @@ export class ProbeStore {
     });
   }
 
-  #assertAgentContext(activity: Activity, status: RequestStatus, assembly: Pick<RequestAssemblyInput, 'context' | 'sources' | 'usedMemories' | 'intent'>): void {
+  #assertAgentContext(activity: Activity, status: RequestStatus, assembly: Pick<RequestAssemblyInput, 'context' | 'sources' | 'usedMemories' | 'intent' | 'selection'>): void {
     // Counting probes also append task-outcome Agent events without using model windows.
     if (!status.events.some(event => event.kind === 'agent/event@v1'
       && (JSON.parse(event.payload).event as AgentEvent).kind === 'window-opened')) {
@@ -2102,6 +2138,8 @@ export class ProbeStore {
     check(current.operationHash === sha256(JSON.stringify(this.correctionModelSummaries(activity))), 'operation-summary-stale');
     check(JSON.stringify(assembly.usedMemories ?? []) === JSON.stringify(this.agentMemoryUses(activity, status.run.runId, assembly.sources)),
       'assembly-memory-mismatch');
+    check(JSON.stringify(assembly.selection) === JSON.stringify(this.agentSourceSelections(activity, status.run.runId, assembly.sources)),
+      'assembly-retrieval-mismatch');
   }
 
   #requestIntentCurrent(activity: Activity, run: RequestRun, assembly: RequestAssembly): boolean {
@@ -2480,6 +2518,7 @@ export class ProbeStore {
       }
       if (event.kind === 'file-prepared') this.#validateSource(event.admission.source);
       if (event.kind === 'tool-result') this.#validateSource(event.result.source);
+      if (event.kind === 'tool-result' && event.result.retrieval) this.#validateMemoryRetrieval(result, event.result);
       const receipt = event.kind === 'tool-result' ? event.result.file : event.kind === 'file-reconciled' ? event.receipt : null;
       if (receipt && (event.kind === 'tool-result' || event.kind === 'file-reconciled')) {
         const callId = event.kind === 'tool-result' ? event.result.callId : event.callId;
@@ -4735,7 +4774,8 @@ export class ProbeStore {
       check(typeof request.query === 'string' && Buffer.byteLength(request.query) <= 4096, 'invalid-search-query');
       check(request.target === undefined || validSearchTarget(request.target), 'invalid-search-target');
       const terms = searchTerms(request.query);
-      const groups = searchGroups(request.query);
+      const queryGroups = searchGroups(request.query);
+      const groups = [...new Map(queryGroups.map(group => [`${group.kind}:${group.text}`, group])).values()];
       const grant = request.grantId ? this.#discoveryProjects(activity, request.grantId) : null;
       check(!grant || request.target === undefined, 'invalid-search-target');
       const projects = grant?.projects ?? localProjects(this.#binding);
@@ -4803,7 +4843,8 @@ export class ProbeStore {
         coverage: unavailableCoverage('candidate-limit'), truncated: true, nextCursor: null };
       const candidates: SearchResult[] = [];
       const lanes = groups.map(() => [] as SearchResult[]);
-      const seen = new Set<string>();
+      const claimKeys = new Map<SearchResult, string>();
+      const candidateRecords = new Map<SearchResult, MemoryRecord>();
       const now = Date.now();
       for (const row of rows) {
         let record: MemoryRecord;
@@ -4825,8 +4866,7 @@ export class ProbeStore {
         const words = normalizeSearchText(record.content).split(' ');
         const matchingGroups = groups.flatMap((group, index) =>
           words.some(word => group.kind === 'han' ? word.includes(group.text) : word === group.text) ? [index] : []);
-        if (!numericContextMatches(groups, words) || matchingGroups.length === 0) continue;
-        const rank = -matchingGroups.length;
+        if (!numericContextMatches(queryGroups, words) || matchingGroups.length === 0) continue;
         const projectId = this.#memoryProject(record);
         const targetProjects = record.scope.kind === 'project' ? [record.scope.id]
           : record.scope.kind === 'personal' ? projects
@@ -4847,40 +4887,53 @@ export class ProbeStore {
           const key = record.conflictSetId ? `conflict:${projectId}:${targetProjectId}:${record.conflictSetId}`
             : JSON.stringify([projectId, targetProjectId, record.scope.kind, record.scope.id, record.claimKey,
               applicabilityKey, temporal ?? 'current', record.verification]);
-          if (seen.has(key)) continue;
-          seen.add(key);
           if (record.verification !== 'verified' || record.conflictSetId || temporal) {
             const reason = temporal ?? (record.verification === 'stale' ? 'stale' : 'conflicted');
             candidates.push({ kind: 'status', unitId: record.recordId, claimRef: sha256(record.claimKey),
               verification: record.verification, reason, conflictSetId: record.conflictSetId,
-              projectId, targetProjectId, target, exposureMode: 'status_only', rank });
+              projectId, targetProjectId, target, exposureMode: 'status_only', rank: null });
           } else candidates.push({ kind: 'memory', unitId: record.recordId, record, projectId, targetProjectId, target,
-            applicability, exposureMode: applicability === 'needs-verification' ? 'reference_only' : 'normal', rank });
+            applicability, exposureMode: applicability === 'needs-verification' ? 'reference_only' : 'normal', rank: 0 });
           if (candidates.length > 256) return { status: 'unavailable', results: [],
             coverage: unavailableCoverage('candidate-limit'), truncated: true, nextCursor: null };
           const hit = candidates[candidates.length - 1]!;
+          claimKeys.set(hit, key);
+          candidateRecords.set(hit, record);
           for (const index of matchingGroups) lanes[index]!.push(hit);
         }
       }
-      for (const lane of lanes) lane.sort((a, b) => a.rank - b.rank);
-      const fused: SearchResult[] = [];
-      const selected = new Set<SearchResult>();
-      while (fused.length < candidates.length) {
-        let advanced = false;
-        for (const lane of lanes) {
-          const next = lane.find(hit => !selected.has(hit));
-          if (!next) continue;
-          fused.push(next);
-          selected.add(next);
-          advanced = true;
-        }
-        if (!advanced) break;
+      const documents = [...new Map(candidates.filter(hit => hit.kind === 'memory')
+        .map(hit => [hit.record.recordId, { recordId: hit.record.recordId,
+          revisionId: hit.record.revisionId, headEventId: hit.record.headEventId, contentHash: hit.record.contentHash,
+          text: `${normalizeSearchText(hit.record.content)} ${cjkBigrams(hit.record.content)}`.trim() }])).values()];
+      const ranked = rankMemoryCandidates(documents, groups.map((group, index) => ({
+        match: searchTerms(group.text).map(term => `"${term.replaceAll('"', '""')}"`).join(' OR '),
+        recordIds: lanes[index]!.filter(hit => hit.kind === 'memory').map(hit => hit.record.recordId),
+      })));
+      const { ranks } = ranked;
+      const corpusHash = sha256(JSON.stringify(documents.map(({ text, ...identity }) => ({ ...identity, indexedHash: sha256(text) }))));
+      for (const hit of candidates) if (hit.kind === 'memory') {
+        const rank = ranks.get(hit.record.recordId);
+        check(rank !== undefined, 'search-evidence-gap');
+        hit.rank = rank.score;
       }
-      candidates.splice(0, candidates.length, ...fused);
+      candidates.sort((a, b) => (a.kind === 'status' ? 1 : 0) - (b.kind === 'status' ? 1 : 0)
+        || (a.kind === 'memory' && b.kind === 'memory' ? ranks.get(a.record.recordId)!.ordinal - ranks.get(b.record.recordId)!.ordinal
+          : lanes.findIndex(lane => lane.includes(a)) - lanes.findIndex(lane => lane.includes(b))));
+      const rankedCandidates = [...candidates];
+      const decisions = new Map<SearchResult, MemorySearchTrace['candidates'][number]['decision']>();
+      const seen = new Set<string>();
+      const distinct = candidates.filter(hit => {
+        const key = claimKeys.get(hit)!;
+        if (seen.has(key)) { decisions.set(hit, 'duplicate'); return false; }
+        seen.add(key); return true;
+      });
+      candidates.splice(0, candidates.length, ...distinct);
       coverage.inspectedProjects = projects;
       coverage.candidateCount = candidates.length;
-      const fingerprint = sha256(JSON.stringify(candidates.map(hit => [hit.unitId, hit.projectId, hit.targetProjectId,
-        hit.kind === 'memory' ? hit.record.headEventId : hit.reason])));
+      const fingerprint = sha256(JSON.stringify({ corpusHash, rankingVersion: MEMORY_RANKING_VERSION,
+        queryTokenizer: MEMORY_QUERY_TOKENIZER, indexTokenizer: MEMORY_INDEX_TOKENIZER,
+        candidates: candidates.map(hit => [hit.unitId, hit.projectId, hit.targetProjectId, candidateRecords.get(hit)!.headEventId, hit.rank]) }));
       const cursorScope = sha256(JSON.stringify([this.#binding.sessionId, request.grantId ?? null, request.query, request.target ?? null, projects]));
       let offset = 0;
       if (request.cursor !== undefined) {
@@ -4888,7 +4941,7 @@ export class ProbeStore {
         let cursor: { schema?: string; scope?: string; fingerprint?: string; offset?: number };
         try { cursor = JSON.parse(Buffer.from(request.cursor, 'base64url').toString('utf8')); }
         catch { throw new Error('invalid-search-cursor'); }
-        check(cursor.schema === 'memory-search-cursor@1' && cursor.scope === cursorScope
+        check(cursor.schema === 'memory-search-cursor@2' && cursor.scope === cursorScope
           && cursor.fingerprint === fingerprint && Number.isSafeInteger(cursor.offset)
           && cursor.offset! > 0 && cursor.offset! <= candidates.length, 'invalid-search-cursor');
         offset = cursor.offset!;
@@ -4898,16 +4951,35 @@ export class ProbeStore {
       const remaining = grant?.remaining ?? limit;
       const remainingBytes = grant?.remainingBytes ?? byteBudget;
       const pageBytes = Math.min(byteBudget, remainingBytes);
+      for (const hit of candidates.slice(0, offset)) decisions.set(hit, 'previous-page');
       for (; end < candidates.length && results.length < Math.min(limit, remaining); end++) {
         const candidate = candidates[end]!;
         const size = Buffer.byteLength(JSON.stringify(candidate));
-        if (size > pageBytes) { skipped++; continue; }
+        if (size > pageBytes) { skipped++; decisions.set(candidate, 'candidate-over-byte-budget'); continue; }
         if (bytes + size > pageBytes) break;
         results.push(candidate);
+        decisions.set(candidate, 'returned');
         bytes += size;
       }
+      for (const hit of candidates) if (!decisions.has(hit)) decisions.set(hit,
+        results.length >= Math.min(limit, remaining) ? 'page-result-limit' : 'page-byte-budget');
+      const retrieval: MemorySearchTrace = { schema: 'memory-retrieval@1', queryHash: sha256(request.query),
+        queryTokenizer: MEMORY_QUERY_TOKENIZER, indexTokenizer: MEMORY_INDEX_TOKENIZER, sqliteVersion: ranked.sqliteVersion,
+        rankingVersion: MEMORY_RANKING_VERSION, bm25: { k1: 1.2, b: 0.75 }, fusion: ranked.fusion ? { method: 'rrf', k: 60 } : null,
+        corpus: { kind: 'eligible-lexical-candidates', count: documents.length, hash: corpusHash },
+        lanes: groups.map((group, ordinal) => ({ ordinal, queryHash: sha256(group.text), termHashes: searchTerms(group.text).map(sha256) })),
+        candidates: rankedCandidates.map((hit, ordinal) => {
+          const record = candidateRecords.get(hit)!, returnedOrdinal = results.indexOf(hit);
+          return { recordId: record.recordId, revisionId: record.revisionId, headEventId: record.headEventId,
+            hash: record.hash, contentHash: record.contentHash, targetProjectId: hit.targetProjectId, kind: hit.kind,
+            ordinal, corpusOrdinal: hit.kind === 'memory' ? documents.findIndex(document => document.recordId === hit.record.recordId) : null,
+            resultHash: retrievalResultHash(hit), scoreKind: hit.kind === 'status' ? 'not-applicable' : ranked.fusion ? 'rrf' : 'bm25',
+            score: hit.kind === 'memory' && ranked.fusion ? -hit.rank : hit.rank,
+            lanes: hit.kind === 'memory' ? ranks.get(hit.record.recordId)!.lanes : [],
+            decision: decisions.get(hit)!, returnedOrdinal: returnedOrdinal < 0 ? null : returnedOrdinal, measurement: measureRetrievalResult(hit) };
+        }) };
       if (!results.length && candidates.length > offset) return { status: 'unavailable', results: [],
-        coverage: { ...coverage, unavailableProjects: projects, reason: 'result-over-budget' }, truncated: true, nextCursor: null };
+        coverage: { ...coverage, unavailableProjects: projects, reason: 'result-over-budget' }, truncated: true, nextCursor: null, retrieval };
       if (grant && results.length) {
         const updated = this.#db.prepare(`UPDATE memory_discovery_grants
           SET used_results=used_results+?, used_bytes=used_bytes+? WHERE grant_id=? AND state='active'
@@ -4918,10 +4990,10 @@ export class ProbeStore {
       const truncated = end < candidates.length || skipped > 0;
       const exhausted = grant && (results.length >= grant.remaining || bytes >= grant.remainingBytes || grant.remainingQueries === 1);
       const nextCursor = end < candidates.length && !exhausted
-        ? Buffer.from(JSON.stringify({ schema: 'memory-search-cursor@1', scope: cursorScope, fingerprint, offset: end })).toString('base64url') : null;
+        ? Buffer.from(JSON.stringify({ schema: 'memory-search-cursor@2', scope: cursorScope, fingerprint, offset: end })).toString('base64url') : null;
       const reason = skipped ? 'oversized-candidate-skipped'
         : truncated && exhausted ? grant?.remainingQueries === 1 ? 'task-query-budget-exhausted' : 'task-budget-exhausted' : null;
-      const page: SearchPage = { status: 'ready', results, coverage: { ...coverage, reason }, truncated, nextCursor };
+      const page: SearchPage = { status: 'ready', results, coverage: { ...coverage, reason }, truncated, nextCursor, retrieval };
       for (const result of results) if (result.kind === 'memory') this.#recordMemoryFeedback(result.record, 'retrieved',
         { operation: 'memory-search', request, pageHash: sha256(JSON.stringify(page)), targetProjectId: result.targetProjectId,
           exposureMode: result.exposureMode }, randomUUID());

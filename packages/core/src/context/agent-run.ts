@@ -4,6 +4,7 @@ import { API_VERSION, check, requireProject, sha256, sourceEventId, validateBudg
 import type { Binding, HostAdapter, ProbeBudget, SourceAck, SourceExcerpt } from '../contracts.ts';
 import type { Activity, ProbeStore } from '../store/probe-store.ts';
 import type { RequestAttempt, RequestRecovery, RequestAssemblyInput, RequestStatus } from '../store/request-ledger.ts';
+import type { MemoryRetrievalReceipt, MemorySearchTrace } from '../store/memory-retrieval.ts';
 import { coreToolSchemas, controlledToolSchema } from './tool-schemas.ts';
 import type { ToolSchema } from './tool-schemas.ts';
 import { fileToolSchemas, parseFileCall, validateFileCapability } from './file-contract.ts';
@@ -68,6 +69,7 @@ export class AgentRun {
   readonly #retrievalChecks = new Map<string, () => void>();
   readonly #sourceRecoveries = new Map<string, MemorySourceRecovery[]>();
   readonly #sourceGrantIds = new Set<string>();
+  readonly #retrievalReceipts = new Map<string, { trace: MemorySearchTrace; resultHash: string }>();
   readonly #conversationChecks = new Set<string>();
   readonly #executionMode: 'parallel-safe' | 'sequential';
   readonly #abort = new AbortController();
@@ -168,6 +170,11 @@ export class AgentRun {
     if (!call || !['source.search', 'source.expand', 'memory.search', 'skill.search'].includes(call.name)) return null;
     const tool = this.status().tools.find(item => item.callId === callId);
     check(this.#active() && tool?.started && !tool.result, 'tool-not-admissible');
+    let retrieval: MemorySearchTrace | undefined;
+    const resultForHost = (outcome: 'success' | 'failure', modelResult: string) => {
+      if (retrieval) this.#retrievalReceipts.set(callId, { trace: retrieval, resultHash: sha256(modelResult) });
+      return { outcome, modelResult };
+    };
     try {
       this.#store.assertToolAdmission(this.#activity, this.runId);
       this.#checkRetrieval(); this.#checkGuidance(this.#inflightGuidanceHash);
@@ -224,6 +231,8 @@ export class AgentRun {
         } else if (call.name === 'memory.search') {
           const page = this.#store.searchMemories(this.#activity, { query, byteBudget, limit: 8,
             ...(cursor ? { cursor } : {}), ...(grant ? { grantId: grant } : {}) });
+          const { retrieval: trace, ...modelPage } = page;
+          retrieval = trace;
           const records = [...new Map(page.results.filter(hit => hit.kind === 'memory')
             .map(hit => [`${hit.record.recordId}:${hit.record.headEventId}`, hit.record])).values()];
           for (const grantId of this.#store.sourceGrantDependencies(this.#activity, records.map(record => record.source), grant)) this.#sourceGrantIds.add(grantId);
@@ -253,7 +262,7 @@ export class AgentRun {
             sourceRecovery[index] = recovery; remaining -= extra;
           }
           if (sourceRecovery.length) this.#sourceRecoveries.set(callId, sourceRecovery);
-          result = page;
+          result = modelPage;
           this.#retrievalChecks.set(callId, () => {
             for (const hit of page.results) if (hit.kind === 'memory') this.#store.assertRetrievedMemory(this.#activity, hit.record, grant);
           });
@@ -264,10 +273,10 @@ export class AgentRun {
       }
       const modelResult = JSON.stringify(result);
       check(Buffer.byteLength(modelResult) <= 32768, 'source-result-too-large');
-      return { outcome: 'success', modelResult };
+      return resultForHost('success', modelResult);
     } catch (error) {
       const reason = error instanceof Error && /^[a-z][a-z0-9-]{0,80}$/.test(error.message) ? error.message : 'source-evidence-gap';
-      return { outcome: 'failure', modelResult: JSON.stringify({ status: 'unavailable', reason }) };
+      return resultForHost('failure', JSON.stringify({ status: 'unavailable', reason }));
     }
   }
   #guidance() {
@@ -498,7 +507,7 @@ export class AgentRun {
       sources: selectedSources, intent: { eventId: intent.eventId, hash: intent.hash }, payload, payloadHash: sha256(payload), byteLength,
       estimatedTokens: byteLength, budget: this.#budget, zones: { p0: Buffer.byteLength(JSON.stringify(p0)),
         p1: Buffer.byteLength(JSON.stringify(neutral.p1)), p2: Buffer.byteLength(JSON.stringify(neutral.p2)), p3: Buffer.byteLength(JSON.stringify(p3)) },
-      selection: selectedSources.map((source, ordinal) => ({ ordinal, hash: source.hash, reason: 'mandatory-source' })), degradation });
+      selection: this.#store.agentSourceSelections(this.#activity, this.runId, selectedSources), degradation });
     this.#event({ kind: 'bound', assemblyId: assembly.assemblyId, eventIds: bindingInputs.map(input => input.source.eventId) });
     const request = { assemblyId: assembly.assemblyId, payload, payloadHash: sha256(payload) };
     this.#prepared.set(request, { digest: sha256(JSON.stringify(request)), summaryHash: sha256(JSON.stringify(operationSummaries)),
@@ -821,14 +830,22 @@ export class AgentRun {
       archivedOutcome = 'failure';
       archivedErrorClass = 'tool-result-truncated';
     }
+    const retrieved = this.#retrievalReceipts.get(callId);
+    if (retrieved && kind === 'tool-result') check(retrieved.resultHash === sha256(modelResult), 'retrieval-result-mismatch');
+    const retrieval: MemoryRetrievalReceipt | undefined = retrieved ? { schema: 'memory-retrieval-tool@1',
+      resultHash: sha256(archivedResult), trace: retrieved.trace,
+      returned: archivedOutcome === 'success' ? retrieved.trace.candidates.filter(candidate => candidate.decision === 'returned')
+        .sort((a, b) => a.returnedOrdinal! - b.returnedOrdinal!).map(candidate => candidate.ordinal) : [] } : undefined;
     const source = this.#appendOutput(sourceEventId(kind, this.runId, callId), encode(archivedResult, archivedOutcome), 'tool');
     this.#store.withActivity(this.#activity, () => {
       this.#event({ kind: 'tool-result', result: { callId, executionState: tool.started ? 'started' : 'not_started',
-        outcome: archivedOutcome, argumentsHash: tool.argumentsHash, errorClass: archivedErrorClass, source, ...(file ? { file: structuredClone(file) } : {}) } });
+        outcome: archivedOutcome, argumentsHash: tool.argumentsHash, errorClass: archivedErrorClass, source,
+        ...(file ? { file: structuredClone(file) } : {}), ...(retrieval ? { retrieval } : {}) } });
       if (tool.attemptId && this.status().tools.filter(item => item.attemptId === tool.attemptId).every(item => item.result && item.result.outcome !== 'unknown')) {
         this.#store.queueCaptureBoundary(this.#activity, this.runId, tool.attemptId);
       }
     });
+    this.#retrievalReceipts.delete(callId);
     if (this.status().tools.every(item => item.result && item.result.outcome !== 'unknown')) this.#queueHistorian();
   }
   #queueHistorian(): void {

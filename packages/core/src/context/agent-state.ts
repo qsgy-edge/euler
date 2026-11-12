@@ -2,6 +2,7 @@ import type { RequestContext, RequestStatus } from '../store/request-ledger.ts';
 import type { Binding, SourceAck } from '../contracts.ts';
 import { check } from '../contracts.ts';
 import type { FileAdmission, FileReceipt, FileCapability, FileFailureReason } from './file-contract.ts';
+import type { MemoryRetrievalReceipt } from '../store/memory-retrieval.ts';
 
 export type RunTerminal = 'completed' | 'needs-input' | 'cancelled' | 'budget-exhausted' | 'deadline' | 'failed' | 'blocked-unknown';
 export interface ModelRoute { provider: string; model: string; route: string; authNamespace: string }
@@ -10,7 +11,7 @@ export interface ToolCall { id: string; name: string; arguments: Record<string, 
 export interface ToolResult {
   callId: string; executionState: 'not_started' | 'started' | 'unknown';
   outcome: 'success' | 'failure' | 'cancelled' | 'timeout' | 'unavailable' | 'unknown';
-  argumentsHash: string; errorClass: string | null; source: SourceAck; file?: FileReceipt;
+  argumentsHash: string; errorClass: string | null; source: SourceAck; file?: FileReceipt; retrieval?: MemoryRetrievalReceipt;
 }
 export interface ToolFact { callId: string; name: string; argumentsHash: string; attemptId: string | null; started: boolean; result: ToolResult | null }
 export type AgentEvent =

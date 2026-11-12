@@ -14,6 +14,7 @@ export type { GuidanceOperation, RecognizedConstraint, OwnerDirective, GuidanceR
 export * from './contracts.ts';
 export { AgentRun } from './context/agent-run.ts';
 export type { AgentHost, ModelRequest, NeutralRequest } from './context/agent-run.ts';
+export type { MemorySearchTrace, MemoryRetrievalReceipt, MemoryDelivery, RetrievalMeasurement } from './store/memory-retrieval.ts';
 export { coreToolSchemas } from './context/tool-schemas.ts';
 export type { ToolSchema } from './context/tool-schemas.ts';
 export { parseFileCall, fileToolSchemas } from './context/file-contract.ts';
