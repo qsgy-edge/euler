@@ -53,9 +53,24 @@ A 为原系统策略；B 只增加“当已有项目约定、决定或偏好可�
 
 - A 将 `memory.search` 返回的 memory recordId 作为 `source.expand.unitId`；该分支查 published source/proposal，返回 `source-scope-mismatch`。
 - B 将 seed 的另会话 eventId 交给 `source.expand.eventId`；模型工具从当前 archive lookup，返回 `source-evidence-gap`。
-- [AgentRun](../../packages/core/src/context/agent-run.ts) 的模型工具只暴露 eventId/unitId；[ProbeStore](../../packages/core/src/store/probe-store.ts) 另有 recordId 展开重载。这是接口可达性及用法核对线索，不是源数据丢失或一律禁止跨会话来源的证据。
+- 上述旧实现的模型工具仅有 eventId/unitId，Core 已有 recordId 展开。PR #65 将合格记忆的 `recordId` 展开和命中后精确原文预取接入普通 CLI，开发组合结果见 [gate 报告](t24-first-cli-acceptance.md#pr-65-合并基线的组合验证)。
 
 新历史 fixture 通过既有 `publishSourceUnit` 发布项目来源；`artifacts/t24-history-dependency-8a90e54/offline-xDiZ6e/receipt.json` 验证 project search→published unit expand→答案、memory search→答案、直接回答三条离线链。离线模型回复为 mock，外部请求为 0。两次真实历史写作都使用搜索内容，没有调用 source.expand。
+
+## G1 项目规则对照
+
+受测 head `248e5db57688da1711cf51432c73a890ded9a44a`，tree `9c21dbcdf0d7d4cb42c33833cca33e445b6aabc9`。独立于前两轮各 18 次请求，G1 获批 4 次上限，每臂最多 2 次。两臂各用一次请求，均 HTTP 200、`received/completed`，工具调用为 0。沿用 `mistral-vibe / deepseek-v4-1-flash-1017` 和输出上限 1024 tokens，实际发送参数 `reasoning_effort=high`。
+
+| 场景 | 请求与回答 |
+|---|---|
+| 已绑定项目 | system 中含已发布规则。回答严格两行，正确表达巡检完成并使用固定签收灯 |
+| 未绑定且持任务只读 grant | 请求无项目规则。回答表达巡检完成，另加输入未提供的巡检范围和归档事实 |
+
+两臂的文件 capability 和 `file.read/write` 工具集也有差异，无法单独归因到 guidance。真实原件为 `artifacts/t24-b3-next-plan/run-real-2026-11-12T08-28-10-611Z-68aece7a/`。只读复核匹配 5 份脚本／计划摘要、2 个槽位以及请求的 6570／4108 bytes 和响应的 1010／3370 bytes。离线演练 `run-offline-2026-11-12T08-20-28-736Z-f0c39a7f` 的 3 次 loopback 单列。
+
+## G4 未发布原文离线演练
+
+在 PR #65 合并 `c9e4e7b` 的 Windows 普通 CLI 上，用冻结的 G4 中文输入完成三次 Mistral 格式 loopback。旧会话存原文及简写记忆，发布来源数为 0。新会话绑定同项目后依次检索、用 `recordId` 显式展开、给出逐字引文和实际 locator／contentHash。首请求无原文，检索返回的记忆正文无完整引文，最终冻结请求带 108 bytes 原文。只读复核匹配 4 份脚本／计划摘要、6 份 wire 摘要，三次请求的 6008／9985／13179 bytes 与 JSON、SQLite 的 attempt 和 assembly 一致。原件在 `artifacts/t24-b3-g4-preflight/run-2026-11-12T09-18-03-242Z-bbe54633/`，真实 provider 请求数为 0。模型是否会主动检索并准确引用仍待真实 G4。
 
 ## B5：本轮独立取证
 

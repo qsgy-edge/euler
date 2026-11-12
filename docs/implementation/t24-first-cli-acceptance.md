@@ -8,7 +8,7 @@ Issue：[#25](https://github.com/qsgy-edge/euler/issues/25)。证据核对日期
 
 普通 CLI 输入、显式项目绑定及待定候选自动续办已由 [#54 / PR #56](https://github.com/qsgy-edge/euler/pull/56)、[#55 / PR #58](https://github.com/qsgy-edge/euler/pull/58) 交付，并在合并基线上通过受影响组合复验。共享 Core 三平台回归、Windows 实际 CLI/文件操作、候选验证、恢复与清理证据符合下述限定场景。真实 provider 与部分独立证据尚未齐备。
 
-当前产品基线为 [PR #61](https://github.com/qsgy-edge/euler/pull/61) 合并 `5a0098ecaf9c872e27a815f7f330be451de3ee59`：disposable schema 为 **31**，独立 forward-migration 测试副本为 **32**。下方 B1/B2 组合原件仍绑定 schema 30／副本 31 的原基线，不改标为当前版本。初始生产 DDL、migration 和 SHA-256 均未冻结。
+当前产品基线为 [PR #67](https://github.com/qsgy-edge/euler/pull/67) 合并 `a04b494a8fdff3824f8da83313e7b101843d2c49`，含 [PR #65](https://github.com/qsgy-edge/euler/pull/65) 的来源恢复及检索交付。Disposable schema 为 **31**，独立 forward-migration 测试副本为 **32**。B1/B2 组合原件仍绑定原基线的 schema 30／副本 31。初始生产 DDL、migration 和 SHA-256 均未冻结。
 
 判定依据是 [I01/I03/I05/I08](../architecture/issues/15-euler-v1-spec.md)、[08 §4a](../architecture/issues/08-automate-memory-evolution.md)、[X-card](../architecture/issues/12-build-evidence-experiment-matrix.md) 和 [D8 / Physical contract](../architecture/issues/13-select-target-v1-migration.md)。#25 是验收票；缺功能与基础验证交回所属实施票。
 
@@ -100,6 +100,12 @@ Pi 各模式、MCP、overview/raw backfill、bundle/X-15、行为评估/X-08、m
 
 T18 counting 归档只有 payload hash/长度，不据此宣称完整 wire bytes 重建。SIGKILL、部分追加、ENOSPC/SQLITE_FULL 注入保留各自证据等级，不替代真实断电或填满物理卷。
 
+### 共享上下文的独立清理范围（PR #67）
+
+[跟进 #66](https://github.com/qsgy-edge/euler/issues/66) 在旧基线 `d12e7cd` 及 `248e5db` 均复现。共享 policy、intent 和 task grant 时，A 的清理预览选择了独立记忆 B、B 的来源及共享 grant。两次预览均取消。修复后同一预览排除 B 及其来源，选择的 grant 数为 0。五项回归覆盖相同请求下的独立回答、实际派生输出、无身份 counting receiver 回执、旧冻结 intent，以及实际维护 CLI 的批准、备份、清除与重开。重开后 B 可检索，来源、账本及 grant 保留，A 和派生副本已清除。前后探针在 `artifacts/t24-shared-grant-purge-probe/`。
+
+受测 head `8362d4a3cc4ec267df80a2a59761299ab30f207d` 与合并提交的 tree 均为 `62ee33d902e2791c2bd40cc87a927ccdf76389ea`。Windows `npm run check` 为 **1049 通过、0 失败、1 跳过**。两轮三平台 CI **6/6**，Greptile 对同一 head 为 **5/5**。本机日志和维护门禁原件在 `artifacts/t66-verified/t66-full-8362d4a/`。[PR CI](https://github.com/qsgy-edge/euler/actions/runs/43190306637) · [push CI](https://github.com/qsgy-edge/euler/actions/runs/43190292576)
+
 ## 冻结阻塞与归属
 
 ### B3 — 有限真实模型探索已完成，完整验收未齐
@@ -120,7 +126,11 @@ T18 counting 归档只有 payload hash/长度，不据此宣称完整 wire bytes
 
 明确要求沿用历史格式的简单写作，在两个新会话中均首轮检索并于第二请求正确完成；完整给出格式的一次观察无检索且答对。原模糊维护通报题 A/B 均未检索，未观察到新增指导改善；该题的历史依赖未明确，隐藏落款缺失不足以单独判必要检索失败。两次历史样本都使用 B 指导且新增了可用历史来源，未测出指导的独立贡献或通用稳定性。旧明确落款题的来源展开拒绝、新 fixture 的离线展开成功和真实搜索结果使用分别登记，不合写成完整原文恢复通过。
 
-**仍缺：** 完整两条验证管线、长会话／交接、纠正意图、Historian 忠实度、真实模型遵守已加载项目规则的效果，以及 X-14 缓存／成本／延迟配对。接近实际长度的合成 source 吞吐与 deadline 结算也需有界 workload 证据；有限普通回答和工具往返不关闭这些组合验收。
+G1 项目规则对照在 `248e5db` 另获最多 4 次请求额度。沿用 `mistral-vibe / deepseek-v4-1-flash-1017`、`high` 和单次输出上限 1024 tokens，两个会话各用一次请求后正常完成，共 **2/4** 次。绑定会话的请求含规则，回答严格符合两行格式和固定签收灯。未绑定只读会话的请求无该规则，回答添加了输入未提供的巡检范围和归档细节。两臂还有文件能力差异，无法从本组单独估计 guidance 的作用。[G1 原件索引](t24-retrieval-experiment-index.md#g1-项目规则对照)
+
+G4 用冻结中文样例完成三次普通 CLI loopback，模拟检索、精确原文展开和逐字引用，实际请求及原文标识均已核对。[G4 原件索引](t24-retrieval-experiment-index.md#g4-未发布原文离线演练)
+
+**仍缺：** 两条完整验证管线、真实模型恢复并引用同项目未发布原文、纠正／遗忘、长会话／跨项目交接、Historian 忠实度、规则遵守的重复及对照证据，以及 X-14 缓存／成本／延迟配对。接近实际长度的合成 source 吞吐与 deadline 结算也需有界 workload 证据。
 
 当前非流式 transport 的 TTFT 为 `unsupported`；未给价格表则费用 `unknown`，没有 cache on/off、冷重置或明确服务端指标时不推断命中。普通记忆采用按需检索、持续约束由明确发布的项目规则提供，已按 [R1–R8 决策](../architecture/memory-retrieval-policy-proposal.md) 同步正式规格。后续验收按 [清单](t24-retrieval-acceptance-plan.md) 核对触发、实际返回和冻结送达；设计确认不代替完整实现及独立验收。
 
@@ -161,11 +171,17 @@ B3 的模型探索与 PR #61 的项目规则 guidance 已分别提供有限证�
 - **guidance 与来源 ID 边界：** [#25 补证记录](https://github.com/qsgy-edge/euler/issues/25#issuecomment-6816058947) 已登记 4/4 场景、7 次 loopback HTTP。显式绑定加载项目 guidance；未绑定仅任务只读 grant 可查询 reference-only 记忆／项目来源，未加载 guidance；模型自报项目范围未建立授权或泄露种子正文。原件为 `artifacts/t24-b4-boundary-probe/run-2026-11-12T05-59-39-496Z-e97b0ebb/`。同基线 PR CI 的既有 27 项边界案例三平台各 27/27，直接复用该证据。
 - **canonical 状态与投影：** `artifacts/t24-b4-canonical-probe/run-2026-11-12T06-25-02.568Z-dea1bb7f/` 通过 15 项开发断言，保留 20 步观测、操作结果、查询页、恢复对照及文件摘要。公开 Store API 覆盖 candidate→verified→active、revision、forget→restore、block→rejected、conflict；投影滞后明确返回 dirty，drain 后读取当前 head，旧 revision／已忘记／冲突快照拒用，重启后 head 不变。此组未发送模型请求，不能替代冻结请求送达和独立集四个未知 transition 的验收。首轮探针误将稳定 `claimKey` 中的旧文本判为旧事实；依据既有身份契约，修正为检查当前 `record.content` 并核对 claimKey 不变，原失败目录保留。
 - **中文单字成对观测：** 上述同一 head 的「松」查询返回 `unsupported-query`，「松林」命中。确认现有单字路径不支持；慢路径及独立配对质量仍缺证，未据此选择 fallback 算法。
-- **未发布原文不可达：** `artifacts/t24-source-reachability/run-2026-11-12T06-23-31-064Z-0aa46445/` 用两个同项目会话与一条未发布来源复现：`memory.search` 命中、项目来源搜索为空；模型把 memory ID 作为 unitId、跨会话 eventId、recordId 参数展开，分别得到 `source-scope-mismatch`、`source-evidence-gap`、`invalid-source-request`。同环境 Core `expandSource(recordId)` 精确恢复原文。三个受控 AgentRun 请求的 hash／bytes 与 attempt 对齐，原文 marker 均未进入请求；该路径也未发生定向预取。此组为内存中的受控 transport，无 HTTP 或外部 provider 请求。归属 #11/T11 与 #8/T08，须补实现后再验收，工具说明调整不足以关闭该差异。
+- **未发布原文不可达的旧基线：** `artifacts/t24-source-reachability/run-2026-11-12T06-23-31-064Z-0aa46445/` 用两个同项目会话与一条未发布来源复现。`memory.search` 命中，项目来源搜索为空。模型把 memory ID 作为 unitId、跨会话 eventId、recordId 参数展开，分别得到 `source-scope-mismatch`、`source-evidence-gap`、`invalid-source-request`。同环境 Core `expandSource(recordId)` 精确恢复原文。三个受控 AgentRun 请求的 hash／bytes 与 attempt 对齐，原文 marker 均未进入请求。此组使用内存 transport。
 
-当前排序实现仍是 FTS 命中后按 query-group 命中数排序，再对 lane 轮询去重（`ProbeStore.searchMemories`）；未计算规格要求的 BM25／可复算排名融合分。索引保存 `latin-cjk@3`，逐查询返回没有 query/index tokenizer 版本；查询预算按 UTF-8 bytes，assembly 使用 `utf8-bytes-upper-bound@1` 整包估算，缺逐候选 token／成本。分别交 #10/T10 与 context/ledger owner 核对，不能把现有 rank 或字节数标为相应指标。
+旧排序按 FTS 命中组数及 lane 轮询，缺少 BM25／RRF、逐查询 tokenizer 版本及逐候选计量。来源恢复与排序／计量的实施差异已由 [#63](https://github.com/qsgy-edge/euler/issues/63)、[#64](https://github.com/qsgy-edge/euler/issues/64) 交付。当前按合格 lexical 候选计算 BM25，多 lane 用 RRF，并区分检索返回和实际送达。账本记录 query/index tokenizer 版本、候选选择原因和 UTF-8 bytes 预算计量。实际 token 仍为 `unsupported`，费用为 `unknown`。
 
 原文不可达原件经另一只读核验者复算：3 份请求与 JSON／SQLite 的 attempt 和 assembly 一致，35 个 ledger payload 摘要、10 个 source ACK 与两份 archive 一致，SQLite quick_check/FK 正常；canonical 探针的 30 个原件文件摘要及字节数全部匹配。这组补证没有读取或重跑 held-out、启用第三套题或调用外部 provider。B4 继续开放，初始 schema 未冻结。
+
+#### PR #65 合并基线的组合验证
+
+受测 head `248e5db57688da1711cf51432c73a890ded9a44a` 与合并提交的 tree 均为 `9c21dbcdf0d7d4cb42c33833cca33e445b6aabc9`。本机完整检查 **1044 通过、0 失败、1 跳过**。两轮 Windows、macOS、Ubuntu CI 共 **6/6** 成功，同 head 的 Greptile 为 **5/5**。[PR CI](https://github.com/qsgy-edge/euler/actions/runs/43181156057) · [push CI](https://github.com/qsgy-edge/euler/actions/runs/43181048945)
+
+普通 Windows CLI 连续三次 loopback HTTP 200，覆盖首请求无种子记忆、BM25 顺序、同项目跨会话精确原文预取及 `source.expand(recordId)` 分页。完整 ReAct 回合保留原文，排序审计 metadata 留在账本。只读复核匹配全部 34 个原件摘要、三份 wire 请求与响应及 29 个 ledger event 摘要。原件为 `artifacts/t24-retrieval-closure-evidence/run-2026-11-12T08-04-37-963Z-5aee9774/`。这是开发组合证据，B4 独立首测判定仍保留。
 
 #### 24 个缺证案例：证据分布与开发验证
 
@@ -180,7 +196,7 @@ B3 的模型探索与 PR #61 的项目规则 guidance 已分别提供有限证�
 
 **跨案例的观测限制（不另加案例数）：**
 
-- **排序和成本。** 首测可复算 24 条候选排序轨迹：各查询组内排序，再轮流选取未选候选。收据没有 BM25/RRF 数值、独立的查询分词器版本或自动装配的 token 成本；只观察到索引版本 `latin-cjk@3`。开发验证应记录实际排序规则、查询端版本和计量口径；若受测路径不计算某项分数，保留为与 [X-02 观测要求](https://github.com/qsgy-edge/euler/blob/a860533cf7673533ee6f951266cf088496c2ad49/docs/architecture/issues/12-build-evidence-experiment-matrix.md#L93-L98) 的差异，不把名次当分数，也不把字节数当 token。
+- **排序和成本。** 旧独立首测可复算 24 条轮询排序轨迹，收据只有索引版本 `latin-cjk@3`，缺 BM25/RRF 分数、查询分词器版本和逐候选 token 成本。PR #65 已提供排序分数、两端版本和 UTF-8 bytes 计量。独立排序与送达复验，以及 [X-02](https://github.com/qsgy-edge/euler/blob/a860533cf7673533ee6f951266cf088496c2ad49/docs/architecture/issues/12-build-evidence-experiment-matrix.md#L93-L98) 要求的逐候选实际 token 计量仍缺。
 - **任务、环境与访问范围。** 首测的 Store 搜索使用显式 `query`，未观测到任务上下文组合查询，也未独立构造项目不可用和权限版本变化。开发数据应区分已授权、未授权、可披露不可用状态的项目，记录任务/授权版本、目标环境和实际读取范围；以真实 cursor/ref 检验任务切换、结束或撤销后的拒读。没有对应入口或宿主时标记缺证，不用 Windows 结果推算其他平台。
 
 这份清单依据公开判定元数据；没有打开标准答案、运行新旧盲测集或启用第三套题。开发验证用于定位缺口，不改写独立首测结论。
@@ -199,14 +215,16 @@ B3 的模型探索与 PR #61 的项目规则 guidance 已分别提供有限证�
 
 **历史超时复跑。** 两个历史提交使用各自 lockfile、全新合成目录、空 Jiti cache、Node v24.18.0 和原限时，在 Windows 顺序运行；T16 保留原来的两个并行测试文件。普通/分阶段冷复跑中，T16 目标用例分别为 2.449 / 2.671 秒，第二轮依次观察到 setup、未提交 checkpoint、强杀与 reconcile。T20 的 receipt 目标用例分别为 33.555 / 43.955 秒，第二轮 nested focused runner 占 42.391 秒并返回 0。两次历史超时均未重现；复跑时长不用于解释原失败。T20 的目标重放没有模拟原全量 suite 的宿主负载。
 
+**T20 全量上下文复跑。** 在原提交 `17d961e` 和原 180 秒限时下，以独立临时根运行完整串行 `npm run check`。原 receipt 目标用例 **32.841 秒通过**，其中嵌套 owner-memory 测试用时 31.386 秒，exit 0。历史套件合计 741 通过、3 失败、1 跳过。另三项分别是 guidance 返回 `unavailable` 和两项 context HTTP 在前置检查失败。保留长临时根时 guidance 定向复现，改用较短的独立临时根后三项定向 **3/3 通过**。原件 `artifacts/t24-b5-t20-full/run-b5bb3110b7184e56bf58edb511e90d03/` 保留全量、路径对照和进程阶段，原 180 秒停顿仍缺当时的阶段证据。
+
 **原件与归属。** `D:/GithubRepositories/Agent/euler-t24-resume/artifacts/t24-b5-4d50e24/` 保留两次历史超时样本、按原提交隔离的冷复跑和逐阶段 trace、Windows Job 与 Linux /proc 样本。PR #61 的原失败与最终成功日志分别保留于上述 `project-rule-resume-check-ab369825/`、`project-rule-final-check-494b0afa/`；后者的 `maintenance-capture.mjs` 是仅供取证的诊断探针，不是产品或必跑检查。首次维护门禁 observations/residuals 未留存，仍需原现场或同路径再次失败的判定证据。
 
-本轮另在 PR #61 最终 head `c3a6993`（tree `dea7613`）对 database restore 单用例做三次带诊断定向运行，均为 1 pass / 0 fail，门禁均 `acquired: true`。这三次与上表旧复跑分列，未提供拒绝现场；[索引中的 B5 记录](t24-retrieval-experiment-index.md#b5本轮独立取证) 指向原件与具体观测字段。
+PR #61 最终 head `c3a6993`（tree `dea7613`）的 database restore 单用例有三次带诊断定向运行，均为 1 pass / 0 fail，门禁均 `acquired: true`。[B5 定向取证索引](t24-retrieval-experiment-index.md#b5本轮独立取证) 保留原件和观测字段。PR #65、PR #67 的本机全量各记录两次 `acquired: true`，各轮的参与者／残留观测数依次为 2／8、4／9。PR #65 原件在 `artifacts/t24-full-2f2ecb9259df420599dd5cb7c8a2834f/`，PR #67 原件见上节。原门禁拒绝仍缺现场判定。
 
 #25 登记的 GitHub 前置均已关闭。B5 仍留 #2/T02、#12/owner-evidence 两次历史超时内部原因，以及 #20/T20 备份恢复维护门禁拒绝。Linux 的退出顺序单列，不计为 Windows 失败。规则擦除中断恢复 P1 和 #38 的 T15 轮询竞态已有独立修复证据，不重新打开，也不用于关闭其他未解释失败。
 
 ## 放行条件与支持范围
 
-B1/B2 的实施及受影响组合证据已闭合，PR #61 项目规则能力已交付。B3 完整真实路径、B4 独立检索证据、B5 的两次 Windows 历史超时和备份维护门禁拒绝仍须闭合；修复后按实际影响更新组合证据。满足当前已确认规格的完整 gate 并保留历史判定后，才冻结初始 DDL、版本、SHA-256 和实现 commit。
+B1/B2 的实施及受影响组合证据已闭合。项目规则、来源恢复、排序／送达计量和独立清理范围均已交付。B3 完整真实路径、B4 独立检索证据、B5 的两次 Windows 历史超时和备份维护门禁拒绝仍须闭合。满足当前已确认规格的完整 gate 并保留历史判定后，才冻结初始 DDL、版本、SHA-256 和实现 commit。
 
 有效结论为共享 Core 三平台 CI、Windows 合成普通 CLI、候选续办与本文列出的组合路径通过；首次完整 capability 仍 blocked。该结论不授权 MC 重建、真实数据迁移、owner 切换或 T27 canary。
